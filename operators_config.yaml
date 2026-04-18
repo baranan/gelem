@@ -1,0 +1,31 @@
+# operators_config.yaml
+#
+# Lists all operators available in Gelem and their default settings.
+# To disable an operator, set enabled: false.
+# To add a new operator, add an entry here and create the
+# corresponding .py file in the operators/ folder.
+
+operators:
+  thumbnail:
+    enabled: true
+    description: "Generates gallery thumbnails and previews."
+
+  blendshapes:
+    enabled: true
+    description: "Extracts blendshape values from face images using mediapipe."
+
+  blendshape_avatar:
+    enabled: true
+    description: "Renders a face avatar from blendshape column values."
+
+  mean_face:
+    enabled: true
+    description: "Computes a mean face image from a selection of frames."
+
+  plot:
+    enabled: true
+    description: "Generates a blendshape-over-time plot for each item."
+
+  summary_stats:
+    enabled: true
+    description: "Computes descriptive statistics over a selection of rows."
