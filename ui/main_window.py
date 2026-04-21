@@ -165,7 +165,7 @@ class MainWindow(QMainWindow):
         right_tabs.addTab(self._results_panel, "Results")
 
         splitter.addWidget(right_tabs)
-        splitter.setSizes([220, 800, 380])
+        splitter.setSizes([180, 840, 380])
 
     # ── Operators menu ────────────────────────────────────────────────
 

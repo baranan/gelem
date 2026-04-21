@@ -19,6 +19,8 @@ Student A is responsible for implementing this class.
 """
 
 from __future__ import annotations
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QPainter, QPixmap
 from ui.tiles.base_tile import BaseTile
 
 
@@ -118,10 +120,29 @@ class GridTile(BaseTile):
                self._cached_size   = size
                return result
         """
-        # PLACEHOLDER: renders first child only at full size.
-        if self._children:
-            return self._children[0].render(size)
-        return None
+        if self._cached_pixmap is not None and self._cached_size == size:
+            return self._cached_pixmap
+
+        n = len(self._children)
+        child_size = size // n
+
+        result = QPixmap(size, size)
+        result.fill(Qt.GlobalColor.white)
+
+        painter = QPainter(result)
+        for i, child in enumerate(self._children):
+            child_pixmap = child.render(child_size)
+            if child_pixmap is None:
+                continue
+            if self._direction == "horizontal":
+                painter.drawPixmap(i * child_size, 0, child_pixmap)
+            else:
+                painter.drawPixmap(0, i * child_size, child_pixmap)
+        painter.end()
+
+        self._cached_pixmap = result
+        self._cached_size = size
+        return result
 
     def get_row_ids(self) -> list[str]:
         """
