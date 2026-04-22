@@ -76,7 +76,7 @@ class TileWidget(QLabel):
         Asks the tile to render itself and displays the result.
         Shows a gray placeholder if rendering returns None.
         """
-        pixmap = self._tile.render(self._size)
+        pixmap = self._tile.render(self._size, self._size)
         if pixmap is not None:
             self.setPixmap(
                 pixmap.scaled(
