@@ -72,11 +72,11 @@ class FilterPanel(QWidget):
         self._active_filters: dict[str, Filter] = {}
         # Key: column name. Value: active Filter or None.
 
-        self.setMinimumWidth(220)
-        self.setMaximumWidth(300)
+        self.setMinimumWidth(180)
+        self.setMaximumWidth(180)
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(4, 4, 4, 4)
+        outer.setContentsMargins(2, 2, 2, 2)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -87,8 +87,8 @@ class FilterPanel(QWidget):
 
         self._inner  = QWidget()
         self._layout = QVBoxLayout(self._inner)
-        self._layout.setContentsMargins(4, 4, 4, 4)
-        self._layout.setSpacing(8)
+        self._layout.setContentsMargins(2, 2, 2, 2)
+        self._layout.setSpacing(4)
         self._layout.addStretch()
         scroll.setWidget(self._inner)
 
@@ -207,14 +207,16 @@ class FilterPanel(QWidget):
         group = QGroupBox(column)
 
         if len(values) < CATEGORICAL_THRESHOLD:
-            # Low cardinality — show toggle buttons.
-            layout = QHBoxLayout(group)
+            # Low cardinality — show toggle buttons stacked vertically
+            # so each button can stay narrow and labels are never truncated.
+            layout = QVBoxLayout(group)
             layout.setSpacing(2)
+            layout.setContentsMargins(4, 4, 4, 4)
 
             for val in values:
                 btn = QPushButton(str(val))
                 btn.setCheckable(True)
-                btn.setMaximumWidth(80)
+                btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
                 btn.clicked.connect(
                     lambda checked, c=column, v=val:
                     self._on_text_toggle(c, v, checked)
@@ -224,6 +226,8 @@ class FilterPanel(QWidget):
         else:
             # High cardinality — show text search input.
             layout = QVBoxLayout(group)
+            layout.setContentsMargins(4, 4, 4, 4)
+            layout.setSpacing(2)
 
             hint = QLabel(f"{len(values)} unique values")
             hint.setStyleSheet("color: #888888; font-size: 10px;")

@@ -35,7 +35,7 @@ class BaseTile(ABC):
     """
 
     @abstractmethod
-    def render(self, size: int):
+    def render(self, width: int, height: int):
         """
         Produces a QPixmap representing this tile at the given size.
         Called by GalleryWidget whenever a tile needs to be painted.
@@ -45,8 +45,9 @@ class BaseTile(ABC):
                        them into one QPixmap.
 
         Args:
-            size: The width (and height) of the tile in pixels.
-                  The rendered image should fit within size x size.
+            width:  The width of the tile in pixels.
+            height: The height of the tile in pixels.
+                    The rendered image should fit within width x height.
 
         Returns:
             A QPixmap ready for display, or None if rendering fails.
