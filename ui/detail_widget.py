@@ -39,11 +39,10 @@ class DetailWidget(QWidget):
 
     Supports:
         - Single item view (one media widget + metadata table)
-        - Multi-item view (TODO: several items side by side)
+        - Multi-item view (several items side by side in a QSplitter)
         - Set-bound result view (mean face or other group outputs)
 
     TODO (Student A): Implement metadata table display.
-    TODO (Student A): Implement side-by-side multi-item layout.
     """
 
     def __init__(self, controller, parent=None):
@@ -97,30 +96,32 @@ class DetailWidget(QWidget):
         """
         Shows the content for the given row_ids.
 
-        Calls controller.render_column_value(mode='detail') to get the
-        appropriate widget for the row's full_path column. Displays
-        that widget in the detail area.
-
-        For a single row_id, shows one media widget plus metadata.
-        For multiple row_ids, shows the first item (side-by-side layout
-        is a TODO for Student A).
+        For a single row_id, shows one media widget on top with the
+        metadata text below it. For multiple row_ids, shows one panel
+        per row_id arranged left-to-right in a horizontal QSplitter, so
+        the researcher can resize each panel and compare items side by
+        side. Each panel has its own media widget, file-name header,
+        and metadata text.
 
         Args:
             row_ids: List of row_ids to display.
-
-        TODO (Student A): Implement side-by-side layout for multiple
-        row_ids — create one media widget per row_id and arrange them
-        in a QSplitter or QHBoxLayout.
         """
         if not row_ids:
             return
 
-        row_id   = row_ids[0]
+        if len(row_ids) == 1:
+            self._show_single(row_ids[0])
+        else:
+            self._show_multi(row_ids)
+
+    def _show_single(self, row_id: str) -> None:
+        """
+        Renders a single row in the existing one-column layout.
+        Updates the title, media widget, metadata label, and the cached
+        pixmap used by Save as PNG.
+        """
         metadata = self._controller.get_row(row_id)
 
-        # Ask the controller to render full_path in detail mode.
-        # The renderer decides whether to return a ZoomableImageView,
-        # a video player, or a placeholder — DetailWidget does not care.
         full_path = metadata.get("full_path", "")
         widget    = self._controller.render_column_value(
             "full_path", full_path, size=600, mode="detail",
@@ -129,22 +130,105 @@ class DetailWidget(QWidget):
 
         self._swap_media_widget(widget)
 
-        # Update the title label with the file name.
-        self._label.setText(metadata.get("file_name", row_id))
+        # Restore the global metadata label in case we just came back
+        # from a multi-item view that hid it.
+        self._meta_label.show()
 
-        # Show metadata as simple text (placeholder for a proper table).
-        meta_text = "\n".join(
-            f"{k}: {v}"
-            for k, v in metadata.items()
-            if k not in ("full_path", "row_id")
-        )
-        self._meta_label.setText(meta_text)
+        self._label.setText(metadata.get("file_name", row_id))
+        self._meta_label.setText(self._format_meta_text(metadata))
 
         # Store pixmap if the widget is a ZoomableImageView (for Save PNG).
         if isinstance(widget, ZoomableImageView) and widget._pixmap_item:
             self._current_pixmap = widget._pixmap_item.pixmap()
         else:
             self._current_pixmap = None
+
+    def _show_multi(self, row_ids: list[str]) -> None:
+        """
+        Renders a side-by-side comparison of several rows in a
+        horizontal QSplitter. Each panel gets its own media widget,
+        a file-name header, and a small metadata label so panels are
+        independently readable.
+
+        Save as PNG is disabled in multi-item mode — no single pixmap
+        represents the view.
+        """
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+
+        for row_id in row_ids:
+            panel = self._build_item_panel(row_id)
+            splitter.addWidget(panel)
+
+        # Equal split between panels by default.
+        splitter.setSizes([1] * len(row_ids))
+
+        self._swap_media_widget(splitter)
+
+        # Hide the global metadata label — each panel has its own.
+        self._meta_label.hide()
+
+        self._label.setText(f"{len(row_ids)} items")
+
+        # No single pixmap is meaningful when several items are shown.
+        self._current_pixmap = None
+
+    def _build_item_panel(self, row_id: str) -> QWidget:
+        """
+        Builds one column of the multi-item view: file-name header,
+        rendered media widget, and a compact metadata label.
+
+        Args:
+            row_id: The row to render.
+
+        Returns:
+            A QWidget ready to be added to the side-by-side splitter.
+        """
+        metadata  = self._controller.get_row(row_id)
+        full_path = metadata.get("full_path", "")
+        media     = self._controller.render_column_value(
+            "full_path", full_path, size=400, mode="detail",
+            context={"row_id": row_id, "column_name": "full_path"},
+        )
+
+        panel  = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(2)
+
+        title = QLabel(metadata.get("file_name", row_id))
+        title.setStyleSheet("font-weight: bold;")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+
+        if media is not None:
+            layout.addWidget(media, stretch=1)
+
+        meta = QLabel(self._format_meta_text(metadata))
+        meta.setWordWrap(True)
+        meta.setStyleSheet(
+            "font-size: 11px; color: #444444; padding: 4px;"
+        )
+        layout.addWidget(meta)
+
+        return panel
+
+    def _format_meta_text(self, metadata: dict) -> str:
+        """
+        Renders metadata as `key: value` lines, skipping the columns
+        that aren't useful in the detail view (full_path is the media
+        itself, row_id is internal). Floats are formatted with 4
+        significant digits to keep the panel narrow.
+        """
+        lines: list[str] = []
+        for key, value in metadata.items():
+            if key in ("full_path", "row_id"):
+                continue
+            if isinstance(value, float):
+                lines.append(f"{key}: {value:.4g}")
+            else:
+                lines.append(f"{key}: {value}")
+        return "\n".join(lines)
 
     def show_result(self, result: dict) -> None:
         """
