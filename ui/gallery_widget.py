@@ -182,6 +182,9 @@ class GalleryWidget(QWidget):
         self._visible_cols: list[str] = []
         self._selected_ids: set[str]  = set()
         self._tile_widgets: list[TileWidget] = []
+        # Index of the last plain- or ctrl-clicked tile in self._row_ids.
+        # Acts as the anchor for shift+click range selection.
+        self._last_clicked_index: int | None = None
 
         # Main layout.
         self._layout = QVBoxLayout(self)
@@ -217,6 +220,7 @@ class GalleryWidget(QWidget):
         """
         self._row_ids = row_ids
         self._selected_ids.clear()
+        self._last_clicked_index = None
         self._rebuild_tiles()
 
     def set_tile_size(self, size: int) -> None:
@@ -333,37 +337,51 @@ class GalleryWidget(QWidget):
         ]
         return GridTile(children, direction="horizontal")
 
-    def _on_tile_clicked(self, 
-                         row_ids: list[str], 
-                         ctrl_held: bool = False, 
+    def _on_tile_clicked(self,
+                         row_ids: list[str],
+                         ctrl_held: bool = False,
                          shift_held: bool = False) -> None:
         """
         Handles tile selection.
         - Plain click:  select only this tile, deselect all others.
         - Ctrl+click:   toggle this tile in/out of the selection.
-        - Shift+click:  TODO (Student A): select all tiles between the
-                        last clicked tile and this one. Requires tracking
-                        the index of the last clicked tile in self._last_clicked_index.
-                        Then select all row_ids between that index and the
-                        current tile's index in self._row_ids.
+        - Shift+click:  replace the selection with every tile between the
+                        anchor (last plain- or ctrl-clicked tile) and this
+                        tile, inclusive. The anchor is not moved, so
+                        repeated shift+clicks extend from the same anchor.
+                        If no anchor exists yet, falls back to plain click.
         """
-        if shift_held and not ctrl_held:
-            # TODO (Student A): implement range selection.
-            # For now, fall through to plain click behaviour.
-            pass
+        if not row_ids:
+            return
 
-        if ctrl_held:
-            # Toggle this tile in or out of the existing selection.
+        # Locate the clicked tile in self._row_ids. Tiles always group
+        # by row_id (one row_id per tile for ImageTile, or a list of
+        # ImageTiles for the same row_id in GridTile), so the first
+        # row_id is enough to identify the tile's position.
+        clicked_id = row_ids[0]
+        try:
+            clicked_idx = self._row_ids.index(clicked_id)
+        except ValueError:
+            clicked_idx = None
+
+        if (shift_held
+                and not ctrl_held
+                and self._last_clicked_index is not None
+                and clicked_idx is not None):
+            lo = min(self._last_clicked_index, clicked_idx)
+            hi = max(self._last_clicked_index, clicked_idx)
+            self._selected_ids = set(self._row_ids[lo:hi + 1])
+            # Anchor stays put so further shift+clicks extend from it.
+        elif ctrl_held:
             for row_id in row_ids:
                 if row_id in self._selected_ids:
                     self._selected_ids.discard(row_id)
                 else:
                     self._selected_ids.add(row_id)
+            self._last_clicked_index = clicked_idx
         else:
-            # Plain click — replace selection with just this tile.
-            self._selected_ids.clear()
-            for row_id in row_ids:
-                self._selected_ids.add(row_id)
+            self._selected_ids = set(row_ids)
+            self._last_clicked_index = clicked_idx
 
         # Update visual selection state on all tiles.
         for tw in self._tile_widgets:
