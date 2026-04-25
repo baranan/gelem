@@ -71,6 +71,8 @@ class FilterPanel(QWidget):
         self._controller     = controller
         self._active_filters: dict[str, Filter] = {}
         # Key: column name. Value: active Filter or None.
+        self._toggle_values: dict[str, set] = {}
+        # Key: column name. Value: set of currently-checked toggle values.
 
         self.setMinimumWidth(180)
         self.setMaximumWidth(180)
@@ -213,6 +215,10 @@ class FilterPanel(QWidget):
             layout.setSpacing(2)
             layout.setContentsMargins(4, 4, 4, 4)
 
+            # Buttons are recreated unchecked, so reset state to match.
+            self._toggle_values[column] = set()
+            self._active_filters.pop(column, None)
+
             for val in values:
                 btn = QPushButton(str(val))
                 btn.setCheckable(True)
@@ -253,15 +259,26 @@ class FilterPanel(QWidget):
     ) -> None:
         """
         Called when a text filter toggle button is clicked.
-        Activates or deactivates an 'eq' filter for the given value.
+
+        Multiple values can be active at once per column. Their union is
+        represented as a single Filter(column, "isin", [...]). When no
+        values are checked, the column's filter is removed entirely.
 
         Args:
             column:  The column being filtered.
             value:   The value being toggled.
             checked: True if the button is now active.
         """
+        values = self._toggle_values.setdefault(column, set())
         if checked:
-            self._active_filters[column] = Filter(column, "eq", value)
+            values.add(value)
+        else:
+            values.discard(value)
+
+        if values:
+            self._active_filters[column] = Filter(
+                column, "isin", sorted(values, key=str)
+            )
         else:
             self._active_filters.pop(column, None)
 
