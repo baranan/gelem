@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QWidget, QScrollArea, QVBoxLayout, QGridLayout,
     QLabel, QSizePolicy
 )
-from PySide6.QtCore import Signal, Qt
+from PySide6.QtCore import Signal, Qt, QEvent
 from PySide6.QtGui import QPixmap
 
 from ui.tiles.image_tile import ImageTile
@@ -131,18 +131,25 @@ class TileWidget(QLabel):
         self._repaint()
 
     def mousePressEvent(self, event) -> None:
-        """Handles single click — emits clicked signal with modifier keys."""
+        """
+        Handles single click — emits clicked signal with modifier keys.
+
+        We call event.accept() so the press doesn't bubble up to the
+        gallery's grid background, where the event filter would
+        misinterpret it as a click on empty space and clear the
+        selection.
+        """
         from PySide6.QtCore import Qt
         modifiers = event.modifiers()
         ctrl_held  = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
         shift_held = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
         self.clicked.emit(self._tile.get_row_ids(), ctrl_held, shift_held)
-        super().mousePressEvent(event)
+        event.accept()
 
     def mouseDoubleClickEvent(self, event) -> None:
         """Handles double click — emits double_clicked signal."""
         self.double_clicked.emit(self._tile.get_row_ids())
-        super().mouseDoubleClickEvent(event)
+        event.accept()
 
 
 class GalleryWidget(QWidget):
@@ -204,6 +211,14 @@ class GalleryWidget(QWidget):
         self._grid_layout = QGridLayout(self._grid_widget)
         self._grid_layout.setSpacing(4)
         self._scroll.setWidget(self._grid_widget)
+
+        # Clicks that land on the grid background (between or below
+        # tiles) or on the scroll-area viewport should clear the
+        # current selection — same convention as Windows Explorer
+        # and macOS Finder. We watch them via an event filter so we
+        # don't have to subclass QWidget/QScrollArea.
+        self._grid_widget.installEventFilter(self)
+        self._scroll.viewport().installEventFilter(self)
 
     # ── Public API ────────────────────────────────────────────────────
 
@@ -343,7 +358,11 @@ class GalleryWidget(QWidget):
                          shift_held: bool = False) -> None:
         """
         Handles tile selection.
-        - Plain click:  select only this tile, deselect all others.
+        - Plain click:  if the clicked tile is already in the selection,
+                        leave the selection alone (only update the
+                        anchor) so a follow-up double-click still sees
+                        the multi-selection. Clicking an unselected
+                        tile replaces the selection with just that one.
         - Ctrl+click:   toggle this tile in/out of the selection.
         - Shift+click:      replace the selection with every tile between
                             the anchor (last plain- or ctrl-clicked tile)
@@ -390,7 +409,15 @@ class GalleryWidget(QWidget):
                     self._selected_ids.add(row_id)
             self._last_clicked_index = clicked_idx
         else:
-            self._selected_ids = set(row_ids)
+            # Plain click — if the clicked tile is already part of the
+            # current selection, preserve the selection so a follow-up
+            # double-click can open every selected item side-by-side.
+            # Otherwise, replace the selection with just this tile.
+            already_selected = any(
+                r in self._selected_ids for r in row_ids
+            )
+            if not already_selected:
+                self._selected_ids = set(row_ids)
             self._last_clicked_index = clicked_idx
 
         # Update visual selection state on all tiles.
@@ -402,6 +429,34 @@ class GalleryWidget(QWidget):
             tw.set_selected(is_selected)
 
         self.selection_changed.emit(list(self._selected_ids))
+
+    def eventFilter(self, obj, event) -> bool:
+        """
+        Watches mouse presses on the grid background and the scroll
+        viewport. A press on either (which means the user clicked
+        between tiles, not on a TileWidget) clears the current
+        selection. Tile clicks never reach this filter because
+        TileWidget.mousePressEvent accepts them first.
+        """
+        if event.type() == QEvent.Type.MouseButtonPress and (
+            obj is self._grid_widget
+            or obj is self._scroll.viewport()
+        ):
+            if self._selected_ids:
+                self._clear_selection()
+        return super().eventFilter(obj, event)
+
+    def _clear_selection(self) -> None:
+        """
+        Empties the selection, repaints affected tiles, and emits
+        selection_changed. Anchor is also reset so the next plain-
+        or ctrl-click starts a fresh range.
+        """
+        self._selected_ids.clear()
+        self._last_clicked_index = None
+        for tw in self._tile_widgets:
+            tw.set_selected(False)
+        self.selection_changed.emit([])
 
     def _on_tile_double_clicked(self, row_ids: list[str]) -> None:
         """
