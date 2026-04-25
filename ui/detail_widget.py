@@ -56,6 +56,10 @@ class DetailWidget(QWidget):
         self._current_pixmap  = None   # For Save as PNG (images only).
         self._media_widget    = None   # The currently displayed QWidget.
         self._meta_table_sized = False  # First-populate splitter resize.
+        # Row_ids currently shown in the multi-item splitter, kept in
+        # the order they appear left-to-right. Drives the per-panel
+        # close buttons — when one is removed we re-render from this list.
+        self._current_row_ids: list[str] = []
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -154,6 +158,9 @@ class DetailWidget(QWidget):
         Updates the title, media widget, metadata label, and the cached
         pixmap used by Save as PNG.
         """
+        # Single-item view doesn't need the multi-item bookkeeping.
+        self._current_row_ids = []
+
         metadata = self._controller.get_row(row_id)
 
         full_path = metadata.get("full_path", "")
@@ -195,6 +202,10 @@ class DetailWidget(QWidget):
         represents the view. The single-item metadata table is hidden
         because each panel carries its own metadata text.
         """
+        # Remember which rows we're showing so per-panel close buttons
+        # can rebuild the splitter with the survivors.
+        self._current_row_ids = list(row_ids)
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
 
@@ -216,6 +227,39 @@ class DetailWidget(QWidget):
         self._current_pixmap = None
         self._save_btn.setEnabled(False)
         self._close_btn.setEnabled(True)
+
+    def _close_multi_panel(self, row_id: str) -> None:
+        """
+        Removes a single row from the multi-item view when the user
+        clicks its close button. Falls back to the single-item layout
+        if only one row is left, or to the empty placeholder if the
+        last row is closed.
+        """
+        if row_id in self._current_row_ids:
+            self._current_row_ids.remove(row_id)
+
+        remaining = list(self._current_row_ids)
+        if not remaining:
+            self._reset_to_placeholder()
+        elif len(remaining) == 1:
+            self._current_row_ids = []
+            self._show_single(remaining[0])
+        else:
+            self._show_multi(remaining)
+
+    def _reset_to_placeholder(self) -> None:
+        """
+        Returns the detail view to the empty 'nothing selected' state
+        — used when every panel in a multi-item view has been closed.
+        """
+        self._swap_media_widget(None)
+        self._meta_table.setVisible(True)
+        self._meta_table.setRowCount(0)
+        self._label.setText("No item selected")
+        self._current_pixmap = None
+        self._current_row_ids = []
+        self._save_btn.setEnabled(False)
+        self._close_btn.setEnabled(False)
 
     def _build_item_panel(self, row_id: str) -> QWidget:
         """
@@ -240,10 +284,27 @@ class DetailWidget(QWidget):
         layout.setContentsMargins(2, 2, 2, 2)
         layout.setSpacing(2)
 
+        # Header row: file name in the middle, close button on the right.
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.addStretch()
+
         title = QLabel(metadata.get("file_name", row_id))
         title.setStyleSheet("font-weight: bold;")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(title)
+        header.addWidget(title)
+        header.addStretch()
+
+        close_btn = QPushButton("\u2715")  # multiplication-x glyph
+        close_btn.setToolTip("Remove this item from the comparison")
+        close_btn.setFixedWidth(24)
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(
+            lambda _checked, rid=row_id: self._close_multi_panel(rid)
+        )
+        header.addWidget(close_btn)
+
+        layout.addLayout(header)
 
         if media is not None:
             layout.addWidget(media, stretch=1)
