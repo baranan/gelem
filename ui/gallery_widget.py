@@ -345,11 +345,15 @@ class GalleryWidget(QWidget):
         Handles tile selection.
         - Plain click:  select only this tile, deselect all others.
         - Ctrl+click:   toggle this tile in/out of the selection.
-        - Shift+click:  replace the selection with every tile between the
-                        anchor (last plain- or ctrl-clicked tile) and this
-                        tile, inclusive. The anchor is not moved, so
-                        repeated shift+clicks extend from the same anchor.
-                        If no anchor exists yet, falls back to plain click.
+        - Shift+click:      replace the selection with every tile between
+                            the anchor (last plain- or ctrl-clicked tile)
+                            and this tile, inclusive. The anchor is not
+                            moved, so repeated shift+clicks extend from
+                            the same anchor. If no anchor exists yet,
+                            falls back to plain click.
+        - Ctrl+Shift+click: union the anchor-to-target range with the
+                            existing selection, preserving prior picks.
+                            The anchor stays put.
         """
         if not row_ids:
             return
@@ -364,13 +368,19 @@ class GalleryWidget(QWidget):
         except ValueError:
             clicked_idx = None
 
-        if (shift_held
-                and not ctrl_held
-                and self._last_clicked_index is not None
-                and clicked_idx is not None):
+        have_anchor = (self._last_clicked_index is not None
+                       and clicked_idx is not None)
+
+        if shift_held and have_anchor:
             lo = min(self._last_clicked_index, clicked_idx)
             hi = max(self._last_clicked_index, clicked_idx)
-            self._selected_ids = set(self._row_ids[lo:hi + 1])
+            range_ids = set(self._row_ids[lo:hi + 1])
+            if ctrl_held:
+                # Ctrl+Shift — extend the existing selection with the range.
+                self._selected_ids |= range_ids
+            else:
+                # Shift only — replace selection with just the range.
+                self._selected_ids = range_ids
             # Anchor stays put so further shift+clicks extend from it.
         elif ctrl_held:
             for row_id in row_ids:
