@@ -87,37 +87,26 @@ class Filter:
             return df.iloc[0:0]
 
         if self.comparison == "eq":
-            # PLACEHOLDER
-            return df
+            return df[df[self.column] == self.value]
         elif self.comparison == "neq":
-            # PLACEHOLDER
-            return df
+            return df[df[self.column] != self.value]
         elif self.comparison == "lt":
-            # PLACEHOLDER
-            return df
+            return df[df[self.column] < self.value]
         elif self.comparison == "gt":
-            # PLACEHOLDER
-            return df
+            return df[df[self.column] > self.value]
         elif self.comparison == "lte":
-            # PLACEHOLDER
-            return df
+            return df[df[self.column] <= self.value]
         elif self.comparison == "gte":
-            # PLACEHOLDER
-            return df
+            return df[df[self.column] >= self.value]
         elif self.comparison == "isin":
-            # PLACEHOLDER
-            return df
+            return df[df[self.column].isin(self.value)]
         elif self.comparison == "between":
-            # PLACEHOLDER
-            return df
+            return df[df[self.column].between(self.value[0], self.value[1])]
         elif self.comparison == "contains":
-            # PLACEHOLDER: case-insensitive substring match.
-            # Real implementation:
-            #   mask = df[self.column].astype(str).str.contains(
-            #       str(self.value), case=False, na=False
-            #   )
-            #   return df[mask]
-            return df
+            mask = df[self.column].astype(str).str.contains(
+                str(self.value), case=False, na=False
+            )
+            return df[mask]
         else:
             raise ValueError(
                 f"Unknown comparison type '{self.comparison}'. "

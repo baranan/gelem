@@ -241,13 +241,14 @@ class Dataset:
                     "full_path": str(f),
                     "file_name": f.name,
                 })
-        else:
-            for i in range(5):
-                rows.append({
-                    "row_id":    self._next_id(),
-                    "full_path": str(folder_path / f"placeholder_{i}.jpg"),
-                    "file_name": f"placeholder_{i}.jpg",
-                })
+        # placeholder code intented to be a fail-safe during development before real folder scanning is implemented. It creates 5 dummy rows with placeholder paths so the UI can display something.
+        # else:
+        #     for i in range(5):
+        #         rows.append({
+        #             "row_id":    self._next_id(),
+        #             "full_path": str(folder_path / f"placeholder_{i}.jpg"),
+        #             "file_name": f"placeholder_{i}.jpg",
+        #         })
 
         self._tables["frames"] = pd.DataFrame(rows)
 
