@@ -20,12 +20,10 @@ Student A is responsible for implementing this class.
 from __future__ import annotations
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QGraphicsView, QGraphicsScene,
-    QFileDialog, QSplitter, QTableWidget, QTableWidgetItem,
-    QHeaderView
+    QPushButton, QFileDialog, QSplitter, QTableWidget,
+    QTableWidgetItem, QHeaderView
 )
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QPixmap, QWheelEvent
+from PySide6.QtCore import Qt
 from shared_widgets.zoomable_image_view import ZoomableImageView
 
 class DetailWidget(QWidget):
@@ -173,8 +171,8 @@ class DetailWidget(QWidget):
         self._populate_meta_table(metadata)
 
         # Store pixmap if the widget is a ZoomableImageView (for Save PNG).
-        if isinstance(widget, ZoomableImageView) and widget._pixmap_item:
-            self._current_pixmap = widget._pixmap_item.pixmap()
+        if isinstance(widget, ZoomableImageView):
+            self._current_pixmap = widget.current_pixmap()
         else:
             self._current_pixmap = None
 
@@ -203,8 +201,13 @@ class DetailWidget(QWidget):
             )
             self._swap_media_widget(widget)
             self._label.setText("Group result")
-            if isinstance(widget, ZoomableImageView) and widget._pixmap_item:
-                self._current_pixmap = widget._pixmap_item.pixmap()
+
+            # Clear any per-row metadata left over from a previous
+            # show_rows() call — group results don't share that schema.
+            self._meta_table.setRowCount(0)
+
+            if isinstance(widget, ZoomableImageView):
+                self._current_pixmap = widget.current_pixmap()
             else:
                 self._current_pixmap = None
             self._save_btn.setEnabled(self._current_pixmap is not None)
@@ -224,6 +227,9 @@ class DetailWidget(QWidget):
         self._current_pixmap = None
         self._save_btn.setEnabled(False)
         self._close_btn.setEnabled(False)
+        # Reset the first-populate flag so the splitter auto-fits the
+        # metadata table again the next time a row is shown.
+        self._meta_table_sized = False
 
     def _swap_media_widget(self, new_widget: QWidget | None) -> None:
         """

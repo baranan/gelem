@@ -41,6 +41,17 @@ class ZoomableImageView(QGraphicsView):
             Qt.AspectRatioMode.KeepAspectRatio,
         )
 
+    def current_pixmap(self) -> QPixmap | None:
+        """
+        Returns the QPixmap currently displayed, or None if no image
+        has been shown yet. Callers (e.g. DetailWidget's Save-as-PNG)
+        should use this rather than reaching into the private
+        _pixmap_item attribute.
+        """
+        if self._pixmap_item is None:
+            return None
+        return self._pixmap_item.pixmap()
+
     def wheelEvent(self, event: QWheelEvent) -> None:
         """
         Zooms in or out when the scroll wheel is used.
