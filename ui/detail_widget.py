@@ -20,11 +20,10 @@ Student A is responsible for implementing this class.
 from __future__ import annotations
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QGraphicsView, QGraphicsScene,
-    QFileDialog, QSplitter
+    QPushButton, QFileDialog, QSplitter, QTableWidget,
+    QTableWidgetItem, QHeaderView
 )
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QPixmap, QWheelEvent
+from PySide6.QtCore import Qt
 from shared_widgets.zoomable_image_view import ZoomableImageView
 
 class DetailWidget(QWidget):
@@ -42,7 +41,6 @@ class DetailWidget(QWidget):
         - Multi-item view (TODO: several items side by side)
         - Set-bound result view (mean face or other group outputs)
 
-    TODO (Student A): Implement metadata table display.
     TODO (Student A): Implement side-by-side multi-item layout.
     """
 
@@ -58,40 +56,76 @@ class DetailWidget(QWidget):
         self._controller      = controller
         self._current_pixmap  = None   # For Save as PNG (images only).
         self._media_widget    = None   # The currently displayed QWidget.
+        self._meta_table_sized = False  # First-populate splitter resize.
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
 
-        # Toolbar with label and Save button.
+        # Toolbar with label, Save button, and Close button.
         toolbar = QHBoxLayout()
         self._label = QLabel("No item selected")
         self._label.setStyleSheet("font-weight: bold;")
         toolbar.addWidget(self._label)
         toolbar.addStretch()
 
-        save_btn = QPushButton("Save as PNG")
-        save_btn.clicked.connect(self._save_as_png)
-        toolbar.addWidget(save_btn)
+        self._save_btn = QPushButton("Save as PNG")
+        self._save_btn.clicked.connect(self._save_as_png)
+        self._save_btn.setEnabled(False)
+        self._save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        toolbar.addWidget(self._save_btn)
+
+        self._close_btn = QPushButton("\u2715")  # multiplication-x glyph
+        self._close_btn.setToolTip("Close")
+        self._close_btn.setFixedWidth(28)
+        self._close_btn.clicked.connect(self._clear)
+        self._close_btn.setEnabled(False)
+        self._close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        toolbar.addWidget(self._close_btn)
+
         layout.addLayout(toolbar)
 
-        # Placeholder shown before any item is selected.
+        # Container for the media area. The placeholder lives inside it
+        # initially; once a row is shown, the placeholder is hidden and
+        # the rendered media widget is added alongside it.
+        self._media_area    = QWidget()
+        self._media_layout  = QVBoxLayout(self._media_area)
+        self._media_layout.setContentsMargins(0, 0, 0, 0)
+
         self._placeholder = QLabel("Double-click a tile to view it here.")
         self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._placeholder.setStyleSheet(
             "color: #888888; font-size: 13px;"
         )
-        layout.addWidget(self._placeholder, stretch=1)
+        self._media_layout.addWidget(self._placeholder, stretch=1)
 
-        # Metadata label (shown below the media widget).
-        self._meta_label = QLabel("")
-        self._meta_label.setWordWrap(True)
-        self._meta_label.setStyleSheet(
-            "font-size: 11px; color: #444444; padding: 4px;"
+        # Metadata table (shown below the media widget). Two columns —
+        # property name on the left, value on the right.
+        self._meta_table = QTableWidget(0, 2)
+        self._meta_table.setHorizontalHeaderLabels(["Property", "Value"])
+        self._meta_table.verticalHeader().setVisible(False)
+        self._meta_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._meta_table.setAlternatingRowColors(True)
+        self._meta_table.setSelectionMode(
+            QTableWidget.SelectionMode.NoSelection
         )
-        layout.addWidget(self._meta_label)
+        self._meta_table.setShowGrid(False)
+        header = self._meta_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setDefaultAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
 
-        # Keep a reference to the layout so we can swap media widgets.
-        self._content_layout = layout
+        # Vertical splitter between media area and metadata table so the
+        # researcher can resize either to taste.
+        self._splitter = QSplitter(Qt.Orientation.Vertical)
+        self._splitter.addWidget(self._media_area)
+        self._splitter.addWidget(self._meta_table)
+        self._splitter.setStretchFactor(0, 1)   # media area expands
+        self._splitter.setStretchFactor(1, 0)   # table sized to handle
+        self._splitter.setSizes([600, 200])     # initial proportions
+        self._splitter.setChildrenCollapsible(False)
+        layout.addWidget(self._splitter, stretch=1)
 
     def show_rows(self, row_ids: list[str]) -> None:
         """
@@ -132,19 +166,19 @@ class DetailWidget(QWidget):
         # Update the title label with the file name.
         self._label.setText(metadata.get("file_name", row_id))
 
-        # Show metadata as simple text (placeholder for a proper table).
-        meta_text = "\n".join(
-            f"{k}: {v}"
-            for k, v in metadata.items()
-            if k not in ("full_path", "row_id")
-        )
-        self._meta_label.setText(meta_text)
+        # Populate the metadata table. We hide full_path and row_id —
+        # full_path is shown as media above, row_id is internal.
+        self._populate_meta_table(metadata)
 
         # Store pixmap if the widget is a ZoomableImageView (for Save PNG).
-        if isinstance(widget, ZoomableImageView) and widget._pixmap_item:
-            self._current_pixmap = widget._pixmap_item.pixmap()
+        if isinstance(widget, ZoomableImageView):
+            self._current_pixmap = widget.current_pixmap()
         else:
             self._current_pixmap = None
+
+        # Something is shown — enable the toolbar buttons.
+        self._save_btn.setEnabled(self._current_pixmap is not None)
+        self._close_btn.setEnabled(True)
 
     def show_result(self, result: dict) -> None:
         """
@@ -168,32 +202,118 @@ class DetailWidget(QWidget):
             self._swap_media_widget(widget)
             self._label.setText("Group result")
 
+            # Clear any per-row metadata left over from a previous
+            # show_rows() call — group results don't share that schema.
+            self._meta_table.setRowCount(0)
+
+            if isinstance(widget, ZoomableImageView):
+                self._current_pixmap = widget.current_pixmap()
+            else:
+                self._current_pixmap = None
+            self._save_btn.setEnabled(self._current_pixmap is not None)
+            self._close_btn.setEnabled(True)
+
     # ── Internal helpers ──────────────────────────────────────────────
+
+    def _clear(self) -> None:
+        """
+        Resets the detail view to its empty state — hides any media
+        widget, restores the placeholder, empties the metadata table,
+        and disables the toolbar buttons.
+        """
+        self._swap_media_widget(None)
+        self._meta_table.setRowCount(0)
+        self._label.setText("No item selected")
+        self._current_pixmap = None
+        self._save_btn.setEnabled(False)
+        self._close_btn.setEnabled(False)
+        # Reset the first-populate flag so the splitter auto-fits the
+        # metadata table again the next time a row is shown.
+        self._meta_table_sized = False
 
     def _swap_media_widget(self, new_widget: QWidget | None) -> None:
         """
-        Replaces the current media widget with a new one.
-        Removes the old widget from the layout and adds the new one.
+        Replaces the current media widget with a new one inside the
+        media area of the splitter.
 
         Args:
-            new_widget: The widget to display, or None for placeholder.
+            new_widget: The widget to display, or None to fall back to
+                        the placeholder.
         """
-        # Remove the old media widget if present.
         if self._media_widget is not None:
-            self._content_layout.removeWidget(self._media_widget)
+            self._media_layout.removeWidget(self._media_widget)
             self._media_widget.deleteLater()
             self._media_widget = None
 
-        # Hide or show the placeholder.
         if new_widget is not None:
             self._placeholder.hide()
-            # Insert the new widget above the metadata label.
-            # The metadata label is always the last item; insert before it.
-            insert_index = self._content_layout.count() - 1
-            self._content_layout.insertWidget(insert_index, new_widget, stretch=1)
+            self._media_layout.addWidget(new_widget, stretch=1)
             self._media_widget = new_widget
         else:
             self._placeholder.show()
+
+    def _populate_meta_table(self, metadata: dict) -> None:
+        """
+        Fills the metadata table with one row per property in metadata,
+        skipping fields that aren't useful to show ('full_path' is the
+        media itself, 'row_id' is internal).
+
+        Floats are formatted with 4 significant digits to keep the
+        column compact; everything else is rendered with str().
+        """
+        rows = [
+            (k, v) for k, v in metadata.items()
+            if k not in ("full_path", "row_id")
+        ]
+
+        self._meta_table.setRowCount(len(rows))
+        for row_idx, (key, value) in enumerate(rows):
+            key_item = QTableWidgetItem(str(key))
+            key_item.setTextAlignment(
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+            )
+
+            text = f"{value:.4g}" if isinstance(value, float) else str(value)
+            val_item = QTableWidgetItem(text)
+            val_item.setTextAlignment(
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+            )
+
+            self._meta_table.setItem(row_idx, 0, key_item)
+            self._meta_table.setItem(row_idx, 1, val_item)
+
+        self._meta_table.resizeRowsToContents()
+
+        # On the first populate, resize the splitter so the entire table
+        # is visible without scrolling. Subsequent populates leave the
+        # researcher's manual splitter position alone.
+        if not self._meta_table_sized and rows:
+            self._fit_splitter_to_table()
+            self._meta_table_sized = True
+
+    def _fit_splitter_to_table(self) -> None:
+        """
+        Adjusts the splitter so the metadata table is tall enough to show
+        every row without a vertical scrollbar — capped so the media area
+        never shrinks below half the splitter's height.
+        """
+        header_h = self._meta_table.horizontalHeader().height()
+        rows_h   = sum(
+            self._meta_table.rowHeight(r)
+            for r in range(self._meta_table.rowCount())
+        )
+        frame    = 2 * self._meta_table.frameWidth()
+        desired  = header_h + rows_h + frame + 6  # small buffer
+
+        total = sum(self._splitter.sizes()) or self._splitter.height()
+        if total <= 0:
+            return
+
+        # Don't let the table eat more than ~60% of the splitter.
+        max_table = int(total * 0.6)
+        table_h   = min(desired, max_table)
+        media_h   = max(total - table_h, 1)
+        self._splitter.setSizes([media_h, table_h])
 
     def _save_as_png(self) -> None:
         """
