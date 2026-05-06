@@ -4,3 +4,9 @@ pyarrow
 Pillow
 numpy
 matplotlib
+mediapipe
+opencv-python
+plotly
+kaleido
+pingouin
+scipy

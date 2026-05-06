@@ -240,6 +240,14 @@ class OperatorRegistry:
                             f"[OperatorRegistry] Could not load image "
                             f"for {row_id}: {full_path}"
                         )
+                        # Return None for every output column so the row
+                        # still appears in the table and progress updates.
+                        result = {col: None for col, _ in operator.output_columns}
+                        if on_item_complete is not None:
+                            on_item_complete(operation_id, table_name, row_id, result)
+                        if on_progress is not None:
+                            percent = int((i + 1) / total * 100)
+                            on_progress(percent)
                         continue
                 else:
                     image = None
