@@ -195,6 +195,10 @@ class GalleryWidget(QWidget):
         self._mounted:   dict[int, TileWidget] = {}
         self._free_pool: list[TileWidget]      = []
         self._cols:      int = 1
+        # Vertical gap between rows, recomputed in _relayout to flex
+        # with the viewport height the same way QGridLayout's column
+        # distribution flexes the horizontal gaps with width.
+        self._v_gap:     int = self._SPACING
 
         # Index of the last plain- or ctrl-clicked tile in self._row_ids.
         # Acts as the anchor for shift+click range selection.
@@ -348,10 +352,10 @@ class GalleryWidget(QWidget):
 
     def _relayout(self) -> None:
         """
-        Recomputes column count, returns every currently mounted tile
-        to the free pool, and then re-mounts the tiles that fall
-        inside the viewport. Called whenever the data set, tile size,
-        visible columns, or viewport width change.
+        Recomputes column count and vertical row spacing, returns every
+        currently mounted tile to the free pool, and then re-mounts the
+        tiles that fall inside the viewport. Called whenever the data
+        set, tile size, visible columns, or viewport size change.
         """
         for tw in self._mounted.values():
             self._grid_layout.removeWidget(tw)
@@ -360,8 +364,27 @@ class GalleryWidget(QWidget):
             self._free_pool.append(tw)
         self._mounted.clear()
 
-        self._cols = self._columns_per_row()
+        self._cols  = self._columns_per_row()
+        self._v_gap = self._vertical_gap()
+        # Match QGridLayout's horizontal spacing (4 px between cells)
+        # while letting the vertical spacing flex with viewport height.
+        self._grid_layout.setHorizontalSpacing(self._SPACING)
+        self._grid_layout.setVerticalSpacing(self._v_gap)
         self._update_visible_tiles()
+
+    def _vertical_gap(self) -> int:
+        """
+        Vertical gap between rows, distributed the same way the QGridLayout
+        distributes horizontal slack between columns: take the rows that
+        fit in the viewport, and split any leftover height evenly across
+        (rows + 1) slots.
+        """
+        viewport_h = self._scroll.viewport().height()
+        if viewport_h <= 0:
+            viewport_h = self.height() or 600
+        rows_fit = max(1, viewport_h // (self._tile_size + self._SPACING))
+        slack    = max(0, viewport_h - rows_fit * self._tile_size)
+        return max(self._SPACING, slack // (rows_fit + 1))
 
     def _update_visible_tiles(self) -> None:
         """
@@ -378,12 +401,14 @@ class GalleryWidget(QWidget):
             return
 
         total_rows = (n + self._cols - 1) // self._cols
-        row_h      = self._tile_size + self._SPACING
+        row_h      = self._tile_size + self._v_gap
 
         viewport_top = self._scroll.verticalScrollBar().value()
         viewport_h   = self._scroll.viewport().height()
 
-        top_row = max(0, (viewport_top // row_h) - self._BUFFER_ROWS)
+        top_row = max(
+            0, ((viewport_top - self._v_gap) // row_h) - self._BUFFER_ROWS
+        )
         bottom_row = min(
             total_rows - 1,
             ((viewport_top + viewport_h) // row_h) + self._BUFFER_ROWS,
@@ -432,10 +457,12 @@ class GalleryWidget(QWidget):
                 self._mounted[idx] = tw
 
         # Spacer heights stand in for the rows we did not mount, so the
-        # scrollbar range matches the full virtual content.
-        self._top_spacer.setFixedHeight(top_row * row_h)
+        # scrollbar range matches the full virtual content. The extra
+        # v_gap on each side is the very-top and very-bottom padding
+        # (the analog of the side padding around the horizontal grid).
+        self._top_spacer.setFixedHeight(self._v_gap + top_row * row_h)
         self._bot_spacer.setFixedHeight(
-            max(0, (total_rows - bottom_row - 1) * row_h)
+            max(0, (total_rows - bottom_row - 1) * row_h + self._v_gap)
         )
 
     def _make_tile(self, row_id: str, columns: list[str]) -> BaseTile:
@@ -584,12 +611,14 @@ class GalleryWidget(QWidget):
     def resizeEvent(self, event) -> None:
         """
         Re-mounts visible tiles on viewport resize. Triggers a full
-        relayout when the column count changes; otherwise just refreshes
-        the visible window in case the viewport got taller.
+        relayout when the column count or vertical-gap changes (column
+        count flexes the horizontal flow, vertical-gap flexes the row
+        spacing); otherwise just refreshes the visible window.
         """
         super().resizeEvent(event)
-        new_cols = self._columns_per_row()
-        if new_cols != self._cols:
+        new_cols  = self._columns_per_row()
+        new_v_gap = self._vertical_gap()
+        if new_cols != self._cols or new_v_gap != self._v_gap:
             self._relayout()
         else:
             self._update_visible_tiles()
