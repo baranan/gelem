@@ -25,11 +25,10 @@ Key Qt concepts used here:
 
 from __future__ import annotations
 from PySide6.QtWidgets import (
-    QWidget, QScrollArea, QVBoxLayout, QGridLayout,
-    QLabel, QSizePolicy
+    QWidget, QScrollArea, QVBoxLayout,
+    QLabel,
 )
 from PySide6.QtCore import Signal, Qt, QEvent
-from PySide6.QtGui import QPixmap
 
 from ui.tiles.image_tile import ImageTile
 from ui.tiles.grid_tile import GridTile
@@ -156,15 +155,12 @@ class GalleryWidget(QWidget):
     """
     A scrollable grid of TileWidgets driven by a list of row_ids.
 
-    Receives row_ids from AppController via gallery_updated signal.
-    Builds tiles using the currently selected visible columns.
-    Handles tile selection and communicates selections back to the
-    controller.
-
-    TODO (Student A): Implement virtual scrolling so only visible
-    tiles are rendered at any time. The current placeholder
-    implementation renders all tiles at once, which will be slow
-    for large datasets.
+    Uses virtual scrolling: only tiles for the rows currently inside
+    (or near) the viewport are mounted as widgets. As the user scrolls,
+    tiles that leave the viewport are recycled into a free pool and
+    later re-bound to newly visible rows. The inner content widget is
+    sized to the full grid so the scrollbar reflects all rows even
+    though most are not materialised.
     """
 
     # Signal emitted when the user selects one or more tiles.
@@ -173,6 +169,10 @@ class GalleryWidget(QWidget):
 
     # Signal emitted when the user double-clicks a tile.
     tile_double_clicked = Signal(list)
+
+    _SPACING     = 4   # gap between adjacent tiles, in pixels
+    _MARGIN      = 4   # padding around the whole grid, in pixels
+    _BUFFER_ROWS = 1   # rows above and below the viewport kept mounted
 
     def __init__(self, controller, parent=None):
         """
@@ -188,7 +188,14 @@ class GalleryWidget(QWidget):
         self._tile_size:    int       = 150
         self._visible_cols: list[str] = []
         self._selected_ids: set[str]  = set()
-        self._tile_widgets: list[TileWidget] = []
+
+        # Virtual-scrolling state.
+        # _mounted maps row_id index -> TileWidget currently shown.
+        # _free_pool holds hidden TileWidgets ready to be recycled.
+        self._mounted:   dict[int, TileWidget] = {}
+        self._free_pool: list[TileWidget]      = []
+        self._cols:      int = 1
+
         # Index of the last plain- or ctrl-clicked tile in self._row_ids.
         # Acts as the anchor for shift+click range selection.
         self._last_clicked_index: int | None = None
@@ -198,18 +205,20 @@ class GalleryWidget(QWidget):
         self._layout.setContentsMargins(4, 4, 4, 4)
         self._layout.setSpacing(4)
 
-        # Scroll area containing the grid.
+        # Scroll area. setWidgetResizable(False) lets us size the inner
+        # widget to the full virtual content so the scrollbar range is
+        # correct even though most tiles are not materialised.
         self._scroll = QScrollArea()
-        self._scroll.setWidgetResizable(True)
+        self._scroll.setWidgetResizable(False)
         self._scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
         self._layout.addWidget(self._scroll)
 
-        # Grid container widget.
+        # Inner content widget. Children are positioned manually with
+        # move() — no layout — so we can place tiles wherever the
+        # virtual grid maths says they belong.
         self._grid_widget = QWidget()
-        self._grid_layout = QGridLayout(self._grid_widget)
-        self._grid_layout.setSpacing(4)
         self._scroll.setWidget(self._grid_widget)
 
         # Clicks that land on the grid background (between or below
@@ -220,34 +229,37 @@ class GalleryWidget(QWidget):
         self._grid_widget.installEventFilter(self)
         self._scroll.viewport().installEventFilter(self)
 
+        self._scroll.verticalScrollBar().valueChanged.connect(
+            self._update_visible_tiles
+        )
+
     # ── Public API ────────────────────────────────────────────────────
 
     def set_row_ids(self, row_ids: list[str]) -> None:
         """
         Updates the gallery with a new ordered list of row_ids.
-        Rebuilds all tiles. Called when gallery_updated signal arrives.
+        Resets selection and scroll position, then re-mounts the
+        visible viewport.
 
         Args:
             row_ids: Ordered list of row_ids to display.
-
-        TODO (Student A): Replace this with virtual scrolling.
-        Currently rebuilds all tiles at once.
         """
         self._row_ids = row_ids
         self._selected_ids.clear()
         self._last_clicked_index = None
-        self._rebuild_tiles()
+        self._relayout()
+        self._scroll.verticalScrollBar().setValue(0)
 
     def set_tile_size(self, size: int) -> None:
         """
-        Updates the tile size and repaints all tiles.
+        Updates the tile size and re-mounts the visible viewport.
         Called when the tile-size slider changes.
 
         Args:
             size: New tile size in pixels (50-600).
         """
         self._tile_size = size
-        self._rebuild_tiles()
+        self._relayout()
 
     def set_visible_columns(self, column_names: list[str]) -> None:
         """
@@ -259,25 +271,27 @@ class GalleryWidget(QWidget):
             column_names: Ordered list of column names to display.
         """
         self._visible_cols = column_names
-        self._rebuild_tiles()
+        self._relayout()
 
     def on_row_updated(self, row_id: str) -> None:
         """
         Called when a row's data has changed (e.g. operator result
-        arrived). Finds the tile for this row and invalidates it
-        so it re-renders with the new value.
+        arrived). Finds the mounted tile for this row, if any, and
+        invalidates it so it re-renders with the new value. Tiles that
+        are not currently mounted will pick up the new value naturally
+        the next time they scroll into view.
 
         Args:
             row_id: The row whose data changed.
         """
-        for tw in self._tile_widgets:
+        for tw in self._mounted.values():
             if row_id in tw._tile.get_row_ids():
                 tw.invalidate()
 
     def on_thumbnail_ready(self, row_id: str) -> None:
         """
         Called when a thumbnail has been generated for row_id.
-        Finds the corresponding tile and repaints it.
+        Finds the corresponding mounted tile and repaints it.
 
         Args:
             row_id: The item whose thumbnail is now available.
@@ -295,40 +309,110 @@ class GalleryWidget(QWidget):
 
     # ── Internal helpers ──────────────────────────────────────────────
 
-    def _rebuild_tiles(self) -> None:
-        """
-        Clears the grid and rebuilds all tile widgets from scratch.
+    def _columns_per_row(self) -> int:
+        """How many tiles fit horizontally in the current viewport."""
+        viewport_w = self._scroll.viewport().width()
+        if viewport_w <= 0:
+            viewport_w = self.width() or 800
+        usable = viewport_w - 2 * self._MARGIN + self._SPACING
+        return max(1, usable // (self._tile_size + self._SPACING))
 
-        TODO (Student A): Replace with virtual scrolling that only
-        creates tiles for the visible viewport area.
+    def _relayout(self) -> None:
         """
-        # Clear existing tiles.
-        for tw in self._tile_widgets:
-            self._grid_layout.removeWidget(tw)
-            tw.deleteLater()
-        self._tile_widgets.clear()
+        Recomputes column count and content size, returns every
+        currently mounted tile to the free pool, and then re-mounts
+        the tiles that fall inside the viewport. Called whenever the
+        data set, tile size, visible columns, or viewport width change.
+        """
+        for tw in self._mounted.values():
+            tw.hide()
+            self._free_pool.append(tw)
+        self._mounted.clear()
 
-        if not self._row_ids:
+        self._cols = self._columns_per_row()
+
+        n = len(self._row_ids)
+        viewport_w = self._scroll.viewport().width()
+        if n == 0:
+            self._grid_widget.setFixedSize(max(viewport_w, 0), 0)
             return
 
-        # Determine how many columns fit in the available width.
-        available_width = self.width() or 800
-        cols = max(1, available_width // (self._tile_size + 4))
+        rows = (n + self._cols - 1) // self._cols
+        content_w = (
+            self._MARGIN * 2
+            + self._cols * self._tile_size
+            + max(0, self._cols - 1) * self._SPACING
+        )
+        content_h = (
+            self._MARGIN * 2
+            + rows * self._tile_size
+            + max(0, rows - 1) * self._SPACING
+        )
+        self._grid_widget.setFixedSize(max(content_w, viewport_w), content_h)
 
-        # Use full_path as default column if none selected.
+        self._update_visible_tiles()
+
+    def _update_visible_tiles(self) -> None:
+        """
+        Computes which row_id indices fall inside (or near) the
+        viewport, drops mounted tiles that are no longer needed back
+        into the free pool, and mounts tiles for newly-visible
+        indices, recycling pool widgets where possible.
+        """
+        n = len(self._row_ids)
+        if n == 0:
+            return
+
+        viewport_top = self._scroll.verticalScrollBar().value()
+        viewport_h   = self._scroll.viewport().height()
+        row_h        = self._tile_size + self._SPACING
+
+        top_row = max(
+            0, (viewport_top - self._MARGIN) // row_h - self._BUFFER_ROWS
+        )
+        bottom_row = (
+            (viewport_top + viewport_h - self._MARGIN) // row_h
+            + self._BUFFER_ROWS
+        )
+
+        first_idx = max(0, top_row * self._cols)
+        last_idx  = min(n - 1, (bottom_row + 1) * self._cols - 1)
+        if last_idx < first_idx:
+            return
+        needed = set(range(first_idx, last_idx + 1))
+
+        # Unmount tiles that have left the visible window.
+        for idx in list(self._mounted.keys()):
+            if idx not in needed:
+                tw = self._mounted.pop(idx)
+                tw.hide()
+                self._free_pool.append(tw)
+
         columns = self._visible_cols or ["full_path"]
 
-        # Build and place tiles.
-        for i, row_id in enumerate(self._row_ids):
-            tile = self._make_tile(row_id, columns)
-            tw   = TileWidget(tile, self._tile_size)
-            tw.clicked.connect(self._on_tile_clicked)
-            tw.double_clicked.connect(self._on_tile_double_clicked)
+        # Mount tiles for newly visible indices, recycling pool
+        # widgets when possible.
+        for idx in needed:
+            if idx in self._mounted:
+                continue
+            row_id = self._row_ids[idx]
+            tile   = self._make_tile(row_id, columns)
+            if self._free_pool:
+                tw = self._free_pool.pop()
+                tw.update_tile(tile, self._tile_size)
+            else:
+                tw = TileWidget(tile, self._tile_size, parent=self._grid_widget)
+                tw.clicked.connect(self._on_tile_clicked)
+                tw.double_clicked.connect(self._on_tile_double_clicked)
 
-            row = i // cols
-            col = i % cols
-            self._grid_layout.addWidget(tw, row, col)
-            self._tile_widgets.append(tw)
+            row = idx // self._cols
+            col = idx %  self._cols
+            x = self._MARGIN + col * (self._tile_size + self._SPACING)
+            y = self._MARGIN + row * (self._tile_size + self._SPACING)
+            tw.move(x, y)
+            tw.set_selected(row_id in self._selected_ids)
+            tw.show()
+            self._mounted[idx] = tw
 
     def _make_tile(self, row_id: str, columns: list[str]) -> BaseTile:
         """
@@ -420,8 +504,10 @@ class GalleryWidget(QWidget):
                 self._selected_ids = set(row_ids)
             self._last_clicked_index = clicked_idx
 
-        # Update visual selection state on all tiles.
-        for tw in self._tile_widgets:
+        # Update visual selection state on currently mounted tiles.
+        # Hidden (recycled) tiles will pick up the right state when
+        # they next scroll into view.
+        for tw in self._mounted.values():
             is_selected = any(
                 r in self._selected_ids
                 for r in tw._tile.get_row_ids()
@@ -454,7 +540,7 @@ class GalleryWidget(QWidget):
         """
         self._selected_ids.clear()
         self._last_clicked_index = None
-        for tw in self._tile_widgets:
+        for tw in self._mounted.values():
             tw.set_selected(False)
         self.selection_changed.emit([])
 
@@ -471,6 +557,14 @@ class GalleryWidget(QWidget):
         self.tile_double_clicked.emit(row_ids)
 
     def resizeEvent(self, event) -> None:
-        """Rebuilds tiles when the widget is resized (column count changes)."""
+        """
+        Re-mounts visible tiles on viewport resize. Triggers a full
+        relayout when the column count changes; otherwise just refreshes
+        the visible window in case the viewport got taller.
+        """
         super().resizeEvent(event)
-        self._rebuild_tiles()
+        new_cols = self._columns_per_row()
+        if new_cols != self._cols:
+            self._relayout()
+        else:
+            self._update_visible_tiles()
