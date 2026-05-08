@@ -6,3 +6,5 @@ Thumbs.db
 .env
 *.env
 operators/models/*.task
+
+setup.ps1
