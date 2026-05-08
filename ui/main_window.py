@@ -65,6 +65,7 @@ class MainWindow(QMainWindow):
     def _build_menu(self) -> None:
         """Creates the menu bar."""
         menubar = self.menuBar()
+        menubar.setNativeMenuBar(False)
 
         # File menu.
         file_menu = menubar.addMenu("File")

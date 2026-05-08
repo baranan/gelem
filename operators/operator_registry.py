@@ -225,6 +225,15 @@ class OperatorRegistry:
         """
         total = len(work_items)
 
+        def _send_null_result(row_id, table_name, i):
+            """Send None for all output columns so the row isn't lost."""
+            result = {col: None for col, _ in operator.output_columns}
+            if on_item_complete is not None:
+                on_item_complete(operation_id, table_name, row_id, result)
+            if on_progress is not None:
+                percent = int((i + 1) / total * 100)
+                on_progress(percent)
+
         for i, item in enumerate(work_items):
             row_id     = item["row_id"]
             table_name = item["table_name"]
@@ -240,6 +249,7 @@ class OperatorRegistry:
                             f"[OperatorRegistry] Could not load image "
                             f"for {row_id}: {full_path}"
                         )
+                        _send_null_result(row_id, table_name, i)
                         continue
                 else:
                     image = None
@@ -260,6 +270,8 @@ class OperatorRegistry:
                     f"[OperatorRegistry] Error in create_columns "
                     f"for '{operator.name}' on {row_id}: {e}"
                 )
+                _send_null_result(row_id, table_name, i)
+                continue
 
             if on_progress is not None:
                 percent = int((i + 1) / total * 100)
@@ -323,9 +335,14 @@ class OperatorRegistry:
     ) -> None:
         """Worker that runs create_table() in the background thread."""
         try:
-            result_df = operator.create_table(df, group_by)
+            result = operator.create_table(df, group_by)
+            # Support operators returning (result_df, row_updates) tuple.
+            if isinstance(result, tuple):
+                result_df, row_updates = result
+            else:
+                result_df, row_updates = result, {}
             if on_complete is not None:
-                on_complete(operator.name, result_df)
+                on_complete(operator.name, result_df, row_updates)
         except NotImplementedError:
             print(
                 f"[OperatorRegistry] Operator '{operator.name}' "

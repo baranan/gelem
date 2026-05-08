@@ -14,6 +14,12 @@ Student C is responsible for implementing this operator.
 Dependencies:
     pip install mediapipe
 
+Model setup:
+    Download the face landmarker model file into operators/models/ before first use.
+    Copy and run:
+
+    curl -L -o operators/models/face_landmarker.task "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
+
 Reference:
     https://developers.google.com/mediapipe/solutions/vision/face_landmarker
 """
@@ -21,8 +27,12 @@ Reference:
 from __future__ import annotations
 from pathlib import Path
 import numpy as np
+import mediapipe as mp
 
 from operators.base import BaseOperator
+
+# Path to the downloaded model file.
+_MODEL_PATH = Path(__file__).parent / "models" / "face_landmarker.task"
 
 
 # The 52 blendshape names mediapipe returns, in order.
@@ -73,17 +83,18 @@ class BlendshapeOperator(BaseOperator):
     requires_image = True  # Needs the face image to run mediapipe.
 
     def __init__(self):
-        """
-        Initialises the mediapipe FaceLandmarker.
-
-        TODO (Student C): Initialise the mediapipe FaceLandmarker here.
-        The model should be loaded once when the operator is created,
-        not once per image — loading it per image would be very slow.
-
-        See: https://developers.google.com/mediapipe/solutions/vision/face_landmarker/python
-        """
-        # PLACEHOLDER: model not yet loaded.
-        self._landmarker = None
+        # Load the mediapipe FaceLandmarker model once when the operator is created.
+        # This avoids reloading the model for every single image (which would be slow).
+        landmarker_config = mp.tasks.vision.FaceLandmarkerOptions(
+            base_options=mp.tasks.BaseOptions(
+                model_asset_path=str(_MODEL_PATH),
+            ),
+            output_face_blendshapes=True,  # Tell mediapipe to compute blendshapes.
+            num_faces=1,  # Only detect one face per image.
+        )
+        self._landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(
+            landmarker_config
+        )
 
     def create_columns(
         self,
@@ -92,41 +103,42 @@ class BlendshapeOperator(BaseOperator):
         metadata: dict,
     ) -> dict:
         """
-        Extracts blendshape values from one face image.
+        Runs mediapipe face detection on one image and returns blendshape scores.
 
         Args:
-            row_id:   The row being processed.
-            image:    RGB numpy array (height, width, 3), uint8.
-            metadata: Existing column values for this row. Not used here.
+            row_id:   Unique ID of the row being processed.
+            image:    The face image as a numpy array (height, width, 3), RGB.
+            metadata: Existing column values for this row (not used here).
 
         Returns:
-            Dict mapping blendshape column names to float values (0.0-1.0).
+            Dict mapping each blendshape name to its score (0.0–1.0).
             If no face is detected, all values are None.
-
-        TODO (Student C): Implement this method.
-
-        Suggested approach:
-            1. Convert the numpy array to a mediapipe Image object:
-               mp_image = mediapipe.Image(
-                   image_format=mediapipe.ImageFormat.SRGB, data=image
-               )
-            2. Run self._landmarker.detect(mp_image).
-            3. If no face detected (results.face_blendshapes is empty):
-               return {name: None for name in BLENDSHAPE_NAMES}
-            4. Extract the score for each blendshape from the result.
-            5. Return a dict mapping BLENDSHAPE_NAMES to float scores.
-
-        Example return value:
-            {
-                'bs_jawOpen': 0.42,
-                'bs_mouthSmileLeft': 0.18,
-                'bs_mouthSmileRight': 0.21,
-                ... (all 52 blendshapes)
-            }
         """
-        # PLACEHOLDER: returns zeros for all blendshapes.
-        # Replace with real mediapipe extraction.
-        print(
-            f"[BlendshapeOperator] PLACEHOLDER — returning zeros for {row_id}"
-        )
-        return {bs_name: 0.0 for bs_name in BLENDSHAPE_NAMES}
+        try:
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image)
+            detection_result = self._landmarker.detect(mp_image)
+
+            if not detection_result.face_blendshapes:
+                return {name: None for name in BLENDSHAPE_NAMES}
+
+            detected_scores = detection_result.face_blendshapes[0]
+            blendshape_scores = {}
+            for i, bs_name in enumerate(BLENDSHAPE_NAMES):
+                blendshape_scores[bs_name] = detected_scores[i].score
+            return blendshape_scores
+
+        except Exception as e:
+            print(f"[BlendshapeOperator] Error processing {row_id}: {e}")
+            return {name: None for name in BLENDSHAPE_NAMES}
+
+# TODO: until the integration will be completed with the ui, we can print the result for a single picture by running this in the terminal:
+# (only change to the correct picture name from this folder)
+
+# python -c "
+# from operators.blendshapes import BlendshapeOperator
+# op = BlendshapeOperator()
+# image = op.load_image('test_images/001_08.jpg')
+# scores = op.create_columns('test_001', image, {})
+# for name, value in scores.items():
+#     print(f'{name}: {value}')
+# "

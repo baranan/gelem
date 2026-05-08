@@ -142,8 +142,9 @@ class AppController(QObject):
         self,
         operator_name: str,
         result_df: pd.DataFrame,
+        row_updates: dict | None = None,
     ) -> None:
-        self._complete_queue.append(("create_table", (operator_name, result_df)))
+        self._complete_queue.append(("create_table", (operator_name, result_df, row_updates or {})))
 
     def _on_create_display_complete(
         self,
@@ -164,7 +165,11 @@ class AppController(QObject):
             self._refresh_gallery()
 
         elif mode == "create_table":
-            operator_name, result_df = payload
+            operator_name, result_df, row_updates = payload
+            # Persist extracted blendshapes back to the source table.
+            if row_updates:
+                for row_id, values in row_updates.items():
+                    self._dataset.update_row(row_id, values, self._active_table)
             table_name = f"{operator_name}_result"
             try:
                 self._dataset.create_table_from_df(table_name, result_df)
@@ -178,6 +183,9 @@ class AppController(QObject):
 
         elif mode == "create_display":
             operator_name, result = payload
+            if "row_updates" in result:
+                for row_id, values in result.pop("row_updates").items():
+                    self._dataset.update_row(row_id, values, self._active_table)
             result["operator_name"] = operator_name
             self.display_result_ready.emit(result)
             self.operator_complete.emit(operator_name)

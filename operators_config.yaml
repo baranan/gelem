@@ -29,3 +29,11 @@ operators:
   summary_stats:
     enabled: true
     description: "Computes descriptive statistics over a selection of rows."
+
+  plot_advanced:
+    enabled: true
+    description: "Generates interactive Plotly Express plots."
+
+  stats:
+    enabled: true
+    description: "Runs statistical tests using pingouin."
