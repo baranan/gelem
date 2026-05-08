@@ -83,12 +83,14 @@ class BlendshapeOperator(BaseOperator):
     requires_image = True  # Needs the face image to run mediapipe.
 
     def __init__(self):
+        # Load the mediapipe FaceLandmarker model once when the operator is created.
+        # This avoids reloading the model for every single image (which would be slow).
         landmarker_config = mp.tasks.vision.FaceLandmarkerOptions(
             base_options=mp.tasks.BaseOptions(
                 model_asset_path=str(_MODEL_PATH),
             ),
-            output_face_blendshapes=True,
-            num_faces=1,
+            output_face_blendshapes=True,  # Tell mediapipe to compute blendshapes.
+            num_faces=1,  # Only detect one face per image.
         )
         self._landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(
             landmarker_config
@@ -100,19 +102,36 @@ class BlendshapeOperator(BaseOperator):
         image: np.ndarray,
         metadata: dict,
     ) -> dict:
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image)
-        detection_result = self._landmarker.detect(mp_image)
+        """
+        Runs mediapipe face detection on one image and returns blendshape scores.
 
-        if not detection_result.face_blendshapes:
+        Args:
+            row_id:   Unique ID of the row being processed.
+            image:    The face image as a numpy array (height, width, 3), RGB.
+            metadata: Existing column values for this row (not used here).
+
+        Returns:
+            Dict mapping each blendshape name to its score (0.0–1.0).
+            If no face is detected, all values are None.
+        """
+        try:
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image)
+            detection_result = self._landmarker.detect(mp_image)
+
+            if not detection_result.face_blendshapes:
+                return {name: None for name in BLENDSHAPE_NAMES}
+
+            detected_scores = detection_result.face_blendshapes[0]
+            blendshape_scores = {}
+            for i, bs_name in enumerate(BLENDSHAPE_NAMES):
+                blendshape_scores[bs_name] = detected_scores[i].score
+            return blendshape_scores
+
+        except Exception as e:
+            print(f"[BlendshapeOperator] Error processing {row_id}: {e}")
             return {name: None for name in BLENDSHAPE_NAMES}
 
-        detected_scores = detection_result.face_blendshapes[0]
-        blendshape_scores = {}
-        for i, bs_name in enumerate(BLENDSHAPE_NAMES):
-            blendshape_scores[bs_name] = detected_scores[i].score
-        return blendshape_scores
-
-# TODO: until the integration will be comletes with the ui, we can print the result for a single picture by running in the terminal this:
+# TODO: until the integration will be completed with the ui, we can print the result for a single picture by running this in the terminal:
 # (only change to the correct picture name from this folder)
 
 # python -c "
