@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QWidget, QScrollArea, QVBoxLayout, QGridLayout,
     QLabel, QSizePolicy
 )
-from PySide6.QtCore import Signal, Qt
+from PySide6.QtCore import Signal, Qt, QEvent
 from PySide6.QtGui import QPixmap
 
 from ui.tiles.image_tile import ImageTile
@@ -76,7 +76,7 @@ class TileWidget(QLabel):
         Asks the tile to render itself and displays the result.
         Shows a gray placeholder if rendering returns None.
         """
-        pixmap = self._tile.render(self._size)
+        pixmap = self._tile.render(self._size, self._size)
         if pixmap is not None:
             self.setPixmap(
                 pixmap.scaled(
@@ -131,18 +131,25 @@ class TileWidget(QLabel):
         self._repaint()
 
     def mousePressEvent(self, event) -> None:
-        """Handles single click — emits clicked signal with modifier keys."""
+        """
+        Handles single click — emits clicked signal with modifier keys.
+
+        We call event.accept() so the press doesn't bubble up to the
+        gallery's grid background, where the event filter would
+        misinterpret it as a click on empty space and clear the
+        selection.
+        """
         from PySide6.QtCore import Qt
         modifiers = event.modifiers()
         ctrl_held  = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
         shift_held = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
         self.clicked.emit(self._tile.get_row_ids(), ctrl_held, shift_held)
-        super().mousePressEvent(event)
+        event.accept()
 
     def mouseDoubleClickEvent(self, event) -> None:
         """Handles double click — emits double_clicked signal."""
         self.double_clicked.emit(self._tile.get_row_ids())
-        super().mouseDoubleClickEvent(event)
+        event.accept()
 
 
 class GalleryWidget(QWidget):
@@ -182,6 +189,9 @@ class GalleryWidget(QWidget):
         self._visible_cols: list[str] = []
         self._selected_ids: set[str]  = set()
         self._tile_widgets: list[TileWidget] = []
+        # Index of the last plain- or ctrl-clicked tile in self._row_ids.
+        # Acts as the anchor for shift+click range selection.
+        self._last_clicked_index: int | None = None
 
         # Main layout.
         self._layout = QVBoxLayout(self)
@@ -202,6 +212,14 @@ class GalleryWidget(QWidget):
         self._grid_layout.setSpacing(4)
         self._scroll.setWidget(self._grid_widget)
 
+        # Clicks that land on the grid background (between or below
+        # tiles) or on the scroll-area viewport should clear the
+        # current selection — same convention as Windows Explorer
+        # and macOS Finder. We watch them via an event filter so we
+        # don't have to subclass QWidget/QScrollArea.
+        self._grid_widget.installEventFilter(self)
+        self._scroll.viewport().installEventFilter(self)
+
     # ── Public API ────────────────────────────────────────────────────
 
     def set_row_ids(self, row_ids: list[str]) -> None:
@@ -217,6 +235,7 @@ class GalleryWidget(QWidget):
         """
         self._row_ids = row_ids
         self._selected_ids.clear()
+        self._last_clicked_index = None
         self._rebuild_tiles()
 
     def set_tile_size(self, size: int) -> None:
@@ -333,37 +352,73 @@ class GalleryWidget(QWidget):
         ]
         return GridTile(children, direction="horizontal")
 
-    def _on_tile_clicked(self, 
-                         row_ids: list[str], 
-                         ctrl_held: bool = False, 
+    def _on_tile_clicked(self,
+                         row_ids: list[str],
+                         ctrl_held: bool = False,
                          shift_held: bool = False) -> None:
         """
         Handles tile selection.
-        - Plain click:  select only this tile, deselect all others.
+        - Plain click:  if the clicked tile is already in the selection,
+                        leave the selection alone (only update the
+                        anchor) so a follow-up double-click still sees
+                        the multi-selection. Clicking an unselected
+                        tile replaces the selection with just that one.
         - Ctrl+click:   toggle this tile in/out of the selection.
-        - Shift+click:  TODO (Student A): select all tiles between the
-                        last clicked tile and this one. Requires tracking
-                        the index of the last clicked tile in self._last_clicked_index.
-                        Then select all row_ids between that index and the
-                        current tile's index in self._row_ids.
+        - Shift+click:      replace the selection with every tile between
+                            the anchor (last plain- or ctrl-clicked tile)
+                            and this tile, inclusive. The anchor is not
+                            moved, so repeated shift+clicks extend from
+                            the same anchor. If no anchor exists yet,
+                            falls back to plain click.
+        - Ctrl+Shift+click: union the anchor-to-target range with the
+                            existing selection, preserving prior picks.
+                            The anchor stays put.
         """
-        if shift_held and not ctrl_held:
-            # TODO (Student A): implement range selection.
-            # For now, fall through to plain click behaviour.
-            pass
+        if not row_ids:
+            return
 
-        if ctrl_held:
-            # Toggle this tile in or out of the existing selection.
+        # Locate the clicked tile in self._row_ids. Tiles always group
+        # by row_id (one row_id per tile for ImageTile, or a list of
+        # ImageTiles for the same row_id in GridTile), so the first
+        # row_id is enough to identify the tile's position.
+        clicked_id = row_ids[0]
+        try:
+            clicked_idx = self._row_ids.index(clicked_id)
+        except ValueError:
+            clicked_idx = None
+
+        have_anchor = (self._last_clicked_index is not None
+                       and clicked_idx is not None)
+
+        if shift_held and have_anchor:
+            lo = min(self._last_clicked_index, clicked_idx)
+            hi = max(self._last_clicked_index, clicked_idx)
+            range_ids = set(self._row_ids[lo:hi + 1])
+            if ctrl_held:
+                # Ctrl+Shift — extend the existing selection with the range.
+                self._selected_ids |= range_ids
+            else:
+                # Shift only — replace selection with just the range.
+                self._selected_ids = range_ids
+            # Anchor stays put so further shift+clicks extend from it.
+        elif ctrl_held:
             for row_id in row_ids:
                 if row_id in self._selected_ids:
                     self._selected_ids.discard(row_id)
                 else:
                     self._selected_ids.add(row_id)
+            self._last_clicked_index = clicked_idx
         else:
-            # Plain click — replace selection with just this tile.
-            self._selected_ids.clear()
-            for row_id in row_ids:
-                self._selected_ids.add(row_id)
+            # Plain click — if the clicked tile is already part of the
+            # current selection, preserve the selection so a follow-up
+            # double-click can open every selected item side-by-side.
+            # Otherwise, replace the selection with just this tile.
+            already_selected = any(
+                r in self._selected_ids for r in row_ids
+            )
+            if not already_selected:
+                self._selected_ids = set(row_ids)
+            self._last_clicked_index = clicked_idx
 
         # Update visual selection state on all tiles.
         for tw in self._tile_widgets:
@@ -374,6 +429,34 @@ class GalleryWidget(QWidget):
             tw.set_selected(is_selected)
 
         self.selection_changed.emit(list(self._selected_ids))
+
+    def eventFilter(self, obj, event) -> bool:
+        """
+        Watches mouse presses on the grid background and the scroll
+        viewport. A press on either (which means the user clicked
+        between tiles, not on a TileWidget) clears the current
+        selection. Tile clicks never reach this filter because
+        TileWidget.mousePressEvent accepts them first.
+        """
+        if event.type() == QEvent.Type.MouseButtonPress and (
+            obj is self._grid_widget
+            or obj is self._scroll.viewport()
+        ):
+            if self._selected_ids:
+                self._clear_selection()
+        return super().eventFilter(obj, event)
+
+    def _clear_selection(self) -> None:
+        """
+        Empties the selection, repaints affected tiles, and emits
+        selection_changed. Anchor is also reset so the next plain-
+        or ctrl-click starts a fresh range.
+        """
+        self._selected_ids.clear()
+        self._last_clicked_index = None
+        for tw in self._tile_widgets:
+            tw.set_selected(False)
+        self.selection_changed.emit([])
 
     def _on_tile_double_clicked(self, row_ids: list[str]) -> None:
         """

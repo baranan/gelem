@@ -52,7 +52,32 @@ class ImageTile(BaseTile):
         self._cached_pixmap = None
         self._cached_size   = None
 
-    def render(self, size: int):
+    def _compose(self, pixmap, width: int, height: int):
+        """
+        Paints `pixmap` centered into a (width x height) white canvas,
+        scaled with KeepAspectRatio. Returns the canvas QPixmap.
+        """
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QPainter, QPixmap
+
+        canvas = QPixmap(width, height)
+        canvas.fill(Qt.GlobalColor.white)
+        if pixmap is None or pixmap.isNull():
+            return canvas
+
+        scaled = pixmap.scaled(
+            width, height,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        x = (width - scaled.width()) // 2
+        y = (height - scaled.height()) // 2
+        painter = QPainter(canvas)
+        painter.drawPixmap(x, y, scaled)
+        painter.end()
+        return canvas
+
+    def render(self, width: int, height: int):
         """
         Renders the column value as a QPixmap at the given size.
 
@@ -65,18 +90,23 @@ class ImageTile(BaseTile):
         last render call.
 
         Args:
-            size: The tile size in pixels.
+            width:  The tile width in pixels.
+            height: The tile height in pixels.
 
         Returns:
             A QPixmap, or None if rendering fails.
         """
         # Return cached result if nothing has changed.
-        if self._cached_pixmap is not None and self._cached_size == size:
+        if self._cached_pixmap is not None and self._cached_size == (width, height):
             return self._cached_pixmap
 
         # Read the column value from the dataset via the controller.
         metadata = self._controller.get_row(self.row_id)
         value    = metadata.get(self.column_name)
+
+        # The renderer takes a single size hint; use the larger dimension
+        # so the source pixmap has enough resolution to fill the slot.
+        size = max(width, height)
 
         # Ask the controller to render it. The renderer decides how —
         # thumbnail from ArtifactStore for media, formatted text for
@@ -86,9 +116,12 @@ class ImageTile(BaseTile):
             context={"row_id": self.row_id, "column_name": self.column_name},
         )
 
-        self._cached_pixmap = pixmap
-        self._cached_size   = size
-        return pixmap
+        # Fit the rendered pixmap into a (width, height) canvas with
+        # KeepAspectRatio so the tile exactly fills its slot.
+        result = self._compose(pixmap, width, height)
+        self._cached_pixmap = result
+        self._cached_size   = (width, height)
+        return result
 
     def get_row_ids(self) -> list[str]:
         """

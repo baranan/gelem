@@ -71,12 +71,14 @@ class FilterPanel(QWidget):
         self._controller     = controller
         self._active_filters: dict[str, Filter] = {}
         # Key: column name. Value: active Filter or None.
+        self._toggle_values: dict[str, set] = {}
+        # Key: column name. Value: set of currently-checked toggle values.
 
-        self.setMinimumWidth(220)
-        self.setMaximumWidth(300)
+        self.setMinimumWidth(180)
+        self.setMaximumWidth(180)
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(4, 4, 4, 4)
+        outer.setContentsMargins(2, 2, 2, 2)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -87,8 +89,8 @@ class FilterPanel(QWidget):
 
         self._inner  = QWidget()
         self._layout = QVBoxLayout(self._inner)
-        self._layout.setContentsMargins(4, 4, 4, 4)
-        self._layout.setSpacing(8)
+        self._layout.setContentsMargins(2, 2, 2, 2)
+        self._layout.setSpacing(4)
         self._layout.addStretch()
         scroll.setWidget(self._inner)
 
@@ -207,14 +209,20 @@ class FilterPanel(QWidget):
         group = QGroupBox(column)
 
         if len(values) < CATEGORICAL_THRESHOLD:
-            # Low cardinality — show toggle buttons.
-            layout = QHBoxLayout(group)
+            # Low cardinality — show toggle buttons stacked vertically
+            # so each button can stay narrow and labels are never truncated.
+            layout = QVBoxLayout(group)
             layout.setSpacing(2)
+            layout.setContentsMargins(4, 4, 4, 4)
+
+            # Buttons are recreated unchecked, so reset state to match.
+            self._toggle_values[column] = set()
+            self._active_filters.pop(column, None)
 
             for val in values:
                 btn = QPushButton(str(val))
                 btn.setCheckable(True)
-                btn.setMaximumWidth(80)
+                btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
                 btn.clicked.connect(
                     lambda checked, c=column, v=val:
                     self._on_text_toggle(c, v, checked)
@@ -224,6 +232,8 @@ class FilterPanel(QWidget):
         else:
             # High cardinality — show text search input.
             layout = QVBoxLayout(group)
+            layout.setContentsMargins(4, 4, 4, 4)
+            layout.setSpacing(2)
 
             hint = QLabel(f"{len(values)} unique values")
             hint.setStyleSheet("color: #888888; font-size: 10px;")
@@ -249,15 +259,26 @@ class FilterPanel(QWidget):
     ) -> None:
         """
         Called when a text filter toggle button is clicked.
-        Activates or deactivates an 'eq' filter for the given value.
+
+        Multiple values can be active at once per column. Their union is
+        represented as a single Filter(column, "isin", [...]). When no
+        values are checked, the column's filter is removed entirely.
 
         Args:
             column:  The column being filtered.
             value:   The value being toggled.
             checked: True if the button is now active.
         """
+        values = self._toggle_values.setdefault(column, set())
         if checked:
-            self._active_filters[column] = Filter(column, "eq", value)
+            values.add(value)
+        else:
+            values.discard(value)
+
+        if values:
+            self._active_filters[column] = Filter(
+                column, "isin", sorted(values, key=str)
+            )
         else:
             self._active_filters.pop(column, None)
 

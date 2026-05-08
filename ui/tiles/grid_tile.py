@@ -19,6 +19,8 @@ Student A is responsible for implementing this class.
 """
 
 from __future__ import annotations
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QPainter, QPixmap
 from ui.tiles.base_tile import BaseTile
 
 
@@ -64,18 +66,19 @@ class GridTile(BaseTile):
         self._cached_pixmap = None
         self._cached_size   = None
 
-    def render(self, size: int):
+    def render(self, width: int, height: int):
         """
         Renders all children at proportionally smaller sizes and
         composites them into a single QPixmap.
 
         For horizontal layout with N children, each child gets
-        size // N pixels of width and the full size as height.
-        For vertical layout, each child gets the full size as width
-        and size // N pixels of height.
+        width // N pixels of width and the full height.
+        For vertical layout, each child gets the full width
+        and height // N pixels of height.
 
         Args:
-            size: The total tile size in pixels (both width and height).
+            width:  The total tile width in pixels.
+            height: The total tile height in pixels.
 
         Returns:
             A QPixmap containing all children composited together,
@@ -100,17 +103,16 @@ class GridTile(BaseTile):
                from PySide6.QtGui import QPainter
                painter = QPainter(result)
 
-            5. For each child, render it and draw it at the right offset:
-               for i, child in enumerate(self._children):
-                   child_pixmap = child.render(child_size)
-                   if child_pixmap is None:
-                       continue
-                   if self._direction == 'horizontal':
-                       x_offset = i * child_size
-                       painter.drawPixmap(x_offset, 0, child_pixmap)
-                   else:
-                       y_offset = i * child_size
-                       painter.drawPixmap(0, y_offset, child_pixmap)
+            5. For each child, render it and draw it at the right offset.
+               Horizontal layout passes (child_size, height); vertical
+               passes (width, child_size), so each child fills its slot:
+                   for i, child in enumerate(self._children):
+                       if self._direction == 'horizontal':
+                           child_pixmap = child.render(child_size, height)
+                           painter.drawPixmap(i * child_size, 0, child_pixmap)
+                       else:
+                           child_pixmap = child.render(width, child_size)
+                           painter.drawPixmap(0, i * child_size, child_pixmap)
 
             6. End the painter and cache the result:
                painter.end()
@@ -118,10 +120,34 @@ class GridTile(BaseTile):
                self._cached_size   = size
                return result
         """
-        # PLACEHOLDER: renders first child only at full size.
-        if self._children:
-            return self._children[0].render(size)
-        return None
+        if self._cached_pixmap is not None and self._cached_size == (width, height):
+            return self._cached_pixmap
+
+        n = len(self._children)
+
+        result = QPixmap(width, height)
+        result.fill(Qt.GlobalColor.white)
+
+        painter = QPainter(result)
+        if self._direction == "horizontal":
+            child_size = width // n
+            for i, child in enumerate(self._children):
+                child_pixmap = child.render(child_size, height)
+                if child_pixmap is None:
+                    continue
+                painter.drawPixmap(i * child_size, 0, child_pixmap)
+        else:
+            child_size = height // n
+            for i, child in enumerate(self._children):
+                child_pixmap = child.render(width, child_size)
+                if child_pixmap is None:
+                    continue
+                painter.drawPixmap(0, i * child_size, child_pixmap)
+        painter.end()
+
+        self._cached_pixmap = result
+        self._cached_size = (width, height)
+        return result
 
     def get_row_ids(self) -> list[str]:
         """
