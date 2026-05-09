@@ -214,11 +214,6 @@ class Dataset:
         Args:
             folder_path: Absolute path to the folder containing files.
 
-        TODO (Student B): Implement real folder scanning. Use
-        folder_path.glob() or folder_path.iterdir() to find media files.
-        Check each file's suffix against MEDIA_EXTENSIONS.keys().
-        Generate a row_id for each using self._next_id(). Build the
-        DataFrame and store it in self._tables['frames'].
         """
         # Reset the table and counter for a fresh load.
         self._id_counter = 0
@@ -226,8 +221,7 @@ class Dataset:
             columns=self.FRAMES_REQUIRED_COLUMNS
         )
 
-        # PLACEHOLDER: finds real media files if they exist, otherwise
-        # creates placeholder rows so the UI has something to show.
+        # Scan the folder for supported media files and create rows.
         found_files = []
         for f in folder_path.iterdir():
             if f.suffix.lower() in MEDIA_EXTENSIONS:
@@ -241,17 +235,14 @@ class Dataset:
                     "full_path": str(f),
                     "file_name": f.name,
                 })
-        # placeholder code intented to be a fail-safe during development before real folder scanning is implemented. It creates 5 dummy rows with placeholder paths so the UI can display something.
-        # else:
-        #     for i in range(5):
-        #         rows.append({
-        #             "row_id":    self._next_id(),
-        #             "full_path": str(folder_path / f"placeholder_{i}.jpg"),
-        #             "file_name": f"placeholder_{i}.jpg",
-        #         })
 
-        self._tables["frames"] = pd.DataFrame(rows)
+        # If no media files found, create placeholder empty table with one row so the UI has something to show.
+        if rows:
+            self._tables["frames"] = pd.DataFrame(rows)
+        else:
+            self._tables["frames"] = pd.DataFrame(columns=self.FRAMES_REQUIRED_COLUMNS)
 
+        
         # Register full_path as media_path — works for images and videos.
         self._register_column("full_path", "media_path")
 
@@ -347,16 +338,59 @@ class Dataset:
         Returns:
             A MergeReport describing the quality of the join.
 
-        TODO (Student B): Implement this method.
         """
-        # PLACEHOLDER
-        report = MergeReport(
-            total_csv_rows=0,
-            total_image_files=len(self._tables["frames"]),
-            matched_rows=0,
+        # Step 1: Read the CSV file into a DataFrame. 
+        csv_df = pd.read_csv(csv_path)
+
+        # Step 2: apply preproccesing rules to the keys if needed.
+        if preprocess is not None:
+            pass # TODO: apply preprocessing rules TBD on.
+
+        # Step 3: Perform a left join of csv_df onto self._tables["frames"] using the specified join_on column and file_name.
+        frames_df = self._tables["frames"]
+        joined = frames_df.merge(
+            csv_df,
+            left_on="file_name",
+            right_on=join_on,
+            how="left",
         )
-        report._pending_df  = self._tables["frames"].copy()
-        report._new_columns = []
+
+        # Step 4: Calculate statistics and build the report.
+        new_columns = [c for c in csv_df.columns if c != join_on]
+
+        if new_columns:
+            matched_mask = joined[new_columns[0]].notna()
+        else:
+            matched_mask = pd.Series([False] * len(joined))
+
+        unmatched_files = list(joined.loc[~matched_mask, "file_name"])
+        matched_keys    = set(frames_df.loc[matched_mask.values, "file_name"])
+        unmatched_csv   = list(
+            csv_df.loc[~csv_df[join_on].isin(matched_keys), join_on].astype(str)
+        )
+
+        # Duplicate detection
+        file_counts     = frames_df["file_name"].value_counts()
+        duplicate_files = list(file_counts[file_counts > 1].index)
+
+        csv_counts    = csv_df[join_on].value_counts()
+        duplicate_csv = list(csv_counts[csv_counts > 1].index.astype(str))
+
+        frames_keys = set(frames_df["file_name"])
+        one_to_many = [k for k in duplicate_csv if k in frames_keys]
+
+        report = MergeReport(
+            total_csv_rows=len(csv_df),
+            total_image_files=len(frames_df),
+            matched_rows=int(matched_mask.sum()),
+            unmatched_files=unmatched_files,
+            unmatched_csv_rows=unmatched_csv,
+            duplicate_keys_files=duplicate_files,
+            duplicate_keys_csv=duplicate_csv,
+            one_to_many=one_to_many,
+        )
+        report._pending_df  = joined
+        report._new_columns = new_columns
         return report
 
     def confirm_merge(self, report: MergeReport) -> None:
@@ -365,13 +399,17 @@ class Dataset:
 
         Args:
             report: The MergeReport returned by merge_csv().
-
-        TODO (Student B): Implement this method.
         """
         if report._pending_df is not None:
             self._tables["frames"] = report._pending_df.copy()
+
         for col in report._new_columns:
-            self._register_column(col, "text")
+            if self._registry is not None:
+                inferred = self._registry.infer_type(self._tables["frames"][col])
+            else:
+                inferred = "text"
+            self._register_column(col, inferred)
+
         self.provenance.record(
             "confirm_merge", {"matched_rows": report.matched_rows}
         )

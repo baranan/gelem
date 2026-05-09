@@ -75,14 +75,11 @@ class Filter:
             A filtered DataFrame containing only rows that satisfy
             this filter condition.
 
-        TODO (Student B): Implement each comparison type. Use pandas
-        boolean indexing: df[mask] where mask is a boolean Series.
-        Example for 'eq': mask = df[self.column] == self.value
 
         Raise a clear ValueError if self.comparison is not one of the
         supported types listed above.
         """
-        # PLACEHOLDER: returns all rows unfiltered.
+        # edge case: if column doesn't exist, return empty DataFrame with same columns
         if self.column not in df.columns:
             return df.iloc[0:0]
 
@@ -157,16 +154,16 @@ class QueryEngine:
         Returns:
             An ordered list of row_id strings.
 
-        TODO (Student B): Apply each filter by calling filter.apply(df)
-        in sequence. Then sort or shuffle. Then return list(df['row_id']).
         """
-        # PLACEHOLDER: returns all row_ids in original order.
+
         result = df.copy()
 
+        # Apply filters
         if filters:
             for f in filters:
                 result = f.apply(result)
 
+        # Sort or randomise if requested
         if randomise:
             result = result.sample(frac=1, random_state=seed)
         elif sort_by and sort_by in result.columns:
