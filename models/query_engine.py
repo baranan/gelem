@@ -200,9 +200,7 @@ class QueryEngine:
         Returns:
             A dict mapping group value (as string) to list of row_ids.
 
-        TODO (Student B): Implement this method.
-        """
-        # PLACEHOLDER
+        """  
         result = df.copy()
 
         if filters:
@@ -241,10 +239,7 @@ class QueryEngine:
         Returns:
             Sorted list of unique values. Empty list if column does
             not exist.
-
-        TODO (Student B): Use df[column].dropna().unique() and sort.
         """
-        # PLACEHOLDER
         if column not in df.columns:
             return []
         return sorted(df[column].dropna().unique().tolist())
@@ -269,9 +264,7 @@ class QueryEngine:
         Returns:
             An ordered list of row_ids, one per group.
 
-        TODO (Student B): Implement this method.
         """
-        # PLACEHOLDER
         if time_col not in df.columns or group_col not in df.columns:
             return list(df["row_id"])
 

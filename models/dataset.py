@@ -434,13 +434,11 @@ class Dataset:
             expression: A pandas eval-compatible expression.
             col_type:   Column type tag. Defaults to 'numeric'.
             table_name: Which table to add the column to.
-
-        TODO (Student B): Implement this method.
         """
-        # PLACEHOLDER
         df = self.get_table(table_name)
-        df[name] = 0.0
+        df[name] = df.eval(expression)
         self._tables[table_name] = df
+
         self._register_column(name, col_type)
         self.provenance.record("add_computed_column", {
             "name":       name,
