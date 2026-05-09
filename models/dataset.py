@@ -514,16 +514,29 @@ class Dataset:
             source_table: Name of the table to aggregate from.
             group_by:     Column or list of columns to group by.
             aggregations: Dict mapping column names to aggregation functions.
-
-        TODO (Student B): Implement this method.
         """
-        # PLACEHOLDER
+        # Step 1: Group the source table and apply the aggregation functions.
         source_df = self.get_table(source_table)
-        agg_df = pd.DataFrame({
-            "row_id": [self._next_id()],
-            "note":   [f"aggregated from {source_table} — not yet implemented"],
-        })
+        agg_df    = source_df.groupby(group_by).agg(aggregations)
+        agg_df    = agg_df.reset_index()
+
+        # Step 2: Assign a new row_id to each aggregated row.
+        agg_df["row_id"] = [self._next_id() for _ in range(len(agg_df))]
+
+        # Step 3: Store the new table.
         self._tables[name] = agg_df
+
+        # Step 4: Register the column types for the new table.
+        for col in agg_df.columns:
+            if col == "row_id":
+                continue
+            if self._registry is not None:
+                inferred = self._registry.infer_type(agg_df[col])
+            else:
+                inferred = "text"
+            self._register_column(col, inferred)
+
+        # Step 5: Record the operation in the provenance log.
         self.provenance.record("aggregate", {
             "name":         name,
             "source_table": source_table,
