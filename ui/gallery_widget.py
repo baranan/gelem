@@ -182,6 +182,8 @@ class GalleryWidget(QWidget):
         self._visible_cols: list[str] = []
         self._selected_ids: set[str]  = set()
         self._tile_widgets: list[TileWidget] = []
+        # Placeholder shown when the active table has no visual column.
+        self._placeholder_label: QLabel | None = None
         # Index of the last plain- or ctrl-clicked tile in self._row_ids.
         # Acts as the anchor for shift+click range selection.
         self._last_clicked_index: int | None = None
@@ -284,6 +286,15 @@ class GalleryWidget(QWidget):
         """
         Clears the grid and rebuilds all tile widgets from scratch.
 
+        If the researcher has chosen visible columns, those are used.
+        Otherwise the gallery falls back to the registered visual
+        columns reported by the controller. When neither yields any
+        visual column (e.g. a CSV-only project where the researcher
+        picked "(none)" in the image-column dialog), the gallery
+        shows a single "No visual column selected" placeholder
+        instead of building broken tiles that render
+        "Unknown: full_path".
+
         TODO (Student A): Replace with virtual scrolling that only
         creates tiles for the visible viewport area.
         """
@@ -293,15 +304,25 @@ class GalleryWidget(QWidget):
             tw.deleteLater()
         self._tile_widgets.clear()
 
+        # Clear any previous "no visual column" placeholder.
+        self._clear_placeholder()
+
         if not self._row_ids:
+            return
+
+        # Choose which columns each tile should display:
+        #   1. Researcher's explicit selection (when implemented).
+        #   2. Otherwise, the visual columns the controller reports.
+        # If neither yields anything, the active table has no visual
+        # content — show a placeholder and stop.
+        columns = self._visible_cols or self._controller.list_visual_columns()
+        if not columns:
+            self._show_no_visual_column_placeholder()
             return
 
         # Determine how many columns fit in the available width.
         available_width = self.width() or 800
         cols = max(1, available_width // (self._tile_size + 4))
-
-        # Use full_path as default column if none selected.
-        columns = self._visible_cols or ["full_path"]
 
         # Build and place tiles.
         for i, row_id in enumerate(self._row_ids):
@@ -314,6 +335,34 @@ class GalleryWidget(QWidget):
             col = i % cols
             self._grid_layout.addWidget(tw, row, col)
             self._tile_widgets.append(tw)
+
+    def _show_no_visual_column_placeholder(self) -> None:
+        """
+        Adds a single full-width label to the grid telling the
+        researcher that the active table has no visual column and
+        no thumbnails will be drawn.
+        """
+        label = QLabel(
+            "No visual column selected.\n\n"
+            "This table has no image/video column to display.\n"
+            "Run an operator that produces a visual column, or "
+            "load a project that includes one."
+        )
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setWordWrap(True)
+        label.setStyleSheet(
+            "color: #666666; font-size: 13px; padding: 24px;"
+        )
+        self._grid_layout.addWidget(label, 0, 0)
+        self._placeholder_label = label
+
+    def _clear_placeholder(self) -> None:
+        """Removes the no-visual-column placeholder if one is present."""
+        label = getattr(self, "_placeholder_label", None)
+        if label is not None:
+            self._grid_layout.removeWidget(label)
+            label.deleteLater()
+            self._placeholder_label = None
 
     def _make_tile(self, row_id: str, columns: list[str]) -> BaseTile:
         """

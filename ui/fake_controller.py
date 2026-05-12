@@ -238,6 +238,13 @@ class FakeController(QObject):
     def get_visible_columns(self) -> list[str]:
         return list(self._visual_columns)
 
+    def list_visual_columns(self) -> list[str]:
+        """Returns the visual columns registered for the fake table."""
+        return [
+            col for col, tag in self._column_types.items()
+            if tag == "media_path"
+        ]
+
     def select_row(self, row_id: str) -> None:
         metadata = self._metadata.get(row_id, {"row_id": row_id})
         self.row_selected.emit(metadata)
