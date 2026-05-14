@@ -165,7 +165,7 @@ class MainWindow(QMainWindow):
         right_tabs.addTab(self._results_panel, "Results")
 
         splitter.addWidget(right_tabs)
-        splitter.setSizes([220, 800, 380])
+        splitter.setSizes([180, 840, 380])
 
     # ── Operators menu ────────────────────────────────────────────────
 
@@ -366,8 +366,32 @@ class MainWindow(QMainWindow):
             self._stats_panel_removed_placeholder
         )
         self._main_gallery.tile_double_clicked.connect(
-            lambda ids: ctrl.select_row(ids[0]) if ids else None
+            self._on_tile_double_clicked
         )
+
+    def _on_tile_double_clicked(self, clicked_ids: list[str]) -> None:
+        """
+        Handles tile double-click. When several tiles are currently
+        selected and the double-clicked tile is one of them, opens the
+        whole selection in the detail panel side-by-side. Otherwise
+        opens just the double-clicked tile.
+        """
+        if not clicked_ids:
+            return
+
+        selected = self._main_gallery.get_selected_row_ids()
+        if len(selected) > 1 and clicked_ids[0] in selected:
+            # Preserve gallery order so panels read left-to-right the
+            # same way the tiles do.
+            ordered = [
+                rid for rid in self._main_gallery._row_ids
+                if rid in selected
+            ]
+            self._detail_widget.show_rows(ordered)
+        else:
+            # Single-item path goes through the controller so other
+            # listeners (e.g. row_selected signal) still fire.
+            self._controller.select_row(clicked_ids[0])
 
     def _stats_panel_removed_placeholder(self, row_ids: list[str]) -> None:
         """
