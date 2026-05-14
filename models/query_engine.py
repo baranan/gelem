@@ -75,49 +75,35 @@ class Filter:
             A filtered DataFrame containing only rows that satisfy
             this filter condition.
 
-        TODO (Student B): Implement each comparison type. Use pandas
-        boolean indexing: df[mask] where mask is a boolean Series.
-        Example for 'eq': mask = df[self.column] == self.value
 
         Raise a clear ValueError if self.comparison is not one of the
         supported types listed above.
         """
-        # PLACEHOLDER: returns all rows unfiltered.
+        # edge case: if column doesn't exist, return empty DataFrame with same columns
         if self.column not in df.columns:
             return df.iloc[0:0]
 
         if self.comparison == "eq":
-            # PLACEHOLDER
-            return df
+            return df[df[self.column] == self.value]
         elif self.comparison == "neq":
-            # PLACEHOLDER
-            return df
+            return df[df[self.column] != self.value]
         elif self.comparison == "lt":
-            # PLACEHOLDER
-            return df
+            return df[df[self.column] < self.value]
         elif self.comparison == "gt":
-            # PLACEHOLDER
-            return df
+            return df[df[self.column] > self.value]
         elif self.comparison == "lte":
-            # PLACEHOLDER
-            return df
+            return df[df[self.column] <= self.value]
         elif self.comparison == "gte":
-            # PLACEHOLDER
-            return df
+            return df[df[self.column] >= self.value]
         elif self.comparison == "isin":
-            # PLACEHOLDER
-            return df
+            return df[df[self.column].isin(self.value)]
         elif self.comparison == "between":
-            # PLACEHOLDER
-            return df
+            return df[df[self.column].between(self.value[0], self.value[1])]
         elif self.comparison == "contains":
-            # PLACEHOLDER: case-insensitive substring match.
-            # Real implementation:
-            #   mask = df[self.column].astype(str).str.contains(
-            #       str(self.value), case=False, na=False
-            #   )
-            #   return df[mask]
-            return df
+            mask = df[self.column].astype(str).str.contains(
+                str(self.value), case=False, na=False
+            )
+            return df[mask]
         else:
             raise ValueError(
                 f"Unknown comparison type '{self.comparison}'. "
@@ -168,16 +154,16 @@ class QueryEngine:
         Returns:
             An ordered list of row_id strings.
 
-        TODO (Student B): Apply each filter by calling filter.apply(df)
-        in sequence. Then sort or shuffle. Then return list(df['row_id']).
         """
-        # PLACEHOLDER: returns all row_ids in original order.
+
         result = df.copy()
 
+        # Apply filters
         if filters:
             for f in filters:
                 result = f.apply(result)
 
+        # Sort or randomise if requested
         if randomise:
             result = result.sample(frac=1, random_state=seed)
         elif sort_by and sort_by in result.columns:
@@ -214,9 +200,7 @@ class QueryEngine:
         Returns:
             A dict mapping group value (as string) to list of row_ids.
 
-        TODO (Student B): Implement this method.
-        """
-        # PLACEHOLDER
+        """  
         result = df.copy()
 
         if filters:
@@ -255,10 +239,7 @@ class QueryEngine:
         Returns:
             Sorted list of unique values. Empty list if column does
             not exist.
-
-        TODO (Student B): Use df[column].dropna().unique() and sort.
         """
-        # PLACEHOLDER
         if column not in df.columns:
             return []
         return sorted(df[column].dropna().unique().tolist())
@@ -283,9 +264,7 @@ class QueryEngine:
         Returns:
             An ordered list of row_ids, one per group.
 
-        TODO (Student B): Implement this method.
         """
-        # PLACEHOLDER
         if time_col not in df.columns or group_col not in df.columns:
             return list(df["row_id"])
 
