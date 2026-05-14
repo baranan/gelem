@@ -365,17 +365,6 @@ class AppController(QObject):
         """Returns the currently selected visible columns."""
         return list(self._visible_cols)
 
-    def list_visual_columns(self) -> list[str]:
-        """
-        Returns every registered column whose type produces a visual
-        (image-like) output. The gallery uses this as the default set
-        of columns to render when the researcher has not explicitly
-        chosen visible columns. An empty list means the active table
-        has no visual content, and the gallery shows a "no visual
-        column" placeholder rather than building broken tiles.
-        """
-        return self._registry.list_visual_columns()
-
     def select_row(self, row_id: str) -> None:
         """
         Retrieves full metadata for a row and emits row_selected.

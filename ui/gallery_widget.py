@@ -312,13 +312,20 @@ class GalleryWidget(QWidget):
 
         # Choose which columns each tile should display:
         #   1. Researcher's explicit selection (when implemented).
-        #   2. Otherwise, the visual columns the controller reports.
-        # If neither yields anything, the active table has no visual
-        # content — show a placeholder and stop.
-        columns = self._visible_cols or self._controller.list_visual_columns()
+        #   2. Otherwise, a single default visual column — prefer
+        #      "full_path" (the canonical primary visual column), and
+        #      fall back to the first visual column the controller
+        #      reports. This keeps the one-tile-per-row layout that
+        #      preceded PR #11.
+        # If no visual column exists at all, the active table has no
+        # visual content — show a placeholder and stop.
+        columns = self._visible_cols
         if not columns:
-            self._show_no_visual_column_placeholder()
-            return
+            visual = self._controller.get_visual_column_names()
+            if not visual:
+                self._show_no_visual_column_placeholder()
+                return
+            columns = ["full_path"] if "full_path" in visual else [visual[0]]
 
         # Determine how many columns fit in the available width.
         available_width = self.width() or 800
