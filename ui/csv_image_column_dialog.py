@@ -81,21 +81,23 @@ class CsvImageColumnDialog(QDialog):
         self._combo.addItem(NO_IMAGE_COLUMN_LABEL, userData=None)
         for col in self._columns:
             self._combo.addItem(col, userData=col)
-        self._combo.currentIndexChanged.connect(self._refresh_preview)
         layout.addWidget(self._combo)
 
-        # Auto-pick a sensible default if the CSV has an obvious
-        # image-path column. The researcher can still change it.
-        self._guess_default_column()
-
-        # Preview label — shows the first value from the chosen
-        # column so the researcher can confirm.
+        # Preview label — created before _guess_default_column() (and
+        # before the signal hook-up) so _refresh_preview can safely
+        # touch it the first time the combo's index changes.
         self._preview = QLabel("")
         self._preview.setWordWrap(True)
         self._preview.setStyleSheet(
             "color: #444444; font-size: 11px; padding: 4px;"
         )
         layout.addWidget(self._preview)
+
+        self._combo.currentIndexChanged.connect(self._refresh_preview)
+
+        # Auto-pick a sensible default if the CSV has an obvious
+        # image-path column. The researcher can still change it.
+        self._guess_default_column()
         self._refresh_preview()
 
         # Buttons.
