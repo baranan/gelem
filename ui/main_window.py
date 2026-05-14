@@ -28,6 +28,7 @@ from ui.results_panel import ResultsPanel
 from ui.run_operator_dialog import RunOperatorDialog
 from ui.save_table_dialog import SaveTableDialog
 from ui.csv_image_column_dialog import CsvImageColumnDialog
+from ui.merge_report_dialog import MergeReportDialog
 
 
 class MainWindow(QMainWindow):
@@ -499,16 +500,13 @@ class MainWindow(QMainWindow):
 
     def _on_merge_report(self, report) -> None:
         """
-        Shows the merge diagnostics report and asks whether to proceed.
-        TODO (Student A): Replace with a proper merge diagnostics dialog.
+        Shows the merge diagnostics dialog. The researcher sees the
+        match/unmatch counts and per-issue lists (unmatched files,
+        unmatched CSV rows, duplicate keys) before deciding whether
+        to commit the merge.
         """
-        reply = QMessageBox.question(
-            self,
-            "Merge report",
-            f"{report.summary()}\n\nProceed with merge?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply == QMessageBox.StandardButton.Yes:
+        dialog = MergeReportDialog(report, parent=self)
+        if dialog.exec() != 0 and dialog.accepted_merge:
             self._controller.confirm_merge(report)
 
     # ── Menu actions ──────────────────────────────────────────────────
