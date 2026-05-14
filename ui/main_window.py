@@ -16,7 +16,7 @@ from __future__ import annotations
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QSplitter, QLabel, QComboBox, QToolBar,
-    QFileDialog, QMessageBox, QTabWidget, QInputDialog
+    QFileDialog, QMessageBox, QTabWidget
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction
@@ -27,6 +27,7 @@ from ui.detail_widget import DetailWidget
 from ui.results_panel import ResultsPanel
 from ui.run_operator_dialog import RunOperatorDialog
 from ui.save_table_dialog import SaveTableDialog
+from ui.csv_image_column_dialog import CsvImageColumnDialog
 from ui.merge_report_dialog import MergeReportDialog
 
 
@@ -367,8 +368,32 @@ class MainWindow(QMainWindow):
             self._stats_panel_removed_placeholder
         )
         self._main_gallery.tile_double_clicked.connect(
-            lambda ids: ctrl.select_row(ids[0]) if ids else None
+            self._on_tile_double_clicked
         )
+
+    def _on_tile_double_clicked(self, clicked_ids: list[str]) -> None:
+        """
+        Handles tile double-click. When several tiles are currently
+        selected and the double-clicked tile is one of them, opens the
+        whole selection in the detail panel side-by-side. Otherwise
+        opens just the double-clicked tile.
+        """
+        if not clicked_ids:
+            return
+
+        selected = self._main_gallery.get_selected_row_ids()
+        if len(selected) > 1 and clicked_ids[0] in selected:
+            # Preserve gallery order so panels read left-to-right the
+            # same way the tiles do.
+            ordered = [
+                rid for rid in self._main_gallery._row_ids
+                if rid in selected
+            ]
+            self._detail_widget.show_rows(ordered)
+        else:
+            # Single-item path goes through the controller so other
+            # listeners (e.g. row_selected signal) still fire.
+            self._controller.select_row(clicked_ids[0])
 
     def _stats_panel_removed_placeholder(self, row_ids: list[str]) -> None:
         """
@@ -498,9 +523,12 @@ class MainWindow(QMainWindow):
     def _on_new_from_csv(self) -> None:
         """
         Opens a CSV file to start a new project without images.
-        TODO (Student A): Replace the simple input dialog with a proper
-        dialog that shows CSV column names and lets the researcher
-        select which column contains image paths.
+
+        After the file is chosen, CsvImageColumnDialog reads the CSV
+        header and lets the researcher pick which column (if any)
+        holds image file paths from a combo box, with a one-line
+        preview of that column's first value so they can confirm
+        their pick.
         """
         from pathlib import Path
 
@@ -510,18 +538,12 @@ class MainWindow(QMainWindow):
         if not path:
             return
 
-        image_col, ok = QInputDialog.getText(
-            self,
-            "Image column",
-            "If your CSV has a column containing image file paths,\n"
-            "enter its name here. Leave blank if there are no images.",
-            text=""
-        )
+        csv_path = Path(path)
+        dialog = CsvImageColumnDialog(csv_path, parent=self)
+        if dialog.exec() == 0:
+            return
 
-        image_column = (
-            image_col.strip() if ok and image_col.strip() else None
-        )
-        self._controller.load_csv_as_primary(Path(path), image_column)
+        self._controller.load_csv_as_primary(csv_path, dialog.image_column)
 
     def _on_merge_csv(self) -> None:
         """Opens a CSV file chooser for merging metadata."""

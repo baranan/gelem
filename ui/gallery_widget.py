@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QWidget, QScrollArea, QVBoxLayout, QGridLayout,
     QLabel, QSizePolicy
 )
-from PySide6.QtCore import Signal, Qt
+from PySide6.QtCore import Signal, Qt, QEvent
 from PySide6.QtGui import QPixmap
 
 from ui.tiles.image_tile import ImageTile
@@ -131,18 +131,25 @@ class TileWidget(QLabel):
         self._repaint()
 
     def mousePressEvent(self, event) -> None:
-        """Handles single click — emits clicked signal with modifier keys."""
+        """
+        Handles single click — emits clicked signal with modifier keys.
+
+        We call event.accept() so the press doesn't bubble up to the
+        gallery's grid background, where the event filter would
+        misinterpret it as a click on empty space and clear the
+        selection.
+        """
         from PySide6.QtCore import Qt
         modifiers = event.modifiers()
         ctrl_held  = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
         shift_held = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
         self.clicked.emit(self._tile.get_row_ids(), ctrl_held, shift_held)
-        super().mousePressEvent(event)
+        event.accept()
 
     def mouseDoubleClickEvent(self, event) -> None:
         """Handles double click — emits double_clicked signal."""
         self.double_clicked.emit(self._tile.get_row_ids())
-        super().mouseDoubleClickEvent(event)
+        event.accept()
 
 
 class GalleryWidget(QWidget):
@@ -182,6 +189,8 @@ class GalleryWidget(QWidget):
         self._visible_cols: list[str] = []
         self._selected_ids: set[str]  = set()
         self._tile_widgets: list[TileWidget] = []
+        # Placeholder shown when the active table has no visual column.
+        self._placeholder_label: QLabel | None = None
         # Index of the last plain- or ctrl-clicked tile in self._row_ids.
         # Acts as the anchor for shift+click range selection.
         self._last_clicked_index: int | None = None
@@ -204,6 +213,14 @@ class GalleryWidget(QWidget):
         self._grid_layout = QGridLayout(self._grid_widget)
         self._grid_layout.setSpacing(4)
         self._scroll.setWidget(self._grid_widget)
+
+        # Clicks that land on the grid background (between or below
+        # tiles) or on the scroll-area viewport should clear the
+        # current selection — same convention as Windows Explorer
+        # and macOS Finder. We watch them via an event filter so we
+        # don't have to subclass QWidget/QScrollArea.
+        self._grid_widget.installEventFilter(self)
+        self._scroll.viewport().installEventFilter(self)
 
     # ── Public API ────────────────────────────────────────────────────
 
@@ -284,6 +301,15 @@ class GalleryWidget(QWidget):
         """
         Clears the grid and rebuilds all tile widgets from scratch.
 
+        If the researcher has chosen visible columns, those are used.
+        Otherwise the gallery falls back to the registered visual
+        columns reported by the controller. When neither yields any
+        visual column (e.g. a CSV-only project where the researcher
+        picked "(none)" in the image-column dialog), the gallery
+        shows a single "No visual column selected" placeholder
+        instead of building broken tiles that render
+        "Unknown: full_path".
+
         TODO (Student A): Replace with virtual scrolling that only
         creates tiles for the visible viewport area.
         """
@@ -293,15 +319,35 @@ class GalleryWidget(QWidget):
             tw.deleteLater()
         self._tile_widgets.clear()
 
+        # Clear any previous "no visual column" placeholder.
+        self._clear_placeholder()
+
         if not self._row_ids:
             return
+
+        # Choose which columns each tile should display:
+        #   1. Researcher's explicit selection (when implemented).
+        #   2. Otherwise, the canonical primary visual column
+        #      "full_path", but only when Dataset has actually
+        #      registered it as visual — i.e. the project was loaded
+        #      from a folder, or from a CSV where the researcher
+        #      picked an image column. When the researcher picked
+        #      "(none)" full_path is not registered, so we fall
+        #      through to the placeholder rather than silently
+        #      rendering whatever other column auto-inference happened
+        #      to flag as media_path (e.g. a bare "file_name" that
+        #      doesn't resolve to real files on disk).
+        columns = self._visible_cols
+        if not columns:
+            visual = self._controller.get_visual_column_names()
+            if "full_path" not in visual:
+                self._show_no_visual_column_placeholder()
+                return
+            columns = ["full_path"]
 
         # Determine how many columns fit in the available width.
         available_width = self.width() or 800
         cols = max(1, available_width // (self._tile_size + 4))
-
-        # Use full_path as default column if none selected.
-        columns = self._visible_cols or ["full_path"]
 
         # Build and place tiles.
         for i, row_id in enumerate(self._row_ids):
@@ -314,6 +360,34 @@ class GalleryWidget(QWidget):
             col = i % cols
             self._grid_layout.addWidget(tw, row, col)
             self._tile_widgets.append(tw)
+
+    def _show_no_visual_column_placeholder(self) -> None:
+        """
+        Adds a single full-width label to the grid telling the
+        researcher that the active table has no visual column and
+        no thumbnails will be drawn.
+        """
+        label = QLabel(
+            "No visual column selected.\n\n"
+            "This table has no image/video column to display.\n"
+            "Run an operator that produces a visual column, or "
+            "load a project that includes one."
+        )
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setWordWrap(True)
+        label.setStyleSheet(
+            "color: #666666; font-size: 13px; padding: 24px;"
+        )
+        self._grid_layout.addWidget(label, 0, 0)
+        self._placeholder_label = label
+
+    def _clear_placeholder(self) -> None:
+        """Removes the no-visual-column placeholder if one is present."""
+        label = getattr(self, "_placeholder_label", None)
+        if label is not None:
+            self._grid_layout.removeWidget(label)
+            label.deleteLater()
+            self._placeholder_label = None
 
     def _make_tile(self, row_id: str, columns: list[str]) -> BaseTile:
         """
@@ -343,7 +417,11 @@ class GalleryWidget(QWidget):
                          shift_held: bool = False) -> None:
         """
         Handles tile selection.
-        - Plain click:  select only this tile, deselect all others.
+        - Plain click:  if the clicked tile is already in the selection,
+                        leave the selection alone (only update the
+                        anchor) so a follow-up double-click still sees
+                        the multi-selection. Clicking an unselected
+                        tile replaces the selection with just that one.
         - Ctrl+click:   toggle this tile in/out of the selection.
         - Shift+click:      replace the selection with every tile between
                             the anchor (last plain- or ctrl-clicked tile)
@@ -390,7 +468,15 @@ class GalleryWidget(QWidget):
                     self._selected_ids.add(row_id)
             self._last_clicked_index = clicked_idx
         else:
-            self._selected_ids = set(row_ids)
+            # Plain click — if the clicked tile is already part of the
+            # current selection, preserve the selection so a follow-up
+            # double-click can open every selected item side-by-side.
+            # Otherwise, replace the selection with just this tile.
+            already_selected = any(
+                r in self._selected_ids for r in row_ids
+            )
+            if not already_selected:
+                self._selected_ids = set(row_ids)
             self._last_clicked_index = clicked_idx
 
         # Update visual selection state on all tiles.
@@ -402,6 +488,34 @@ class GalleryWidget(QWidget):
             tw.set_selected(is_selected)
 
         self.selection_changed.emit(list(self._selected_ids))
+
+    def eventFilter(self, obj, event) -> bool:
+        """
+        Watches mouse presses on the grid background and the scroll
+        viewport. A press on either (which means the user clicked
+        between tiles, not on a TileWidget) clears the current
+        selection. Tile clicks never reach this filter because
+        TileWidget.mousePressEvent accepts them first.
+        """
+        if event.type() == QEvent.Type.MouseButtonPress and (
+            obj is self._grid_widget
+            or obj is self._scroll.viewport()
+        ):
+            if self._selected_ids:
+                self._clear_selection()
+        return super().eventFilter(obj, event)
+
+    def _clear_selection(self) -> None:
+        """
+        Empties the selection, repaints affected tiles, and emits
+        selection_changed. Anchor is also reset so the next plain-
+        or ctrl-click starts a fresh range.
+        """
+        self._selected_ids.clear()
+        self._last_clicked_index = None
+        for tw in self._tile_widgets:
+            tw.set_selected(False)
+        self.selection_changed.emit([])
 
     def _on_tile_double_clicked(self, row_ids: list[str]) -> None:
         """
