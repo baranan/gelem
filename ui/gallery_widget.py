@@ -312,20 +312,23 @@ class GalleryWidget(QWidget):
 
         # Choose which columns each tile should display:
         #   1. Researcher's explicit selection (when implemented).
-        #   2. Otherwise, a single default visual column — prefer
-        #      "full_path" (the canonical primary visual column), and
-        #      fall back to the first visual column the controller
-        #      reports. This keeps the one-tile-per-row layout that
-        #      preceded PR #11.
-        # If no visual column exists at all, the active table has no
-        # visual content — show a placeholder and stop.
+        #   2. Otherwise, the canonical primary visual column
+        #      "full_path", but only when Dataset has actually
+        #      registered it as visual — i.e. the project was loaded
+        #      from a folder, or from a CSV where the researcher
+        #      picked an image column. When the researcher picked
+        #      "(none)" full_path is not registered, so we fall
+        #      through to the placeholder rather than silently
+        #      rendering whatever other column auto-inference happened
+        #      to flag as media_path (e.g. a bare "file_name" that
+        #      doesn't resolve to real files on disk).
         columns = self._visible_cols
         if not columns:
             visual = self._controller.get_visual_column_names()
-            if not visual:
+            if "full_path" not in visual:
                 self._show_no_visual_column_placeholder()
                 return
-            columns = ["full_path"] if "full_path" in visual else [visual[0]]
+            columns = ["full_path"]
 
         # Determine how many columns fit in the available width.
         available_width = self.width() or 800
