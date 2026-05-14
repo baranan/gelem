@@ -16,7 +16,7 @@ from __future__ import annotations
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QSplitter, QLabel, QComboBox, QToolBar,
-    QFileDialog, QMessageBox, QTabWidget, QInputDialog
+    QFileDialog, QMessageBox, QTabWidget
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction
@@ -27,6 +27,8 @@ from ui.detail_widget import DetailWidget
 from ui.results_panel import ResultsPanel
 from ui.run_operator_dialog import RunOperatorDialog
 from ui.save_table_dialog import SaveTableDialog
+from ui.csv_image_column_dialog import CsvImageColumnDialog
+from ui.merge_report_dialog import MergeReportDialog
 
 
 class MainWindow(QMainWindow):
@@ -498,16 +500,13 @@ class MainWindow(QMainWindow):
 
     def _on_merge_report(self, report) -> None:
         """
-        Shows the merge diagnostics report and asks whether to proceed.
-        TODO (Student A): Replace with a proper merge diagnostics dialog.
+        Shows the merge diagnostics dialog. The researcher sees the
+        match/unmatch counts and per-issue lists (unmatched files,
+        unmatched CSV rows, duplicate keys) before deciding whether
+        to commit the merge.
         """
-        reply = QMessageBox.question(
-            self,
-            "Merge report",
-            f"{report.summary()}\n\nProceed with merge?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply == QMessageBox.StandardButton.Yes:
+        dialog = MergeReportDialog(report, parent=self)
+        if dialog.exec() != 0 and dialog.accepted_merge:
             self._controller.confirm_merge(report)
 
     # ── Menu actions ──────────────────────────────────────────────────
@@ -524,9 +523,12 @@ class MainWindow(QMainWindow):
     def _on_new_from_csv(self) -> None:
         """
         Opens a CSV file to start a new project without images.
-        TODO (Student A): Replace the simple input dialog with a proper
-        dialog that shows CSV column names and lets the researcher
-        select which column contains image paths.
+
+        After the file is chosen, CsvImageColumnDialog reads the CSV
+        header and lets the researcher pick which column (if any)
+        holds image file paths from a combo box, with a one-line
+        preview of that column's first value so they can confirm
+        their pick.
         """
         from pathlib import Path
 
@@ -536,18 +538,12 @@ class MainWindow(QMainWindow):
         if not path:
             return
 
-        image_col, ok = QInputDialog.getText(
-            self,
-            "Image column",
-            "If your CSV has a column containing image file paths,\n"
-            "enter its name here. Leave blank if there are no images.",
-            text=""
-        )
+        csv_path = Path(path)
+        dialog = CsvImageColumnDialog(csv_path, parent=self)
+        if dialog.exec() == 0:
+            return
 
-        image_column = (
-            image_col.strip() if ok and image_col.strip() else None
-        )
-        self._controller.load_csv_as_primary(Path(path), image_column)
+        self._controller.load_csv_as_primary(csv_path, dialog.image_column)
 
     def _on_merge_csv(self) -> None:
         """Opens a CSV file chooser for merging metadata."""

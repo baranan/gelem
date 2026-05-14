@@ -199,7 +199,11 @@ class GalleryWidget(QWidget):
         # with the viewport height the same way QGridLayout's column
         # distribution flexes the horizontal gaps with width.
         self._v_gap:     int = self._SPACING
-
+        # Columns each tile should display, resolved in _relayout. None
+        # means the placeholder is shown and no tiles should be mounted.
+        self._tile_columns: list[str] | None = None
+        # Placeholder shown when the active table has no visual column.
+        self._placeholder_label: QLabel | None = None
         # Index of the last plain- or ctrl-clicked tile in self._row_ids.
         # Acts as the anchor for shift+click range selection.
         self._last_clicked_index: int | None = None
@@ -356,6 +360,14 @@ class GalleryWidget(QWidget):
         currently mounted tile to the free pool, and then re-mounts the
         tiles that fall inside the viewport. Called whenever the data
         set, tile size, visible columns, or viewport size change.
+
+        Also resolves which columns each tile will display. If the
+        researcher has chosen visible columns, those are used. Otherwise
+        the gallery falls back to "full_path" — but only when Dataset
+        has registered it as visual. When neither yields a visual column
+        (e.g. a CSV-only project where the researcher picked "(none)"),
+        the gallery shows a single "No visual column selected"
+        placeholder instead of building broken tiles.
         """
         for tw in self._mounted.values():
             self._grid_layout.removeWidget(tw)
@@ -363,6 +375,21 @@ class GalleryWidget(QWidget):
             tw.hide()
             self._free_pool.append(tw)
         self._mounted.clear()
+        self._clear_placeholder()
+
+        # Resolve which columns each tile will display.
+        columns = self._visible_cols
+        if not columns:
+            visual = self._controller.get_visual_column_names()
+            if "full_path" not in visual:
+                self._tile_columns = None
+                if self._row_ids:
+                    self._show_no_visual_column_placeholder()
+                self._top_spacer.setFixedHeight(0)
+                self._bot_spacer.setFixedHeight(0)
+                return
+            columns = ["full_path"]
+        self._tile_columns = columns
 
         self._cols  = self._columns_per_row()
         self._v_gap = self._vertical_gap()
@@ -395,7 +422,7 @@ class GalleryWidget(QWidget):
         range and position stay correct.
         """
         n = len(self._row_ids)
-        if n == 0:
+        if n == 0 or self._tile_columns is None:
             self._top_spacer.setFixedHeight(0)
             self._bot_spacer.setFixedHeight(0)
             return
@@ -428,7 +455,7 @@ class GalleryWidget(QWidget):
                     tw.hide()
                     self._free_pool.append(tw)
 
-            columns = self._visible_cols or ["full_path"]
+            columns = self._tile_columns
 
             # Mount tiles for newly-visible indices, placed at their
             # absolute (row, col) in the QGridLayout. Empty rows above
@@ -464,6 +491,34 @@ class GalleryWidget(QWidget):
         self._bot_spacer.setFixedHeight(
             max(0, (total_rows - bottom_row - 1) * row_h + self._v_gap)
         )
+
+    def _show_no_visual_column_placeholder(self) -> None:
+        """
+        Adds a single full-width label to the grid telling the
+        researcher that the active table has no visual column and
+        no thumbnails will be drawn.
+        """
+        label = QLabel(
+            "No visual column selected.\n\n"
+            "This table has no image/video column to display.\n"
+            "Run an operator that produces a visual column, or "
+            "load a project that includes one."
+        )
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setWordWrap(True)
+        label.setStyleSheet(
+            "color: #666666; font-size: 13px; padding: 24px;"
+        )
+        self._grid_layout.addWidget(label, 0, 0)
+        self._placeholder_label = label
+
+    def _clear_placeholder(self) -> None:
+        """Removes the no-visual-column placeholder if one is present."""
+        label = getattr(self, "_placeholder_label", None)
+        if label is not None:
+            self._grid_layout.removeWidget(label)
+            label.deleteLater()
+            self._placeholder_label = None
 
     def _make_tile(self, row_id: str, columns: list[str]) -> BaseTile:
         """
