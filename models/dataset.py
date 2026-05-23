@@ -215,11 +215,12 @@ class Dataset:
             folder_path: Absolute path to the folder containing files.
 
         """
-        # Reset the table and counter for a fresh load.
+        # Reset all tables for a fresh load (not just 'frames') so old
+        # derived tables don't linger.
         self._id_counter = 0
-        self._tables["frames"] = pd.DataFrame(
-            columns=self.FRAMES_REQUIRED_COLUMNS
-        )
+        self._tables = {
+            "frames": pd.DataFrame(columns=self.FRAMES_REQUIRED_COLUMNS)
+        }
 
         # Scan the folder for supported media files and create rows.
         found_files = []
@@ -268,11 +269,12 @@ class Dataset:
 
         TODO (Student B): Implement this method.
         """
-        # Reset the table and counter for a fresh load.
+        # Reset all tables for a fresh load (not just 'frames') so old
+        # derived tables don't linger.
         self._id_counter = 0
-        self._tables["frames"] = pd.DataFrame(
-            columns=self.FRAMES_REQUIRED_COLUMNS
-        )
+        self._tables = {
+            "frames": pd.DataFrame(columns=self.FRAMES_REQUIRED_COLUMNS)
+        }
 
         # PLACEHOLDER: reads the CSV and creates rows.
         try:
@@ -339,8 +341,22 @@ class Dataset:
             A MergeReport describing the quality of the join.
 
         """
-        # Step 1: Read the CSV file into a DataFrame. 
+        # Step 1: Read the CSV file into a DataFrame.
         csv_df = pd.read_csv(csv_path)
+
+        # Step 1b: Reject CSVs that reuse Gelem's reserved column names
+        # (the join_on column is allowed).
+        reserved = [
+            c for c in csv_df.columns
+            if c in self.FRAMES_REQUIRED_COLUMNS and c != join_on
+        ]
+        if reserved:
+            raise ValueError(
+                f"The CSV contains column name(s) reserved by Gelem: "
+                f"{', '.join(reserved)}. The names "
+                f"{', '.join(self.FRAMES_REQUIRED_COLUMNS)} are used internally "
+                f"by Gelem. Please rename these columns in the CSV before merging."
+            )
 
         # Step 2: apply preproccesing rules to the keys if needed.
         if preprocess is not None:
@@ -552,20 +568,17 @@ class Dataset:
     ) -> None:
         """
         Creates a new table by copying a subset of rows from an existing
-        table. The new table gets its own fresh row_ids.
+        table. Copied rows keep their original row_ids (they are the same
+        media items).
 
         Args:
             name:         Name for the new table.
             row_ids:      List of row_ids to include.
             source_table: Name of the source table.
-
-        TODO (Student B): Implement this method.
         """
-        # PLACEHOLDER
         source_df = self.get_table(source_table)
         subset = source_df[source_df["row_id"].isin(row_ids)].copy()
         subset = subset.reset_index(drop=True)
-        subset["row_id"] = [self._next_id() for _ in range(len(subset))]
         self._tables[name] = subset
         self.provenance.record("create_table_from_rows", {
             "name":         name,
