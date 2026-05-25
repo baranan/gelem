@@ -65,6 +65,7 @@ class MergeReport:
     duplicate_keys_files: list[str] = field(default_factory=list)
     duplicate_keys_csv: list[str] = field(default_factory=list)
     one_to_many: list[str] = field(default_factory=list)
+    renamed_columns: dict = field(default_factory=dict)
     sample_problems: list[dict] = field(default_factory=list)
 
     # The joined DataFrame, held privately until confirm_merge() is called.
@@ -344,6 +345,14 @@ class Dataset:
         # Step 1: Read the CSV file into a DataFrame.
         csv_df = pd.read_csv(csv_path)
 
+        # Step 1a: The join column must exist in the CSV (it can be any
+        # column the caller chose, not necessarily file_name).
+        if join_on not in csv_df.columns:
+            raise ValueError(
+                f"The CSV has no column '{join_on}' to merge on. "
+                f"Available columns: {', '.join(csv_df.columns)}."
+            )
+
         # Step 1b: Reject CSVs that reuse Gelem's reserved column names
         # (the join_on column is allowed).
         reserved = [
@@ -362,17 +371,48 @@ class Dataset:
         if preprocess is not None:
             pass # TODO: apply preprocessing rules TBD on.
 
-        # Step 3: Perform a left join of csv_df onto self._tables["frames"] using the specified join_on column and file_name.
+        # Step 2b: Reject one-to-many merges (a CSV key matching >1 image row
+        # would duplicate that image, e.g. 20 -> 40). Refuse, don't expand.
+        csv_counts    = csv_df[join_on].value_counts()
+        duplicate_csv = list(csv_counts[csv_counts > 1].index.astype(str))
+        frames_keys   = set(self._tables["frames"]["file_name"])
+        one_to_many   = [k for k in duplicate_csv if k in frames_keys]
+        if one_to_many:
+            report = MergeReport(
+                total_csv_rows=len(csv_df),
+                total_image_files=len(self._tables["frames"]),
+                matched_rows=0,
+                duplicate_keys_csv=duplicate_csv,
+                one_to_many=one_to_many,
+            )
+            # _pending_df stays None, so confirm_merge() will not commit.
+            return report
+
+        # Step 3: Left join the CSV onto the frames table. A column present in
+        # BOTH (other than the keys) would collide, so we suffix them: existing
+        # -> <name>_a, incoming -> <name>_b, keeping both instead of crashing.
         frames_df = self._tables["frames"]
+        collisions = [
+            c for c in csv_df.columns
+            if c in frames_df.columns and c not in ("file_name", join_on)
+        ]
         joined = frames_df.merge(
             csv_df,
             left_on="file_name",
             right_on=join_on,
             how="left",
+            suffixes=("_a", "_b"),
         )
+        renamed_columns = {c: (f"{c}_a", f"{c}_b") for c in collisions}
 
-        # Step 4: Calculate statistics and build the report.
-        new_columns = [c for c in csv_df.columns if c != join_on]
+        # Step 4: Calculate statistics and build the report. The CSV-side
+        # duplicate_csv and one_to_many were already computed in Step 2b and
+        # are reused in the report below. A collided column 'path' arrives in
+        # the joined table as 'path_b', so new_columns uses the post-merge name.
+        new_columns = [
+            (f"{c}_b" if c in collisions else c)
+            for c in csv_df.columns if c != join_on
+        ]
 
         if new_columns:
             matched_mask = joined[new_columns[0]].notna()
@@ -385,15 +425,9 @@ class Dataset:
             csv_df.loc[~csv_df[join_on].isin(matched_keys), join_on].astype(str)
         )
 
-        # Duplicate detection
+        # Duplicate file names among the loaded images themselves (usually none).
         file_counts     = frames_df["file_name"].value_counts()
         duplicate_files = list(file_counts[file_counts > 1].index)
-
-        csv_counts    = csv_df[join_on].value_counts()
-        duplicate_csv = list(csv_counts[csv_counts > 1].index.astype(str))
-
-        frames_keys = set(frames_df["file_name"])
-        one_to_many = [k for k in duplicate_csv if k in frames_keys]
 
         report = MergeReport(
             total_csv_rows=len(csv_df),
@@ -404,6 +438,7 @@ class Dataset:
             duplicate_keys_files=duplicate_files,
             duplicate_keys_csv=duplicate_csv,
             one_to_many=one_to_many,
+            renamed_columns=renamed_columns,
         )
         report._pending_df  = joined
         report._new_columns = new_columns
