@@ -4,3 +4,10 @@ pyarrow
 Pillow
 numpy
 matplotlib
+mediapipe
+opencv-python
+plotly
+# kaleido — currently not used, PNG export uses matplotlib instead (kaleido has issues on macOS)
+kaleido
+pingouin
+scipy

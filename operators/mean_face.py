@@ -27,7 +27,7 @@ import numpy as np
 import pandas as pd
 
 from operators.base import BaseOperator
-from operators.blendshapes import BLENDSHAPE_NAMES
+from operators.operator_constants import BLENDSHAPE_NAMES
 
 
 class MeanFaceOperator(BaseOperator):
@@ -55,108 +55,132 @@ class MeanFaceOperator(BaseOperator):
         )
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
+    # ── Extraction Logic (reuses PlotAdvancedOperator) ────────────────
+
+    def _ensure_blendshapes(self, df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+        """
+        Checks for missing blendshape data and extracts if needed.
+        Returns (updated_df, row_updates_dict).
+        """
+        from operators.plot_advanced import PlotAdvancedOperator
+
+        extractor = PlotAdvancedOperator()
+        rows_to_extract = extractor._find_rows_to_extract(df)
+
+        row_updates = {}
+        if rows_to_extract:
+            df, row_updates = extractor._extract_blendshapes(df, rows_to_extract)
+        else:
+            print("[MeanFace] All rows already have blendshape data.")
+
+        for col in BLENDSHAPE_NAMES:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        return df, row_updates
+
+    # ── create_table ─────────────────────────────────────────────────
+
     def create_table(
         self,
         df: pd.DataFrame,
         group_by: str | list[str] | None = None,
-    ) -> pd.DataFrame:
+    ) -> tuple[pd.DataFrame, dict]:
         """
-        Computes a mean face per group and returns a new DataFrame.
-        One row per group, containing mean blendshape values and the
-        path to the rendered mean face image.
+        Computes a mean face per group and returns a new DataFrame
+        plus row_updates so extracted blendshapes are persisted.
 
         Args:
             df:       The active table as a DataFrame.
-            group_by: Column or columns to group by, chosen by the
-                      researcher in the parameter dialog.
+            group_by: Column to group by (e.g. "condition").
+                      If None, treats all rows as one group.
 
         Returns:
-            A new DataFrame with one row per group. Columns include
-            the group-by column(s), mean blendshape values, and
-            'mean_face_path'. Do not include row_id — OperatorRegistry
-            generates new row_ids before storing.
-
-        TODO (Student C): Implement this method.
-
-        Suggested approach:
-            1. If group_by is None, treat all rows as one group.
-            2. For each group:
-               a. Filter df to the group's rows.
-               b. Compute mean of each blendshape column.
-               c. Render a face with those mean values.
-               d. Save the image and record the path.
-            3. Build a DataFrame from the group results and return it.
+            A tuple of (result_df, row_updates).
+            result_df: one row per group. Do not include
+            row_id — OperatorRegistry generates those.
+            row_updates: dict of row_id -> extracted blendshape values.
         """
-        # PLACEHOLDER: returns one row per group with gray images.
         from PIL import Image
 
+        df = df.copy()
+        df, row_updates = self._ensure_blendshapes(df)
+
+        # If no grouping, treat all rows as a single group called "all".
         if group_by is None:
             groups = [("all", df)]
         else:
             groups = list(df.groupby(group_by))
 
         rows = []
-        for group_val, group_df in groups:
-            output_path = (
-                self._output_dir / f"mean_face_{group_val}.jpg"
-            )
+        for group_value, group_df in groups:
+            # Compute mean of each blendshape for this group.
+            row = {"n_frames": len(group_df)}
+            if group_by:
+                row[group_by] = group_value
+
+            for bs_name in BLENDSHAPE_NAMES:
+                if bs_name in group_df.columns:
+                    mean_value = group_df[bs_name].dropna().mean()
+                    row[f"{bs_name}_mean"] = float(mean_value) if not np.isnan(mean_value) else None
+                else:
+                    row[f"{bs_name}_mean"] = None
+
+            # TODO: Placeholder image — will be replaced with avatar rendering later.
+            output_path = self._output_dir / f"mean_face_{group_value}.jpg"
             Image.new("RGB", (256, 256), color=(160, 160, 160)).save(
                 str(output_path), "JPEG"
             )
-            row = {
-                "mean_face_path": str(output_path),
-                "n_frames":       len(group_df),
-            }
-            if group_by:
-                row[group_by] = group_val
-            for bs_name in BLENDSHAPE_NAMES:
-                row[f"{bs_name}_mean"] = 0.0
+            row["mean_face_path"] = str(output_path)
             rows.append(row)
 
-        print(
-            f"[MeanFaceOperator] PLACEHOLDER create_table — "
-            f"{len(rows)} groups"
-        )
-        return pd.DataFrame(rows)
+        return pd.DataFrame(rows), row_updates
+
+    # ── create_display ───────────────────────────────────────────────
 
     def create_display(
         self,
         df: pd.DataFrame,
     ) -> dict:
         """
-        Computes a single mean face from all rows in df and returns
-        a result dict for display in the Results panel.
+        Computes the mean blendshape values across all selected rows
+        and returns the result for display in the Results panel.
 
         Args:
             df: The selected rows as a DataFrame.
 
         Returns:
-            Dict with keys:
-                'artifact_path': str path to the rendered mean face.
-                'operator_name': 'mean_face'
-                'n_frames':      int number of frames averaged.
-                'summary':       dict of mean blendshape values.
-
-        TODO (Student C): Implement this method.
-
-        Suggested approach:
-            1. For each blendshape in BLENDSHAPE_NAMES, compute the
-               mean of that column across all rows in df, skipping NaN.
-            2. Render a face deformed by those mean values.
-            3. Save the image and return the result dict.
+            Dict with mean blendshape values and a placeholder image
+            (image rendering will be added when avatar approach is decided).
         """
-        # PLACEHOLDER: creates a gray image.
         from PIL import Image
 
-        n = len(df)
-        output_path = self._output_dir / f"mean_face_{n}_frames.jpg"
+        df = df.copy()
+        df, row_updates = self._ensure_blendshapes(df)
+
+        # Compute the mean of each blendshape across all selected rows.
+        mean_blendshapes = {}
+        for bs_name in BLENDSHAPE_NAMES:
+            if bs_name in df.columns:
+                mean_value = df[bs_name].dropna().mean()
+                mean_blendshapes[bs_name] = {
+                    "mean": float(mean_value) if not np.isnan(mean_value) else None
+                }
+            else:
+                mean_blendshapes[bs_name] = {"mean": None}
+
+        n_frames = len(df)
+
+        # Placeholder image — will be replaced with avatar rendering later.
+        output_path = self._output_dir / f"mean_face_{n_frames}_frames.jpg"
         Image.new("RGB", (256, 256), color=(160, 160, 160)).save(
             str(output_path), "JPEG"
         )
-        print(f"[MeanFaceOperator] PLACEHOLDER create_display — {n} frames")
+
         return {
             "artifact_path": str(output_path),
             "operator_name": "mean_face",
-            "n_frames":      n,
-            "summary":       {bs_name: 0.0 for bs_name in BLENDSHAPE_NAMES},
+            "n_frames":      n_frames,
+            "summary":       mean_blendshapes,
+            "row_updates":   row_updates,
         }
