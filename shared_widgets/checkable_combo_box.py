@@ -51,6 +51,7 @@ class CheckableComboBox(QComboBox):
     def set_placeholder(self, text: str) -> None:
         """Sets the text shown when no item is checked."""
         self._placeholder = text
+        self.updateGeometry()
         self.update()
 
     def set_items(self, labels: list[str], checked: list[str] | None = None) -> None:
@@ -78,6 +79,7 @@ class CheckableComboBox(QComboBox):
             )
             self.model().appendRow(item)
         self.model().blockSignals(False)
+        self.updateGeometry()
         self.update()
 
     def checked_items(self) -> list[str]:
@@ -90,6 +92,25 @@ class CheckableComboBox(QComboBox):
         return result
 
     # ── Internal behaviour ────────────────────────────────────────────
+
+    def sizeHint(self):
+        # A normal combo sizes itself to its widest item, but the closed
+        # control here may instead show the placeholder or a multi-column
+        # summary. Make sure the widest of (placeholder, item labels) fits
+        # so the text is not clipped.
+        hint = super().sizeHint()
+        metrics = self.fontMetrics()
+        widest = metrics.horizontalAdvance(self._placeholder)
+        for row in range(self.model().rowCount()):
+            item = self.model().item(row)
+            if item is not None:
+                widest = max(widest, metrics.horizontalAdvance(item.text()))
+        # Padding for the frame, dropdown arrow, and check indicator.
+        hint.setWidth(max(hint.width(), widest + 50))
+        return hint
+
+    def minimumSizeHint(self):
+        return self.sizeHint()
 
     def showPopup(self) -> None:
         self.about_to_show.emit()
