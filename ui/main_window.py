@@ -119,6 +119,10 @@ class MainWindow(QMainWindow):
         toolbar = QToolBar("Main toolbar")
         self.addToolBar(toolbar)
 
+        # Extra padding below the controls so the toolbar doesn't sit
+        # flush against the gallery underneath it.
+        toolbar.setContentsMargins(0, 4, 0, 12)
+
         toolbar.addWidget(QLabel("Table: "))
         self._table_combo = QComboBox()
         self._table_combo.addItem("frames")
