@@ -119,35 +119,40 @@ class MainWindow(QMainWindow):
         toolbar = QToolBar("Main toolbar")
         self.addToolBar(toolbar)
 
-        # Equal top/bottom padding so the controls sit vertically centered
-        # in a taller bar, with breathing room above and below.
-        toolbar.setContentsMargins(0, 8, 0, 8)
+        # QToolBar top-aligns the widgets it hosts, so we put the controls
+        # in our own container whose QHBoxLayout vertically centres them
+        # and adds equal padding above and below the row.
+        controls = QWidget()
+        row = QHBoxLayout(controls)
+        row.setContentsMargins(8, 8, 8, 8)
+        row.setSpacing(6)
 
-        toolbar.addWidget(QLabel("Table: "))
+        row.addWidget(QLabel("Table: "), 0, Qt.AlignmentFlag.AlignVCenter)
         self._table_combo = QComboBox()
         self._table_combo.addItem("frames")
         self._table_combo.currentTextChanged.connect(
             self._controller.set_active_table
         )
-        toolbar.addWidget(self._table_combo)
+        row.addWidget(self._table_combo, 0, Qt.AlignmentFlag.AlignVCenter)
 
         # A little breathing room between the table and columns controls.
-        spacer = QWidget()
-        spacer.setFixedWidth(16)
-        toolbar.addWidget(spacer)
+        row.addSpacing(16)
 
         # Visible-columns selector. A combo box of checkable visual
         # columns, letting the researcher choose which columns each tile
         # shows. It is repopulated on open so it always reflects the
         # currently registered visual columns.
-        toolbar.addWidget(QLabel("Columns: "))
+        row.addWidget(QLabel("Columns: "), 0, Qt.AlignmentFlag.AlignVCenter)
         self._columns_combo = CheckableComboBox()
         self._columns_combo.set_placeholder("Visible columns")
         self._columns_combo.about_to_show.connect(self._refresh_columns_combo)
         self._columns_combo.selection_changed.connect(
             self._apply_visible_columns
         )
-        toolbar.addWidget(self._columns_combo)
+        row.addWidget(self._columns_combo, 0, Qt.AlignmentFlag.AlignVCenter)
+        row.addStretch(1)
+
+        toolbar.addWidget(controls)
 
     def _build_central_widget(self) -> None:
         """
