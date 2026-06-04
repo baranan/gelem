@@ -127,6 +127,11 @@ class MainWindow(QMainWindow):
         )
         toolbar.addWidget(self._table_combo)
 
+        # A little breathing room between the table and columns controls.
+        spacer = QWidget()
+        spacer.setFixedWidth(16)
+        toolbar.addWidget(spacer)
+
         # Visible-columns selector. A combo box of checkable visual
         # columns, letting the researcher choose which columns each tile
         # shows. It is repopulated on open so it always reflects the
