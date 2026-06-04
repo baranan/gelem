@@ -15,12 +15,13 @@ Student A is responsible for implementing this class.
 from __future__ import annotations
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
-    QSplitter, QLabel, QComboBox, QToolBar, QToolButton, QMenu,
+    QSplitter, QLabel, QComboBox, QToolBar,
     QFileDialog, QMessageBox, QTabWidget
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction
 
+from shared_widgets.checkable_combo_box import CheckableComboBox
 from ui.gallery_widget import GalleryWidget
 from ui.filter_panel import FilterPanel
 from ui.detail_widget import DetailWidget
@@ -126,21 +127,18 @@ class MainWindow(QMainWindow):
         )
         toolbar.addWidget(self._table_combo)
 
-        # Visible-columns selector. A dropdown of checkable actions, one
-        # per visual column, letting the researcher choose which columns
-        # each tile shows. The menu is rebuilt on open so it always
-        # reflects the currently registered visual columns.
-        toolbar.addSeparator()
+        # Visible-columns selector. A combo box of checkable visual
+        # columns, letting the researcher choose which columns each tile
+        # shows. It is repopulated on open so it always reflects the
+        # currently registered visual columns.
         toolbar.addWidget(QLabel("Columns: "))
-        self._columns_button = QToolButton()
-        self._columns_button.setText("Visible columns")
-        self._columns_button.setPopupMode(
-            QToolButton.ToolButtonPopupMode.InstantPopup
+        self._columns_combo = CheckableComboBox()
+        self._columns_combo.set_placeholder("Visible columns")
+        self._columns_combo.about_to_show.connect(self._refresh_columns_combo)
+        self._columns_combo.selection_changed.connect(
+            self._apply_visible_columns
         )
-        self._columns_menu = QMenu(self._columns_button)
-        self._columns_menu.aboutToShow.connect(self._refresh_columns_menu)
-        self._columns_button.setMenu(self._columns_menu)
-        toolbar.addWidget(self._columns_button)
+        toolbar.addWidget(self._columns_combo)
 
     def _build_central_widget(self) -> None:
         """
@@ -253,43 +251,19 @@ class MainWindow(QMainWindow):
 
     # ── Visible-columns selector ──────────────────────────────────────
 
-    def _refresh_columns_menu(self) -> None:
+    def _refresh_columns_combo(self) -> None:
         """
-        Rebuilds the visible-columns menu just before it is shown.
+        Repopulates the visible-columns combo from the controller.
 
-        Lists every visual column (those that render as tiles) as a
-        checkable action. An action is checked when its column is part
-        of the controller's current visible-column selection. Toggling
-        an action re-applies the whole checked set.
+        Lists every visual column (those that render as tiles), checking
+        the ones in the controller's current visible-column selection.
+        Repopulating does not fire selection_changed, so it never loops
+        back into _apply_visible_columns.
         """
-        self._columns_menu.clear()
-
-        visual_cols = self._controller.get_visual_column_names()
-        if not visual_cols:
-            empty = QAction("No visual columns available", self)
-            empty.setEnabled(False)
-            self._columns_menu.addAction(empty)
-            return
-
-        selected = set(self._controller.get_visible_columns())
-        for col in visual_cols:
-            action = QAction(col, self)
-            action.setCheckable(True)
-            action.setChecked(col in selected)
-            action.toggled.connect(self._on_visible_column_toggled)
-            self._columns_menu.addAction(action)
-
-    def _on_visible_column_toggled(self, _checked: bool) -> None:
-        """
-        Collects every checked column from the menu and applies the new
-        visible-column set to the galleries and the controller.
-        """
-        cols = [
-            action.text()
-            for action in self._columns_menu.actions()
-            if action.isCheckable() and action.isChecked()
-        ]
-        self._apply_visible_columns(cols)
+        self._columns_combo.set_items(
+            self._controller.get_visual_column_names(),
+            checked=self._controller.get_visible_columns(),
+        )
 
     def _apply_visible_columns(self, column_names: list[str]) -> None:
         """
@@ -501,8 +475,9 @@ class MainWindow(QMainWindow):
         self._main_gallery.set_row_ids(all_row_ids)
 
     def _on_columns_updated(self, column_names: list[str]) -> None:
-        """Refreshes filter panel when columns change."""
+        """Refreshes filter panel and columns combo when columns change."""
         self._filter_panel.refresh_columns(column_names)
+        self._refresh_columns_combo()
 
     def _on_tables_updated(self, table_names: list[str]) -> None:
         """Updates the table selector combo when tables change."""
