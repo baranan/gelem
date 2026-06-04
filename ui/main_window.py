@@ -124,7 +124,7 @@ class MainWindow(QMainWindow):
         # and adds equal padding above and below the row.
         controls = QWidget()
         row = QHBoxLayout(controls)
-        row.setContentsMargins(8, 8, 8, 8)
+        row.setContentsMargins(8, 7, 8, 7)
         row.setSpacing(6)
 
         row.addWidget(QLabel("Table: "), 0, Qt.AlignmentFlag.AlignVCenter)
