@@ -119,9 +119,9 @@ class MainWindow(QMainWindow):
         toolbar = QToolBar("Main toolbar")
         self.addToolBar(toolbar)
 
-        # Extra padding below the controls so the toolbar doesn't sit
-        # flush against the gallery underneath it.
-        toolbar.setContentsMargins(0, 4, 0, 12)
+        # Equal top/bottom padding so the controls sit vertically centered
+        # in a taller bar, with breathing room above and below.
+        toolbar.setContentsMargins(0, 8, 0, 8)
 
         toolbar.addWidget(QLabel("Table: "))
         self._table_combo = QComboBox()
