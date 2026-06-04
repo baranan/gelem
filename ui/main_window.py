@@ -15,7 +15,7 @@ Student A is responsible for implementing this class.
 from __future__ import annotations
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
-    QSplitter, QLabel, QComboBox, QToolBar,
+    QSplitter, QLabel, QComboBox, QToolBar, QToolButton, QMenu,
     QFileDialog, QMessageBox, QTabWidget
 )
 from PySide6.QtCore import Qt
@@ -40,7 +40,6 @@ class MainWindow(QMainWindow):
 
     TODO (Student A): Implement grouped gallery view (multiple
     GalleryWidgets in a shared scroll area).
-    TODO (Student A): Implement the column selector for visible columns.
     """
 
     def __init__(self, controller):
@@ -126,6 +125,22 @@ class MainWindow(QMainWindow):
             self._controller.set_active_table
         )
         toolbar.addWidget(self._table_combo)
+
+        # Visible-columns selector. A dropdown of checkable actions, one
+        # per visual column, letting the researcher choose which columns
+        # each tile shows. The menu is rebuilt on open so it always
+        # reflects the currently registered visual columns.
+        toolbar.addSeparator()
+        toolbar.addWidget(QLabel("Columns: "))
+        self._columns_button = QToolButton()
+        self._columns_button.setText("Visible columns")
+        self._columns_button.setPopupMode(
+            QToolButton.ToolButtonPopupMode.InstantPopup
+        )
+        self._columns_menu = QMenu(self._columns_button)
+        self._columns_menu.aboutToShow.connect(self._refresh_columns_menu)
+        self._columns_button.setMenu(self._columns_menu)
+        toolbar.addWidget(self._columns_button)
 
     def _build_central_widget(self) -> None:
         """
@@ -235,6 +250,59 @@ class MainWindow(QMainWindow):
             empty = QAction("No operators registered", self)
             empty.setEnabled(False)
             self._operators_menu.addAction(empty)
+
+    # ── Visible-columns selector ──────────────────────────────────────
+
+    def _refresh_columns_menu(self) -> None:
+        """
+        Rebuilds the visible-columns menu just before it is shown.
+
+        Lists every visual column (those that render as tiles) as a
+        checkable action. An action is checked when its column is part
+        of the controller's current visible-column selection. Toggling
+        an action re-applies the whole checked set.
+        """
+        self._columns_menu.clear()
+
+        visual_cols = self._controller.get_visual_column_names()
+        if not visual_cols:
+            empty = QAction("No visual columns available", self)
+            empty.setEnabled(False)
+            self._columns_menu.addAction(empty)
+            return
+
+        selected = set(self._controller.get_visible_columns())
+        for col in visual_cols:
+            action = QAction(col, self)
+            action.setCheckable(True)
+            action.setChecked(col in selected)
+            action.toggled.connect(self._on_visible_column_toggled)
+            self._columns_menu.addAction(action)
+
+    def _on_visible_column_toggled(self, _checked: bool) -> None:
+        """
+        Collects every checked column from the menu and applies the new
+        visible-column set to the galleries and the controller.
+        """
+        cols = [
+            action.text()
+            for action in self._columns_menu.actions()
+            if action.isCheckable() and action.isChecked()
+        ]
+        self._apply_visible_columns(cols)
+
+    def _apply_visible_columns(self, column_names: list[str]) -> None:
+        """
+        Pushes the chosen visible columns to every gallery and records
+        them on the controller.
+
+        Galleries are updated first so that the gallery refresh the
+        controller triggers re-lays out with the new columns already in
+        place.
+        """
+        for gallery in self._galleries:
+            gallery.set_visible_columns(column_names)
+        self._controller.set_visible_columns(column_names)
 
     # ── Operator run handlers ─────────────────────────────────────────
 
