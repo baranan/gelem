@@ -66,6 +66,9 @@ class MainWindow(QMainWindow):
         # Current tile size, mirrored from the filter panel so new
         # per-group galleries can be created at the right size.
         self._tile_size = 150
+        # Current per-group gallery height, adjustable from the filter
+        # panel's "Group height" slider.
+        self._group_gallery_height = self._GROUP_GALLERY_HEIGHT
 
         self.setWindowTitle("Gelem — Visual Data Explorer")
         self.resize(1400, 900)
@@ -382,6 +385,9 @@ class MainWindow(QMainWindow):
         self._filter_panel.tile_size_changed.connect(
             self._on_tile_size_changed
         )
+        self._filter_panel.group_height_changed.connect(
+            self._on_group_height_changed
+        )
         self._filter_panel.randomise_clicked.connect(
             lambda: ctrl.set_filters(
                 self._filter_panel.get_active_filters(),
@@ -524,7 +530,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(header)
 
         gallery = GalleryWidget(self._controller)
-        gallery.setFixedHeight(self._GROUP_GALLERY_HEIGHT)
+        gallery.setFixedHeight(self._group_gallery_height)
         # Match the flat gallery's current display settings.
         gallery.set_visible_columns(self._controller.get_visible_columns())
         gallery.set_tile_size(self._tile_size)
@@ -606,6 +612,17 @@ class MainWindow(QMainWindow):
         self._tile_size = size
         for gallery in self._galleries:
             gallery.set_tile_size(size)
+
+    def _on_group_height_changed(self, height: int) -> None:
+        """
+        Updates the per-group gallery height. Applies live to the
+        currently displayed grouped sections and is remembered so that
+        sections built later use the same height.
+        """
+        self._group_gallery_height = height
+        if self._gallery_stack.currentWidget() is self._grouped_scroll:
+            for gallery in self._galleries:
+                gallery.setFixedHeight(height)
 
     def _on_display_result(self, result: dict) -> None:
         """
