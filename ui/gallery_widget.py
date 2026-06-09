@@ -26,10 +26,9 @@ Key Qt concepts used here:
 from __future__ import annotations
 from PySide6.QtWidgets import (
     QWidget, QScrollArea, QVBoxLayout, QGridLayout,
-    QLabel, QSizePolicy
+    QLabel,
 )
 from PySide6.QtCore import Signal, Qt, QEvent
-from PySide6.QtGui import QPixmap
 
 from ui.tiles.image_tile import ImageTile
 from ui.tiles.grid_tile import GridTile
@@ -156,15 +155,12 @@ class GalleryWidget(QWidget):
     """
     A scrollable grid of TileWidgets driven by a list of row_ids.
 
-    Receives row_ids from AppController via gallery_updated signal.
-    Builds tiles using the currently selected visible columns.
-    Handles tile selection and communicates selections back to the
-    controller.
-
-    TODO (Student A): Implement virtual scrolling so only visible
-    tiles are rendered at any time. The current placeholder
-    implementation renders all tiles at once, which will be slow
-    for large datasets.
+    Uses virtual scrolling: only tiles for the rows currently inside
+    (or near) the viewport are mounted as widgets. As the user scrolls,
+    tiles that leave the viewport are recycled into a free pool and
+    later re-bound to newly visible rows. The inner content widget is
+    sized to the full grid so the scrollbar reflects all rows even
+    though most are not materialised.
     """
 
     # Signal emitted when the user selects one or more tiles.
@@ -173,6 +169,10 @@ class GalleryWidget(QWidget):
 
     # Signal emitted when the user double-clicks a tile.
     tile_double_clicked = Signal(list)
+
+    _SPACING     = 4   # gap between adjacent tiles, in pixels
+    _MARGIN      = 4   # padding around the whole grid, in pixels
+    _BUFFER_ROWS = 1   # rows above and below the viewport kept mounted
 
     def __init__(self, controller, parent=None):
         """
@@ -188,7 +188,20 @@ class GalleryWidget(QWidget):
         self._tile_size:    int       = 150
         self._visible_cols: list[str] = []
         self._selected_ids: set[str]  = set()
-        self._tile_widgets: list[TileWidget] = []
+
+        # Virtual-scrolling state.
+        # _mounted maps row_id index -> TileWidget currently shown.
+        # _free_pool holds hidden TileWidgets ready to be recycled.
+        self._mounted:   dict[int, TileWidget] = {}
+        self._free_pool: list[TileWidget]      = []
+        self._cols:      int = 1
+        # Vertical gap between rows, recomputed in _relayout to flex
+        # with the viewport height the same way QGridLayout's column
+        # distribution flexes the horizontal gaps with width.
+        self._v_gap:     int = self._SPACING
+        # Columns each tile should display, resolved in _relayout. None
+        # means the placeholder is shown and no tiles should be mounted.
+        self._tile_columns: list[str] | None = None
         # Placeholder shown when the active table has no visual column.
         self._placeholder_label: QLabel | None = None
         # Index of the last plain- or ctrl-clicked tile in self._row_ids.
@@ -200,7 +213,10 @@ class GalleryWidget(QWidget):
         self._layout.setContentsMargins(4, 4, 4, 4)
         self._layout.setSpacing(4)
 
-        # Scroll area containing the grid.
+        # Scroll area. setWidgetResizable(True) lets the inner widget
+        # match the viewport width, so QGridLayout distributes columns
+        # across that width exactly the way the old non-virtual gallery
+        # did.
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
         self._scroll.setHorizontalScrollBarPolicy(
@@ -208,48 +224,76 @@ class GalleryWidget(QWidget):
         )
         self._layout.addWidget(self._scroll)
 
-        # Grid container widget.
+        # Inner content widget. Layout is:
+        #     [ top_spacer ]   <- height stands in for off-screen rows above
+        #     [ grid_layout ]  <- real QGridLayout holding only visible tiles
+        #     [ bot_spacer ]   <- height stands in for off-screen rows below
+        # The spacers preserve scrollbar range and scroll position; the
+        # QGridLayout still does the horizontal flow itself.
         self._grid_widget = QWidget()
-        self._grid_layout = QGridLayout(self._grid_widget)
-        self._grid_layout.setSpacing(4)
+        self._vbox = QVBoxLayout(self._grid_widget)
+        self._vbox.setContentsMargins(0, 0, 0, 0)
+        self._vbox.setSpacing(0)
+
+        self._top_spacer = QWidget()
+        self._top_spacer.setFixedHeight(0)
+        self._vbox.addWidget(self._top_spacer)
+
+        self._grid_container = QWidget()
+        self._grid_layout = QGridLayout(self._grid_container)
+        self._grid_layout.setSpacing(self._SPACING)
+        self._vbox.addWidget(self._grid_container)
+
+        self._bot_spacer = QWidget()
+        self._bot_spacer.setFixedHeight(0)
+        self._vbox.addWidget(self._bot_spacer)
+
+        # An expanding stretch below the bottom spacer keeps the grid
+        # pinned to the top when the content is shorter than the
+        # viewport. With virtual scrolling at scale this is normally
+        # not the case, but it matters for small datasets.
+        self._vbox.addStretch(1)
+
         self._scroll.setWidget(self._grid_widget)
 
-        # Clicks that land on the grid background (between or below
-        # tiles) or on the scroll-area viewport should clear the
-        # current selection — same convention as Windows Explorer
-        # and macOS Finder. We watch them via an event filter so we
-        # don't have to subclass QWidget/QScrollArea.
+        # Clicks that land on the spacers, the grid background, or the
+        # scroll-area viewport should clear the current selection —
+        # same convention as Windows Explorer and macOS Finder. Tile
+        # presses call event.accept() so they never reach this filter.
         self._grid_widget.installEventFilter(self)
+        self._grid_container.installEventFilter(self)
         self._scroll.viewport().installEventFilter(self)
+        self._scroll.verticalScrollBar().valueChanged.connect(
+            self._update_visible_tiles
+        )
 
     # ── Public API ────────────────────────────────────────────────────
 
     def set_row_ids(self, row_ids: list[str]) -> None:
         """
         Updates the gallery with a new ordered list of row_ids.
-        Rebuilds all tiles. Called when gallery_updated signal arrives.
+        Resets selection and scroll position, then re-mounts the
+        visible viewport.
 
         Args:
             row_ids: Ordered list of row_ids to display.
-
-        TODO (Student A): Replace this with virtual scrolling.
-        Currently rebuilds all tiles at once.
         """
         self._row_ids = row_ids
         self._selected_ids.clear()
         self._last_clicked_index = None
-        self._rebuild_tiles()
+        self._relayout()
+        self._scroll.verticalScrollBar().setValue(0)
 
     def set_tile_size(self, size: int) -> None:
         """
-        Updates the tile size and repaints all tiles.
+        Updates the tile size and re-mounts the visible viewport.
         Called when the tile-size slider changes.
 
         Args:
             size: New tile size in pixels (50-600).
         """
         self._tile_size = size
-        self._rebuild_tiles()
+        self._relayout()
 
     def set_visible_columns(self, column_names: list[str]) -> None:
         """
@@ -261,25 +305,27 @@ class GalleryWidget(QWidget):
             column_names: Ordered list of column names to display.
         """
         self._visible_cols = column_names
-        self._rebuild_tiles()
+        self._relayout()
 
     def on_row_updated(self, row_id: str) -> None:
         """
         Called when a row's data has changed (e.g. operator result
-        arrived). Finds the tile for this row and invalidates it
-        so it re-renders with the new value.
+        arrived). Finds the mounted tile for this row, if any, and
+        invalidates it so it re-renders with the new value. Tiles that
+        are not currently mounted will pick up the new value naturally
+        the next time they scroll into view.
 
         Args:
             row_id: The row whose data changed.
         """
-        for tw in self._tile_widgets:
+        for tw in self._mounted.values():
             if row_id in tw._tile.get_row_ids():
                 tw.invalidate()
 
     def on_thumbnail_ready(self, row_id: str) -> None:
         """
         Called when a thumbnail has been generated for row_id.
-        Finds the corresponding tile and repaints it.
+        Finds the corresponding mounted tile and repaints it.
 
         Args:
             row_id: The item whose thumbnail is now available.
@@ -297,69 +343,154 @@ class GalleryWidget(QWidget):
 
     # ── Internal helpers ──────────────────────────────────────────────
 
-    def _rebuild_tiles(self) -> None:
-        """
-        Clears the grid and rebuilds all tile widgets from scratch.
+    def _columns_per_row(self) -> int:
+        """How many tiles fit horizontally in the current viewport."""
+        viewport_w = self._scroll.viewport().width()
+        if viewport_w <= 0:
+            viewport_w = self.width() or 800
+        # Account for the QGridLayout's default contents margins so we
+        # don't over-estimate how many columns fit.
+        m = self._grid_layout.contentsMargins()
+        usable = viewport_w - m.left() - m.right() + self._SPACING
+        return max(1, usable // (self._tile_size + self._SPACING))
 
-        If the researcher has chosen visible columns, those are used.
-        Otherwise the gallery falls back to the registered visual
-        columns reported by the controller. When neither yields any
-        visual column (e.g. a CSV-only project where the researcher
-        picked "(none)" in the image-column dialog), the gallery
-        shows a single "No visual column selected" placeholder
-        instead of building broken tiles that render
-        "Unknown: full_path".
-
-        TODO (Student A): Replace with virtual scrolling that only
-        creates tiles for the visible viewport area.
+    def _relayout(self) -> None:
         """
-        # Clear existing tiles.
-        for tw in self._tile_widgets:
+        Recomputes column count and vertical row spacing, returns every
+        currently mounted tile to the free pool, and then re-mounts the
+        tiles that fall inside the viewport. Called whenever the data
+        set, tile size, visible columns, or viewport size change.
+
+        Also resolves which columns each tile will display. If the
+        researcher has chosen visible columns, those are used. Otherwise
+        the gallery falls back to "full_path" — but only when Dataset
+        has registered it as visual. When neither yields a visual column
+        (e.g. a CSV-only project where the researcher picked "(none)"),
+        the gallery shows a single "No visual column selected"
+        placeholder instead of building broken tiles.
+        """
+        for tw in self._mounted.values():
             self._grid_layout.removeWidget(tw)
-            tw.deleteLater()
-        self._tile_widgets.clear()
-
-        # Clear any previous "no visual column" placeholder.
+            tw.setParent(None)
+            tw.hide()
+            self._free_pool.append(tw)
+        self._mounted.clear()
         self._clear_placeholder()
 
-        if not self._row_ids:
-            return
-
-        # Choose which columns each tile should display:
-        #   1. Researcher's explicit selection (when implemented).
-        #   2. Otherwise, the canonical primary visual column
-        #      "full_path", but only when Dataset has actually
-        #      registered it as visual — i.e. the project was loaded
-        #      from a folder, or from a CSV where the researcher
-        #      picked an image column. When the researcher picked
-        #      "(none)" full_path is not registered, so we fall
-        #      through to the placeholder rather than silently
-        #      rendering whatever other column auto-inference happened
-        #      to flag as media_path (e.g. a bare "file_name" that
-        #      doesn't resolve to real files on disk).
+        # Resolve which columns each tile will display.
         columns = self._visible_cols
         if not columns:
             visual = self._controller.get_visual_column_names()
             if "full_path" not in visual:
-                self._show_no_visual_column_placeholder()
+                self._tile_columns = None
+                if self._row_ids:
+                    self._show_no_visual_column_placeholder()
+                self._top_spacer.setFixedHeight(0)
+                self._bot_spacer.setFixedHeight(0)
                 return
             columns = ["full_path"]
+        self._tile_columns = columns
 
-        # Determine how many columns fit in the available width.
-        available_width = self.width() or 800
-        cols = max(1, available_width // (self._tile_size + 4))
+        self._cols  = self._columns_per_row()
+        self._v_gap = self._vertical_gap()
+        # Match QGridLayout's horizontal spacing (4 px between cells)
+        # while letting the vertical spacing flex with viewport height.
+        self._grid_layout.setHorizontalSpacing(self._SPACING)
+        self._grid_layout.setVerticalSpacing(self._v_gap)
+        self._update_visible_tiles()
 
-        # Build and place tiles.
-        for i, row_id in enumerate(self._row_ids):
-            tile = self._make_tile(row_id, columns)
-            tw   = TileWidget(tile, self._tile_size)
-            tw.clicked.connect(self._on_tile_clicked)
-            tw.double_clicked.connect(self._on_tile_double_clicked)
+    def _vertical_gap(self) -> int:
+        """
+        Vertical gap between rows, distributed the same way the QGridLayout
+        distributes horizontal slack between columns: take the rows that
+        fit in the viewport, and split any leftover height evenly across
+        (rows + 1) slots.
+        """
+        viewport_h = self._scroll.viewport().height()
+        if viewport_h <= 0:
+            viewport_h = self.height() or 600
+        rows_fit = max(1, viewport_h // (self._tile_size + self._SPACING))
+        slack    = max(0, viewport_h - rows_fit * self._tile_size)
+        return max(self._SPACING, slack // (rows_fit + 1))
 
-            row = i // cols
-            col = i % cols
-            self._grid_layout.addWidget(tw, row, col)
-            self._tile_widgets.append(tw)
+    def _update_visible_tiles(self) -> None:
+        """
+        Computes which row_id indices fall inside (or near) the
+        viewport, drops mounted tiles that are no longer needed back
+        into the free pool, mounts tiles for newly-visible indices,
+        and updates the top/bottom spacer heights so the scrollbar
+        range and position stay correct.
+        """
+        n = len(self._row_ids)
+        if n == 0 or self._tile_columns is None:
+            self._top_spacer.setFixedHeight(0)
+            self._bot_spacer.setFixedHeight(0)
+            return
+
+        total_rows = (n + self._cols - 1) // self._cols
+        row_h      = self._tile_size + self._v_gap
+
+        viewport_top = self._scroll.verticalScrollBar().value()
+        viewport_h   = self._scroll.viewport().height()
+
+        top_row = max(
+            0, ((viewport_top - self._v_gap) // row_h) - self._BUFFER_ROWS
+        )
+        bottom_row = min(
+            total_rows - 1,
+            ((viewport_top + viewport_h) // row_h) + self._BUFFER_ROWS,
+        )
+
+        first_idx = top_row * self._cols
+        last_idx  = min(n - 1, (bottom_row + 1) * self._cols - 1)
+        needed    = set(range(first_idx, last_idx + 1))
+
+        if needed != set(self._mounted.keys()):
+            # Drop tiles that left the visible window.
+            for idx in list(self._mounted.keys()):
+                if idx not in needed:
+                    tw = self._mounted.pop(idx)
+                    self._grid_layout.removeWidget(tw)
+                    tw.setParent(None)
+                    tw.hide()
+                    self._free_pool.append(tw)
+
+            columns = self._tile_columns
+
+            # Mount tiles for newly-visible indices, placed at their
+            # absolute (row, col) in the QGridLayout. Empty rows above
+            # collapse to zero height; the top_spacer below provides
+            # the visual offset.
+            for idx in needed:
+                if idx in self._mounted:
+                    continue
+                row_id = self._row_ids[idx]
+                tile   = self._make_tile(row_id, columns)
+                if self._free_pool:
+                    tw = self._free_pool.pop()
+                    tw.update_tile(tile, self._tile_size)
+                    tw.setParent(self._grid_container)
+                else:
+                    tw = TileWidget(tile, self._tile_size,
+                                    parent=self._grid_container)
+                    tw.clicked.connect(self._on_tile_clicked)
+                    tw.double_clicked.connect(self._on_tile_double_clicked)
+
+                grid_row = idx // self._cols
+                grid_col = idx %  self._cols
+                self._grid_layout.addWidget(tw, grid_row, grid_col)
+                tw.set_selected(row_id in self._selected_ids)
+                tw.show()
+                self._mounted[idx] = tw
+
+        # Spacer heights stand in for the rows we did not mount, so the
+        # scrollbar range matches the full virtual content. The extra
+        # v_gap on each side is the very-top and very-bottom padding
+        # (the analog of the side padding around the horizontal grid).
+        self._top_spacer.setFixedHeight(self._v_gap + top_row * row_h)
+        self._bot_spacer.setFixedHeight(
+            max(0, (total_rows - bottom_row - 1) * row_h + self._v_gap)
+        )
 
     def _show_no_visual_column_placeholder(self) -> None:
         """
@@ -479,8 +610,10 @@ class GalleryWidget(QWidget):
                 self._selected_ids = set(row_ids)
             self._last_clicked_index = clicked_idx
 
-        # Update visual selection state on all tiles.
-        for tw in self._tile_widgets:
+        # Update visual selection state on currently mounted tiles.
+        # Hidden (recycled) tiles will pick up the right state when
+        # they next scroll into view.
+        for tw in self._mounted.values():
             is_selected = any(
                 r in self._selected_ids
                 for r in tw._tile.get_row_ids()
@@ -499,6 +632,7 @@ class GalleryWidget(QWidget):
         """
         if event.type() == QEvent.Type.MouseButtonPress and (
             obj is self._grid_widget
+            or obj is self._grid_container
             or obj is self._scroll.viewport()
         ):
             if self._selected_ids:
@@ -513,7 +647,7 @@ class GalleryWidget(QWidget):
         """
         self._selected_ids.clear()
         self._last_clicked_index = None
-        for tw in self._tile_widgets:
+        for tw in self._mounted.values():
             tw.set_selected(False)
         self.selection_changed.emit([])
 
@@ -530,6 +664,16 @@ class GalleryWidget(QWidget):
         self.tile_double_clicked.emit(row_ids)
 
     def resizeEvent(self, event) -> None:
-        """Rebuilds tiles when the widget is resized (column count changes)."""
+        """
+        Re-mounts visible tiles on viewport resize. Triggers a full
+        relayout when the column count or vertical-gap changes (column
+        count flexes the horizontal flow, vertical-gap flexes the row
+        spacing); otherwise just refreshes the visible window.
+        """
         super().resizeEvent(event)
-        self._rebuild_tiles()
+        new_cols  = self._columns_per_row()
+        new_v_gap = self._vertical_gap()
+        if new_cols != self._cols or new_v_gap != self._v_gap:
+            self._relayout()
+        else:
+            self._update_visible_tiles()
