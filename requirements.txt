@@ -4,3 +4,5 @@ pyarrow
 Pillow
 numpy
 matplotlib
+mediapipe
+pytest
