@@ -7,7 +7,8 @@ from the active table's columns.
     text columns (low cardinality)  -> toggle buttons, one per unique value
     text columns (high cardinality) -> text search input (contains filter)
     media_path columns              -> no filter control (not filterable)
-    numeric columns                 -> placeholder (recode tool, later stage)
+    numeric columns                 -> min/max range spin boxes ('between')
+    boolean columns                 -> All / True / False selector ('eq')
     Group-by selector               -> dropdown to choose a grouping column
     Tile-size slider                -> controls gallery tile size
     Randomise button                -> shuffles the current gallery order
@@ -28,7 +29,7 @@ from __future__ import annotations
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QSlider, QComboBox, QScrollArea,
-    QGroupBox, QLineEdit, QSizePolicy
+    QGroupBox, QLineEdit, QSizePolicy, QDoubleSpinBox
 )
 from PySide6.QtCore import Signal, Qt
 
@@ -73,6 +74,9 @@ class FilterPanel(QWidget):
         # Key: column name. Value: active Filter or None.
         self._toggle_values: dict[str, set] = {}
         # Key: column name. Value: set of currently-checked toggle values.
+        self._numeric_spins: dict[str, tuple] = {}
+        # Key: column name. Value: (min_spin, max_spin, col_min, col_max)
+        # for the numeric range controls, so both ends can be read together.
 
         self.setMinimumWidth(180)
         self.setMaximumWidth(180)
@@ -142,13 +146,12 @@ class FilterPanel(QWidget):
               values, shows toggle buttons (one per value).
             - Otherwise shows a text search input.
 
-        For numeric columns: shows a placeholder label for now.
+        For numeric columns: a min/max range control ('between' filter).
+        For boolean columns: an All / True / False selector ('eq' filter).
         For media_path columns: no filter control (not filterable).
 
         Args:
             column_names: List of all registered column names.
-
-        TODO (Student A): Implement recode tool for numeric columns.
         """
         # Remove old column controls (keep fixed controls at indices 0-2,
         # plus the stretch at the end).
@@ -156,6 +159,10 @@ class FilterPanel(QWidget):
             item = self._layout.takeAt(3)
             if item.widget():
                 item.widget().deleteLater()
+
+        # The numeric range widgets are about to be destroyed and rebuilt,
+        # so drop the references to the old ones.
+        self._numeric_spins.clear()
 
         # Update group-by combo.
         self._group_combo.blockSignals(True)
@@ -173,11 +180,16 @@ class FilterPanel(QWidget):
 
             if col_type.tag == "text":
                 self._add_text_filter(col)
+            elif col_type.tag == "numeric":
+                self._add_numeric_filter(col)
+            elif col_type.tag == "boolean_flag":
+                self._add_boolean_filter(col)
             elif col_type.tag in ("media_path",):
                 # Media columns — no filter control needed.
                 pass
             else:
-                # Placeholder for numeric and boolean types.
+                # Unknown type — show a non-interactive label so the
+                # column is at least visible in the panel.
                 label = QLabel(f"{col} ({col_type.tag})")
                 label.setStyleSheet("color: #888888; font-size: 11px;")
                 self._layout.insertWidget(
@@ -300,6 +312,161 @@ class FilterPanel(QWidget):
             )
         else:
             self._active_filters.pop(column, None)
+
+        self.filters_changed.emit(list(self._active_filters.values()))
+
+    def _add_numeric_filter(self, column: str) -> None:
+        """
+        Adds a min/max range control for a numeric column.
+
+        The column's observed minimum and maximum bound two spin boxes
+        (a lower "≥" bound and an upper "≤" bound). Moving either emits a
+        Filter(column, "between", [lo, hi]). When both ends are back at
+        the full observed range, the filter is removed entirely so the
+        column stops constraining the view.
+
+        Columns with fewer than two distinct numeric values can't be
+        meaningfully ranged, so they fall back to a static label.
+
+        Args:
+            column: The numeric column to create a range control for.
+        """
+        values = [
+            v for v in self._controller.get_group_values(column)
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        ]
+        if len(values) < 2:
+            label = QLabel(f"{column} (numeric)")
+            label.setStyleSheet("color: #888888; font-size: 11px;")
+            self._layout.insertWidget(self._layout.count() - 1, label)
+            return
+
+        col_min, col_max = float(min(values)), float(max(values))
+
+        # Whole-number columns read better without decimal places.
+        is_integer = all(float(v).is_integer() for v in values)
+        decimals   = 0 if is_integer else 3
+        step       = 1.0 if is_integer else max((col_max - col_min) / 100, 0.001)
+
+        # Rebuilding the control resets it to the full range, i.e. no
+        # active filter — match that here.
+        self._active_filters.pop(column, None)
+
+        group  = QGroupBox(column)
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(2)
+
+        min_spin = self._make_range_spin(col_min, col_max, decimals, step, "≥ ")
+        max_spin = self._make_range_spin(col_min, col_max, decimals, step, "≤ ")
+        min_spin.setValue(col_min)
+        max_spin.setValue(col_max)
+        layout.addWidget(min_spin)
+        layout.addWidget(max_spin)
+
+        self._numeric_spins[column] = (min_spin, max_spin, col_min, col_max)
+        min_spin.valueChanged.connect(
+            lambda _v, c=column: self._on_numeric_changed(c)
+        )
+        max_spin.valueChanged.connect(
+            lambda _v, c=column: self._on_numeric_changed(c)
+        )
+
+        self._layout.insertWidget(self._layout.count() - 1, group)
+
+    def _make_range_spin(
+        self,
+        col_min: float,
+        col_max: float,
+        decimals: int,
+        step: float,
+        prefix: str,
+    ) -> QDoubleSpinBox:
+        """Builds one bound spin box for a numeric range control."""
+        spin = QDoubleSpinBox()
+        spin.setDecimals(decimals)
+        spin.setRange(col_min, col_max)
+        spin.setSingleStep(step)
+        spin.setPrefix(prefix)
+        return spin
+
+    def _on_numeric_changed(self, column: str) -> None:
+        """
+        Called when either bound of a numeric range control changes.
+
+        Keeps the two bounds from crossing, then emits a 'between' filter
+        for the current [lo, hi] — or removes the filter when the range
+        covers the whole column again.
+
+        Args:
+            column: The numeric column being filtered.
+        """
+        entry = self._numeric_spins.get(column)
+        if entry is None:
+            return
+        min_spin, max_spin, col_min, col_max = entry
+
+        lo, hi = min_spin.value(), max_spin.value()
+
+        # Stop the two handles crossing over each other. Block signals so
+        # tightening one bound doesn't recurse back into this handler.
+        min_spin.blockSignals(True)
+        max_spin.blockSignals(True)
+        min_spin.setMaximum(hi)
+        max_spin.setMinimum(lo)
+        min_spin.blockSignals(False)
+        max_spin.blockSignals(False)
+
+        if lo <= col_min and hi >= col_max:
+            # Full range selected — no constraint.
+            self._active_filters.pop(column, None)
+        else:
+            self._active_filters[column] = Filter(column, "between", [lo, hi])
+
+        self.filters_changed.emit(list(self._active_filters.values()))
+
+    def _add_boolean_filter(self, column: str) -> None:
+        """
+        Adds an All / True / False selector for a boolean column.
+
+        "All" clears the filter; "True"/"False" emit Filter(column, "eq",
+        value).
+
+        Args:
+            column: The boolean column to create a selector for.
+        """
+        # Rebuilding the control resets it to "All", i.e. no active filter.
+        self._active_filters.pop(column, None)
+
+        group  = QGroupBox(column)
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(2)
+
+        combo = QComboBox()
+        combo.addItem("All", userData=None)
+        combo.addItem("True", userData=True)
+        combo.addItem("False", userData=False)
+        combo.currentIndexChanged.connect(
+            lambda idx, c=column, cb=combo:
+            self._on_boolean_changed(c, cb.itemData(idx))
+        )
+        layout.addWidget(combo)
+
+        self._layout.insertWidget(self._layout.count() - 1, group)
+
+    def _on_boolean_changed(self, column: str, value) -> None:
+        """
+        Called when a boolean selector changes.
+
+        Args:
+            column: The boolean column being filtered.
+            value:  True, False, or None ("All" — clears the filter).
+        """
+        if value is None:
+            self._active_filters.pop(column, None)
+        else:
+            self._active_filters[column] = Filter(column, "eq", value)
 
         self.filters_changed.emit(list(self._active_filters.values()))
 

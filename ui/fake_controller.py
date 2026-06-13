@@ -87,6 +87,8 @@ class FakeController(QObject):
                 "bs_jawOpen":         round(random.uniform(0.0, 0.8), 3),
                 "bs_mouthSmileLeft":  round(random.uniform(0.0, 0.6), 3),
                 "bs_mouthSmileRight": round(random.uniform(0.0, 0.6), 3),
+                "frame_index":        random.randint(0, 240),
+                "is_keyframe":        random.choice([True, False]),
             }
 
         # Column type tags — updated to use current type names.
@@ -101,6 +103,8 @@ class FakeController(QObject):
             "bs_jawOpen":         "numeric",
             "bs_mouthSmileLeft":  "numeric",
             "bs_mouthSmileRight": "numeric",
+            "frame_index":        "numeric",
+            "is_keyframe":        "boolean_flag",
         }
 
         self._visual_columns: list[str] = ["full_path"]
@@ -332,7 +336,21 @@ class FakeController(QObject):
             "session_id": ["S01", "S02", "S03"],
             "trial_id":   [f"T{i:02d}" for i in range(1, 6)],
         }
-        return fake_values.get(column, ["A", "B", "C"])
+        if column in fake_values:
+            return fake_values[column]
+        # For every other column (numeric, boolean, ...) return the real
+        # sorted unique values from the fake metadata, mirroring the real
+        # QueryEngine.get_group_values so range/boolean controls bind to
+        # actual data.
+        values = {
+            md[column]
+            for md in self._metadata.values()
+            if column in md and md[column] is not None
+        }
+        try:
+            return sorted(values)
+        except TypeError:
+            return sorted(values, key=str)
 
     def get_row(self, row_id: str, _table_name: str = "frames") -> dict:
         return self._metadata.get(row_id, {"row_id": row_id})
