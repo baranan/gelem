@@ -21,7 +21,7 @@ from __future__ import annotations
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QFileDialog, QSplitter, QTableWidget,
-    QTableWidgetItem, QHeaderView
+    QTableWidgetItem, QHeaderView, QStackedWidget, QScrollArea
 )
 from PySide6.QtCore import Qt
 from shared_widgets.zoomable_image_view import ZoomableImageView
@@ -119,13 +119,33 @@ class DetailWidget(QWidget):
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
         )
 
-        # Vertical splitter between media area and metadata table so the
+        # Stats panel — used by show_result() when the operator returns
+        # a 'summary' / 'table' / 'interpretation' payload. Its inner
+        # vbox is rebuilt on every call.
+        self._stats_panel  = QScrollArea()
+        self._stats_panel.setWidgetResizable(True)
+        self._stats_panel.setFrameShape(QScrollArea.Shape.NoFrame)
+        self._stats_inner  = QWidget()
+        self._stats_layout = QVBoxLayout(self._stats_inner)
+        self._stats_layout.setContentsMargins(4, 4, 4, 4)
+        self._stats_layout.setSpacing(6)
+        self._stats_panel.setWidget(self._stats_inner)
+
+        # Page 0 — per-row metadata table (current behaviour).
+        # Page 1 — group-result stats panel (summary/table/interpretation).
+        # Keeping both pages in a stack avoids juggling splitter widgets
+        # at runtime and means meta_table_sized stays meaningful.
+        self._bottom_stack = QStackedWidget()
+        self._bottom_stack.addWidget(self._meta_table)
+        self._bottom_stack.addWidget(self._stats_panel)
+
+        # Vertical splitter between media area and the bottom stack so the
         # researcher can resize either to taste.
         self._splitter = QSplitter(Qt.Orientation.Vertical)
         self._splitter.addWidget(self._media_area)
-        self._splitter.addWidget(self._meta_table)
+        self._splitter.addWidget(self._bottom_stack)
         self._splitter.setStretchFactor(0, 1)   # media area expands
-        self._splitter.setStretchFactor(1, 0)   # table sized to handle
+        self._splitter.setStretchFactor(1, 0)   # bottom sized to handle
         self._splitter.setSizes([600, 200])     # initial proportions
         self._splitter.setChildrenCollapsible(False)
         layout.addWidget(self._splitter, stretch=1)
@@ -171,9 +191,11 @@ class DetailWidget(QWidget):
 
         self._swap_media_widget(widget)
 
-        # Restore the metadata table in case we just came back from a
-        # multi-item view that hid it.
-        self._meta_table.setVisible(True)
+        # Restore the metadata-table page in case we just came back from
+        # a multi-item view that hid the bottom stack or a group-result
+        # view that switched to the stats page.
+        self._bottom_stack.setCurrentIndex(0)
+        self._bottom_stack.setVisible(True)
 
         # Update the title and populate the metadata table. We hide
         # full_path and row_id — full_path is shown as media above,
@@ -218,8 +240,8 @@ class DetailWidget(QWidget):
 
         self._swap_media_widget(splitter)
 
-        # Hide the metadata table — each panel has its own.
-        self._meta_table.setVisible(False)
+        # Hide the bottom stack — each panel has its own metadata text.
+        self._bottom_stack.setVisible(False)
 
         self._label.setText(f"{len(row_ids)} items")
 
@@ -253,7 +275,8 @@ class DetailWidget(QWidget):
         — used when every panel in a multi-item view has been closed.
         """
         self._swap_media_widget(None)
-        self._meta_table.setVisible(True)
+        self._bottom_stack.setCurrentIndex(0)
+        self._bottom_stack.setVisible(True)
         self._meta_table.setRowCount(0)
         self._label.setText("No item selected")
         self._current_pixmap = None
@@ -337,36 +360,169 @@ class DetailWidget(QWidget):
 
     def show_result(self, result: dict) -> None:
         """
-        Shows a set-bound operator result (e.g. mean face image).
-        Called when display_result_ready signal arrives.
+        Shows a set-bound operator result (e.g. mean face image, summary
+        statistics). Called when display_result_ready signal arrives.
 
-        Uses the same render_column_value pathway if result contains
-        an artifact_path — treats it as a media_path column value.
+        If the result has an 'artifact_path', it's rendered in the media
+        area via the same render_column_value pathway used for per-row
+        media. If it has a 'summary', 'table', or 'interpretation', the
+        bottom panel switches to the stats page to show them alongside
+        the image. Either part can be absent — a pure-stats result
+        (SummaryStatsOperator) shows only the stats page.
 
         Args:
-            result: Dict from the operator. May contain 'artifact_path'.
-
-        TODO (Student A): Display summary statistics from result dict
-        alongside the media widget.
+            result: Dict from the operator. May contain 'artifact_path',
+                    'summary', 'table', 'interpretation', 'operator_name'.
         """
+        # ── Media area ────────────────────────────────────────────────
         artifact_path = result.get("artifact_path", "")
         if artifact_path:
             widget = self._controller.render_column_value(
                 "full_path", artifact_path, size=600, mode="detail"
             )
             self._swap_media_widget(widget)
-            self._label.setText("Group result")
-
-            # Clear any per-row metadata left over from a previous
-            # show_rows() call — group results don't share that schema.
-            self._meta_table.setRowCount(0)
 
             if isinstance(widget, ZoomableImageView):
                 self._current_pixmap = widget.current_pixmap()
             else:
                 self._current_pixmap = None
-            self._save_btn.setEnabled(self._current_pixmap is not None)
-            self._close_btn.setEnabled(True)
+        else:
+            # No image — fall back to the placeholder so the stats panel
+            # has room to breathe.
+            self._swap_media_widget(None)
+            self._current_pixmap = None
+
+        # ── Stats area ────────────────────────────────────────────────
+        # If the operator returned any tabular/stats payload, populate the
+        # stats page and switch to it. Otherwise fall back to the per-row
+        # metadata table, cleared (group results don't share that schema).
+        has_stats = (
+            bool(result.get("summary"))
+            or bool(result.get("table"))
+            or bool(result.get("interpretation"))
+        )
+
+        if has_stats:
+            self._populate_stats_panel(result)
+            self._bottom_stack.setCurrentIndex(1)
+        else:
+            self._meta_table.setRowCount(0)
+            self._bottom_stack.setCurrentIndex(0)
+
+        self._bottom_stack.setVisible(True)
+
+        # ── Header / toolbar ──────────────────────────────────────────
+        op_name = result.get("operator_name") or "Group result"
+        n_rows  = result.get("n_rows") or result.get("n_frames")
+        if n_rows is not None:
+            self._label.setText(f"{op_name} — {n_rows} rows")
+        else:
+            self._label.setText(op_name)
+
+        self._save_btn.setEnabled(self._current_pixmap is not None)
+        self._close_btn.setEnabled(True)
+
+    def _populate_stats_panel(self, result: dict) -> None:
+        """
+        Rebuilds the stats page from a create_display result dict.
+
+        Adds (in order) a summary-stats table if 'summary' is present, a
+        generic table if 'table' is present, and an interpretation
+        paragraph if 'interpretation' is present.
+
+        Args:
+            result: The operator result dict.
+        """
+        # Clear out anything from the previous run.
+        while self._stats_layout.count():
+            item = self._stats_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+        summary = result.get("summary") or {}
+        if summary:
+            self._stats_layout.addWidget(self._build_summary_table(summary))
+
+        table_data = result.get("table") or []
+        if table_data:
+            self._stats_layout.addWidget(self._build_generic_table(table_data))
+
+        interpretation = result.get("interpretation") or ""
+        if interpretation:
+            interp = QLabel(interpretation)
+            interp.setWordWrap(True)
+            interp.setStyleSheet(
+                "font-size: 11px; color: #444444; padding: 4px;"
+                "background-color: #F9F9F9; border: 1px solid #EEEEEE;"
+            )
+            self._stats_layout.addWidget(interp)
+
+        self._stats_layout.addStretch(1)
+
+    def _build_summary_table(self, summary: dict) -> QTableWidget:
+        """
+        Builds a read-only table from a nested summary dict.
+
+        The summary has the shape {column: {stat: value, ...}, ...} —
+        one row per column, one column per stat.
+        """
+        # Collect stat keys from the first entry so column order matches
+        # whatever the operator emitted.
+        all_stats: list[str] = []
+        for stats in summary.values():
+            if isinstance(stats, dict):
+                all_stats = list(stats.keys())
+                break
+
+        headers = ["Column"] + all_stats
+        table   = QTableWidget(len(summary), len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.horizontalHeader().setStretchLastSection(True)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setAlternatingRowColors(True)
+        table.verticalHeader().setVisible(False)
+
+        for row_idx, (col_name, stats) in enumerate(summary.items()):
+            table.setItem(row_idx, 0, QTableWidgetItem(col_name))
+            if isinstance(stats, dict):
+                for col_idx, stat_name in enumerate(all_stats, start=1):
+                    val = stats.get(stat_name, "")
+                    text = f"{val:.4g}" if isinstance(val, float) else str(val)
+                    item = QTableWidgetItem(text)
+                    item.setTextAlignment(
+                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                    )
+                    table.setItem(row_idx, col_idx, item)
+
+        table.resizeColumnsToContents()
+        return table
+
+    def _build_generic_table(self, table_data: list[dict]) -> QTableWidget:
+        """
+        Builds a read-only table from a list of dicts (one dict per row).
+        Used for the 'table' result key (e.g. StatsOperator).
+        """
+        headers = list(table_data[0].keys())
+        table   = QTableWidget(len(table_data), len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.horizontalHeader().setStretchLastSection(True)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setAlternatingRowColors(True)
+        table.verticalHeader().setVisible(False)
+
+        for row_idx, row_dict in enumerate(table_data):
+            for col_idx, key in enumerate(headers):
+                val  = row_dict.get(key, "")
+                text = f"{val:.4g}" if isinstance(val, float) else str(val)
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(
+                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                )
+                table.setItem(row_idx, col_idx, item)
+
+        table.resizeColumnsToContents()
+        return table
 
     # ── Internal helpers ──────────────────────────────────────────────
 
@@ -378,6 +534,8 @@ class DetailWidget(QWidget):
         """
         self._swap_media_widget(None)
         self._meta_table.setRowCount(0)
+        self._bottom_stack.setCurrentIndex(0)
+        self._bottom_stack.setVisible(True)
         self._label.setText("No item selected")
         self._current_pixmap = None
         self._save_btn.setEnabled(False)
