@@ -60,6 +60,7 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self._build_toolbar()
         self._build_central_widget()
+        self._build_status_bar()
         self._connect_signals()
 
     # ── Building the UI ───────────────────────────────────────────────
@@ -168,6 +169,34 @@ class MainWindow(QMainWindow):
 
         splitter.addWidget(right_tabs)
         splitter.setSizes([180, 840, 380])
+
+    def _build_status_bar(self) -> None:
+        """
+        Adds a status bar with a permanent label that reports gallery
+        selection: "{N} items" when nothing is selected, "{K} of {N}
+        selected" otherwise. The label is updated by
+        _on_selection_changed (selection edits) and the gallery-update
+        handlers (filter changes).
+        """
+        self._selection_label = QLabel()
+        self._selection_label.setStyleSheet("padding: 0 8px;")
+        # addPermanentWidget pins it to the right side so transient
+        # messages from QStatusBar.showMessage() don't displace it.
+        self.statusBar().addPermanentWidget(self._selection_label)
+        self._refresh_status_bar()
+
+    def _refresh_status_bar(self) -> None:
+        """
+        Updates the selection-count label from the main gallery's
+        current selected and visible counts.
+        """
+        selected = len(self._main_gallery.get_selected_row_ids())
+        visible  = self._main_gallery.get_visible_count()
+        if selected:
+            text = f"{selected} of {visible} selected"
+        else:
+            text = f"{visible} items"
+        self._selection_label.setText(text)
 
     # ── Operators menu ────────────────────────────────────────────────
 
@@ -365,7 +394,7 @@ class MainWindow(QMainWindow):
 
         # Gallery -> Controller
         self._main_gallery.selection_changed.connect(
-            self._stats_panel_removed_placeholder
+            self._on_selection_changed
         )
         self._main_gallery.tile_double_clicked.connect(
             self._on_tile_double_clicked
@@ -395,18 +424,13 @@ class MainWindow(QMainWindow):
             # listeners (e.g. row_selected signal) still fire.
             self._controller.select_row(clicked_ids[0])
 
-    def _stats_panel_removed_placeholder(self, row_ids: list[str]) -> None:
+    def _on_selection_changed(self, row_ids: list[str]) -> None:
         """
-        Placeholder slot for the gallery selection_changed signal.
-        Previously connected to StatisticsPanel.update_selection().
-        StatisticsPanel has been removed — summary statistics are now
-        run explicitly via the Operators menu (SummaryStatsOperator)
-        and appear as a tab in ResultsPanel.
-
-        TODO (Student A): If you want selection count to show somewhere
-        in the UI (e.g. a status bar label), connect it here.
+        Updates the status bar when the gallery selection changes.
+        The row_ids argument is the new selection set; the actual count
+        is read back from the gallery so all sources of truth agree.
         """
-        pass  # Nothing to do — results panel is operator-driven.
+        self._refresh_status_bar()
 
     # ── Signal handlers ───────────────────────────────────────────────
 
@@ -419,6 +443,7 @@ class MainWindow(QMainWindow):
     def _on_gallery_updated(self, row_ids: list[str]) -> None:
         """Updates the main gallery with a new flat list of row_ids."""
         self._main_gallery.set_row_ids(row_ids)
+        self._refresh_status_bar()
 
     def _on_grouped_gallery_updated(self, grouped: dict) -> None:
         """
@@ -431,6 +456,7 @@ class MainWindow(QMainWindow):
         for group_row_ids in grouped.values():
             all_row_ids.extend(group_row_ids)
         self._main_gallery.set_row_ids(all_row_ids)
+        self._refresh_status_bar()
 
     def _on_columns_updated(self, column_names: list[str]) -> None:
         """Refreshes filter panel when columns change."""

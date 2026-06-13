@@ -341,6 +341,14 @@ class GalleryWidget(QWidget):
         """
         return list(self._selected_ids)
 
+    def get_visible_count(self) -> int:
+        """
+        Returns the number of rows currently visible in the gallery
+        (after any active filter). Used by MainWindow's status bar to
+        report "K of N selected".
+        """
+        return len(self._row_ids)
+
     # ── Internal helpers ──────────────────────────────────────────────
 
     def _columns_per_row(self) -> int:
