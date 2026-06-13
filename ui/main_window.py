@@ -158,15 +158,17 @@ class MainWindow(QMainWindow):
         splitter.addWidget(gallery_container)
 
         # Right: tabbed panels — Detail and Results only.
-        right_tabs = QTabWidget()
+        # Kept as an instance attribute so handlers can switch focus
+        # between Detail and Results in response to user actions.
+        self._right_tabs = QTabWidget()
 
         self._detail_widget = DetailWidget(self._controller)
-        right_tabs.addTab(self._detail_widget, "Detail")
+        self._right_tabs.addTab(self._detail_widget, "Detail")
 
         self._results_panel = ResultsPanel(self._controller)
-        right_tabs.addTab(self._results_panel, "Results")
+        self._right_tabs.addTab(self._results_panel, "Results")
 
-        splitter.addWidget(right_tabs)
+        splitter.addWidget(self._right_tabs)
         splitter.setSizes([180, 840, 380])
 
     # ── Operators menu ────────────────────────────────────────────────
@@ -390,6 +392,7 @@ class MainWindow(QMainWindow):
                 if rid in selected
             ]
             self._detail_widget.show_rows(ordered)
+            self._right_tabs.setCurrentWidget(self._detail_widget)
         else:
             # Single-item path goes through the controller so other
             # listeners (e.g. row_selected signal) still fire.
@@ -411,10 +414,16 @@ class MainWindow(QMainWindow):
     # ── Signal handlers ───────────────────────────────────────────────
 
     def _on_row_selected(self, metadata: dict) -> None:
-        """Shows the selected row in the detail panel."""
+        """
+        Shows the selected row in the detail panel and brings the Detail
+        tab forward. Picking a row is an explicit ask to see it; if the
+        Results tab is showing (e.g. after a create_display operator),
+        the user expects the Detail tab to take focus on their click.
+        """
         row_id = metadata.get("row_id")
         if row_id:
             self._detail_widget.show_rows([row_id])
+            self._right_tabs.setCurrentWidget(self._detail_widget)
 
     def _on_gallery_updated(self, row_ids: list[str]) -> None:
         """Updates the main gallery with a new flat list of row_ids."""
@@ -470,9 +479,7 @@ class MainWindow(QMainWindow):
         """
         self._results_panel.show_result(result)
         # Switch to the Results tab so the researcher sees it immediately.
-        right_tabs = self._results_panel.parent()
-        if hasattr(right_tabs, 'indexOf'):
-            right_tabs.setCurrentWidget(self._results_panel)
+        self._right_tabs.setCurrentWidget(self._results_panel)
 
     def _on_operator_complete(self, operator_name: str) -> None:
         """Called when any operator finishes."""
