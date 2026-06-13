@@ -491,7 +491,7 @@ class DetailWidget(QWidget):
                     text = f"{val:.4g}" if isinstance(val, float) else str(val)
                     item = QTableWidgetItem(text)
                     item.setTextAlignment(
-                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                        Qt.AlignmentFlag.AlignCenter
                     )
                     table.setItem(row_idx, col_idx, item)
 
@@ -517,7 +517,7 @@ class DetailWidget(QWidget):
                 text = f"{val:.4g}" if isinstance(val, float) else str(val)
                 item = QTableWidgetItem(text)
                 item.setTextAlignment(
-                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                    Qt.AlignmentFlag.AlignCenter
                 )
                 table.setItem(row_idx, col_idx, item)
 
