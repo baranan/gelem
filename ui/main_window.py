@@ -465,10 +465,17 @@ class MainWindow(QMainWindow):
 
     def _on_display_result(self, result: dict) -> None:
         """
-        Shows a create_display operator result in the results panel
-        and switches to the Results tab.
+        Shows a create_display operator result. The result is sent to
+        both panels: ResultsPanel keeps the full history as closeable
+        tabs, DetailWidget shows the most recent group artifact/stats
+        in-place. The Results tab takes focus because that's where the
+        result history lives.
         """
         self._results_panel.show_result(result)
+        # Mirror the result into DetailWidget so the same artifact (mean
+        # face image, summary stats, ...) is visible there too without
+        # the user having to navigate.
+        self._detail_widget.show_result(result)
         # Switch to the Results tab so the researcher sees it immediately.
         right_tabs = self._results_panel.parent()
         if hasattr(right_tabs, 'indexOf'):
