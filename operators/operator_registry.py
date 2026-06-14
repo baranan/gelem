@@ -159,6 +159,7 @@ class OperatorRegistry:
         on_progress=None,
         on_complete=None,
         on_setup_error=None,
+        on_row_errors=None,
     ) -> None:
         """
         Runs create_columns() on pre-snapshotted work items in a background
@@ -192,6 +193,15 @@ class OperatorRegistry:
                               OperatorSetupError on any row. The run is
                               aborted and remaining rows are skipped.
                               Signature: (operator_name: str, message: str)
+            on_row_errors:    Called once at the end of the run if any rows
+                              raised an unexpected exception. Lets the
+                              controller surface a single end-of-run
+                              summary to the user so unexpected failures
+                              are visibly distinct from the normal "no
+                              face detected" case.
+                              Signature: (operator_name: str,
+                                          errors: list[tuple[str, str, str]])
+                              Each tuple is (row_id, exc_type_name, message).
         """
         operator = self._operators.get(operator_name)
         if operator is None:
@@ -209,7 +219,8 @@ class OperatorRegistry:
             target=self._run_create_columns_worker,
             args=(
                 operator, work_items, operation_id,
-                on_item_complete, on_progress, on_complete, on_setup_error,
+                on_item_complete, on_progress, on_complete,
+                on_setup_error, on_row_errors,
             ),
             daemon=True,
         )
@@ -224,12 +235,14 @@ class OperatorRegistry:
         on_progress,
         on_complete,
         on_setup_error,
+        on_row_errors,
     ) -> None:
         """
         Worker that runs create_columns() in the background thread.
         Processes only the pre-snapshotted work items — never reads Dataset.
         """
         total = len(work_items)
+        row_errors: list[tuple[str, str, str]] = []
 
         for i, item in enumerate(work_items):
             row_id     = item["row_id"]
@@ -271,14 +284,25 @@ class OperatorRegistry:
                     on_setup_error(operator.name, str(e))
                 break
             except Exception as e:
+                # Unexpected per-row failure (mediapipe crash, bug, malformed
+                # image, etc.). Mark the row as missing for consistency with
+                # the operator's no-face path, and remember it so we can
+                # surface a single summary at the end of the run.
                 print(
-                    f"[OperatorRegistry] Error in create_columns "
-                    f"for '{operator.name}' on {row_id}: {e}"
+                    f"[OperatorRegistry] Unexpected error in '{operator.name}' "
+                    f"on {row_id}: {type(e).__name__}: {e}"
                 )
+                row_errors.append((row_id, type(e).__name__, str(e)))
+                if on_item_complete is not None:
+                    all_none = {name: None for name, _ in operator.output_columns}
+                    on_item_complete(operation_id, table_name, row_id, all_none)
 
             if on_progress is not None:
                 percent = int((i + 1) / total * 100)
                 on_progress(percent)
+
+        if row_errors and on_row_errors is not None:
+            on_row_errors(operator.name, row_errors)
 
         if on_complete is not None:
             on_complete(operator.name)

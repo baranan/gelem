@@ -136,30 +136,24 @@ class BlendshapeOperator(BaseOperator):
             # whole run and surface the message to the user.
             self._load_model()
 
-        try:
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image)
-            detection_result = self._landmarker.detect(mp_image)
+        # Unexpected exceptions are intentionally NOT caught here — the
+        # worker catches them, marks the row as missing, and reports them
+        # in an end-of-run summary so they're distinguishable from the
+        # normal "no face detected" case below.
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image)
+        detection_result = self._landmarker.detect(mp_image)
 
-            if not detection_result.face_blendshapes:
-                return {name: None for name in BLENDSHAPE_NAMES}
-
-            detected_scores = detection_result.face_blendshapes[0]
-            # The order is NOT the same as BLENDSHAPE_NAMES — its first entry is "_neutral". 
-            # tongueOut is currently absent from MediaPipe output, so it will be None.
-            score_by_name = {bs.category_name: bs.score for bs in detected_scores}
-            return {
-                bs_name: score_by_name.get(bs_name.removeprefix("bs_"))
-                for bs_name in BLENDSHAPE_NAMES
-            }
-
-        except Exception as e:
-            import traceback
-            print(
-                f"[BlendshapeOperator] UNEXPECTED ERROR processing {row_id}: "
-                f"{type(e).__name__}: {e}"
-            )
-            traceback.print_exc()
+        if not detection_result.face_blendshapes:
             return {name: None for name in BLENDSHAPE_NAMES}
+
+        detected_scores = detection_result.face_blendshapes[0]
+        # The order is NOT the same as BLENDSHAPE_NAMES — its first entry is "_neutral".
+        # tongueOut is currently absent from MediaPipe output, so it will be None.
+        score_by_name = {bs.category_name: bs.score for bs in detected_scores}
+        return {
+            bs_name: score_by_name.get(bs_name.removeprefix("bs_"))
+            for bs_name in BLENDSHAPE_NAMES
+        }
 
 # TODO: until the integration will be completed with the ui, we can print the result for a single picture by running this in the terminal:
 # (only change to the correct picture name from this folder)

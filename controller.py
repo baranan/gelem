@@ -159,6 +159,38 @@ class AppController(QObject):
             f'Cannot run operator "{label}"\n\n{message}'
         )
 
+    def _on_operator_row_errors(
+        self,
+        operator_name: str,
+        errors: list[tuple[str, str, str]],
+    ) -> None:
+        # Called from the worker thread once at the end of a run if any rows
+        # raised an unexpected exception. Group by exception type with a
+        # representative message so the dialog stays compact, then queue the
+        # summary for emission on the main thread via error_occurred.
+        operator = self._op_registry.get(operator_name)
+        label = (
+            getattr(operator, "create_columns_label", None)
+            or getattr(operator, "create_table_label", None)
+            or getattr(operator, "create_display_label", None)
+            or operator_name
+        )
+        counts: dict[str, int] = {}
+        first_msg: dict[str, str] = {}
+        for _row_id, exc_type, msg in errors:
+            counts[exc_type] = counts.get(exc_type, 0) + 1
+            first_msg.setdefault(exc_type, msg)
+        lines = [
+            f'  - {t} (x{counts[t]}) - "{first_msg[t]}"'
+            for t in sorted(counts, key=lambda k: -counts[k])
+        ]
+        self._error_queue.append(
+            f'"{label}" finished, but {len(errors)} row(s) hit unexpected '
+            f"errors.\n\nError types seen:\n"
+            + "\n".join(lines)
+            + "\n\nThe affected rows have no values for the new columns."
+        )
+
     def _on_create_table_complete(
         self,
         operator_name: str,
@@ -437,6 +469,7 @@ class AppController(QObject):
                 on_progress=self._on_progress,
                 on_complete=self._on_create_columns_complete,
                 on_setup_error=self._on_operator_setup_error,
+                on_row_errors=self._on_operator_row_errors,
             )
         except Exception as e:
             self.error_occurred.emit(
