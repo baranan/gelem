@@ -276,6 +276,7 @@ class OperatorRegistry:
         df: pd.DataFrame,
         group_by: str | list[str] | None,
         on_complete=None,
+        on_error=None,
     ) -> None:
         """
         Runs create_table() in a background thread.
@@ -294,6 +295,9 @@ class OperatorRegistry:
                                        result_df: pd.DataFrame)
                            Called from background thread — AppController
                            routes to main thread.
+            on_error:      Called if create_table raises an exception.
+                           Signature: (operator_name: str, message: str)
+                           Called from background thread.
         """
         operator = self._operators.get(operator_name)
         if operator is None:
@@ -309,7 +313,7 @@ class OperatorRegistry:
 
         thread = threading.Thread(
             target=self._run_create_table_worker,
-            args=(operator, df, group_by, on_complete),
+            args=(operator, df, group_by, on_complete, on_error),
             daemon=True,
         )
         thread.start()
@@ -320,6 +324,7 @@ class OperatorRegistry:
         df: pd.DataFrame,
         group_by,
         on_complete,
+        on_error,
     ) -> None:
         """Worker that runs create_table() in the background thread."""
         try:
@@ -336,6 +341,8 @@ class OperatorRegistry:
                 f"[OperatorRegistry] Error in create_table "
                 f"for '{operator.name}': {e}"
             )
+            if on_error is not None:
+                on_error(operator.name, str(e))
 
     # ── run_create_display ────────────────────────────────────────────
 
@@ -344,6 +351,7 @@ class OperatorRegistry:
         operator_name: str,
         df: pd.DataFrame,
         on_complete=None,
+        on_error=None,
     ) -> None:
         """
         Runs create_display() in a background thread.
@@ -358,6 +366,9 @@ class OperatorRegistry:
             on_complete:   Called when done.
                            Signature: (operator_name: str,
                                        result: dict)
+                           Called from background thread.
+            on_error:      Called if create_display raises an exception.
+                           Signature: (operator_name: str, message: str)
                            Called from background thread.
         """
         operator = self._operators.get(operator_name)
@@ -374,7 +385,7 @@ class OperatorRegistry:
 
         thread = threading.Thread(
             target=self._run_create_display_worker,
-            args=(operator, df, on_complete),
+            args=(operator, df, on_complete, on_error),
             daemon=True,
         )
         thread.start()
@@ -384,6 +395,7 @@ class OperatorRegistry:
         operator: BaseOperator,
         df: pd.DataFrame,
         on_complete,
+        on_error,
     ) -> None:
         """Worker that runs create_display() in the background thread."""
         try:
@@ -400,3 +412,5 @@ class OperatorRegistry:
                 f"[OperatorRegistry] Error in create_display "
                 f"for '{operator.name}': {e}"
             )
+            if on_error is not None:
+                on_error(operator.name, str(e))

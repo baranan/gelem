@@ -4,3 +4,4 @@ pyarrow
 Pillow
 numpy
 matplotlib
+opencv-python

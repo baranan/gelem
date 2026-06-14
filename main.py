@@ -62,6 +62,7 @@ def create_app(fake_data: bool = False):
     from operators.summary_stats import SummaryStatsOperator
     from operators.plot_advanced import PlotAdvancedOperator
     from operators.stats_operator import StatsOperator
+    from operators.video_frames import VideoFramesOperator
     from controller import AppController
 
     artifacts_dir = Path(tempfile.gettempdir()) / "gelem_artifacts"
@@ -88,6 +89,7 @@ def create_app(fake_data: bool = False):
     operator_registry.register(SummaryStatsOperator())
     operator_registry.register(PlotAdvancedOperator())
     operator_registry.register(StatsOperator())
+    operator_registry.register(VideoFramesOperator())
 
     controller = AppController(
         dataset=dataset,
