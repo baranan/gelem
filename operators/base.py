@@ -55,6 +55,15 @@ import numpy as np
 import pandas as pd
 
 
+class OperatorSetupError(Exception):
+    """
+    Raised by an operator when a one-time setup step has not been
+    completed yet (e.g. a required model file has not been downloaded).
+    The runner aborts the run on the first occurrence and surfaces the
+    message to the user via AppController.error_occurred.
+    """
+
+
 class BaseOperator:
     """
     Abstract base class for all Gelem operators.

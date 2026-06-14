@@ -49,9 +49,14 @@ def test_face_image_returns_scores():
 
     assert set(scores.keys()) == set(BLENDSHAPE_NAMES), \
         "result keys do not match BLENDSHAPE_NAMES"
-    assert all(v is not None for v in scores.values()), \
-        "expected every blendshape to be detected on a face image"
-    assert any(v > 0 for v in scores.values()), \
+    # MediaPipe currently does not emit tongueOut (issue #4403), so allow it to
+    # be None while requiring every other blendshape to have a real score.
+    non_tongue = {k: v for k, v in scores.items() if k != "bs_tongueOut"}
+    assert all(v is not None for v in non_tongue.values()), \
+        "expected every blendshape (except bs_tongueOut) to be detected on a face image"
+    assert scores["bs_tongueOut"] is None, \
+        "bs_tongueOut is expected to be None until MediaPipe issue #4403 is resolved"
+    assert any(v is not None and v > 0 for v in scores.values()), \
         "expected at least one blendshape > 0 on a real face"
 
     print(

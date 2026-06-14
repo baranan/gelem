@@ -39,7 +39,7 @@ from pathlib import Path
 import threading
 import pandas as pd
 
-from operators.base import BaseOperator
+from operators.base import BaseOperator, OperatorSetupError
 
 
 class OperatorRegistry:
@@ -158,6 +158,7 @@ class OperatorRegistry:
         on_item_complete=None,
         on_progress=None,
         on_complete=None,
+        on_setup_error=None,
     ) -> None:
         """
         Runs create_columns() on pre-snapshotted work items in a background
@@ -187,6 +188,10 @@ class OperatorRegistry:
             on_progress:      Called with progress percentage (0-100).
             on_complete:      Called when all rows are done.
                               Signature: (operator_name: str)
+            on_setup_error:   Called if the operator raises
+                              OperatorSetupError on any row. The run is
+                              aborted and remaining rows are skipped.
+                              Signature: (operator_name: str, message: str)
         """
         operator = self._operators.get(operator_name)
         if operator is None:
@@ -204,7 +209,7 @@ class OperatorRegistry:
             target=self._run_create_columns_worker,
             args=(
                 operator, work_items, operation_id,
-                on_item_complete, on_progress, on_complete,
+                on_item_complete, on_progress, on_complete, on_setup_error,
             ),
             daemon=True,
         )
@@ -218,6 +223,7 @@ class OperatorRegistry:
         on_item_complete,
         on_progress,
         on_complete,
+        on_setup_error,
     ) -> None:
         """
         Worker that runs create_columns() in the background thread.
@@ -254,6 +260,15 @@ class OperatorRegistry:
                     f"[OperatorRegistry] Operator '{operator.name}' "
                     f"does not implement create_columns()."
                 )
+                break
+            except OperatorSetupError as e:
+                # Setup-level failure (e.g. required model file missing).
+                # Abort the run rather than spamming the same error per row.
+                print(
+                    f"[OperatorRegistry] Setup error in '{operator.name}': {e}"
+                )
+                if on_setup_error is not None:
+                    on_setup_error(operator.name, str(e))
                 break
             except Exception as e:
                 print(

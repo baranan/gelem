@@ -29,10 +29,17 @@ from pathlib import Path
 import numpy as np
 import mediapipe as mp
 
-from operators.base import BaseOperator
+from operators.base import BaseOperator, OperatorSetupError
 
-# Path to the downloaded model file.
+# Where the model file lives, and where to download it from. Kept in one
+# place so the missing-model error message and the docstring above stay
+# consistent.
 _MODEL_PATH = Path(__file__).parent / "models" / "face_landmarker.task"
+_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+    "face_landmarker/float16/latest/face_landmarker.task"
+)
+_MODEL_RELATIVE = "operators/models/face_landmarker.task"
 
 
 # The 52 blendshape names mediapipe returns, in order.
@@ -62,6 +69,9 @@ BLENDSHAPE_NAMES = [
     "bs_mouthStretchLeft", "bs_mouthStretchRight",
     "bs_mouthUpperUpLeft", "bs_mouthUpperUpRight",
     "bs_noseSneerLeft", "bs_noseSneerRight",
+    # MediaPipe currently does not emit tongueOut (see MediaPipe issue #4403),
+    # so this column will evaluate to None. Kept here for compatibility with
+    # the ARKit blendshape set.
     "bs_tongueOut",
 ]
 
@@ -83,14 +93,21 @@ class BlendshapeOperator(BaseOperator):
     requires_image = True  # Needs the face image to run mediapipe.
 
     def __init__(self):
-        # Load the mediapipe FaceLandmarker model once when the operator is created.
-        # This avoids reloading the model for every single image (which would be slow).
+        # Defer loading the mediapipe model until first use, so creating the
+        # operator (and starting the app) does not require the model file.
+        self._landmarker = None
+
+    def _load_model(self):
+        if not _MODEL_PATH.exists():
+            raise OperatorSetupError(
+                f"The MediaPipe face-landmarker model file is missing.\n"
+                f"Download it once with this command:\n"
+                f'  curl -L -o {_MODEL_RELATIVE} "{_MODEL_URL}"'
+            )
         landmarker_config = mp.tasks.vision.FaceLandmarkerOptions(
-            base_options=mp.tasks.BaseOptions(
-                model_asset_path=str(_MODEL_PATH),
-            ),
-            output_face_blendshapes=True,  # Tell mediapipe to compute blendshapes.
-            num_faces=1,  # Only detect one face per image.
+            base_options=mp.tasks.BaseOptions(model_asset_path=str(_MODEL_PATH)),
+            output_face_blendshapes=True,
+            num_faces=1,
         )
         self._landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(
             landmarker_config
@@ -114,6 +131,11 @@ class BlendshapeOperator(BaseOperator):
             Dict mapping each blendshape name to its score (0.0–1.0).
             If no face is detected, all values are None.
         """
+        if self._landmarker is None:
+            # Lets OperatorSetupError propagate so the worker can abort the
+            # whole run and surface the message to the user.
+            self._load_model()
+
         try:
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image)
             detection_result = self._landmarker.detect(mp_image)
@@ -122,13 +144,21 @@ class BlendshapeOperator(BaseOperator):
                 return {name: None for name in BLENDSHAPE_NAMES}
 
             detected_scores = detection_result.face_blendshapes[0]
-            blendshape_scores = {}
-            for i, bs_name in enumerate(BLENDSHAPE_NAMES):
-                blendshape_scores[bs_name] = detected_scores[i].score
-            return blendshape_scores
+            # The order is NOT the same as BLENDSHAPE_NAMES — its first entry is "_neutral". 
+            # tongueOut is currently absent from MediaPipe output, so it will be None.
+            score_by_name = {bs.category_name: bs.score for bs in detected_scores}
+            return {
+                bs_name: score_by_name.get(bs_name.removeprefix("bs_"))
+                for bs_name in BLENDSHAPE_NAMES
+            }
 
         except Exception as e:
-            print(f"[BlendshapeOperator] Error processing {row_id}: {e}")
+            import traceback
+            print(
+                f"[BlendshapeOperator] UNEXPECTED ERROR processing {row_id}: "
+                f"{type(e).__name__}: {e}"
+            )
+            traceback.print_exc()
             return {name: None for name in BLENDSHAPE_NAMES}
 
 # TODO: until the integration will be completed with the ui, we can print the result for a single picture by running this in the terminal:

@@ -88,6 +88,7 @@ class AppController(QObject):
         self._item_result_queue: list[tuple] = []
         self._complete_queue:    list[tuple] = []
         self._progress_queue:    list[int]   = []
+        self._error_queue:       list[str]   = []
 
         self._timer = QTimer(self)
         self._timer.setInterval(50)
@@ -124,6 +125,10 @@ class AppController(QObject):
             operator_name, payload = self._complete_queue.pop(0)
             self._on_operator_complete(operator_name, payload)
 
+        while self._error_queue:
+            message = self._error_queue.pop(0)
+            self.error_occurred.emit(message)
+
     # ── Background thread callbacks ───────────────────────────────────
 
     def _on_thumbnail_ready(self, row_id: str) -> None:
@@ -137,6 +142,22 @@ class AppController(QObject):
 
     def _on_create_columns_complete(self, operator_name: str) -> None:
         self._complete_queue.append(("create_columns", operator_name))
+
+    def _on_operator_setup_error(self, operator_name: str, message: str) -> None:
+        # Called from the worker thread when an operator raises
+        # OperatorSetupError. Looks up the operator's user-facing label so
+        # the dialog reads naturally, then queues the message for emission
+        # on the main thread via error_occurred.
+        operator = self._op_registry.get(operator_name)
+        label = (
+            getattr(operator, "create_columns_label", None)
+            or getattr(operator, "create_table_label", None)
+            or getattr(operator, "create_display_label", None)
+            or operator_name
+        )
+        self._error_queue.append(
+            f'Cannot run operator "{label}"\n\n{message}'
+        )
 
     def _on_create_table_complete(
         self,
@@ -415,6 +436,7 @@ class AppController(QObject):
                 on_item_complete=self._on_item_complete,
                 on_progress=self._on_progress,
                 on_complete=self._on_create_columns_complete,
+                on_setup_error=self._on_operator_setup_error,
             )
         except Exception as e:
             self.error_occurred.emit(
