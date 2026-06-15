@@ -46,12 +46,10 @@ class ResultsPanel(QWidget):
 
     Each result tab contains:
         - A media display area (image, if artifact_path is present)
+        - A multi-image strip (if 'artifacts' is present — e.g. one
+          mean face per condition)
         - A statistics table (if summary dict is present)
         - A label identifying the operator and run time
-
-    TODO (Student A): Support richer result types as operators are added:
-        - Interactive HTML plots (open in browser or embed QWebEngineView)
-        - Multi-image results (e.g. one mean face per condition)
     """
 
     def __init__(self, controller, parent=None):
@@ -101,7 +99,14 @@ class ResultsPanel(QWidget):
 
         The result dict may contain any combination of:
             'operator_name': str  — used as the tab label.
-            'artifact_path': str  — path to an image file to display.
+            'artifact_path': str  — path to a single image file (the
+                                    classic single-result case).
+            'artifacts':     list — multi-image strip. Each entry is
+                                    either a bare path string or a dict
+                                    `{'path': str, 'label': str}` (label
+                                    optional). Useful for "mean face per
+                                    condition", "blendshape per group",
+                                    and similar comparisons.
             'summary':       dict — nested {column: {stat: value}} dict
                                     shown as a statistics table.
             'table':         list — list of dicts shown as a table
@@ -220,6 +225,14 @@ class ResultsPanel(QWidget):
                 image_label.setPixmap(scaled)
                 layout.addWidget(image_label)
 
+        # ── Multi-image strip (from 'artifacts' key) ──────────────────
+        # e.g. one mean face per condition — rendered as a horizontal
+        # scroll strip of labeled cells the researcher can compare at a
+        # glance.
+        artifacts = result.get("artifacts") or []
+        if artifacts:
+            layout.addWidget(self._build_multi_image_strip(artifacts))
+
         # ── Statistics table (from 'summary' key) ────────────────────
         # The 'summary' key contains a nested dict:
         #   {column_name: {stat_name: value, ...}, ...}
@@ -248,6 +261,127 @@ class ResultsPanel(QWidget):
 
         layout.addStretch()
         return container
+
+    # ── Multi-image strip ────────────────────────────────────────────
+
+    _MULTI_IMAGE_CELL_SIZE = 180  # max width/height of each image in pixels
+
+    def _build_multi_image_strip(self, artifacts: list) -> QWidget:
+        """
+        Builds a horizontal scroll strip of labeled image cells.
+
+        Each entry in `artifacts` is either a bare path string or a dict
+        `{'path': str, 'label': str}`. Missing files are rendered as a
+        grey "missing" placeholder so a typo in one path doesn't kill
+        the rest of the strip.
+
+        Args:
+            artifacts: List of artifact descriptors from the result dict.
+
+        Returns:
+            A QScrollArea wrapping an HBox of image cells.
+        """
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        # Cap the strip's height so it doesn't dominate the tab. Cell size
+        # plus label height plus the scroll-area frame.
+        scroll.setFixedHeight(self._MULTI_IMAGE_CELL_SIZE + 40)
+        scroll.setStyleSheet(
+            "QScrollArea { background-color: #F5F5F5;"
+            " border: 1px solid #CCCCCC; }"
+        )
+
+        inner = QWidget()
+        row   = QHBoxLayout(inner)
+        row.setContentsMargins(6, 6, 6, 6)
+        row.setSpacing(8)
+
+        for i, entry in enumerate(artifacts):
+            path, label = self._normalise_artifact(entry, i)
+            row.addWidget(self._build_image_cell(path, label))
+
+        row.addStretch(1)
+        scroll.setWidget(inner)
+        return scroll
+
+    def _normalise_artifact(self, entry, fallback_index: int) -> tuple[str, str]:
+        """
+        Accepts either a bare path string or a `{'path', 'label'}` dict
+        and returns a `(path, label)` tuple. Falls back to `"#N"` if no
+        label is provided so cells stay visually aligned.
+
+        Args:
+            entry:          One artifacts-list entry.
+            fallback_index: Index used for the default label.
+
+        Returns:
+            (path, label) tuple. `path` is an empty string if the entry
+            shape is unrecognised.
+        """
+        if isinstance(entry, str):
+            return entry, f"#{fallback_index + 1}"
+        if isinstance(entry, dict):
+            return (
+                str(entry.get("path", "")),
+                str(entry.get("label", f"#{fallback_index + 1}")),
+            )
+        return "", f"#{fallback_index + 1}"
+
+    def _build_image_cell(self, path: str, label: str) -> QWidget:
+        """
+        Builds one cell of the multi-image strip: a label on top and a
+        bounded image below. Loads `path` as a QPixmap and falls back to
+        a grey "missing" tile when the file can't be read.
+
+        Args:
+            path:  Filesystem path to the image.
+            label: Caption shown above the image (e.g. a group value).
+
+        Returns:
+            A QWidget ready to be added to the strip's HBox.
+        """
+        cell  = QWidget()
+        cellL = QVBoxLayout(cell)
+        cellL.setContentsMargins(0, 0, 0, 0)
+        cellL.setSpacing(2)
+
+        caption = QLabel(label)
+        caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        caption.setStyleSheet("font-size: 11px; color: #444444;")
+        cellL.addWidget(caption)
+
+        image = QLabel()
+        image.setFixedSize(
+            self._MULTI_IMAGE_CELL_SIZE, self._MULTI_IMAGE_CELL_SIZE
+        )
+        image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        image.setStyleSheet(
+            "background-color: #FFFFFF; border: 1px solid #DDDDDD;"
+        )
+        image.setToolTip(path)
+
+        pixmap = QPixmap(path) if path else QPixmap()
+        if not pixmap.isNull():
+            scaled = pixmap.scaled(
+                self._MULTI_IMAGE_CELL_SIZE, self._MULTI_IMAGE_CELL_SIZE,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            image.setPixmap(scaled)
+        else:
+            image.setText("missing")
+            image.setStyleSheet(
+                "background-color: #EEEEEE; border: 1px dashed #BBBBBB;"
+                " color: #888888; font-size: 11px;"
+            )
+
+        cellL.addWidget(image)
+        return cell
+
+    # ── Tables ───────────────────────────────────────────────────────
 
     def _build_summary_table(self, summary: dict) -> QWidget:
         """
