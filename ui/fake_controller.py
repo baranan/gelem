@@ -338,6 +338,18 @@ class FakeController(QObject):
             if tag == "media_path"
         ]
 
+    # Mirror the new AppController public methods so UI code that calls
+    # them (per issue #32) works in --fake-data mode too.
+
+    def get_column_type(self, column_name: str):
+        return self._registry.get(column_name)
+
+    def get_all_row_ids(self, table_name: str | None = None) -> list[str]:
+        return list(self._row_ids)
+
+    def get_operator(self, operator_name: str):
+        return self._op_registry.get(operator_name)
+
     def get_group_values(self, column: str) -> list:
         fake_values = {
             "condition":  ["positive", "negative", "neutral"],

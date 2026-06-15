@@ -339,11 +339,7 @@ class MainWindow(QMainWindow):
         """
         selected_ids = self._collect_selected_row_ids()
         visible_ids  = self._collect_visible_row_ids()
-        all_ids      = list(
-            self._controller._dataset.get_table(
-                self._controller._active_table
-            )["row_id"]
-        )
+        all_ids      = self._controller.get_all_row_ids()
 
         # Step 1: scope dialog.
         scope_dialog = RunOperatorDialog(
@@ -361,7 +357,7 @@ class MainWindow(QMainWindow):
             return None
 
         # Step 2: operator parameter dialog (if the operator has one).
-        operator = self._controller._op_registry.get(operator_name)
+        operator = self._controller.get_operator(operator_name)
         if operator is not None:
             param_dialog = operator.get_parameters_dialog(parent=self)
             if param_dialog is not None:
@@ -394,7 +390,7 @@ class MainWindow(QMainWindow):
             return
 
         # Read the group_by parameter set by the parameter dialog.
-        operator = self._controller._op_registry.get(operator_name)
+        operator = self._controller.get_operator(operator_name)
         group_by = getattr(operator, "_group_by", None)
 
         self._controller.run_create_table(operator_name, row_ids, group_by)
