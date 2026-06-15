@@ -1,187 +1,145 @@
 """
-operators/plot_advanced.py
+PlotAdvancedOperator
+--------------------
+A create_display operator that builds one interactive Plotly Express figure
+for the selected rows.
 
-PlotAdvancedOperator generates interactive Plotly Express figures
-from the selected rows. Unlike PlotOperator which produces a static
-bar chart per row, this operator produces one interactive figure
-for a whole selection.
+The researcher chooses chart type, x/y columns, optional colour and facet
+columns, and whether to summarise groups before plotting (aggregate).
 
-Plotly Express handles on-the-fly aggregation — the researcher does
-not need to pre-aggregate the data before plotting. For example:
-    - Mean blendshape value per condition with error bars
-    - Line chart of blendshape over time, coloured by session
-    - Box plot of blendshape distribution per condition
-
-For complex multi-level aggregations (e.g. mean over time-from-trial-
-start averaged across both trials and sessions simultaneously), the
-researcher should use Dataset.aggregate() first to create an aggregated
-table, then run this operator on that table.
-
-The output is an interactive HTML file (for browser viewing) and a
-static PNG (for the Results panel). Both paths are returned in the
-result dict.
-
-Student C is responsible for implementing this operator.
-
-Dependencies:
-    pip install plotly kaleido
-    kaleido is required for saving static PNG images from Plotly.
+Output: a result dict with two keys --
+    "artifact_path" : path to a static PNG shown in the Results panel
+    "html_path"     : path to an interactive HTML file opened by the
+                      "Open interactive version" button in the Results panel
 """
 
-from __future__ import annotations
-from pathlib import Path
-import tempfile
-import pandas as pd
+import plotly.express as px
 
 from operators.base import BaseOperator
 
 
-# Plot types the researcher can choose from in the parameter dialog.
-PLOT_TYPES = [
-    "bar",          # Bar chart — mean per group
-    "line",         # Line chart — values over x column
-    "box",          # Box plot — distribution per group
-    "violin",       # Violin plot — distribution per group
-    "scatter",      # Scatter plot — x vs y
-    "histogram",    # Histogram — distribution of one column
-]
+# These lookup tables translate the menu words the researcher sees into the
+# names that pandas and Plotly expect internally.  They are module-level
+# constants so the student does not have to look up the exact strings.
+
+# Used in create_display when we do a pandas groupby before plotting.
+_AGG_TO_PANDAS = {
+    "count":  "count",
+    "sum":    "sum",
+    "mean":   "mean",
+    "median": "median",
+}
+
+# Used when chart == "histogram".  Plotly's histfunc does not support median.
+_AGG_TO_HISTFUNC = {
+    "count": "count",
+    "sum":   "sum",
+    "mean":  "avg",
+}
 
 
 class PlotAdvancedOperator(BaseOperator):
-    """
-    Generates an interactive Plotly Express figure from selected rows.
-
-    The researcher chooses x column, y column, colour-by column,
-    and plot type via the parameter dialog.
-
-    For bar charts, Plotly automatically computes the mean of y
-    per group of x, with standard error bars — no pre-aggregation
-    needed.
-    """
 
     name = "plot_advanced"
+    # Setting create_display_label makes this operator appear in the
+    # Operators menu under "Display results for selection".
     create_display_label = "Plot (interactive, Plotly)"
-    output_columns       = []
-    requires_image       = False
 
-    def __init__(self):
-        """Creates the operator with default parameter values."""
-        self._x_column:     str | None = None
-        self._y_column:     str | None = None
-        self._color_column: str | None = None
-        self._plot_type:    str        = "bar"
-        self._output_dir = Path(tempfile.gettempdir()) / "gelem_plots_advanced"
-        self._output_dir.mkdir(parents=True, exist_ok=True)
+    def get_parameters_dialog(self):
+        """Show a dialog and store the researcher's choices as instance attributes.
 
-    def get_parameters_dialog(self, parent=None):
+        Collect:
+            self._chart_type  -- one of: scatter | line | bar | box | violin | histogram
+            self._x           -- column name for the horizontal axis
+            self._y           -- column name for the vertical axis
+            self._color       -- (optional) column to colour marks by group; None if not chosen
+            self._facet       -- (optional) column to split into a grid of small plots; None if not chosen
+            self._aggregate   -- one of: none | count | sum | mean | median
+
+        Notes for the dialog:
+        - Disable the aggregate control when chart_type is "box" or "violin"
+          (those chart types always use every row).
+        - Offer count / sum / mean for histogram (no median -- Plotly does not
+          support median histfunc).
         """
-        Shows a dialog asking the researcher to choose:
-            - Plot type (bar, line, box, violin, scatter, histogram)
-            - X column
-            - Y column
-            - Colour-by column (optional)
+        # TODO (Student C): implement the parameter dialog
+        pass
 
-        Stores the chosen values as instance attributes so
-        create_display() can read them.
+    def create_display(self, df):
+        """Build one interactive Plotly figure for the selected rows.
 
-        TODO (Student C): Implement this dialog.
-        The dialog should read available column names from the
-        controller and show them in dropdowns. Use the pattern
-        shown in the BaseOperator docstring as a starting point.
+        Parameters
+        ----------
+        df : pd.DataFrame
+            The selected rows, passed in by AppController.
+            Do not modify it -- work on a copy.
 
-        For now returns None (no dialog — uses default values).
+        Returns
+        -------
+        dict
+            {"artifact_path": str, "html_path": str}
         """
-        return None
+        data = df.copy()  # never modify the DataFrame received from AppController
 
-    def create_display(
-        self,
-        df: pd.DataFrame,
-    ) -> dict:
-        """
-        Generates a Plotly Express figure from the selected rows.
+        x         = self._x
+        y         = self._y
+        color     = self._color or None   # None is fine -- px ignores it
+        facet     = self._facet or None   # None is fine -- px ignores it
+        chart     = self._chart_type
+        aggregate = self._aggregate
 
-        Args:
-            df: The selected rows as a DataFrame. May be the full
-                frames table or an aggregated table — Plotly handles
-                both.
+        # ------------------------------------------------------------------
+        # Step 1: decide whether to summarise the data before plotting
+        # ------------------------------------------------------------------
+        #
+        # box / violin  → always use every raw row (that is the point of them)
+        # histogram     → Plotly summarises internally via histfunc (see Step 2)
+        # scatter / line / bar with aggregate == "none"
+        #               → use every raw row as-is
+        # scatter / line / bar with a real aggregate
+        #               → do a pandas groupby here; Plotly cannot aggregate
+        #                 these chart types on its own
+        #
+        # Scope note: groupby uses the exact values of x, which is correct
+        # for categorical columns (condition, participant_id, etc.).
+        # Numeric binning is out of scope for this version.
+        #
+        # TODO (Student C): produce plot_df
 
-        Returns:
-            Dict with keys:
-                'operator_name': 'plot_advanced'
-                'artifact_path': str path to a static PNG for display
-                                 in the Results panel.
-                'plot_html':     str path to an interactive HTML file
-                                 for opening in a browser.
-                'n_rows':        int number of rows used.
+        # ------------------------------------------------------------------
+        # Step 2: build the figure with the matching Plotly Express function
+        # ------------------------------------------------------------------
+        #
+        # Use the common keyword dict to avoid repeating x/y/color/facet_col:
+        #
+        #   common = dict(x=x, y=y, color=color, facet_col=facet)
+        #
+        # Then dispatch on chart:
+        #   scatter  → px.scatter(plot_df, **common)
+        #   line     → px.line(plot_df, **common)
+        #   bar      → px.bar(plot_df, **common, barmode="group")
+        #   box      → px.box(plot_df, **common)
+        #   violin   → px.violin(plot_df, **common, box=True, points="all")
+        #   histogram→ px.histogram(plot_df, x=x, y=y, color=color,
+        #                           facet_col=facet,
+        #                           histfunc=_AGG_TO_HISTFUNC.get(aggregate, "count"))
+        #
+        # TODO (Student C): produce fig
 
-        TODO (Student C): Implement this method.
-
-        Suggested approach:
-            1. Read self._x_column, self._y_column, self._color_column,
-               self._plot_type (set by parameter dialog).
-            2. If any required column is not set or not in df, return
-               an error dict with a message.
-            3. Create the Plotly figure using plotly.express:
-               import plotly.express as px
-               if self._plot_type == 'bar':
-                   fig = px.bar(df,
-                       x=self._x_column,
-                       y=self._y_column,
-                       color=self._color_column,
-                       barmode='group',
-                       error_y=True,   # adds standard error bars
-                   )
-               elif self._plot_type == 'line':
-                   fig = px.line(df,
-                       x=self._x_column,
-                       y=self._y_column,
-                       color=self._color_column,
-                   )
-               # ... etc for other plot types
-            4. Save as HTML:
-               html_path = self._output_dir / 'plot.html'
-               fig.write_html(str(html_path))
-            5. Save as PNG (requires kaleido):
-               png_path = self._output_dir / 'plot.png'
-               fig.write_image(str(png_path))
-            6. Return the result dict.
-        """
-        # PLACEHOLDER: creates a simple gray placeholder image.
-        try:
-            from PIL import Image
-            import numpy as np
-
-            png_path  = self._output_dir / "plot_advanced_placeholder.png"
-            html_path = self._output_dir / "plot_advanced_placeholder.html"
-
-            # Create a placeholder PNG.
-            arr = np.ones((300, 400, 3), dtype=np.uint8) * 200
-            Image.fromarray(arr).save(str(png_path))
-
-            # Create a placeholder HTML file.
-            html_path.write_text(
-                "<html><body>"
-                "<h2>PlotAdvancedOperator placeholder</h2>"
-                "<p>Implement create_display() to generate a real plot.</p>"
-                "</body></html>"
-            )
-
-            print(
-                f"[PlotAdvancedOperator] PLACEHOLDER — "
-                f"{len(df)} rows, plot_type={self._plot_type}"
-            )
-            return {
-                "operator_name": "plot_advanced",
-                "artifact_path": str(png_path),
-                "plot_html":     str(html_path),
-                "n_rows":        len(df),
-            }
-
-        except Exception as e:
-            print(f"[PlotAdvancedOperator] Error: {e}")
-            return {
-                "operator_name": "plot_advanced",
-                "artifact_path": None,
-                "plot_html":     None,
-                "n_rows":        len(df),
-            }
+        # ------------------------------------------------------------------
+        # Step 3: save and return
+        # ------------------------------------------------------------------
+        #
+        # Always write into self.output_dir -- do not write next to the source
+        # data files.  Use self.run_id to make filenames unique per run.
+        #
+        #   html_path = self.output_dir / f"plot_{self.run_id}.html"
+        #   png_path  = self.output_dir / f"plot_{self.run_id}.png"
+        #   fig.write_html(str(html_path))
+        #   fig.write_image(str(png_path))   # requires: pip install kaleido
+        #
+        # Return both paths so the Results panel can show the PNG inline and
+        # offer an "Open interactive version" button for the HTML.
+        #
+        # TODO (Student C): save files and return result dict
+        pass
