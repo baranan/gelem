@@ -697,3 +697,49 @@ class AppController(QObject):
             A QPixmap (thumbnail mode), QWidget (detail mode), or None.
         """
         return self._registry.render(column_name, value, size, mode, context)
+
+    def get_column_type(self, column_name: str):
+        """
+        Returns the column-type object registered for *column_name*.
+
+        Gives the UI read access to column type metadata without reaching
+        into _registry directly.
+
+        Args:
+            column_name: The column whose type to look up.
+
+        Returns:
+            The registered column-type object, or None if not found.
+        """
+        return self._registry.get(column_name)
+
+    def get_all_row_ids(self, table_name: str | None = None) -> list[str]:
+        """
+        Returns every row_id in the active table (or *table_name* if given).
+
+        Provides a clean accessor so the UI does not need to reach into
+        _dataset directly.
+
+        Args:
+            table_name: Table to read from.  Defaults to the active table.
+
+        Returns:
+            Ordered list of row_id strings.
+        """
+        name = table_name if table_name is not None else self._active_table
+        return list(self._dataset.get_table(name)["row_id"])
+
+    def get_operator(self, operator_name: str):
+        """
+        Returns the operator registered under *operator_name*.
+
+        Gives the UI access to operator objects without reaching into
+        _op_registry directly.
+
+        Args:
+            operator_name: Name of the operator to retrieve.
+
+        Returns:
+            The operator object, or None if not found.
+        """
+        return self._op_registry.get(operator_name)
