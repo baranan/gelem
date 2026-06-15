@@ -51,13 +51,16 @@ class FilterPanel(QWidget):
                            Carries the column name or None.
         tile_size_changed: Emitted when the tile-size slider moves.
                            Carries the new size in pixels.
+        group_height_changed: Emitted when the group-height slider moves.
+                           Carries the new per-group gallery height in pixels.
         randomise_clicked: Emitted when the Randomise button is clicked.
     """
 
-    filters_changed   = Signal(list)
-    group_by_changed  = Signal(object)
-    tile_size_changed = Signal(int)
-    randomise_clicked = Signal()
+    filters_changed      = Signal(list)
+    group_by_changed     = Signal(object)
+    tile_size_changed    = Signal(int)
+    group_height_changed = Signal(int)
+    randomise_clicked    = Signal()
 
     def __init__(self, controller, parent=None):
         """
@@ -114,7 +117,9 @@ class FilterPanel(QWidget):
         size_layout.addWidget(self._size_slider)
         self._layout.insertWidget(0, size_box)
 
-        # Group-by selector.
+        # Group-by selector, plus the per-group height slider that only
+        # affects the grouped view (kept together in one box so the
+        # column-control index arithmetic in refresh_columns is unchanged).
         group_box    = QGroupBox("Group gallery by")
         group_layout = QVBoxLayout(group_box)
         self._group_combo = QComboBox()
@@ -123,6 +128,23 @@ class FilterPanel(QWidget):
             self._on_group_by_changed
         )
         group_layout.addWidget(self._group_combo)
+
+        self._group_height_label = QLabel("Group height")
+        group_layout.addWidget(self._group_height_label)
+        self._group_height_slider = QSlider(Qt.Orientation.Horizontal)
+        self._group_height_slider.setMinimum(180)
+        self._group_height_slider.setMaximum(700)
+        self._group_height_slider.setValue(340)
+        self._group_height_slider.valueChanged.connect(
+            lambda v: self.group_height_changed.emit(v)
+        )
+        group_layout.addWidget(self._group_height_slider)
+
+        # The group-height control only does something while a grouping
+        # column is active, so it starts disabled (combo defaults to None)
+        # and is re-enabled in _on_group_by_changed.
+        self._set_group_height_enabled(False)
+
         self._layout.insertWidget(1, group_box)
 
         # Randomise button.
@@ -311,7 +333,22 @@ class FilterPanel(QWidget):
             index: The selected index in the combo box.
         """
         column = self._group_combo.itemData(index)
+        # The group-height slider only matters when a real grouping
+        # column is selected (anything other than "None").
+        self._set_group_height_enabled(column is not None)
         self.group_by_changed.emit(column)
+
+    def _set_group_height_enabled(self, enabled: bool) -> None:
+        """
+        Enables or disables the group-height label and slider together.
+        Disabled (greyed-out) when no grouping column is active, since the
+        slider has no effect on the flat gallery view.
+
+        Args:
+            enabled: True to enable the control, False to grey it out.
+        """
+        self._group_height_label.setEnabled(enabled)
+        self._group_height_slider.setEnabled(enabled)
 
     def get_active_filters(self) -> list[Filter]:
         """

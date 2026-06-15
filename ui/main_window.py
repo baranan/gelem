@@ -16,7 +16,8 @@ from __future__ import annotations
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QSplitter, QLabel, QComboBox, QToolBar,
-    QFileDialog, QMessageBox, QTabWidget
+    QFileDialog, QMessageBox, QTabWidget,
+    QStackedWidget, QScrollArea, QFrame,
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction
@@ -39,9 +40,17 @@ class MainWindow(QMainWindow):
     Connects AppController signals to UI widgets and routes UI events
     back to AppController methods.
 
-    TODO (Student A): Implement grouped gallery view (multiple
-    GalleryWidgets in a shared scroll area).
+    The gallery area is a QStackedWidget with two pages: a flat view
+    (a single GalleryWidget) and a grouped view (one GalleryWidget per
+    group value, stacked vertically in a shared scroll area). The
+    controller decides which to show by emitting gallery_updated or
+    grouped_gallery_updated.
     """
+
+    # Height of each per-group gallery in the grouped view. Bounded so
+    # the outer scroll area pages between groups while each group scrolls
+    # internally for overflow.
+    _GROUP_GALLERY_HEIGHT = 340
 
     def __init__(self, controller):
         """
@@ -53,6 +62,12 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._controller = controller
         self._galleries: list[GalleryWidget] = []
+        # Current tile size, mirrored from the filter panel so new
+        # per-group galleries can be created at the right size.
+        self._tile_size = 150
+        # Current per-group gallery height, adjustable from the filter
+        # panel's "Group height" slider.
+        self._group_gallery_height = self._GROUP_GALLERY_HEIGHT
 
         self.setWindowTitle("Gelem — Visual Data Explorer")
         self.resize(1400, 900)
@@ -174,15 +189,29 @@ class MainWindow(QMainWindow):
         self._filter_panel = FilterPanel(self._controller)
         splitter.addWidget(self._filter_panel)
 
-        # Centre: Gallery area.
-        gallery_container = QWidget()
-        gallery_layout    = QVBoxLayout(gallery_container)
-        gallery_layout.setContentsMargins(0, 0, 0, 0)
+        # Centre: Gallery area — a stack of a flat view and a grouped view.
+        self._gallery_stack = QStackedWidget()
 
+        # Page 0 — flat view: a single gallery of all visible rows.
         self._main_gallery = GalleryWidget(self._controller)
         self._galleries    = [self._main_gallery]
-        gallery_layout.addWidget(self._main_gallery)
-        splitter.addWidget(gallery_container)
+        self._gallery_stack.addWidget(self._main_gallery)
+
+        # Page 1 — grouped view: one gallery per group, stacked vertically
+        # inside a shared scroll area. Sections are added/removed as the
+        # grouping changes; the trailing stretch keeps them pinned to top.
+        self._grouped_scroll = QScrollArea()
+        self._grouped_scroll.setWidgetResizable(True)
+        self._grouped_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._grouped_container = QWidget()
+        self._grouped_layout    = QVBoxLayout(self._grouped_container)
+        self._grouped_layout.setContentsMargins(4, 4, 4, 4)
+        self._grouped_layout.setSpacing(8)
+        self._grouped_layout.addStretch(1)
+        self._grouped_scroll.setWidget(self._grouped_container)
+        self._gallery_stack.addWidget(self._grouped_scroll)
+
+        splitter.addWidget(self._gallery_stack)
 
         # Right: tabbed panels — Detail and Results only.
         right_tabs = QTabWidget()
@@ -308,8 +337,8 @@ class MainWindow(QMainWindow):
         Returns:
             List of row_ids to run on, or None if cancelled.
         """
-        selected_ids = self._main_gallery.get_selected_row_ids()
-        visible_ids  = self._main_gallery._row_ids
+        selected_ids = self._collect_selected_row_ids()
+        visible_ids  = self._collect_visible_row_ids()
         all_ids      = list(
             self._controller._dataset.get_table(
                 self._controller._active_table
@@ -411,6 +440,9 @@ class MainWindow(QMainWindow):
         self._filter_panel.tile_size_changed.connect(
             self._on_tile_size_changed
         )
+        self._filter_panel.group_height_changed.connect(
+            self._on_group_height_changed
+        )
         self._filter_panel.randomise_clicked.connect(
             lambda: ctrl.set_filters(
                 self._filter_panel.get_active_filters(),
@@ -427,22 +459,31 @@ class MainWindow(QMainWindow):
             self._on_tile_double_clicked
         )
 
-    def _on_tile_double_clicked(self, clicked_ids: list[str]) -> None:
+    def _on_tile_double_clicked(
+        self, clicked_ids: list[str], gallery: GalleryWidget | None = None
+    ) -> None:
         """
         Handles tile double-click. When several tiles are currently
         selected and the double-clicked tile is one of them, opens the
         whole selection in the detail panel side-by-side. Otherwise
         opens just the double-clicked tile.
+
+        Args:
+            clicked_ids: row_ids of the double-clicked tile.
+            gallery:     The gallery that emitted the event. Defaults to
+                         the flat main gallery; per-group galleries pass
+                         themselves so selection is read from the right one.
         """
         if not clicked_ids:
             return
 
-        selected = self._main_gallery.get_selected_row_ids()
+        gallery  = gallery or self._main_gallery
+        selected = gallery.get_selected_row_ids()
         if len(selected) > 1 and clicked_ids[0] in selected:
             # Preserve gallery order so panels read left-to-right the
             # same way the tiles do.
             ordered = [
-                rid for rid in self._main_gallery._row_ids
+                rid for rid in gallery._row_ids
                 if rid in selected
             ]
             self._detail_widget.show_rows(ordered)
@@ -473,20 +514,127 @@ class MainWindow(QMainWindow):
             self._detail_widget.show_rows([row_id])
 
     def _on_gallery_updated(self, row_ids: list[str]) -> None:
-        """Updates the main gallery with a new flat list of row_ids."""
+        """
+        Shows the flat view: a single gallery of all visible rows.
+
+        Tears down any per-group galleries left over from grouped mode
+        and points broadcasts back at the main gallery.
+        """
+        self._clear_grouped_galleries()
+        self._galleries = [self._main_gallery]
         self._main_gallery.set_row_ids(row_ids)
+        self._gallery_stack.setCurrentWidget(self._main_gallery)
 
     def _on_grouped_gallery_updated(self, grouped: dict) -> None:
         """
-        Updates the gallery area for grouped view.
-        Currently flattens all groups into one gallery.
-        TODO (Student A): Implement multiple synchronized galleries,
-        one per group, in a shared scroll area.
+        Shows the grouped view: one gallery per group value, stacked
+        vertically in the shared scroll area.
+
+        Args:
+            grouped: Maps each group value to its ordered list of row_ids.
         """
-        all_row_ids = []
-        for group_row_ids in grouped.values():
-            all_row_ids.extend(group_row_ids)
-        self._main_gallery.set_row_ids(all_row_ids)
+        self._rebuild_grouped_galleries(grouped)
+        self._gallery_stack.setCurrentWidget(self._grouped_scroll)
+
+    # ── Grouped-view construction ─────────────────────────────────────
+
+    def _rebuild_grouped_galleries(self, grouped: dict) -> None:
+        """
+        Replaces the grouped view's sections with one per group.
+
+        Updates self._galleries so thumbnail, row-update and tile-size
+        broadcasts reach every visible group gallery. Falls back to the
+        main gallery when there are no groups.
+        """
+        self._clear_grouped_galleries()
+
+        galleries: list[GalleryWidget] = []
+        for group_value, row_ids in grouped.items():
+            section, gallery = self._build_group_section(group_value, row_ids)
+            # Insert before the trailing stretch so sections stay top-aligned.
+            self._grouped_layout.insertWidget(
+                self._grouped_layout.count() - 1, section
+            )
+            gallery.set_row_ids(row_ids)
+            galleries.append(gallery)
+
+        self._galleries = galleries or [self._main_gallery]
+
+    def _build_group_section(
+        self, group_value, row_ids: list[str]
+    ) -> tuple[QWidget, GalleryWidget]:
+        """
+        Builds one grouped-view section: a header label plus a
+        bounded-height gallery for the group's rows.
+
+        Args:
+            group_value: The group's value (used in the header label).
+            row_ids:     The row_ids belonging to this group.
+
+        Returns:
+            (section_widget, gallery) — the gallery is returned so the
+            caller can register it for broadcasts and load its rows.
+        """
+        section = QWidget()
+        layout  = QVBoxLayout(section)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        header = QLabel(f"{group_value}  ({len(row_ids)})")
+        header.setStyleSheet("font-weight: bold; padding: 2px 4px;")
+        layout.addWidget(header)
+
+        gallery = GalleryWidget(self._controller)
+        gallery.setFixedHeight(self._group_gallery_height)
+        # Match the flat gallery's current display settings.
+        gallery.set_visible_columns(self._controller.get_visible_columns())
+        gallery.set_tile_size(self._tile_size)
+        gallery.tile_double_clicked.connect(
+            lambda ids, g=gallery: self._on_tile_double_clicked(ids, g)
+        )
+        gallery.selection_changed.connect(
+            self._stats_panel_removed_placeholder
+        )
+        layout.addWidget(gallery)
+
+        return section, gallery
+
+    def _clear_grouped_galleries(self) -> None:
+        """Removes all group sections, leaving the trailing stretch."""
+        while self._grouped_layout.count() > 1:
+            item   = self._grouped_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def _collect_selected_row_ids(self) -> list[str]:
+        """
+        Returns the selected row_ids across every live gallery, in
+        order and de-duplicated. In flat mode this is just the main
+        gallery; in grouped mode it spans all group galleries.
+        """
+        return self._collect_row_ids(
+            lambda g: g.get_selected_row_ids()
+        )
+
+    def _collect_visible_row_ids(self) -> list[str]:
+        """
+        Returns the visible row_ids across every live gallery, in order
+        and de-duplicated (used as the 'visible' operator scope).
+        """
+        return self._collect_row_ids(lambda g: g._row_ids)
+
+    def _collect_row_ids(self, getter) -> list[str]:
+        """Flattens getter(gallery) over self._galleries, keeping order
+        and dropping duplicates."""
+        result: list[str] = []
+        seen: set[str] = set()
+        for gallery in self._galleries:
+            for row_id in getter(gallery):
+                if row_id not in seen:
+                    seen.add(row_id)
+                    result.append(row_id)
+        return result
 
     def _on_columns_updated(self, column_names: list[str]) -> None:
         """Refreshes filter panel and columns combo when columns change."""
@@ -517,8 +665,20 @@ class MainWindow(QMainWindow):
 
     def _on_tile_size_changed(self, size: int) -> None:
         """Updates tile size across all galleries."""
+        self._tile_size = size
         for gallery in self._galleries:
             gallery.set_tile_size(size)
+
+    def _on_group_height_changed(self, height: int) -> None:
+        """
+        Updates the per-group gallery height. Applies live to the
+        currently displayed grouped sections and is remembered so that
+        sections built later use the same height.
+        """
+        self._group_gallery_height = height
+        if self._gallery_stack.currentWidget() is self._grouped_scroll:
+            for gallery in self._galleries:
+                gallery.setFixedHeight(height)
 
     def _on_display_result(self, result: dict) -> None:
         """
