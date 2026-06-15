@@ -89,11 +89,23 @@ class FakeController(QObject):
                 "bs_mouthSmileRight": round(random.uniform(0.0, 0.6), 3),
             }
 
+        # Second visual column, purely so the visible-columns selector
+        # has more than one entry to toggle in fake mode. Each row's
+        # "alt_view" points at the *next* row's image, so when both
+        # columns are shown the two tiles in each cell are visibly
+        # different pictures.
+        n = len(self._row_ids)
+        for i, row_id in enumerate(self._row_ids):
+            if n > 1:
+                next_path = self._path_map[self._row_ids[(i + 1) % n]]
+                self._metadata[row_id]["alt_view"] = str(next_path)
+
         # Column type tags — updated to use current type names.
         # 'media_path' replaces 'image_path'.
         # 'text' replaces 'categorical'.
         self._column_types: dict[str, str] = {
             "full_path":          "media_path",
+            "alt_view":           "media_path",
             "condition":          "text",
             "session_id":         "text",
             "trial_id":           "text",
@@ -360,7 +372,7 @@ class FakeController(QObject):
         renderer so the video player or ZoomableImageView is returned.
         For other columns: returns a colored placeholder.
         """
-        if column_name == "full_path" and value:
+        if self._column_types.get(column_name) == "media_path" and value:
             if mode == "thumbnail":
                 # Use cached PIL thumbnail if available, otherwise load from disk.
                 from column_types.renderers import _pil_to_pixmap
