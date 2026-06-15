@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction
 
+from shared_widgets.checkable_combo_box import CheckableComboBox
 from ui.gallery_widget import GalleryWidget
 from ui.filter_panel import FilterPanel
 from ui.detail_widget import DetailWidget
@@ -40,7 +41,6 @@ class MainWindow(QMainWindow):
 
     TODO (Student A): Implement grouped gallery view (multiple
     GalleryWidgets in a shared scroll area).
-    TODO (Student A): Implement the column selector for visible columns.
     """
 
     def __init__(self, controller):
@@ -120,13 +120,40 @@ class MainWindow(QMainWindow):
         toolbar = QToolBar("Main toolbar")
         self.addToolBar(toolbar)
 
-        toolbar.addWidget(QLabel("Table: "))
+        # QToolBar top-aligns the widgets it hosts, so we put the controls
+        # in our own container whose QHBoxLayout vertically centres them
+        # and adds equal padding above and below the row.
+        controls = QWidget()
+        row = QHBoxLayout(controls)
+        row.setContentsMargins(8, 7, 8, 7)
+        row.setSpacing(6)
+
+        row.addWidget(QLabel("Table: "), 0, Qt.AlignmentFlag.AlignVCenter)
         self._table_combo = QComboBox()
         self._table_combo.addItem("frames")
         self._table_combo.currentTextChanged.connect(
             self._controller.set_active_table
         )
-        toolbar.addWidget(self._table_combo)
+        row.addWidget(self._table_combo, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        # A little breathing room between the table and columns controls.
+        row.addSpacing(16)
+
+        # Visible-columns selector. A combo box of checkable visual
+        # columns, letting the researcher choose which columns each tile
+        # shows. It is repopulated on open so it always reflects the
+        # currently registered visual columns.
+        row.addWidget(QLabel("Columns: "), 0, Qt.AlignmentFlag.AlignVCenter)
+        self._columns_combo = CheckableComboBox()
+        self._columns_combo.set_placeholder("Visible columns")
+        self._columns_combo.about_to_show.connect(self._refresh_columns_combo)
+        self._columns_combo.selection_changed.connect(
+            self._apply_visible_columns
+        )
+        row.addWidget(self._columns_combo, 0, Qt.AlignmentFlag.AlignVCenter)
+        row.addStretch(1)
+
+        toolbar.addWidget(controls)
 
     def _build_central_widget(self) -> None:
         """
@@ -264,6 +291,35 @@ class MainWindow(QMainWindow):
             empty = QAction("No operators registered", self)
             empty.setEnabled(False)
             self._operators_menu.addAction(empty)
+
+    # ── Visible-columns selector ──────────────────────────────────────
+
+    def _refresh_columns_combo(self) -> None:
+        """
+        Repopulates the visible-columns combo from the controller.
+
+        Lists every visual column (those that render as tiles), checking
+        the ones in the controller's current visible-column selection.
+        Repopulating does not fire selection_changed, so it never loops
+        back into _apply_visible_columns.
+        """
+        self._columns_combo.set_items(
+            self._controller.get_visual_column_names(),
+            checked=self._controller.get_visible_columns(),
+        )
+
+    def _apply_visible_columns(self, column_names: list[str]) -> None:
+        """
+        Pushes the chosen visible columns to every gallery and records
+        them on the controller.
+
+        Galleries are updated first so that the gallery refresh the
+        controller triggers re-lays out with the new columns already in
+        place.
+        """
+        for gallery in self._galleries:
+            gallery.set_visible_columns(column_names)
+        self._controller.set_visible_columns(column_names)
 
     # ── Operator run handlers ─────────────────────────────────────────
 
@@ -459,8 +515,9 @@ class MainWindow(QMainWindow):
         self._refresh_status_bar()
 
     def _on_columns_updated(self, column_names: list[str]) -> None:
-        """Refreshes filter panel when columns change."""
+        """Refreshes filter panel and columns combo when columns change."""
         self._filter_panel.refresh_columns(column_names)
+        self._refresh_columns_combo()
 
     def _on_tables_updated(self, table_names: list[str]) -> None:
         """Updates the table selector combo when tables change."""
