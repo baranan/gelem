@@ -101,7 +101,9 @@ class AppController(QObject):
         self._randomise:      bool       = False
         self._seed:           int | None = None
         self._group_by:       str | None = None
-        self._visible_cols:   list[str]  = []
+        # None means the researcher has not made a choice yet; an empty
+        # list means the researcher explicitly unchecked every column.
+        self._visible_cols:   list[str] | None = None
 
     # ── Queue draining (main thread) ──────────────────────────────────
 
@@ -228,7 +230,7 @@ class AppController(QObject):
             self._store.reset()
             self._active_filters = []
             self._group_by       = None
-            self._visible_cols   = []
+            self._visible_cols   = None
 
             self._dataset.load_folder(folder_path)
             df = self._dataset.get_table("frames")
@@ -262,7 +264,7 @@ class AppController(QObject):
             self._store.reset()
             self._active_filters = []
             self._group_by       = None
-            self._visible_cols   = []
+            self._visible_cols   = None
 
             self._dataset.load_csv_as_primary(csv_path, image_column)
             df = self._dataset.get_table("frames")
@@ -353,7 +355,10 @@ class AppController(QObject):
 
     def set_visible_columns(self, column_names: list[str]) -> None:
         """
-        Sets which columns the gallery displays in each tile.
+        Sets which columns the gallery displays in each tile. An empty
+        list records that the researcher explicitly unchecked every
+        column; pass through clear_visible_columns_preference() instead
+        to return to the unset/default state.
 
         Args:
             column_names: Ordered list of column names to display.
@@ -361,9 +366,27 @@ class AppController(QObject):
         self._visible_cols = column_names
         self._refresh_gallery()
 
+    def clear_visible_columns_preference(self) -> None:
+        """Clears the visible-column preference back to its unset state."""
+        self._visible_cols = None
+        self._refresh_gallery()
+
     def get_visible_columns(self) -> list[str]:
-        """Returns the currently selected visible columns."""
-        return list(self._visible_cols)
+        """
+        Returns the currently selected visible columns (empty when
+        the researcher has unchecked every column OR has not made a
+        choice yet — call has_visible_columns_preference() to tell
+        the two states apart).
+        """
+        return list(self._visible_cols) if self._visible_cols else []
+
+    def has_visible_columns_preference(self) -> bool:
+        """
+        True iff the researcher has explicitly set the visible-column
+        list (including unchecking everything). False before any choice
+        has been made or after a project reset.
+        """
+        return self._visible_cols is not None
 
     def select_row(self, row_id: str) -> None:
         """
@@ -536,7 +559,7 @@ class AppController(QObject):
             self._active_table   = name
             self._active_filters = []
             self._group_by       = None
-            self._visible_cols   = []
+            self._visible_cols   = None
             self.columns_updated.emit(self._registry.list_all_columns())
             self._refresh_gallery()
         except KeyError as e:

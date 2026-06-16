@@ -250,6 +250,13 @@ class FakeController(QObject):
     def get_visible_columns(self) -> list[str]:
         return list(self._visual_columns)
 
+    def has_visible_columns_preference(self) -> bool:
+        return True
+
+    def clear_visible_columns_preference(self) -> None:
+        self._visual_columns = ["full_path"]
+        self.gallery_updated.emit(self._visible_ids)
+
     def select_row(self, row_id: str) -> None:
         metadata = self._metadata.get(row_id, {"row_id": row_id})
         self.row_selected.emit(metadata)
