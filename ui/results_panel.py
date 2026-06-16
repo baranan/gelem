@@ -26,6 +26,7 @@ Key Qt concept used here:
 from __future__ import annotations
 import datetime
 import webbrowser
+from pathlib import Path
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -201,7 +202,7 @@ class ResultsPanel(QWidget):
             open_btn = QPushButton("Open interactive plot")
             open_btn.setToolTip(str(html_path))
             open_btn.clicked.connect(
-                lambda checked, p=html_path: webbrowser.open(f"file:///{p}")
+                lambda checked, p=html_path: webbrowser.open(Path(p).as_uri())
             )
             header_row.addWidget(open_btn)
 
