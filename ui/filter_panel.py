@@ -408,12 +408,23 @@ class FilterPanel(QWidget):
 
         lo, hi = min_spin.value(), max_spin.value()
 
-        # Stop the two handles crossing over each other. Block signals so
-        # tightening one bound doesn't recurse back into this handler.
+        # Stop the two handles crossing over each other. We first restore
+        # each spin's full column range, then re-tighten only the crossing
+        # bound — otherwise repeated drags would progressively shrink the
+        # allowed range and lock the filter. Block signals so tightening
+        # one bound doesn't recurse back into this handler.
         min_spin.blockSignals(True)
         max_spin.blockSignals(True)
+
+        min_spin.setMinimum(col_min)
+        min_spin.setMaximum(col_max)
+
+        max_spin.setMinimum(col_min)
+        max_spin.setMaximum(col_max)
+
         min_spin.setMaximum(hi)
         max_spin.setMinimum(lo)
+
         min_spin.blockSignals(False)
         max_spin.blockSignals(False)
 
