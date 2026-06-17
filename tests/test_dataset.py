@@ -286,6 +286,233 @@ else:
     run_test("confirm_merge registers text type", test_confirm_merge_registers_text_type)
     run_test("Row count unchanged after merge", test_confirm_merge_row_count_unchanged)
 
+    # --- MANUALLY ADDED (Student B): merge edge cases. Tests above unchanged.
+    # CASE 1 — one-to-many: CSV has >1 row per image; must be rejected, not
+    # expanded (20 rows must not become 40).
+    def _write_csv(folder, name, frame):
+        """Helper: write `frame` to <folder>/<name> and return the Path."""
+        path = Path(folder) / name
+        frame.to_csv(path, index=False)
+        return path
+
+    def test_merge_one_to_many_does_not_crash():
+        from models.dataset import Dataset, MergeReport
+        ds = Dataset()
+        ds.load_folder(TEST_IMAGES)
+        names = list(ds.get_table("frames")["file_name"])[:2]
+        # Each image name appears twice -> one-to-many.
+        bad = pd.DataFrame({
+            "file_name": [names[0], names[0], names[1], names[1]],
+            "score":     [1, 2, 3, 4],
+        })
+        with tempfile.TemporaryDirectory() as d:
+            report = ds.merge_csv(_write_csv(d, "dupes.csv", bad),
+                                  join_on="file_name")
+        assert isinstance(report, MergeReport), (
+            "merge_csv should return a MergeReport for a one-to-many CSV, "
+            "not crash"
+        )
+
+    def test_merge_one_to_many_flags_duplicates():
+        from models.dataset import Dataset
+        ds = Dataset()
+        ds.load_folder(TEST_IMAGES)
+        names = list(ds.get_table("frames")["file_name"])[:2]
+        bad = pd.DataFrame({
+            "file_name": [names[0], names[0], names[1], names[1]],
+            "score":     [1, 2, 3, 4],
+        })
+        with tempfile.TemporaryDirectory() as d:
+            report = ds.merge_csv(_write_csv(d, "dupes.csv", bad),
+                                  join_on="file_name")
+        assert names[0] in report.one_to_many and names[1] in report.one_to_many, (
+            f"Duplicated image names should be listed in report.one_to_many; "
+            f"got {report.one_to_many}"
+        )
+
+    def test_merge_one_to_many_does_not_expand():
+        from models.dataset import Dataset
+        ds = Dataset()
+        ds.load_folder(TEST_IMAGES)
+        count_before = len(ds.get_table("frames"))
+        names = list(ds.get_table("frames")["file_name"])[:2]
+        bad = pd.DataFrame({
+            "file_name": [names[0], names[0], names[1], names[1]],
+            "score":     [1, 2, 3, 4],
+        })
+        with tempfile.TemporaryDirectory() as d:
+            report = ds.merge_csv(_write_csv(d, "dupes.csv", bad),
+                                  join_on="file_name")
+            ds.confirm_merge(report)   # rejected one-to-many -> no-op
+        count_after = len(ds.get_table("frames"))
+        assert count_after == count_before, (
+            f"A one-to-many merge must be rejected, not expand rows. "
+            f"Before: {count_before}, after: {count_after}"
+        )
+
+    run_test("One-to-many merge does not crash", test_merge_one_to_many_does_not_crash)
+    run_test("One-to-many merge flags duplicates", test_merge_one_to_many_flags_duplicates)
+    run_test("One-to-many merge does not expand rows", test_merge_one_to_many_does_not_expand)
+
+    def test_merge_unmatched_duplicate_still_merges():
+        # A duplicate key matching NO image is harmless (can't expand any
+        # image), so the merge must NOT be blocked.
+        from models.dataset import Dataset
+        ds = Dataset()
+        ds.load_folder(TEST_IMAGES)
+        real = list(ds.get_table("frames")["file_name"])[0]
+        bad = pd.DataFrame({
+            "file_name": ["ghost.jpg", "ghost.jpg", real],
+            "score":     [1, 2, 5],
+        })
+        with tempfile.TemporaryDirectory() as d:
+            report = ds.merge_csv(_write_csv(d, "ghost.csv", bad),
+                                  join_on="file_name")
+            ds.confirm_merge(report)
+        df = ds.get_table("frames")
+        assert report.one_to_many == [], (
+            f"A duplicate matching no image must not block the merge; "
+            f"got one_to_many={report.one_to_many}"
+        )
+        assert "score" in df.columns, (
+            "A normal merge should still attach CSV columns"
+        )
+
+    run_test("Unmatched duplicate still merges", test_merge_unmatched_duplicate_still_merges)
+
+    # CASE 2 — CSV missing the join column. The join column is whatever
+    # join_on names (not necessarily file_name); if the CSV lacks it there's
+    # nothing to match on, so merge_csv should raise a clear ValueError.
+    def test_merge_missing_join_column_raises_clear_error():
+        # Use a distinctive absent name so the error must reference the
+        # REQUESTED column, not a hardcoded "file_name".
+        from models.dataset import Dataset
+        ds = Dataset()
+        ds.load_folder(TEST_IMAGES)
+        csv = pd.DataFrame({"name": ["a", "b"], "score": [1, 2]})  # no 'photo_id'
+        with tempfile.TemporaryDirectory() as d:
+            path = _write_csv(d, "noname.csv", csv)
+            try:
+                ds.merge_csv(path, join_on="photo_id")
+                assert False, "expected a ValueError for the missing join column"
+            except ValueError as e:
+                assert "photo_id" in str(e), (
+                    f"error should name the requested join column 'photo_id'; "
+                    f"got: {e}"
+                )
+
+    def test_merge_with_alternate_join_column():
+        # Filenames living in a differently-named column should still merge
+        # (merge_csv takes join_on as a parameter).
+        from models.dataset import Dataset
+        ds = Dataset()
+        ds.load_folder(TEST_IMAGES)
+        names = list(ds.get_table("frames")["file_name"])[:3]
+        csv = pd.DataFrame({"image": names, "score": [1, 2, 3]})
+        with tempfile.TemporaryDirectory() as d:
+            report = ds.merge_csv(_write_csv(d, "altcol.csv", csv),
+                                  join_on="image")
+            ds.confirm_merge(report)
+        assert "score" in ds.get_table("frames").columns, (
+            "merging on an alternate join column should attach its data"
+        )
+
+    run_test("Missing join column raises clear error", test_merge_missing_join_column_raises_clear_error)
+    run_test("Merge on alternate join column works", test_merge_with_alternate_join_column)
+
+    # CASE 3 — column collision: an incoming CSV column already exists in the
+    # table; keep both as <name>_a (existing) / <name>_b (incoming).
+    def test_merge_column_collision_does_not_crash():
+        from models.dataset import Dataset, MergeReport
+        ds = Dataset()
+        ds.load_folder(TEST_IMAGES)
+        names = list(ds.get_table("frames")["file_name"])[:3]
+        csv = pd.DataFrame({"file_name": names, "path": ["x", "y", "z"]})
+        with tempfile.TemporaryDirectory() as d:
+            p = _write_csv(d, "coll.csv", csv)
+            ds.confirm_merge(ds.merge_csv(p, join_on="file_name"))  # adds 'path'
+            report = ds.merge_csv(p, join_on="file_name")           # 'path' collides
+        assert isinstance(report, MergeReport), (
+            "a column-collision merge should not crash"
+        )
+
+    def test_merge_column_collision_renames_both():
+        from models.dataset import Dataset
+        ds = Dataset()
+        ds.load_folder(TEST_IMAGES)
+        names = list(ds.get_table("frames")["file_name"])[:3]
+        csv = pd.DataFrame({"file_name": names, "path": ["x", "y", "z"]})
+        with tempfile.TemporaryDirectory() as d:
+            p = _write_csv(d, "coll.csv", csv)
+            ds.confirm_merge(ds.merge_csv(p, join_on="file_name"))
+            ds.confirm_merge(ds.merge_csv(p, join_on="file_name"))
+        cols = list(ds.get_table("frames").columns)
+        assert "path_a" in cols and "path_b" in cols, (
+            f"both columns should be preserved as path_a/path_b; got {cols}"
+        )
+        assert "path" not in cols, "the clashing 'path' should have been renamed"
+
+    def test_merge_column_collision_reported():
+        from models.dataset import Dataset
+        ds = Dataset()
+        ds.load_folder(TEST_IMAGES)
+        names = list(ds.get_table("frames")["file_name"])[:3]
+        csv = pd.DataFrame({"file_name": names, "path": ["x", "y", "z"]})
+        with tempfile.TemporaryDirectory() as d:
+            p = _write_csv(d, "coll.csv", csv)
+            ds.confirm_merge(ds.merge_csv(p, join_on="file_name"))
+            report = ds.merge_csv(p, join_on="file_name")
+        assert report.renamed_columns.get("path") == ("path_a", "path_b"), (
+            f"the collision should be recorded; got {report.renamed_columns}"
+        )
+
+    run_test("Column collision does not crash", test_merge_column_collision_does_not_crash)
+    run_test("Column collision renames both", test_merge_column_collision_renames_both)
+    run_test("Column collision is reported", test_merge_column_collision_reported)
+
+    # CASE 4 — a failed merge must leave the table unchanged (merge_csv only
+    # builds a report; confirm_merge is the only writer).
+    def test_failed_merge_leaves_dataset_unchanged():
+        from models.dataset import Dataset
+        ds = Dataset()
+        ds.load_folder(TEST_IMAGES)
+        rows_before = len(ds.get_table("frames"))
+        cols_before = list(ds.get_table("frames").columns)
+        bad = pd.DataFrame({"name": ["a", "b"], "score": [1, 2]})  # no join column
+        with tempfile.TemporaryDirectory() as d:
+            try:
+                ds.merge_csv(_write_csv(d, "bad.csv", bad), join_on="file_name")
+            except ValueError:
+                pass  # expected failure
+        assert len(ds.get_table("frames")) == rows_before, (
+            "row count must not change after a failed merge"
+        )
+        assert list(ds.get_table("frames").columns) == cols_before, (
+            "columns must not change after a failed merge"
+        )
+
+    def test_failed_merge_filters_still_work():
+        from models.dataset import Dataset
+        from models.query_engine import QueryEngine, Filter
+        ds = Dataset()
+        ds.load_folder(TEST_IMAGES)
+        df = ds.get_table("frames")
+        target, target_id = df["file_name"].iloc[0], df["row_id"].iloc[0]
+        bad = pd.DataFrame({"name": ["a"], "score": [1]})  # no join column
+        with tempfile.TemporaryDirectory() as d:
+            try:
+                ds.merge_csv(_write_csv(d, "bad.csv", bad), join_on="file_name")
+            except ValueError:
+                pass
+        rows = QueryEngine().apply(ds.get_table("frames"),
+                                   filters=[Filter("file_name", "eq", target)])
+        assert rows == [target_id], (
+            f"filter should still return the one matching row; got {rows}"
+        )
+
+    run_test("Failed merge leaves dataset unchanged", test_failed_merge_leaves_dataset_unchanged)
+    run_test("Failed merge: filters still work", test_failed_merge_filters_still_work)
+
 
 # ---------------------------------------------------------------------------
 # Section 3: Dataset.update_row()
