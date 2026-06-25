@@ -343,9 +343,9 @@ class GalleryWidget(QWidget):
 
     def get_visible_count(self) -> int:
         """
-        Returns the number of rows currently visible in the gallery
-        (after any active filter). Used by MainWindow's status bar to
-        report "K of N selected".
+        Returns the number of rows this gallery is currently showing
+        (after any active filter). Gallery-local introspection — e.g. a
+        header or label that wants this gallery's item count.
         """
         return len(self._row_ids)
 
