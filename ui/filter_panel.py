@@ -189,7 +189,7 @@ class FilterPanel(QWidget):
 
         # Build a filter control for each column.
         for col in column_names:
-            col_type = self._controller._registry.get(col)
+            col_type = self._controller.get_column_type(col)
             if col_type is None:
                 continue
 
