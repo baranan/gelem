@@ -623,8 +623,12 @@ class MainWindow(QMainWindow):
 
         gallery = GalleryWidget(self._controller)
         gallery.setFixedHeight(self._group_gallery_height)
-        # Match the flat gallery's current display settings.
-        gallery.set_visible_columns(self._controller.get_visible_columns())
+        # Match the flat gallery's current display settings. Only push a
+        # selection if the researcher has actually made one; otherwise we
+        # would clobber the new gallery's "no preference" default and
+        # show the placeholder where the fallback to full_path is wanted.
+        if self._controller.has_visible_columns_preference():
+            gallery.set_visible_columns(self._controller.get_visible_columns())
         gallery.set_tile_size(self._tile_size)
         gallery.tile_double_clicked.connect(
             lambda ids, g=gallery: self._on_tile_double_clicked(ids, g)
