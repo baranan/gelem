@@ -211,8 +211,10 @@ class FilterPanel(QWidget):
         Adds a filter control for a text column.
 
         If the column has fewer than CATEGORICAL_THRESHOLD unique values,
-        shows a row of toggle buttons — one per unique value. Clicking
-        a button activates an 'eq' filter for that value.
+        shows a column of checkable toggle buttons — one per unique
+        value. Buttons are independent; the researcher can have any
+        subset checked at once, and the union is sent as a single
+        ``Filter(column, "isin", [...])`` (see ``_on_text_toggle``).
 
         If the column has CATEGORICAL_THRESHOLD or more unique values,
         shows a text input. As the researcher types, a 'contains' filter
@@ -220,9 +222,6 @@ class FilterPanel(QWidget):
 
         Args:
             column: The column name to create a filter control for.
-
-        TODO (Student A): Implement multi-select for toggle buttons
-        (allow more than one value active at once, using 'isin' filter).
         """
         values = self._controller.get_group_values(column)
         if not values:
