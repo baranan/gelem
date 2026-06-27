@@ -1,12 +1,9 @@
-PySide6
+﻿PySide6
 pandas
 pyarrow
 Pillow
 numpy
 matplotlib
-<<<<<<< HEAD
 mediapipe
 pytest
-=======
 opencv-python
->>>>>>> origin/main
