@@ -1,9 +1,22 @@
 .venv/
+.venv.nosync/
 __pycache__/
 *.pyc
 .DS_Store
 Thumbs.db
 .env
 *.env
+
+# Mediapipe / other operator model files (large, downloaded locally)
+operators/models/*.task
+
+# Word temp lock files
+~$*.docx
+
+# Local reference docs (kept outside the repo, but safety net)
+Gelem_*.docx
+
+# Local test output
+test_plots/
 
 setup.ps1

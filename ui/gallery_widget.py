@@ -341,6 +341,14 @@ class GalleryWidget(QWidget):
         """
         return list(self._selected_ids)
 
+    def get_visible_count(self) -> int:
+        """
+        Returns the number of rows this gallery is currently showing
+        (after any active filter). Gallery-local introspection — e.g. a
+        header or label that wants this gallery's item count.
+        """
+        return len(self._row_ids)
+
     # ── Internal helpers ──────────────────────────────────────────────
 
     def _columns_per_row(self) -> int:

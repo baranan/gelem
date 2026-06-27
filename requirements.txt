@@ -4,5 +4,9 @@ pyarrow
 Pillow
 numpy
 matplotlib
+<<<<<<< HEAD
 mediapipe
 pytest
+=======
+opencv-python
+>>>>>>> origin/main

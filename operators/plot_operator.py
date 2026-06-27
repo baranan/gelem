@@ -68,7 +68,7 @@ class PlotOperator(BaseOperator):
         )
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
-    def get_parameters_dialog(self, parent=None):
+    def get_parameters_dialog(self, parent=None, columns=None):
         """
         Shows a dialog asking the researcher which columns to plot.
         Stores the chosen columns in self._columns so create_columns()
@@ -77,6 +77,7 @@ class PlotOperator(BaseOperator):
         TODO (Student C): Implement this dialog. It should show a
         list of all numeric columns in the current table and let the
         researcher select which ones to include in the plot.
+        Use the `columns` argument supplied by MainWindow.
 
         For now returns None (no dialog, uses default columns).
         """

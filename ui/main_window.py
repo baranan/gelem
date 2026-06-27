@@ -16,11 +16,13 @@ from __future__ import annotations
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QSplitter, QLabel, QComboBox, QToolBar,
-    QFileDialog, QMessageBox, QTabWidget
+    QFileDialog, QMessageBox, QTabWidget,
+    QStackedWidget, QScrollArea, QFrame,
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction
 
+from shared_widgets.checkable_combo_box import CheckableComboBox
 from ui.gallery_widget import GalleryWidget
 from ui.filter_panel import FilterPanel
 from ui.detail_widget import DetailWidget
@@ -38,10 +40,17 @@ class MainWindow(QMainWindow):
     Connects AppController signals to UI widgets and routes UI events
     back to AppController methods.
 
-    TODO (Student A): Implement grouped gallery view (multiple
-    GalleryWidgets in a shared scroll area).
-    TODO (Student A): Implement the column selector for visible columns.
+    The gallery area is a QStackedWidget with two pages: a flat view
+    (a single GalleryWidget) and a grouped view (one GalleryWidget per
+    group value, stacked vertically in a shared scroll area). The
+    controller decides which to show by emitting gallery_updated or
+    grouped_gallery_updated.
     """
+
+    # Height of each per-group gallery in the grouped view. Bounded so
+    # the outer scroll area pages between groups while each group scrolls
+    # internally for overflow.
+    _GROUP_GALLERY_HEIGHT = 340
 
     def __init__(self, controller):
         """
@@ -53,6 +62,12 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._controller = controller
         self._galleries: list[GalleryWidget] = []
+        # Current tile size, mirrored from the filter panel so new
+        # per-group galleries can be created at the right size.
+        self._tile_size = 150
+        # Current per-group gallery height, adjustable from the filter
+        # panel's "Group height" slider.
+        self._group_gallery_height = self._GROUP_GALLERY_HEIGHT
 
         self.setWindowTitle("Gelem — Visual Data Explorer")
         self.resize(1400, 900)
@@ -60,6 +75,7 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self._build_toolbar()
         self._build_central_widget()
+        self._build_status_bar()
         self._connect_signals()
 
     # ── Building the UI ───────────────────────────────────────────────
@@ -113,19 +129,47 @@ class MainWindow(QMainWindow):
         # reflects the currently registered operators.
         self._operators_menu = menubar.addMenu("Operators")
         self._operators_menu.aboutToShow.connect(self._refresh_operators_menu)
+        self._operators_menu.addAction("(loading…)")  # macOS: empty menus don't render
 
     def _build_toolbar(self) -> None:
         """Creates the toolbar with table selector."""
         toolbar = QToolBar("Main toolbar")
         self.addToolBar(toolbar)
 
-        toolbar.addWidget(QLabel("Table: "))
+        # QToolBar top-aligns the widgets it hosts, so we put the controls
+        # in our own container whose QHBoxLayout vertically centres them
+        # and adds equal padding above and below the row.
+        controls = QWidget()
+        row = QHBoxLayout(controls)
+        row.setContentsMargins(8, 7, 8, 7)
+        row.setSpacing(6)
+
+        row.addWidget(QLabel("Table: "), 0, Qt.AlignmentFlag.AlignVCenter)
         self._table_combo = QComboBox()
         self._table_combo.addItem("frames")
         self._table_combo.currentTextChanged.connect(
             self._controller.set_active_table
         )
-        toolbar.addWidget(self._table_combo)
+        row.addWidget(self._table_combo, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        # A little breathing room between the table and columns controls.
+        row.addSpacing(16)
+
+        # Visible-columns selector. A combo box of checkable visual
+        # columns, letting the researcher choose which columns each tile
+        # shows. It is repopulated on open so it always reflects the
+        # currently registered visual columns.
+        row.addWidget(QLabel("Columns: "), 0, Qt.AlignmentFlag.AlignVCenter)
+        self._columns_combo = CheckableComboBox()
+        self._columns_combo.set_placeholder("Visible columns")
+        self._columns_combo.about_to_show.connect(self._refresh_columns_combo)
+        self._columns_combo.selection_changed.connect(
+            self._apply_visible_columns
+        )
+        row.addWidget(self._columns_combo, 0, Qt.AlignmentFlag.AlignVCenter)
+        row.addStretch(1)
+
+        toolbar.addWidget(controls)
 
     def _build_central_widget(self) -> None:
         """
@@ -147,27 +191,73 @@ class MainWindow(QMainWindow):
         self._filter_panel = FilterPanel(self._controller)
         splitter.addWidget(self._filter_panel)
 
-        # Centre: Gallery area.
-        gallery_container = QWidget()
-        gallery_layout    = QVBoxLayout(gallery_container)
-        gallery_layout.setContentsMargins(0, 0, 0, 0)
+        # Centre: Gallery area — a stack of a flat view and a grouped view.
+        self._gallery_stack = QStackedWidget()
 
+        # Page 0 — flat view: a single gallery of all visible rows.
         self._main_gallery = GalleryWidget(self._controller)
         self._galleries    = [self._main_gallery]
-        gallery_layout.addWidget(self._main_gallery)
-        splitter.addWidget(gallery_container)
+        self._gallery_stack.addWidget(self._main_gallery)
+
+        # Page 1 — grouped view: one gallery per group, stacked vertically
+        # inside a shared scroll area. Sections are added/removed as the
+        # grouping changes; the trailing stretch keeps them pinned to top.
+        self._grouped_scroll = QScrollArea()
+        self._grouped_scroll.setWidgetResizable(True)
+        self._grouped_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._grouped_container = QWidget()
+        self._grouped_layout    = QVBoxLayout(self._grouped_container)
+        self._grouped_layout.setContentsMargins(4, 4, 4, 4)
+        self._grouped_layout.setSpacing(8)
+        self._grouped_layout.addStretch(1)
+        self._grouped_scroll.setWidget(self._grouped_container)
+        self._gallery_stack.addWidget(self._grouped_scroll)
+
+        splitter.addWidget(self._gallery_stack)
 
         # Right: tabbed panels — Detail and Results only.
-        right_tabs = QTabWidget()
+        # Kept as an instance attribute so handlers can switch focus
+        # between Detail and Results in response to user actions.
+        self._right_tabs = QTabWidget()
 
         self._detail_widget = DetailWidget(self._controller)
-        right_tabs.addTab(self._detail_widget, "Detail")
+        self._right_tabs.addTab(self._detail_widget, "Detail")
 
         self._results_panel = ResultsPanel(self._controller)
-        right_tabs.addTab(self._results_panel, "Results")
+        self._right_tabs.addTab(self._results_panel, "Results")
 
-        splitter.addWidget(right_tabs)
+        splitter.addWidget(self._right_tabs)
         splitter.setSizes([180, 840, 380])
+
+    def _build_status_bar(self) -> None:
+        """
+        Adds a status bar with a permanent label that reports gallery
+        selection: "{N} items" when nothing is selected, "{K} of {N}
+        selected" otherwise. The label is updated by
+        _on_selection_changed (selection edits) and the gallery-update
+        handlers (filter changes).
+        """
+        self._selection_label = QLabel()
+        self._selection_label.setStyleSheet("padding: 0 8px;")
+        # addPermanentWidget pins it to the right side so transient
+        # messages from QStatusBar.showMessage() don't displace it.
+        self.statusBar().addPermanentWidget(self._selection_label)
+        self._refresh_status_bar()
+
+    def _refresh_status_bar(self) -> None:
+        """
+        Updates the selection-count label from the live galleries'
+        current selected and visible counts. In flat mode this is just
+        the main gallery; in grouped mode the counts are aggregated
+        across every group gallery.
+        """
+        selected = len(self._collect_selected_row_ids())
+        visible  = len(self._collect_visible_row_ids())
+        if selected:
+            text = f"{selected} of {visible} selected"
+        else:
+            text = f"{visible} items"
+        self._selection_label.setText(text)
 
     # ── Operators menu ────────────────────────────────────────────────
 
@@ -236,6 +326,35 @@ class MainWindow(QMainWindow):
             empty.setEnabled(False)
             self._operators_menu.addAction(empty)
 
+    # ── Visible-columns selector ──────────────────────────────────────
+
+    def _refresh_columns_combo(self) -> None:
+        """
+        Repopulates the visible-columns combo from the controller.
+
+        Lists every visual column (those that render as tiles), checking
+        the ones in the controller's current visible-column selection.
+        Repopulating does not fire selection_changed, so it never loops
+        back into _apply_visible_columns.
+        """
+        self._columns_combo.set_items(
+            self._controller.get_visual_column_names(),
+            checked=self._controller.get_visible_columns(),
+        )
+
+    def _apply_visible_columns(self, column_names: list[str]) -> None:
+        """
+        Pushes the chosen visible columns to every gallery and records
+        them on the controller.
+
+        Galleries are updated first so that the gallery refresh the
+        controller triggers re-lays out with the new columns already in
+        place.
+        """
+        for gallery in self._galleries:
+            gallery.set_visible_columns(column_names)
+        self._controller.set_visible_columns(column_names)
+
     # ── Operator run handlers ─────────────────────────────────────────
 
     def _show_scope_and_params_dialog(
@@ -252,8 +371,8 @@ class MainWindow(QMainWindow):
         Returns:
             List of row_ids to run on, or None if cancelled.
         """
-        selected_ids = self._main_gallery.get_selected_row_ids()
-        visible_ids  = self._main_gallery._row_ids
+        selected_ids = self._collect_selected_row_ids()
+        visible_ids  = self._collect_visible_row_ids()
         all_ids      = list(
             self._controller._dataset.get_table(
                 self._controller._active_table
@@ -278,7 +397,13 @@ class MainWindow(QMainWindow):
         # Step 2: operator parameter dialog (if the operator has one).
         operator = self._controller._op_registry.get(operator_name)
         if operator is not None:
-            param_dialog = operator.get_parameters_dialog(parent=self)
+            df = self._controller._dataset.get_table(
+                self._controller._active_table
+            )
+            param_dialog = operator.get_parameters_dialog(
+                parent=self,
+                columns=list(df.columns),
+            )
             if param_dialog is not None:
                 if param_dialog.exec() == 0:
                     return None
@@ -338,6 +463,7 @@ class MainWindow(QMainWindow):
         ctrl.grouped_gallery_updated.connect(self._on_grouped_gallery_updated)
         ctrl.columns_updated.connect(self._on_columns_updated)
         ctrl.tables_updated.connect(self._on_tables_updated)
+        ctrl.active_table_changed.connect(self._on_active_table_changed)
         ctrl.thumbnail_ready.connect(self._on_thumbnail_ready)
         ctrl.row_updated.connect(self._on_row_updated)
         ctrl.row_selected.connect(self._on_row_selected)
@@ -355,6 +481,9 @@ class MainWindow(QMainWindow):
         self._filter_panel.tile_size_changed.connect(
             self._on_tile_size_changed
         )
+        self._filter_panel.group_height_changed.connect(
+            self._on_group_height_changed
+        )
         self._filter_panel.randomise_clicked.connect(
             lambda: ctrl.set_filters(
                 self._filter_panel.get_active_filters(),
@@ -365,76 +494,195 @@ class MainWindow(QMainWindow):
 
         # Gallery -> Controller
         self._main_gallery.selection_changed.connect(
-            self._stats_panel_removed_placeholder
+            self._on_selection_changed
         )
         self._main_gallery.tile_double_clicked.connect(
             self._on_tile_double_clicked
         )
 
-    def _on_tile_double_clicked(self, clicked_ids: list[str]) -> None:
+    def _on_tile_double_clicked(
+        self, clicked_ids: list[str], gallery: GalleryWidget | None = None
+    ) -> None:
         """
         Handles tile double-click. When several tiles are currently
         selected and the double-clicked tile is one of them, opens the
         whole selection in the detail panel side-by-side. Otherwise
         opens just the double-clicked tile.
+
+        Args:
+            clicked_ids: row_ids of the double-clicked tile.
+            gallery:     The gallery that emitted the event. Defaults to
+                         the flat main gallery; per-group galleries pass
+                         themselves so selection is read from the right one.
         """
         if not clicked_ids:
             return
 
-        selected = self._main_gallery.get_selected_row_ids()
+        gallery  = gallery or self._main_gallery
+        selected = gallery.get_selected_row_ids()
         if len(selected) > 1 and clicked_ids[0] in selected:
             # Preserve gallery order so panels read left-to-right the
             # same way the tiles do.
             ordered = [
-                rid for rid in self._main_gallery._row_ids
+                rid for rid in gallery._row_ids
                 if rid in selected
             ]
             self._detail_widget.show_rows(ordered)
+            self._right_tabs.setCurrentWidget(self._detail_widget)
         else:
             # Single-item path goes through the controller so other
             # listeners (e.g. row_selected signal) still fire.
             self._controller.select_row(clicked_ids[0])
 
-    def _stats_panel_removed_placeholder(self, row_ids: list[str]) -> None:
+    def _on_selection_changed(self, row_ids: list[str]) -> None:
         """
-        Placeholder slot for the gallery selection_changed signal.
-        Previously connected to StatisticsPanel.update_selection().
-        StatisticsPanel has been removed — summary statistics are now
-        run explicitly via the Operators menu (SummaryStatsOperator)
-        and appear as a tab in ResultsPanel.
-
-        TODO (Student A): If you want selection count to show somewhere
-        in the UI (e.g. a status bar label), connect it here.
+        Updates the status bar when the gallery selection changes.
+        The row_ids argument is the new selection set; the actual count
+        is read back from the gallery so all sources of truth agree.
         """
-        pass  # Nothing to do — results panel is operator-driven.
+        self._refresh_status_bar()
 
     # ── Signal handlers ───────────────────────────────────────────────
 
     def _on_row_selected(self, metadata: dict) -> None:
-        """Shows the selected row in the detail panel."""
+        """
+        Shows the selected row in the detail panel and brings the Detail
+        tab forward. Picking a row is an explicit ask to see it; if the
+        Results tab is showing (e.g. after a create_display operator),
+        the user expects the Detail tab to take focus on their click.
+        """
         row_id = metadata.get("row_id")
         if row_id:
             self._detail_widget.show_rows([row_id])
+            self._right_tabs.setCurrentWidget(self._detail_widget)
 
     def _on_gallery_updated(self, row_ids: list[str]) -> None:
-        """Updates the main gallery with a new flat list of row_ids."""
+        """
+        Shows the flat view: a single gallery of all visible rows.
+
+        Tears down any per-group galleries left over from grouped mode
+        and points broadcasts back at the main gallery.
+        """
+        self._clear_grouped_galleries()
+        self._galleries = [self._main_gallery]
         self._main_gallery.set_row_ids(row_ids)
+        self._gallery_stack.setCurrentWidget(self._main_gallery)
+        self._refresh_status_bar()
 
     def _on_grouped_gallery_updated(self, grouped: dict) -> None:
         """
-        Updates the gallery area for grouped view.
-        Currently flattens all groups into one gallery.
-        TODO (Student A): Implement multiple synchronized galleries,
-        one per group, in a shared scroll area.
+        Shows the grouped view: one gallery per group value, stacked
+        vertically in the shared scroll area.
+
+        Args:
+            grouped: Maps each group value to its ordered list of row_ids.
         """
-        all_row_ids = []
-        for group_row_ids in grouped.values():
-            all_row_ids.extend(group_row_ids)
-        self._main_gallery.set_row_ids(all_row_ids)
+        self._rebuild_grouped_galleries(grouped)
+        self._gallery_stack.setCurrentWidget(self._grouped_scroll)
+        self._refresh_status_bar()
+
+    # ── Grouped-view construction ─────────────────────────────────────
+
+    def _rebuild_grouped_galleries(self, grouped: dict) -> None:
+        """
+        Replaces the grouped view's sections with one per group.
+
+        Updates self._galleries so thumbnail, row-update and tile-size
+        broadcasts reach every visible group gallery. Falls back to the
+        main gallery when there are no groups.
+        """
+        self._clear_grouped_galleries()
+
+        galleries: list[GalleryWidget] = []
+        for group_value, row_ids in grouped.items():
+            section, gallery = self._build_group_section(group_value, row_ids)
+            # Insert before the trailing stretch so sections stay top-aligned.
+            self._grouped_layout.insertWidget(
+                self._grouped_layout.count() - 1, section
+            )
+            gallery.set_row_ids(row_ids)
+            galleries.append(gallery)
+
+        self._galleries = galleries or [self._main_gallery]
+
+    def _build_group_section(
+        self, group_value, row_ids: list[str]
+    ) -> tuple[QWidget, GalleryWidget]:
+        """
+        Builds one grouped-view section: a header label plus a
+        bounded-height gallery for the group's rows.
+
+        Args:
+            group_value: The group's value (used in the header label).
+            row_ids:     The row_ids belonging to this group.
+
+        Returns:
+            (section_widget, gallery) — the gallery is returned so the
+            caller can register it for broadcasts and load its rows.
+        """
+        section = QWidget()
+        layout  = QVBoxLayout(section)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        header = QLabel(f"{group_value}  ({len(row_ids)})")
+        header.setStyleSheet("font-weight: bold; padding: 2px 4px;")
+        layout.addWidget(header)
+
+        gallery = GalleryWidget(self._controller)
+        gallery.setFixedHeight(self._group_gallery_height)
+        # Match the flat gallery's current display settings.
+        gallery.set_visible_columns(self._controller.get_visible_columns())
+        gallery.set_tile_size(self._tile_size)
+        gallery.tile_double_clicked.connect(
+            lambda ids, g=gallery: self._on_tile_double_clicked(ids, g)
+        )
+        gallery.selection_changed.connect(self._on_selection_changed)
+        layout.addWidget(gallery)
+
+        return section, gallery
+
+    def _clear_grouped_galleries(self) -> None:
+        """Removes all group sections, leaving the trailing stretch."""
+        while self._grouped_layout.count() > 1:
+            item   = self._grouped_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def _collect_selected_row_ids(self) -> list[str]:
+        """
+        Returns the selected row_ids across every live gallery, in
+        order and de-duplicated. In flat mode this is just the main
+        gallery; in grouped mode it spans all group galleries.
+        """
+        return self._collect_row_ids(
+            lambda g: g.get_selected_row_ids()
+        )
+
+    def _collect_visible_row_ids(self) -> list[str]:
+        """
+        Returns the visible row_ids across every live gallery, in order
+        and de-duplicated (used as the 'visible' operator scope).
+        """
+        return self._collect_row_ids(lambda g: g._row_ids)
+
+    def _collect_row_ids(self, getter) -> list[str]:
+        """Flattens getter(gallery) over self._galleries, keeping order
+        and dropping duplicates."""
+        result: list[str] = []
+        seen: set[str] = set()
+        for gallery in self._galleries:
+            for row_id in getter(gallery):
+                if row_id not in seen:
+                    seen.add(row_id)
+                    result.append(row_id)
+        return result
 
     def _on_columns_updated(self, column_names: list[str]) -> None:
-        """Refreshes filter panel when columns change."""
+        """Refreshes filter panel and columns combo when columns change."""
         self._filter_panel.refresh_columns(column_names)
+        self._refresh_columns_combo()
 
     def _on_tables_updated(self, table_names: list[str]) -> None:
         """Updates the table selector combo when tables change."""
@@ -444,6 +692,16 @@ class MainWindow(QMainWindow):
         for name in table_names:
             self._table_combo.addItem(name)
         idx = self._table_combo.findText(current)
+        if idx >= 0:
+            self._table_combo.setCurrentIndex(idx)
+        self._table_combo.blockSignals(False)
+
+    def _on_active_table_changed(self, name: str) -> None:
+        """Keeps the table combo in sync with the controller's active table."""
+        if self._table_combo.currentText() == name:
+            return
+        self._table_combo.blockSignals(True)
+        idx = self._table_combo.findText(name)
         if idx >= 0:
             self._table_combo.setCurrentIndex(idx)
         self._table_combo.blockSignals(False)
@@ -460,8 +718,20 @@ class MainWindow(QMainWindow):
 
     def _on_tile_size_changed(self, size: int) -> None:
         """Updates tile size across all galleries."""
+        self._tile_size = size
         for gallery in self._galleries:
             gallery.set_tile_size(size)
+
+    def _on_group_height_changed(self, height: int) -> None:
+        """
+        Updates the per-group gallery height. Applies live to the
+        currently displayed grouped sections and is remembered so that
+        sections built later use the same height.
+        """
+        self._group_gallery_height = height
+        if self._gallery_stack.currentWidget() is self._grouped_scroll:
+            for gallery in self._galleries:
+                gallery.setFixedHeight(height)
 
     def _on_display_result(self, result: dict) -> None:
         """
@@ -470,9 +740,7 @@ class MainWindow(QMainWindow):
         """
         self._results_panel.show_result(result)
         # Switch to the Results tab so the researcher sees it immediately.
-        right_tabs = self._results_panel.parent()
-        if hasattr(right_tabs, 'indexOf'):
-            right_tabs.setCurrentWidget(self._results_panel)
+        self._right_tabs.setCurrentWidget(self._results_panel)
 
     def _on_operator_complete(self, operator_name: str) -> None:
         """Called when any operator finishes."""

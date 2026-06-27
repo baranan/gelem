@@ -56,6 +56,7 @@ class AppController(QObject):
     row_selected             = Signal(dict)
     columns_updated          = Signal(list)
     tables_updated           = Signal(list)
+    active_table_changed     = Signal(str)
     thumbnail_ready          = Signal(str)
     row_updated              = Signal(str)
     operator_progress        = Signal(int)
@@ -205,6 +206,11 @@ class AppController(QObject):
     ) -> None:
         self._complete_queue.append(("create_display", (operator_name, result)))
 
+    def _on_operator_error(self, operator_name: str, message: str) -> None:
+        """Background-thread callback for operator errors. Marshals
+        the error onto the main thread via _complete_queue."""
+        self._complete_queue.append(("error", (operator_name, message)))
+
     def _on_operator_complete(self, mode: str, payload) -> None:
         """
         Called on the main thread when any operator finishes.
@@ -221,6 +227,14 @@ class AppController(QObject):
             table_name = f"{operator_name}_result"
             try:
                 self._dataset.create_table_from_df(table_name, result_df)
+                stored_df = self._dataset.get_table(table_name)
+                for _, row in stored_df.iterrows():
+                    full_path = row.get("full_path", "")
+                    if full_path and Path(str(full_path)).exists():
+                        self._store.request_thumbnail(
+                            row["row_id"],
+                            Path(str(full_path)),
+                        )
                 self.tables_updated.emit(self._dataset.list_tables())
                 self.table_created.emit(table_name)
                 self.operator_complete.emit(operator_name)
@@ -233,6 +247,11 @@ class AppController(QObject):
             operator_name, result = payload
             result["operator_name"] = operator_name
             self.display_result_ready.emit(result)
+            self.operator_complete.emit(operator_name)
+
+        elif mode == "error":
+            operator_name, message = payload
+            self.error_occurred.emit(message)
             self.operator_complete.emit(operator_name)
 
     # ── Gallery refresh ───────────────────────────────────────────────
@@ -499,6 +518,7 @@ class AppController(QObject):
                 selected_df,
                 group_by,
                 on_complete=self._on_create_table_complete,
+                on_error=self._on_operator_error,
             )
         except Exception as e:
             self.error_occurred.emit(
@@ -525,6 +545,7 @@ class AppController(QObject):
                 operator_name,
                 selected_df,
                 on_complete=self._on_create_display_complete,
+                on_error=self._on_operator_error,
             )
         except Exception as e:
             self.error_occurred.emit(
@@ -592,6 +613,7 @@ class AppController(QObject):
             self._active_filters = []
             self._group_by       = None
             self._visible_cols   = []
+            self.active_table_changed.emit(name)
             self.columns_updated.emit(self._registry.list_all_columns())
             self._refresh_gallery()
         except KeyError as e:
@@ -709,17 +731,20 @@ class AppController(QObject):
         """
         return self._store.get_pixmap(row_id, artifact_type)
 
-    def get_row(self, row_id: str, table_name: str = "frames") -> dict:
+    def get_row(self, row_id: str, table_name: str | None = None) -> dict:
         """
         Returns all column values for one row as a plain dictionary.
 
         Args:
             row_id:     The row to retrieve.
-            table_name: The table containing the row (default: 'frames').
+            table_name: The table containing the row. Defaults to the
+                        currently active table.
 
         Returns:
             Dict of column name to value. Empty dict if not found.
         """
+        if table_name is None:
+            table_name = self._active_table
         return self._dataset.get_row(row_id, table_name)
 
     def render_column_value(
@@ -752,3 +777,49 @@ class AppController(QObject):
             A QPixmap (thumbnail mode), QWidget (detail mode), or None.
         """
         return self._registry.render(column_name, value, size, mode, context)
+
+    def get_column_type(self, column_name: str):
+        """
+        Returns the column-type object registered for *column_name*.
+
+        Gives the UI read access to column type metadata without reaching
+        into _registry directly.
+
+        Args:
+            column_name: The column whose type to look up.
+
+        Returns:
+            The registered column-type object, or None if not found.
+        """
+        return self._registry.get(column_name)
+
+    def get_all_row_ids(self, table_name: str | None = None) -> list[str]:
+        """
+        Returns every row_id in the active table (or *table_name* if given).
+
+        Provides a clean accessor so the UI does not need to reach into
+        _dataset directly.
+
+        Args:
+            table_name: Table to read from.  Defaults to the active table.
+
+        Returns:
+            Ordered list of row_id strings.
+        """
+        name = table_name if table_name is not None else self._active_table
+        return list(self._dataset.get_table(name)["row_id"])
+
+    def get_operator(self, operator_name: str):
+        """
+        Returns the operator registered under *operator_name*.
+
+        Gives the UI access to operator objects without reaching into
+        _op_registry directly.
+
+        Args:
+            operator_name: Name of the operator to retrieve.
+
+        Returns:
+            The operator object, or None if not found.
+        """
+        return self._op_registry.get(operator_name)

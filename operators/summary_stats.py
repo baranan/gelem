@@ -48,7 +48,7 @@ class SummaryStatsOperator(BaseOperator):
         Computes summary statistics for the rows in df.
 
         Args:
-            df: The selected rows as a DataFrame. Read-only.
+            df: The selected rows as a DataFrame. Treated as read-only.
 
         Returns:
             Dict with keys:
@@ -59,27 +59,11 @@ class SummaryStatsOperator(BaseOperator):
                                  where stats are mean, sd, min,
                                  max, median, n.
 
-        TODO (Student C): Implement this method.
-
-        Suggested approach:
-            1. Determine which columns to analyse:
-               - If self._columns is set, use those.
-               - Otherwise use df.select_dtypes(include='number').columns
-               - Exclude 'row_id' from numeric columns.
-            2. For each column:
-               values = df[col].dropna()
-               if len(values) == 0: skip
-               summary[col] = {
-                   'mean':   float(values.mean()),
-                   'sd':     float(values.std()),
-                   'min':    float(values.min()),
-                   'max':    float(values.max()),
-                   'median': float(values.median()),
-                   'n':      int(len(values)),
-               }
-            3. Return the result dict.
+        Notes:
+            - Sample SD is computed with ddof=1 (matches JASP/SPSS).
+            - Works on a defensive copy of df; the input is never mutated.
         """
-        # PLACEHOLDER: returns empty summary.
+        df = df.copy()
         try:
             if self._columns:
                 numeric_cols = [
@@ -102,17 +86,13 @@ class SummaryStatsOperator(BaseOperator):
                     continue
                 summary[col] = {
                     "mean":   float(values.mean()),
-                    "sd":     float(values.std()),
+                    "sd":     float(values.std(ddof=1)),
                     "min":    float(values.min()),
                     "max":    float(values.max()),
                     "median": float(values.median()),
                     "n":      int(len(values)),
                 }
 
-            print(
-                f"[SummaryStatsOperator] Computed stats for "
-                f"{len(summary)} columns across {len(df)} rows"
-            )
             return {
                 "operator_name": "summary_stats",
                 "n_rows":        len(df),

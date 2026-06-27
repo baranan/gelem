@@ -45,7 +45,7 @@ class PlotAdvancedOperator(BaseOperator):
     # Operators menu under "Display results for selection".
     create_display_label = "Plot (interactive, Plotly)"
 
-    def get_parameters_dialog(self):
+    def get_parameters_dialog(self, parent=None, columns=None):
         """Show a dialog and store the researcher's choices as instance attributes.
 
         Collect:
@@ -57,6 +57,8 @@ class PlotAdvancedOperator(BaseOperator):
             self._aggregate   -- one of: none | count | sum | mean | median
 
         Notes for the dialog:
+        - Populate the x/y/color/facet dropdowns from the `columns` argument
+          supplied by MainWindow.
         - Disable the aggregate control when chart_type is "box" or "violin"
           (those chart types always use every row).
         - Offer count / sum / mean for histogram (no median -- Plotly does not
