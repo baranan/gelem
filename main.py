@@ -62,6 +62,7 @@ def create_app(fake_data: bool = False):
     from operators.summary_stats import SummaryStatsOperator
     from operators.plot_advanced import PlotAdvancedOperator
     from operators.stats_operator import StatsOperator
+    from operators.video_frames import VideoFramesOperator
     from controller import AppController
 
     artifacts_dir = Path(tempfile.gettempdir()) / "gelem_artifacts"
@@ -71,6 +72,14 @@ def create_app(fake_data: bool = False):
     #     artifacts_dir = project_path / "artifacts"
     # This ensures thumbnails are preserved when a project is saved and
     # reopened. The temp folder is only appropriate during development.
+
+    project_root = Path(__file__).resolve().parent
+    frames_dir = project_root / "gelem_project" / "frames"
+    # TODO: Same migration as artifacts_dir above — once Dataset.save()
+    # / load() define a real project folder, point frames_dir at it:
+    #     frames_dir = project_path / "frames"
+    # TODO (OPTIONAL): let the researcher pick a custom destination per
+    # extraction via a folder picker in the parameter dialog.
 
     dataset           = Dataset()
     query_engine      = QueryEngine()
@@ -88,6 +97,7 @@ def create_app(fake_data: bool = False):
     operator_registry.register(SummaryStatsOperator())
     operator_registry.register(PlotAdvancedOperator())
     operator_registry.register(StatsOperator())
+    operator_registry.register(VideoFramesOperator(output_dir=frames_dir))
 
     controller = AppController(
         dataset=dataset,

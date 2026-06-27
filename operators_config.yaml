@@ -29,3 +29,7 @@ operators:
   summary_stats:
     enabled: true
     description: "Computes descriptive statistics over a selection of rows."
+
+  video_frames:
+    enabled: true
+    description: "Extracts frames from videos into a frame-level table."

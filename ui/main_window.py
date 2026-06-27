@@ -129,6 +129,7 @@ class MainWindow(QMainWindow):
         # reflects the currently registered operators.
         self._operators_menu = menubar.addMenu("Operators")
         self._operators_menu.aboutToShow.connect(self._refresh_operators_menu)
+        self._operators_menu.addAction("(loading…)")  # macOS: empty menus don't render
 
     def _build_toolbar(self) -> None:
         """Creates the toolbar with table selector."""
@@ -396,7 +397,13 @@ class MainWindow(QMainWindow):
         # Step 2: operator parameter dialog (if the operator has one).
         operator = self._controller._op_registry.get(operator_name)
         if operator is not None:
-            param_dialog = operator.get_parameters_dialog(parent=self)
+            df = self._controller._dataset.get_table(
+                self._controller._active_table
+            )
+            param_dialog = operator.get_parameters_dialog(
+                parent=self,
+                columns=list(df.columns),
+            )
             if param_dialog is not None:
                 if param_dialog.exec() == 0:
                     return None
@@ -456,6 +463,7 @@ class MainWindow(QMainWindow):
         ctrl.grouped_gallery_updated.connect(self._on_grouped_gallery_updated)
         ctrl.columns_updated.connect(self._on_columns_updated)
         ctrl.tables_updated.connect(self._on_tables_updated)
+        ctrl.active_table_changed.connect(self._on_active_table_changed)
         ctrl.thumbnail_ready.connect(self._on_thumbnail_ready)
         ctrl.row_updated.connect(self._on_row_updated)
         ctrl.row_selected.connect(self._on_row_selected)
@@ -684,6 +692,16 @@ class MainWindow(QMainWindow):
         for name in table_names:
             self._table_combo.addItem(name)
         idx = self._table_combo.findText(current)
+        if idx >= 0:
+            self._table_combo.setCurrentIndex(idx)
+        self._table_combo.blockSignals(False)
+
+    def _on_active_table_changed(self, name: str) -> None:
+        """Keeps the table combo in sync with the controller's active table."""
+        if self._table_combo.currentText() == name:
+            return
+        self._table_combo.blockSignals(True)
+        idx = self._table_combo.findText(name)
         if idx >= 0:
             self._table_combo.setCurrentIndex(idx)
         self._table_combo.blockSignals(False)
