@@ -45,9 +45,12 @@ class VideoFramesOperator(BaseOperator):
     requires_image = False
 
     def __init__(self, output_dir: Path | None = None):
-        import tempfile
+        # Default to a project-relative folder, not the system Temp
+        # directory. Temp wasn't durable (Disk Cleanup / Storage Sense
+        # could wipe saved frame paths) and accumulated leftovers
+        # across runs. main.py passes an explicit output_dir.
         self._output_dir = output_dir or (
-            Path(tempfile.gettempdir()) / "gelem_video_frames"
+            Path.cwd() / "gelem_project" / "frames"
         )
         self._output_dir.mkdir(parents=True, exist_ok=True)
         self._video_column: str = "full_path"
