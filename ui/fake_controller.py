@@ -39,6 +39,7 @@ class FakeController(QObject):
     row_selected             = Signal(dict)
     columns_updated          = Signal(list)
     tables_updated           = Signal(list)
+    active_table_changed     = Signal(str)
     thumbnail_ready          = Signal(str)
     row_updated              = Signal(str)
     operator_progress        = Signal(int)
@@ -349,6 +350,41 @@ class FakeController(QObject):
     def get_row(self, row_id: str, _table_name: str = "frames") -> dict:
         return self._metadata.get(row_id, {"row_id": row_id})
 
+# ── Accessors added to mirror AppController's public contract ─────
+    # These three were added to the real controller by the
+    # "add-controller-public-methods" PR. The fake must expose them too,
+    # or any UI widget that calls them will crash only in fake-data mode.
+
+    def get_all_row_ids(self, table_name: str | None = None) -> list[str]:
+        """
+        Returns every row_id in the fake's single table.
+
+        The real controller looks up *table_name* in the dataset; the fake
+        has only one table of generated rows, so it returns those row_ids
+        regardless of which table name is asked for.
+        """
+        # The fake holds all its rows in self._row_ids (built in __init__).
+        return list(self._row_ids)
+
+    def get_column_type(self, column_name: str):
+        """
+        Returns the column-type object for *column_name*.
+
+        The fake has no ColumnTypeRegistry, so it returns None -- which is
+        exactly what the real controller returns for an unregistered column.
+        UI code already has to handle the None case, so this stays safe.
+        """
+        return None
+
+    def get_operator(self, operator_name: str):
+        """
+        Returns the operator registered under *operator_name*.
+
+        The fake has no OperatorRegistry, so it returns None -- matching the
+        real controller's behaviour when an operator name is not found.
+        """
+        return None
+    
     def get_artifact_pixmap(self, row_id: str, artifact_type: str):
         if artifact_type == "thumbnail":
             return self._thumb_cache.get(row_id, None)
