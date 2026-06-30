@@ -300,6 +300,22 @@ class FakeController(QObject):
                 "bs_mouthSmileLeft": {"mean": 0.31, "sd": 0.08, "min": 0.0, "max": 0.6, "median": 0.30},
             }
         }
+
+        # Only the interactive plot operator returns an html_path in reality.
+        # Gate the fake html_path on the operator name so the button does not
+        # wrongly appear for summary_stats or mean_face results.
+        if operator_name == "plot_advanced":
+            # Write a tiny standalone HTML file to the temp folder. as_uri()
+            # needs an ABSOLUTE path (tempfile.gettempdir() gives one), and the
+            # file must exist for the browser to open it rather than 404.
+            html_result_path = Path(tempfile.gettempdir()) / "fake_plot.html"
+            html_result_path.write_text(
+                "<html><body><h2>Fake interactive plot (--fake-data mode)</h2>"
+                "<p>Stands in for a Plotly HTML file.</p></body></html>",
+                encoding="utf-8",
+            )
+            result["html_path"] = str(html_result_path) 
+
         QTimer.singleShot(500, lambda: self.display_result_ready.emit(result))
 
     def add_computed_column(self, name: str, expression: str,
