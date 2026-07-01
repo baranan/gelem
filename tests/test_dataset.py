@@ -949,6 +949,397 @@ run_test("save() creates frames.parquet", test_save_creates_parquet)
 run_test("save/load roundtrip preserves row count", test_save_load_roundtrip)
 run_test("save/load preserves custom values", test_save_load_preserves_values)
 
+# --- MANUALLY ADDED (Student B): Stage 10 thorough edge-case tests. -----
+# Existing tests above are unchanged.
+
+def test_load_missing_project_raises_clear_error():
+    # A path that doesn't exist must fail loudly (no silent empty load).
+    from models.dataset import Dataset
+    ds = Dataset()
+    try:
+        ds.load(Path("definitely_does_not_exist_xyz_42"))
+        assert False, "expected FileNotFoundError on missing project folder"
+    except FileNotFoundError as e:
+        assert "definitely_does_not_exist_xyz_42" in str(e), (
+            f"error should name the missing folder; got: {e}"
+        )
+
+def test_load_empty_folder_raises_clear_error():
+    # Folder exists but has no parquet files -> still loud fail.
+    from models.dataset import Dataset
+    ds = Dataset()
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            ds.load(Path(d))
+            assert False, "expected FileNotFoundError on empty folder"
+        except FileNotFoundError as e:
+            msg = str(e).lower()
+            assert "parquet" in msg or "tables" in msg, (
+                f"error should mention missing tables/parquet; got: {e}"
+            )
+
+def test_load_replaces_existing_state():
+    # "Open project" semantics: loading a project clears any prior in-memory
+    # state. Guards the reset step that load() shares with load_folder /
+    # load_csv_as_primary.
+    from models.dataset import Dataset
+    with tempfile.TemporaryDirectory() as d:
+        project = Path(d)
+        ds_a = Dataset()
+        ds_a.load_folder(TEST_IMAGES)
+        ds_a.save(project)
+        ds_b = Dataset()
+        ds_b.load_folder(TEST_IMAGES)
+        ds_b._tables["extra"] = pd.DataFrame({"row_id": ["999999"], "x": [1]})
+        ds_b.load(project)
+        assert "extra" not in ds_b._tables, (
+            "load should clear stale tables not in the saved project"
+        )
+        assert "frames" in ds_b._tables, "loaded project should restore frames"
+        assert len(ds_b.get_table("frames")) == len(ds_a.get_table("frames")), (
+            "frames row count after load should match the saved project"
+        )
+
+def test_save_load_preserves_id_counter():
+    # _id_counter must be restored so the next _next_id() doesn't collide
+    # with already-existing row_ids.
+    from models.dataset import Dataset
+    with tempfile.TemporaryDirectory() as d:
+        project = Path(d)
+        ds = Dataset()
+        ds.load_folder(TEST_IMAGES)
+        ds.save(project)
+        ds2 = Dataset()
+        ds2.load(project)
+        assert ds2._id_counter == ds._id_counter, (
+            f"_id_counter should be restored; before={ds._id_counter}, "
+            f"after={ds2._id_counter}"
+        )
+        existing_ids = set(ds2.get_table("frames")["row_id"])
+        new_id = ds2._next_id()
+        assert new_id not in existing_ids, (
+            f"newly generated id '{new_id}' collides with an existing row_id"
+        )
+
+def test_save_load_preserves_multiple_tables():
+    # A project with more than one table should round-trip both.
+    from models.dataset import Dataset
+    with tempfile.TemporaryDirectory() as d:
+        project = Path(d)
+        ds = Dataset()
+        ds.load_folder(TEST_IMAGES)
+        ds._tables["extra"] = pd.DataFrame({
+            "row_id": ["100001", "100002"],
+            "value":  [10.0, 20.0],
+        })
+        ds.save(project)
+        ds2 = Dataset()
+        ds2.load(project)
+        assert "frames" in ds2._tables, "frames must be restored"
+        assert "extra"  in ds2._tables, "secondary table must be restored"
+        assert len(ds2.get_table("extra")) == 2, (
+            f"extra table should have 2 rows, got {len(ds2.get_table('extra'))}"
+        )
+
+def test_save_load_full_path_roundtrips():
+    # full_path values must come back identical (external-images case).
+    from models.dataset import Dataset
+    with tempfile.TemporaryDirectory() as d:
+        project = Path(d)
+        ds = Dataset()
+        ds.load_folder(TEST_IMAGES)
+        before = list(ds.get_table("frames")["full_path"])
+        ds.save(project)
+        ds2 = Dataset()
+        ds2.load(project)
+        after = list(ds2.get_table("frames")["full_path"])
+        assert before == after, (
+            f"full_path values should round-trip identically; "
+            f"before sample={before[:2]}, after sample={after[:2]}"
+        )
+
+def test_save_uses_relative_path_when_images_inside_project():
+    # When images live INSIDE project_path, save stores relative paths and
+    # load restores absolute ones. Proves the "where possible" transform
+    # actually fires; current external-images tests above never exercise it.
+    from models.dataset import Dataset
+    with tempfile.TemporaryDirectory() as d:
+        project     = Path(d) / "proj"
+        images_dir  = project / "images"
+        images_dir.mkdir(parents=True)
+        img1 = images_dir / "001.jpg"; img1.touch()
+        img2 = images_dir / "002.jpg"; img2.touch()
+        ds = Dataset()
+        ds._tables["frames"] = pd.DataFrame({
+            "row_id":    ["000001", "000002"],
+            "full_path": [str(img1), str(img2)],
+            "file_name": ["001.jpg", "002.jpg"],
+        })
+        ds.save(project)
+        # The stored parquet should contain RELATIVE paths.
+        stored = list(pd.read_parquet(project / "frames.parquet")["full_path"])
+        assert all(not Path(p).is_absolute() for p in stored), (
+            f"paths inside project should be stored relative; got {stored}"
+        )
+        assert all("\\" not in p for p in stored), (
+            f"stored relative paths should use POSIX separators ('/'); got {stored}"
+        )
+        # And load should restore them to the originals.
+        ds2 = Dataset()
+        ds2.load(project)
+        loaded = list(ds2.get_table("frames")["full_path"])
+        assert loaded == [str(img1), str(img2)], (
+            f"loaded paths should match the originals; got {loaded}"
+        )
+
+def test_save_load_preserves_provenance():
+    # The history log survives save/load; load() records itself as the
+    # last entry on the way back in.
+    from models.dataset import Dataset
+    with tempfile.TemporaryDirectory() as d:
+        project = Path(d)
+        ds = Dataset()
+        ds.load_folder(TEST_IMAGES)
+        actions_before = [e["action"] for e in ds.provenance.to_list()]
+        assert "load_folder" in actions_before, (
+            "sanity: load_folder should be in the log before save"
+        )
+        ds.save(project)
+        ds2 = Dataset()
+        ds2.load(project)
+        actions_after = [e["action"] for e in ds2.provenance.to_list()]
+        assert "load_folder" in actions_after, (
+            f"provenance should preserve load_folder entry; got {actions_after}"
+        )
+        assert actions_after[-1] == "load", (
+            f"load() should record itself as the last entry; got {actions_after}"
+        )
+
+def test_save_load_re_registers_column_types():
+    # After load, the registry knows about the loaded columns so the gallery
+    # can render them (per the guide's "re-register column types" step).
+    from models.dataset import Dataset
+    from column_types.registry import ColumnTypeRegistry
+    from artifacts.artifact_store import ArtifactStore
+
+    with tempfile.TemporaryDirectory() as d:
+        root      = Path(d)
+        store     = ArtifactStore(root / "artifacts")
+        registry  = ColumnTypeRegistry()
+        registry.setup_defaults(store)
+        ds = Dataset()
+        ds.set_registry(registry)
+        ds.load_folder(TEST_IMAGES)
+        project = root / "project"
+        ds.save(project)
+
+        registry2 = ColumnTypeRegistry()
+        registry2.setup_defaults(store)
+        ds2 = Dataset()
+        ds2.set_registry(registry2)
+        ds2.load(project)
+        full_path_type = registry2.get("full_path")
+        assert full_path_type is not None, (
+            "full_path should be re-registered after load"
+        )
+        assert full_path_type.tag == "media_path", (
+            f"full_path should be registered as 'media_path'; "
+            f"got '{full_path_type.tag}'"
+        )
+        file_name_type = registry2.get("file_name")
+        assert file_name_type is None or file_name_type.tag != "media_path", (
+            f"file_name should not be tagged 'media_path'; got "
+            f"'{file_name_type.tag if file_name_type else None}'"
+        )
+
+run_test("load(): missing project folder raises clear error", test_load_missing_project_raises_clear_error)
+run_test("load(): empty folder raises clear error",           test_load_empty_folder_raises_clear_error)
+run_test("load(): replaces existing in-memory state",         test_load_replaces_existing_state)
+run_test("save/load preserves _id_counter (no collision)",    test_save_load_preserves_id_counter)
+run_test("save/load preserves multiple tables",               test_save_load_preserves_multiple_tables)
+run_test("save/load full_path round-trips identically",       test_save_load_full_path_roundtrips)
+run_test("save uses relative path when images inside project", test_save_uses_relative_path_when_images_inside_project)
+run_test("save/load preserves provenance log",                test_save_load_preserves_provenance)
+run_test("save/load re-registers column types",               test_save_load_re_registers_column_types)
+
+def test_save_load_relative_source_path_resolves_correctly():
+    # Locks finding #1: a relative full_path (e.g. from load_folder called
+    # with a relative folder) must still resolve to the same file on disk
+    # after save+load — not get re-rooted inside project_path.
+    from models.dataset import Dataset
+    with tempfile.TemporaryDirectory() as d:
+        project = Path(d)
+        rel_path = "test_images/001.jpg"
+        ds = Dataset()
+        ds._tables["frames"] = pd.DataFrame({
+            "row_id":    ["000001"],
+            "full_path": [rel_path],
+            "file_name": ["001.jpg"],
+        })
+        ds.save(project)
+        ds2 = Dataset()
+        ds2.load(project)
+        loaded = ds2.get_table("frames")["full_path"].iloc[0]
+        assert Path(loaded).resolve() == Path(rel_path).resolve(), (
+            f"round-trip should preserve target file; got {loaded}, "
+            f"expected to resolve to {Path(rel_path).resolve()}"
+        )
+
+run_test("save/load: relative source path resolves correctly", test_save_load_relative_source_path_resolves_correctly)
+
+def test_save_load_relativizes_all_media_path_columns():
+    # Locks finding #4: any column the registry tags as media_path gets
+    # relativized on save and restored on load — not only full_path.
+    from models.dataset import Dataset
+    from column_types.registry import ColumnTypeRegistry
+    from artifacts.artifact_store import ArtifactStore
+    with tempfile.TemporaryDirectory() as d:
+        project = Path(d) / "proj"
+        avatars = project / "avatars"
+        avatars.mkdir(parents=True)
+        avatar_file = avatars / "av1.jpg"
+        avatar_file.touch()
+
+        store    = ArtifactStore(Path(d) / "artifacts")
+        registry = ColumnTypeRegistry()
+        registry.setup_defaults(store)
+        ds = Dataset()
+        ds.set_registry(registry)
+        ds._tables["frames"] = pd.DataFrame({
+            "row_id":      ["000001"],
+            "avatar_path": [str(avatar_file)],
+        })
+        registry.register_by_tag("avatar_path", "media_path")
+        ds.save(project)
+
+        # Stored avatar_path must be relative (registry tagged it media_path).
+        stored = pd.read_parquet(project / "frames.parquet")["avatar_path"].iloc[0]
+        assert not Path(stored).is_absolute(), (
+            f"avatar_path (registered as media_path) should be stored relative; got {stored}"
+        )
+
+        # Load must restore avatar_path back to absolute.
+        registry2 = ColumnTypeRegistry()
+        registry2.setup_defaults(store)
+        ds2 = Dataset()
+        ds2.set_registry(registry2)
+        ds2.load(project)
+        loaded = ds2.get_table("frames")["avatar_path"].iloc[0]
+        assert loaded == str(avatar_file), (
+            f"avatar_path should resolve back to original absolute; got {loaded}"
+        )
+
+run_test("save/load relativizes all media_path columns", test_save_load_relativizes_all_media_path_columns)
+
+def test_load_without_sidecar_still_registers_full_path():
+    # Locks round-2 finding #1: a project saved without a registry has no
+    # column_types.json. Load must still register full_path as media_path
+    # (mirror load_folder's default) so the gallery renders thumbnails.
+    from models.dataset import Dataset
+    from column_types.registry import ColumnTypeRegistry
+    from artifacts.artifact_store import ArtifactStore
+    with tempfile.TemporaryDirectory() as d:
+        project = Path(d) / "proj"
+        # Save WITHOUT a registry -> no sidecar gets written.
+        ds = Dataset()
+        ds.load_folder(TEST_IMAGES)
+        ds.save(project)
+        assert not (project / "column_types.json").exists(), (
+            "sanity: this test relies on no sidecar being written"
+        )
+        # Now load WITH a registry attached.
+        store    = ArtifactStore(Path(d) / "artifacts")
+        registry = ColumnTypeRegistry()
+        registry.setup_defaults(store)
+        ds2 = Dataset()
+        ds2.set_registry(registry)
+        ds2.load(project)
+        ct = registry.get("full_path")
+        assert ct is not None and ct.tag == "media_path", (
+            f"full_path should fall back to media_path when sidecar is missing; "
+            f"got tag={ct.tag if ct else None}"
+        )
+
+def test_load_unknown_tag_does_not_crash():
+    # Locks round-2 finding #2: an unknown tag in column_types.json (e.g.
+    # a custom type from an operator not available in this build) must
+    # not sink the load — that one column stays unregistered, the rest
+    # still register normally.
+    import json as _json
+    from models.dataset import Dataset
+    from column_types.registry import ColumnTypeRegistry
+    from artifacts.artifact_store import ArtifactStore
+    with tempfile.TemporaryDirectory() as d:
+        project = Path(d) / "proj"
+        store    = ArtifactStore(Path(d) / "artifacts")
+        registry = ColumnTypeRegistry()
+        registry.setup_defaults(store)
+        ds = Dataset()
+        ds.set_registry(registry)
+        ds.load_folder(TEST_IMAGES)
+        ds.save(project)
+        # Hand-edit the sidecar to inject an unknown tag.
+        ct_path = project / "column_types.json"
+        column_types = _json.loads(ct_path.read_text())
+        column_types["mystery_col"] = "totally_unknown_tag"
+        ct_path.write_text(_json.dumps(column_types))
+        # Load should not crash.
+        registry2 = ColumnTypeRegistry()
+        registry2.setup_defaults(store)
+        ds2 = Dataset()
+        ds2.set_registry(registry2)
+        ds2.load(project)
+        assert registry2.get("full_path") is not None, (
+            "known tags should still register despite an unknown tag in the sidecar"
+        )
+
+def test_save_load_realistic_merge_roundtrip():
+    # End-to-end real-research scenario: load_folder + merge_csv + save +
+    # load, with a registry attached. Asserts non-media column types
+    # (numeric, text) also round-trip via the sidecar.
+    from models.dataset import Dataset
+    from column_types.registry import ColumnTypeRegistry
+    from artifacts.artifact_store import ArtifactStore
+    if not METADATA_CSV.exists():
+        return  # SKIP — metadata.csv not available
+    with tempfile.TemporaryDirectory() as d:
+        project = Path(d) / "proj"
+        store    = ArtifactStore(Path(d) / "artifacts")
+        registry = ColumnTypeRegistry()
+        registry.setup_defaults(store)
+        ds = Dataset()
+        ds.set_registry(registry)
+        ds.load_folder(TEST_IMAGES)
+        ds.confirm_merge(ds.merge_csv(METADATA_CSV, join_on="file_name"))
+        # Sanity: registry should have tagged the merged columns.
+        cond_before = registry.get("condition")
+        ts_before   = registry.get("timestamp")
+        assert cond_before is not None and cond_before.tag == "text", (
+            f"sanity: condition should be 'text' before save; got {cond_before.tag if cond_before else None}"
+        )
+        assert ts_before is not None and ts_before.tag == "numeric", (
+            f"sanity: timestamp should be 'numeric' before save; got {ts_before.tag if ts_before else None}"
+        )
+        ds.save(project)
+        # Reload into fresh dataset + registry.
+        registry2 = ColumnTypeRegistry()
+        registry2.setup_defaults(store)
+        ds2 = Dataset()
+        ds2.set_registry(registry2)
+        ds2.load(project)
+        cond_after = registry2.get("condition")
+        ts_after   = registry2.get("timestamp")
+        assert cond_after is not None and cond_after.tag == "text", (
+            f"condition should be 'text' after round-trip; got {cond_after.tag if cond_after else None}"
+        )
+        assert ts_after is not None and ts_after.tag == "numeric", (
+            f"timestamp should be 'numeric' after round-trip; got {ts_after.tag if ts_after else None}"
+        )
+
+run_test("load(): no sidecar still registers full_path",      test_load_without_sidecar_still_registers_full_path)
+run_test("load(): unknown tag in sidecar does not crash",     test_load_unknown_tag_does_not_crash)
+run_test("save/load realistic merge round-trip preserves types", test_save_load_realistic_merge_roundtrip)
+
 
 # ---------------------------------------------------------------------------
 # Summary

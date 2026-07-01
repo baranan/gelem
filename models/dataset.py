@@ -16,6 +16,7 @@ Student B is responsible for implementing the real logic in this file.
 from __future__ import annotations
 from pathlib import Path
 from dataclasses import dataclass, field
+import json
 import pandas as pd
 
 
@@ -141,6 +142,33 @@ class ProvenanceLog:
     def to_list(self) -> list[dict]:
         """Returns all log entries as a list of dicts."""
         return list(self._entries)
+
+    def replace(self, entries: list[dict]) -> None:
+        """Replaces all entries with the given list. Used by Dataset.load()
+        to restore the saved log without poking the private _entries field."""
+        self._entries = list(entries)
+
+
+# ---------------------------------------------------------------------------
+# Path helpers for save() / load()
+# ---------------------------------------------------------------------------
+
+def _rel_if_inside(p: str, root: Path) -> str:
+    """Return p as a path relative to root if it lives inside; else unchanged.
+    Uses POSIX-style "/" so stored paths are cross-OS portable."""
+    if not p or pd.isna(p):
+        return p
+    try:
+        return Path(p).relative_to(root).as_posix()
+    except ValueError:
+        return p
+
+
+def _abs_against(p: str, root: Path) -> str:
+    """If p is relative, resolve it against root; if absolute, return as-is."""
+    if not p or pd.isna(p):
+        return p
+    return p if Path(p).is_absolute() else str(root / p)
 
 
 # ---------------------------------------------------------------------------
@@ -715,28 +743,118 @@ class Dataset:
 
     def save(self, project_path: Path) -> None:
         """
-        Saves all tables as Parquet files and the provenance log as
-        JSON to the specified project folder.
+        Saves tables as Parquet, provenance as JSON. Media-path columns
+        are stored relative to project_path when possible; relative
+        inputs are anchored to the current working directory first.
 
         Args:
             project_path: Path to the project folder.
-
-        TODO (Student B): Implement this method.
         """
-        # PLACEHOLDER
         project_path.mkdir(parents=True, exist_ok=True)
-        print(f"[Dataset] save() — not yet implemented. "
-              f"Would save to {project_path}")
+
+        # Which columns hold media paths? full_path always; registry adds the rest.
+        media_cols = {"full_path"}
+        if self._registry is not None:
+            for col in self._registry.list_all_columns():
+                ct = self._registry.get(col)
+                if ct is not None and ct.tag == "media_path":
+                    media_cols.add(col)
+
+        for name, df in self._tables.items():
+            df_out = df
+            cols_to_rewrite = [c for c in df.columns if c in media_cols]
+            if cols_to_rewrite:
+                # Copy so we only rewrite paths on disk, not in memory.
+                df_out = df_out.copy()
+                for col in cols_to_rewrite:
+                    df_out[col] = df_out[col].apply(
+                        lambda p: p if not p or pd.isna(p)
+                                  else _rel_if_inside(
+                                      str(Path(p).absolute()), project_path
+                                  )
+                    )
+            df_out.to_parquet(project_path / f"{name}.parquet")
+
+        # Store the column -> tag map so load() restores types exactly.
+        if self._registry is not None:
+            column_types = {}
+            for col in self._registry.list_all_columns():
+                ct = self._registry.get(col)
+                if ct is not None:
+                    column_types[col] = ct.tag
+            if column_types:
+                (project_path / "column_types.json").write_text(
+                    json.dumps(column_types, indent=2)
+                )
+
+        (project_path / "provenance.json").write_text(
+            json.dumps(self.provenance.to_list(), indent=2)
+        )
+        self.provenance.record("save", {"project_path": str(project_path)})
 
     def load(self, project_path: Path) -> None:
         """
-        Loads a previously saved project from disk.
+        Loads a previously saved project from disk. Replaces all in-memory
+        tables and the provenance log with the saved ones (same "open
+        project" pattern as load_folder / load_csv_as_primary). Relative
+        `full_path` values are resolved back to absolute against
+        project_path.
 
         Args:
             project_path: Path to an existing project folder.
 
-        TODO (Student B): Implement this method.
+        Raises:
+            FileNotFoundError: If project_path doesn't exist or has no
+                parquet files.
         """
-        # PLACEHOLDER
-        print(f"[Dataset] load() — not yet implemented. "
-              f"Would load from {project_path}")
+        if not project_path.exists():
+            raise FileNotFoundError(
+                f"Project folder '{project_path}' does not exist."
+            )
+        parquet_files = list(project_path.glob("*.parquet"))
+        if not parquet_files:
+            raise FileNotFoundError(
+                f"No tables (.parquet) found in '{project_path}'."
+            )
+
+        # Read column types first so we know which columns are media paths.
+        column_types = {}
+        ct_path = project_path / "column_types.json"
+        if ct_path.exists():
+            column_types = json.loads(ct_path.read_text())
+        media_cols = {col for col, tag in column_types.items() if tag == "media_path"}
+        media_cols.add("full_path")  # fallback if no sidecar (saved without registry)
+
+        self._tables = {}
+        for path in parquet_files:
+            df = pd.read_parquet(path)
+            for col in df.columns:
+                if col in media_cols:
+                    df[col] = df[col].apply(
+                        lambda p: _abs_against(p, project_path)
+                    )
+            self._tables[path.stem] = df
+
+        # Restore _id_counter (assumes int-parseable row_id from _next_id()).
+        max_id = 0
+        for df in self._tables.values():
+            if "row_id" in df.columns and not df.empty:
+                max_id = max(max_id, int(df["row_id"].astype(int).max()))
+        self._id_counter = max_id
+
+        prov = project_path / "provenance.json"
+        if prov.exists():
+            self.provenance.replace(json.loads(prov.read_text()))
+
+        if self._registry is not None:
+            if column_types:
+                for col, tag in column_types.items():
+                    try:
+                        self._register_column(col, tag)
+                    except KeyError:
+                        pass  # tag unknown in this build; skip rather than sink the whole load
+            elif "full_path" in self._tables.get("frames", pd.DataFrame()).columns:
+                # No sidecar — fall back to load_folder's default tagging.
+                self._register_column("full_path", "media_path")
+
+        self.provenance.record("load", {"project_path": str(project_path)})
