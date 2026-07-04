@@ -4,6 +4,8 @@ pyarrow
 Pillow
 numpy
 matplotlib
+plotly
+kaleido
 mediapipe
 pytest
 opencv-python
