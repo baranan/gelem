@@ -56,6 +56,7 @@ class AppController(QObject):
     row_selected             = Signal(dict)
     columns_updated          = Signal(list)
     tables_updated           = Signal(list)
+    active_table_changed     = Signal(str)
     thumbnail_ready          = Signal(str)
     row_updated              = Signal(str)
     operator_progress        = Signal(int)
@@ -88,6 +89,7 @@ class AppController(QObject):
         self._item_result_queue: list[tuple] = []
         self._complete_queue:    list[tuple] = []
         self._progress_queue:    list[int]   = []
+        self._error_queue:       list[str]   = []
 
         self._timer = QTimer(self)
         self._timer.setInterval(50)
@@ -126,6 +128,10 @@ class AppController(QObject):
             operator_name, payload = self._complete_queue.pop(0)
             self._on_operator_complete(operator_name, payload)
 
+        while self._error_queue:
+            message = self._error_queue.pop(0)
+            self.error_occurred.emit(message)
+
     # ── Background thread callbacks ───────────────────────────────────
 
     def _on_thumbnail_ready(self, row_id: str) -> None:
@@ -140,6 +146,54 @@ class AppController(QObject):
     def _on_create_columns_complete(self, operator_name: str) -> None:
         self._complete_queue.append(("create_columns", operator_name))
 
+    def _on_operator_setup_error(self, operator_name: str, message: str) -> None:
+        # Called from the worker thread when an operator raises
+        # OperatorSetupError. Looks up the operator's user-facing label so
+        # the dialog reads naturally, then queues the message for emission
+        # on the main thread via error_occurred.
+        operator = self._op_registry.get(operator_name)
+        label = (
+            getattr(operator, "create_columns_label", None)
+            or getattr(operator, "create_table_label", None)
+            or getattr(operator, "create_display_label", None)
+            or operator_name
+        )
+        self._error_queue.append(
+            f'Cannot run operator "{label}"\n\n{message}'
+        )
+
+    def _on_operator_row_errors(
+        self,
+        operator_name: str,
+        errors: list[tuple[str, str, str]],
+    ) -> None:
+        # Called from the worker thread once at the end of a run if any rows
+        # raised an unexpected exception. Group by exception type with a
+        # representative message so the dialog stays compact, then queue the
+        # summary for emission on the main thread via error_occurred.
+        operator = self._op_registry.get(operator_name)
+        label = (
+            getattr(operator, "create_columns_label", None)
+            or getattr(operator, "create_table_label", None)
+            or getattr(operator, "create_display_label", None)
+            or operator_name
+        )
+        counts: dict[str, int] = {}
+        first_msg: dict[str, str] = {}
+        for _row_id, exc_type, msg in errors:
+            counts[exc_type] = counts.get(exc_type, 0) + 1
+            first_msg.setdefault(exc_type, msg)
+        lines = [
+            f'  - {t} (x{counts[t]}) - "{first_msg[t]}"'
+            for t in sorted(counts, key=lambda k: -counts[k])
+        ]
+        self._error_queue.append(
+            f'"{label}" finished, but {len(errors)} row(s) hit unexpected '
+            f"errors.\n\nError types seen:\n"
+            + "\n".join(lines)
+            + "\n\nThe affected rows have no values for the new columns."
+        )
+
     def _on_create_table_complete(
         self,
         operator_name: str,
@@ -153,6 +207,11 @@ class AppController(QObject):
         result: dict,
     ) -> None:
         self._complete_queue.append(("create_display", (operator_name, result)))
+
+    def _on_operator_error(self, operator_name: str, message: str) -> None:
+        """Background-thread callback for operator errors. Marshals
+        the error onto the main thread via _complete_queue."""
+        self._complete_queue.append(("error", (operator_name, message)))
 
     def _on_operator_complete(self, mode: str, payload) -> None:
         """
@@ -170,6 +229,14 @@ class AppController(QObject):
             table_name = f"{operator_name}_result"
             try:
                 self._dataset.create_table_from_df(table_name, result_df)
+                stored_df = self._dataset.get_table(table_name)
+                for _, row in stored_df.iterrows():
+                    full_path = row.get("full_path", "")
+                    if full_path and Path(str(full_path)).exists():
+                        self._store.request_thumbnail(
+                            row["row_id"],
+                            Path(str(full_path)),
+                        )
                 self.tables_updated.emit(self._dataset.list_tables())
                 self.table_created.emit(table_name)
                 self.operator_complete.emit(operator_name)
@@ -182,6 +249,11 @@ class AppController(QObject):
             operator_name, result = payload
             result["operator_name"] = operator_name
             self.display_result_ready.emit(result)
+            self.operator_complete.emit(operator_name)
+
+        elif mode == "error":
+            operator_name, message = payload
+            self.error_occurred.emit(message)
             self.operator_complete.emit(operator_name)
 
     # ── Gallery refresh ───────────────────────────────────────────────
@@ -438,6 +510,8 @@ class AppController(QObject):
                 on_item_complete=self._on_item_complete,
                 on_progress=self._on_progress,
                 on_complete=self._on_create_columns_complete,
+                on_setup_error=self._on_operator_setup_error,
+                on_row_errors=self._on_operator_row_errors,
             )
         except Exception as e:
             self.error_occurred.emit(
@@ -467,6 +541,7 @@ class AppController(QObject):
                 selected_df,
                 group_by,
                 on_complete=self._on_create_table_complete,
+                on_error=self._on_operator_error,
             )
         except Exception as e:
             self.error_occurred.emit(
@@ -493,6 +568,7 @@ class AppController(QObject):
                 operator_name,
                 selected_df,
                 on_complete=self._on_create_display_complete,
+                on_error=self._on_operator_error,
             )
         except Exception as e:
             self.error_occurred.emit(
@@ -560,6 +636,7 @@ class AppController(QObject):
             self._active_filters = []
             self._group_by       = None
             self._visible_cols   = None
+            self.active_table_changed.emit(name)
             self.columns_updated.emit(self._registry.list_all_columns())
             self._refresh_gallery()
         except KeyError as e:
@@ -677,17 +754,20 @@ class AppController(QObject):
         """
         return self._store.get_pixmap(row_id, artifact_type)
 
-    def get_row(self, row_id: str, table_name: str = "frames") -> dict:
+    def get_row(self, row_id: str, table_name: str | None = None) -> dict:
         """
         Returns all column values for one row as a plain dictionary.
 
         Args:
             row_id:     The row to retrieve.
-            table_name: The table containing the row (default: 'frames').
+            table_name: The table containing the row. Defaults to the
+                        currently active table.
 
         Returns:
             Dict of column name to value. Empty dict if not found.
         """
+        if table_name is None:
+            table_name = self._active_table
         return self._dataset.get_row(row_id, table_name)
 
     def render_column_value(

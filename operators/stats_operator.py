@@ -67,7 +67,7 @@ class StatsOperator(BaseOperator):
         self._group_column: str | None = None  # Grouping variable
         self._subject_col:  str | None = None  # Subject ID (for repeated measures)
 
-    def get_parameters_dialog(self, parent=None):
+    def get_parameters_dialog(self, parent=None, columns=None):
         """
         Shows a dialog asking the researcher to choose:
             - Test type
@@ -78,7 +78,8 @@ class StatsOperator(BaseOperator):
         Stores the chosen values as instance attributes.
 
         TODO (Student C): Implement this dialog.
-        Show dropdowns for test type and column selection.
+        Show dropdowns for test type and column selection populated
+        from the `columns` argument supplied by MainWindow.
         Grey out irrelevant fields based on the chosen test type
         (e.g. subject column is only needed for paired tests).
 

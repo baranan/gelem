@@ -39,7 +39,7 @@ from pathlib import Path
 import threading
 import pandas as pd
 
-from operators.base import BaseOperator
+from operators.base import BaseOperator, OperatorSetupError
 
 
 class OperatorRegistry:
@@ -158,6 +158,8 @@ class OperatorRegistry:
         on_item_complete=None,
         on_progress=None,
         on_complete=None,
+        on_setup_error=None,
+        on_row_errors=None,
     ) -> None:
         """
         Runs create_columns() on pre-snapshotted work items in a background
@@ -187,6 +189,19 @@ class OperatorRegistry:
             on_progress:      Called with progress percentage (0-100).
             on_complete:      Called when all rows are done.
                               Signature: (operator_name: str)
+            on_setup_error:   Called if the operator raises
+                              OperatorSetupError on any row. The run is
+                              aborted and remaining rows are skipped.
+                              Signature: (operator_name: str, message: str)
+            on_row_errors:    Called once at the end of the run if any rows
+                              raised an unexpected exception. Lets the
+                              controller surface a single end-of-run
+                              summary to the user so unexpected failures
+                              are visibly distinct from the normal "no
+                              face detected" case.
+                              Signature: (operator_name: str,
+                                          errors: list[tuple[str, str, str]])
+                              Each tuple is (row_id, exc_type_name, message).
         """
         operator = self._operators.get(operator_name)
         if operator is None:
@@ -205,6 +220,7 @@ class OperatorRegistry:
             args=(
                 operator, work_items, operation_id,
                 on_item_complete, on_progress, on_complete,
+                on_setup_error, on_row_errors,
             ),
             daemon=True,
         )
@@ -218,12 +234,15 @@ class OperatorRegistry:
         on_item_complete,
         on_progress,
         on_complete,
+        on_setup_error,
+        on_row_errors,
     ) -> None:
         """
         Worker that runs create_columns() in the background thread.
         Processes only the pre-snapshotted work items — never reads Dataset.
         """
         total = len(work_items)
+        row_errors: list[tuple[str, str, str]] = []
 
         for i, item in enumerate(work_items):
             row_id     = item["row_id"]
@@ -255,15 +274,35 @@ class OperatorRegistry:
                     f"does not implement create_columns()."
                 )
                 break
-            except Exception as e:
+            except OperatorSetupError as e:
+                # Setup-level failure (e.g. required model file missing).
+                # Abort the run rather than spamming the same error per row.
                 print(
-                    f"[OperatorRegistry] Error in create_columns "
-                    f"for '{operator.name}' on {row_id}: {e}"
+                    f"[OperatorRegistry] Setup error in '{operator.name}': {e}"
                 )
+                if on_setup_error is not None:
+                    on_setup_error(operator.name, str(e))
+                break
+            except Exception as e:
+                # Unexpected per-row failure (mediapipe crash, bug, malformed
+                # image, etc.). Mark the row as missing for consistency with
+                # the operator's no-face path, and remember it so we can
+                # surface a single summary at the end of the run.
+                print(
+                    f"[OperatorRegistry] Unexpected error in '{operator.name}' "
+                    f"on {row_id}: {type(e).__name__}: {e}"
+                )
+                row_errors.append((row_id, type(e).__name__, str(e)))
+                if on_item_complete is not None:
+                    all_none = {name: None for name, _ in operator.output_columns}
+                    on_item_complete(operation_id, table_name, row_id, all_none)
 
             if on_progress is not None:
                 percent = int((i + 1) / total * 100)
                 on_progress(percent)
+
+        if row_errors and on_row_errors is not None:
+            on_row_errors(operator.name, row_errors)
 
         if on_complete is not None:
             on_complete(operator.name)
@@ -276,6 +315,7 @@ class OperatorRegistry:
         df: pd.DataFrame,
         group_by: str | list[str] | None,
         on_complete=None,
+        on_error=None,
     ) -> None:
         """
         Runs create_table() in a background thread.
@@ -294,6 +334,9 @@ class OperatorRegistry:
                                        result_df: pd.DataFrame)
                            Called from background thread — AppController
                            routes to main thread.
+            on_error:      Called if create_table raises an exception.
+                           Signature: (operator_name: str, message: str)
+                           Called from background thread.
         """
         operator = self._operators.get(operator_name)
         if operator is None:
@@ -309,7 +352,7 @@ class OperatorRegistry:
 
         thread = threading.Thread(
             target=self._run_create_table_worker,
-            args=(operator, df, group_by, on_complete),
+            args=(operator, df, group_by, on_complete, on_error),
             daemon=True,
         )
         thread.start()
@@ -320,6 +363,7 @@ class OperatorRegistry:
         df: pd.DataFrame,
         group_by,
         on_complete,
+        on_error,
     ) -> None:
         """Worker that runs create_table() in the background thread."""
         try:
@@ -336,6 +380,8 @@ class OperatorRegistry:
                 f"[OperatorRegistry] Error in create_table "
                 f"for '{operator.name}': {e}"
             )
+            if on_error is not None:
+                on_error(operator.name, str(e))
 
     # ── run_create_display ────────────────────────────────────────────
 
@@ -344,6 +390,7 @@ class OperatorRegistry:
         operator_name: str,
         df: pd.DataFrame,
         on_complete=None,
+        on_error=None,
     ) -> None:
         """
         Runs create_display() in a background thread.
@@ -358,6 +405,9 @@ class OperatorRegistry:
             on_complete:   Called when done.
                            Signature: (operator_name: str,
                                        result: dict)
+                           Called from background thread.
+            on_error:      Called if create_display raises an exception.
+                           Signature: (operator_name: str, message: str)
                            Called from background thread.
         """
         operator = self._operators.get(operator_name)
@@ -374,7 +424,7 @@ class OperatorRegistry:
 
         thread = threading.Thread(
             target=self._run_create_display_worker,
-            args=(operator, df, on_complete),
+            args=(operator, df, on_complete, on_error),
             daemon=True,
         )
         thread.start()
@@ -384,6 +434,7 @@ class OperatorRegistry:
         operator: BaseOperator,
         df: pd.DataFrame,
         on_complete,
+        on_error,
     ) -> None:
         """Worker that runs create_display() in the background thread."""
         try:
@@ -400,3 +451,5 @@ class OperatorRegistry:
                 f"[OperatorRegistry] Error in create_display "
                 f"for '{operator.name}': {e}"
             )
+            if on_error is not None:
+                on_error(operator.name, str(e))

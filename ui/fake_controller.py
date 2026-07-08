@@ -39,6 +39,7 @@ class FakeController(QObject):
     row_selected             = Signal(dict)
     columns_updated          = Signal(list)
     tables_updated           = Signal(list)
+    active_table_changed     = Signal(str)
     thumbnail_ready          = Signal(str)
     row_updated              = Signal(str)
     operator_progress        = Signal(int)
@@ -87,6 +88,8 @@ class FakeController(QObject):
                 "bs_jawOpen":         round(random.uniform(0.0, 0.8), 3),
                 "bs_mouthSmileLeft":  round(random.uniform(0.0, 0.6), 3),
                 "bs_mouthSmileRight": round(random.uniform(0.0, 0.6), 3),
+                "frame_index":        random.randint(0, 240),
+                "is_keyframe":        random.choice([True, False]),
             }
 
         # Second visual column, purely so the visible-columns selector
@@ -113,6 +116,8 @@ class FakeController(QObject):
             "bs_jawOpen":         "numeric",
             "bs_mouthSmileLeft":  "numeric",
             "bs_mouthSmileRight": "numeric",
+            "frame_index":        "numeric",
+            "is_keyframe":        "boolean_flag",
         }
 
         self._visual_columns: list[str] = ["full_path"]
@@ -302,6 +307,22 @@ class FakeController(QObject):
                 "bs_mouthSmileLeft": {"mean": 0.31, "sd": 0.08, "min": 0.0, "max": 0.6, "median": 0.30},
             }
         }
+
+        # Only the interactive plot operator returns an html_path in reality.
+        # Gate the fake html_path on the operator name so the button does not
+        # wrongly appear for summary_stats or mean_face results.
+        if operator_name == "plot_advanced":
+            # Write a tiny standalone HTML file to the temp folder. as_uri()
+            # needs an ABSOLUTE path (tempfile.gettempdir() gives one), and the
+            # file must exist for the browser to open it rather than 404.
+            html_result_path = Path(tempfile.gettempdir()) / "fake_plot.html"
+            html_result_path.write_text(
+                "<html><body><h2>Fake interactive plot (--fake-data mode)</h2>"
+                "<p>Stands in for a Plotly HTML file.</p></body></html>",
+                encoding="utf-8",
+            )
+            result["html_path"] = str(html_result_path) 
+
         QTimer.singleShot(500, lambda: self.display_result_ready.emit(result))
 
     def add_computed_column(self, name: str, expression: str,
@@ -345,17 +366,78 @@ class FakeController(QObject):
             if tag == "media_path"
         ]
 
+    # Mirror the new AppController public methods so UI code that calls
+    # them (per issue #32) works in --fake-data mode too.
+
+    def get_column_type(self, column_name: str):
+        return self._registry.get(column_name)
+
+    def get_all_row_ids(self, table_name: str | None = None) -> list[str]:
+        return list(self._row_ids)
+
+    def get_operator(self, operator_name: str):
+        return self._op_registry.get(operator_name)
+
     def get_group_values(self, column: str) -> list:
         fake_values = {
             "condition":  ["positive", "negative", "neutral"],
             "session_id": ["S01", "S02", "S03"],
             "trial_id":   [f"T{i:02d}" for i in range(1, 6)],
         }
-        return fake_values.get(column, ["A", "B", "C"])
+        if column in fake_values:
+            return fake_values[column]
+        # For every other column (numeric, boolean, ...) return the real
+        # sorted unique values from the fake metadata, mirroring the real
+        # QueryEngine.get_group_values so range/boolean controls bind to
+        # actual data.
+        values = {
+            md[column]
+            for md in self._metadata.values()
+            if column in md and md[column] is not None
+        }
+        try:
+            return sorted(values)
+        except TypeError:
+            return sorted(values, key=str)
 
     def get_row(self, row_id: str, _table_name: str = "frames") -> dict:
         return self._metadata.get(row_id, {"row_id": row_id})
 
+# ── Accessors added to mirror AppController's public contract ─────
+    # These three were added to the real controller by the
+    # "add-controller-public-methods" PR. The fake must expose them too,
+    # or any UI widget that calls them will crash only in fake-data mode.
+
+    def get_all_row_ids(self, table_name: str | None = None) -> list[str]:
+        """
+        Returns every row_id in the fake's single table.
+
+        The real controller looks up *table_name* in the dataset; the fake
+        has only one table of generated rows, so it returns those row_ids
+        regardless of which table name is asked for.
+        """
+        # The fake holds all its rows in self._row_ids (built in __init__).
+        return list(self._row_ids)
+
+    def get_column_type(self, column_name: str):
+        """
+        Returns the column-type object for *column_name*.
+
+        The fake has no ColumnTypeRegistry, so it returns None -- which is
+        exactly what the real controller returns for an unregistered column.
+        UI code already has to handle the None case, so this stays safe.
+        """
+        return None
+
+    def get_operator(self, operator_name: str):
+        """
+        Returns the operator registered under *operator_name*.
+
+        The fake has no OperatorRegistry, so it returns None -- matching the
+        real controller's behaviour when an operator name is not found.
+        """
+        return None
+    
     def get_artifact_pixmap(self, row_id: str, artifact_type: str):
         if artifact_type == "thumbnail":
             return self._thumb_cache.get(row_id, None)

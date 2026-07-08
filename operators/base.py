@@ -55,6 +55,15 @@ import numpy as np
 import pandas as pd
 
 
+class OperatorSetupError(Exception):
+    """
+    Raised by an operator when a one-time setup step has not been
+    completed yet (e.g. a required model file has not been downloaded).
+    The runner aborts the run on the first occurrence and surfaces the
+    message to the user via AppController.error_occurred.
+    """
+
+
 class BaseOperator:
     """
     Abstract base class for all Gelem operators.
@@ -274,7 +283,7 @@ class BaseOperator:
 
     # ── Parameter dialog ──────────────────────────────────────────────
 
-    def get_parameters_dialog(self, parent=None):
+    def get_parameters_dialog(self, parent=None, columns=None):
         """
         Returns a QDialog for collecting operator-specific parameters,
         or None if this operator needs no parameters.
@@ -292,13 +301,18 @@ class BaseOperator:
         plot, what kind of plot, and whether to group by a column.
 
         Args:
-            parent: The parent widget for the dialog.
+            parent:  The parent widget for the dialog.
+            columns: List of column names in the active table, supplied
+                     by MainWindow. Operators that need to populate
+                     column dropdowns should read from this list rather
+                     than reaching into the controller themselves.
+                     None when called outside MainWindow (e.g. tests).
 
         Returns:
             A QDialog instance, or None.
 
         Example (in a subclass):
-            def get_parameters_dialog(self, parent=None):
+            def get_parameters_dialog(self, parent=None, columns=None):
                 from PySide6.QtWidgets import (
                     QDialog, QVBoxLayout, QComboBox,
                     QLabel, QPushButton
@@ -308,7 +322,7 @@ class BaseOperator:
                 layout = QVBoxLayout(dialog)
                 layout.addWidget(QLabel("Group by:"))
                 self._group_combo = QComboBox()
-                self._group_combo.addItems(["condition", "session_id"])
+                self._group_combo.addItems(columns or [])
                 layout.addWidget(self._group_combo)
                 btn = QPushButton("OK")
                 btn.clicked.connect(dialog.accept)

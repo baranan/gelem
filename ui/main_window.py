@@ -75,6 +75,7 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self._build_toolbar()
         self._build_central_widget()
+        self._build_status_bar()
         self._connect_signals()
 
     # ── Building the UI ───────────────────────────────────────────────
@@ -128,6 +129,7 @@ class MainWindow(QMainWindow):
         # reflects the currently registered operators.
         self._operators_menu = menubar.addMenu("Operators")
         self._operators_menu.aboutToShow.connect(self._refresh_operators_menu)
+        self._operators_menu.addAction("(loading…)")  # macOS: empty menus don't render
 
     def _build_toolbar(self) -> None:
         """Creates the toolbar with table selector."""
@@ -214,16 +216,48 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self._gallery_stack)
 
         # Right: tabbed panels — Detail and Results only.
-        right_tabs = QTabWidget()
+        # Kept as an instance attribute so handlers can switch focus
+        # between Detail and Results in response to user actions.
+        self._right_tabs = QTabWidget()
 
         self._detail_widget = DetailWidget(self._controller)
-        right_tabs.addTab(self._detail_widget, "Detail")
+        self._right_tabs.addTab(self._detail_widget, "Detail")
 
         self._results_panel = ResultsPanel(self._controller)
-        right_tabs.addTab(self._results_panel, "Results")
+        self._right_tabs.addTab(self._results_panel, "Results")
 
-        splitter.addWidget(right_tabs)
+        splitter.addWidget(self._right_tabs)
         splitter.setSizes([180, 840, 380])
+
+    def _build_status_bar(self) -> None:
+        """
+        Adds a status bar with a permanent label that reports gallery
+        selection: "{N} items" when nothing is selected, "{K} of {N}
+        selected" otherwise. The label is updated by
+        _on_selection_changed (selection edits) and the gallery-update
+        handlers (filter changes).
+        """
+        self._selection_label = QLabel()
+        self._selection_label.setStyleSheet("padding: 0 8px;")
+        # addPermanentWidget pins it to the right side so transient
+        # messages from QStatusBar.showMessage() don't displace it.
+        self.statusBar().addPermanentWidget(self._selection_label)
+        self._refresh_status_bar()
+
+    def _refresh_status_bar(self) -> None:
+        """
+        Updates the selection-count label from the live galleries'
+        current selected and visible counts. In flat mode this is just
+        the main gallery; in grouped mode the counts are aggregated
+        across every group gallery.
+        """
+        selected = len(self._collect_selected_row_ids())
+        visible  = len(self._collect_visible_row_ids())
+        if selected:
+            text = f"{selected} of {visible} selected"
+        else:
+            text = f"{visible} items"
+        self._selection_label.setText(text)
 
     # ── Operators menu ────────────────────────────────────────────────
 
@@ -339,11 +373,7 @@ class MainWindow(QMainWindow):
         """
         selected_ids = self._collect_selected_row_ids()
         visible_ids  = self._collect_visible_row_ids()
-        all_ids      = list(
-            self._controller._dataset.get_table(
-                self._controller._active_table
-            )["row_id"]
-        )
+        all_ids      = self._controller.get_all_row_ids()
 
         # Step 1: scope dialog.
         scope_dialog = RunOperatorDialog(
@@ -361,9 +391,15 @@ class MainWindow(QMainWindow):
             return None
 
         # Step 2: operator parameter dialog (if the operator has one).
-        operator = self._controller._op_registry.get(operator_name)
+        operator = self._controller.get_operator(operator_name)
         if operator is not None:
-            param_dialog = operator.get_parameters_dialog(parent=self)
+            df = self._controller._dataset.get_table(
+                self._controller._active_table
+            )
+            param_dialog = operator.get_parameters_dialog(
+                parent=self,
+                columns=list(df.columns),
+            )
             if param_dialog is not None:
                 if param_dialog.exec() == 0:
                     return None
@@ -394,7 +430,7 @@ class MainWindow(QMainWindow):
             return
 
         # Read the group_by parameter set by the parameter dialog.
-        operator = self._controller._op_registry.get(operator_name)
+        operator = self._controller.get_operator(operator_name)
         group_by = getattr(operator, "_group_by", None)
 
         self._controller.run_create_table(operator_name, row_ids, group_by)
@@ -423,6 +459,7 @@ class MainWindow(QMainWindow):
         ctrl.grouped_gallery_updated.connect(self._on_grouped_gallery_updated)
         ctrl.columns_updated.connect(self._on_columns_updated)
         ctrl.tables_updated.connect(self._on_tables_updated)
+        ctrl.active_table_changed.connect(self._on_active_table_changed)
         ctrl.thumbnail_ready.connect(self._on_thumbnail_ready)
         ctrl.row_updated.connect(self._on_row_updated)
         ctrl.row_selected.connect(self._on_row_selected)
@@ -453,7 +490,7 @@ class MainWindow(QMainWindow):
 
         # Gallery -> Controller
         self._main_gallery.selection_changed.connect(
-            self._stats_panel_removed_placeholder
+            self._on_selection_changed
         )
         self._main_gallery.tile_double_clicked.connect(
             self._on_tile_double_clicked
@@ -487,31 +524,33 @@ class MainWindow(QMainWindow):
                 if rid in selected
             ]
             self._detail_widget.show_rows(ordered)
+            self._right_tabs.setCurrentWidget(self._detail_widget)
         else:
             # Single-item path goes through the controller so other
             # listeners (e.g. row_selected signal) still fire.
             self._controller.select_row(clicked_ids[0])
 
-    def _stats_panel_removed_placeholder(self, row_ids: list[str]) -> None:
+    def _on_selection_changed(self, row_ids: list[str]) -> None:
         """
-        Placeholder slot for the gallery selection_changed signal.
-        Previously connected to StatisticsPanel.update_selection().
-        StatisticsPanel has been removed — summary statistics are now
-        run explicitly via the Operators menu (SummaryStatsOperator)
-        and appear as a tab in ResultsPanel.
-
-        TODO (Student A): If you want selection count to show somewhere
-        in the UI (e.g. a status bar label), connect it here.
+        Updates the status bar when the gallery selection changes.
+        The row_ids argument is the new selection set; the actual count
+        is read back from the gallery so all sources of truth agree.
         """
-        pass  # Nothing to do — results panel is operator-driven.
+        self._refresh_status_bar()
 
     # ── Signal handlers ───────────────────────────────────────────────
 
     def _on_row_selected(self, metadata: dict) -> None:
-        """Shows the selected row in the detail panel."""
+        """
+        Shows the selected row in the detail panel and brings the Detail
+        tab forward. Picking a row is an explicit ask to see it; if the
+        Results tab is showing (e.g. after a create_display operator),
+        the user expects the Detail tab to take focus on their click.
+        """
         row_id = metadata.get("row_id")
         if row_id:
             self._detail_widget.show_rows([row_id])
+            self._right_tabs.setCurrentWidget(self._detail_widget)
 
     def _on_gallery_updated(self, row_ids: list[str]) -> None:
         """
@@ -524,6 +563,7 @@ class MainWindow(QMainWindow):
         self._galleries = [self._main_gallery]
         self._main_gallery.set_row_ids(row_ids)
         self._gallery_stack.setCurrentWidget(self._main_gallery)
+        self._refresh_status_bar()
 
     def _on_grouped_gallery_updated(self, grouped: dict) -> None:
         """
@@ -535,6 +575,7 @@ class MainWindow(QMainWindow):
         """
         self._rebuild_grouped_galleries(grouped)
         self._gallery_stack.setCurrentWidget(self._grouped_scroll)
+        self._refresh_status_bar()
 
     # ── Grouped-view construction ─────────────────────────────────────
 
@@ -596,9 +637,7 @@ class MainWindow(QMainWindow):
         gallery.tile_double_clicked.connect(
             lambda ids, g=gallery: self._on_tile_double_clicked(ids, g)
         )
-        gallery.selection_changed.connect(
-            self._stats_panel_removed_placeholder
-        )
+        gallery.selection_changed.connect(self._on_selection_changed)
         layout.addWidget(gallery)
 
         return section, gallery
@@ -657,6 +696,16 @@ class MainWindow(QMainWindow):
             self._table_combo.setCurrentIndex(idx)
         self._table_combo.blockSignals(False)
 
+    def _on_active_table_changed(self, name: str) -> None:
+        """Keeps the table combo in sync with the controller's active table."""
+        if self._table_combo.currentText() == name:
+            return
+        self._table_combo.blockSignals(True)
+        idx = self._table_combo.findText(name)
+        if idx >= 0:
+            self._table_combo.setCurrentIndex(idx)
+        self._table_combo.blockSignals(False)
+
     def _on_thumbnail_ready(self, row_id: str) -> None:
         """Repaints the tile for row_id when its thumbnail arrives."""
         for gallery in self._galleries:
@@ -691,9 +740,7 @@ class MainWindow(QMainWindow):
         """
         self._results_panel.show_result(result)
         # Switch to the Results tab so the researcher sees it immediately.
-        right_tabs = self._results_panel.parent()
-        if hasattr(right_tabs, 'indexOf'):
-            right_tabs.setCurrentWidget(self._results_panel)
+        self._right_tabs.setCurrentWidget(self._results_panel)
 
     def _on_operator_complete(self, operator_name: str) -> None:
         """Called when any operator finishes."""

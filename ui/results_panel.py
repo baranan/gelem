@@ -25,6 +25,8 @@ Key Qt concept used here:
 
 from __future__ import annotations
 import datetime
+import webbrowser
+from pathlib import Path
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -106,7 +108,10 @@ class ResultsPanel(QWidget):
                                     shown as a statistics table.
             'table':         list — list of dicts shown as a table
                                     (used by StatsOperator).
-            'plot_html':     str  — path to an interactive HTML file.
+            'html_path':     str  — path to an interactive HTML file
+                                    (PlotAdvanced). A button opens it in
+                                    the system browser. Also accepted as
+                                    'plot_html' for legacy compatibility.
             'n_rows':        int  — number of rows the operator ran on.
 
         Args:
@@ -167,14 +172,15 @@ class ResultsPanel(QWidget):
 
         Returns:
             A QWidget containing the result display.
-
-        TODO (Student A): Add support for 'plot_html' key — open the
-        HTML file in the system browser or embed a QWebEngineView.
         """
         container = QWidget()
         layout    = QVBoxLayout(container)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(8)
+
+        # PlotAdvanced uses 'html_path'; the ResultsPanel docstring
+        # originally called it 'plot_html' — accept both.
+        html_path = result.get("html_path") or result.get("plot_html", "")
 
         # ── Header ────────────────────────────────────────────────────
         header_row = QHBoxLayout()
@@ -191,6 +197,15 @@ class ResultsPanel(QWidget):
 
         header_row.addStretch()
 
+        # "Open in browser" button — only shown when an HTML file exists.
+        if html_path:
+            open_btn = QPushButton("Open interactive plot")
+            open_btn.setToolTip(str(html_path))
+            open_btn.clicked.connect(
+                lambda checked, p=html_path: webbrowser.open(Path(p).as_uri())
+            )
+            header_row.addWidget(open_btn)
+
         # Save PNG button — only shown if there is an image to save.
         artifact_path = result.get("artifact_path", "")
         if artifact_path:
@@ -201,6 +216,14 @@ class ResultsPanel(QWidget):
             header_row.addWidget(save_btn)
 
         layout.addLayout(header_row)
+
+        # ── Interactive plot hint ─────────────────────────────────────
+        # When both a static PNG and an HTML file are present, add a
+        # one-line note so the researcher knows the button is there.
+        if html_path and artifact_path:
+            hint = QLabel("Static preview below — click the button for the interactive version.")
+            hint.setStyleSheet("color: #888888; font-size: 11px; font-style: italic;")
+            layout.addWidget(hint)
 
         # ── Image ──────────────────────────────────────────────────────
         if artifact_path:
