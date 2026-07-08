@@ -200,6 +200,20 @@ class ColumnTypeRegistry:
         """
         self._types[col_type.tag] = col_type
 
+    def clear_columns(self) -> None:
+        """
+        Forgets every column-name registration, returning the registry to
+        the state it had right after setup_defaults() — the built-in type
+        tags (media_path, numeric, text, ...) are kept, but no column name
+        maps to a type any more.
+
+        Called by AppController when a new project is loaded so column
+        types from the previous project (e.g. full_path registered as
+        media by a folder load) do not leak into the next one. The new
+        project's columns are re-registered by Dataset during its load.
+        """
+        self._columns.clear()
+
     def get(self, column_name: str) -> ColumnType | None:
         """
         Returns the ColumnType for a given column name, or None if

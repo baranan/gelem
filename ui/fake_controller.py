@@ -48,6 +48,7 @@ class FakeController(QObject):
     error_occurred           = Signal(str)
     display_result_ready     = Signal(dict)
     table_created            = Signal(str)
+    project_reset            = Signal()
 
     def __init__(self, test_images_folder: Path):
         super().__init__()
@@ -254,6 +255,9 @@ class FakeController(QObject):
 
     def get_visible_columns(self) -> list[str]:
         return list(self._visual_columns)
+
+    def get_visible_row_ids(self) -> list[str]:
+        return list(self._visible_ids)
 
     def select_row(self, row_id: str) -> None:
         metadata = self._metadata.get(row_id, {"row_id": row_id})

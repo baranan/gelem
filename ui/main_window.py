@@ -468,6 +468,7 @@ class MainWindow(QMainWindow):
         ctrl.merge_report_ready.connect(self._on_merge_report)
         ctrl.operator_complete.connect(self._on_operator_complete)
         ctrl.table_created.connect(self._on_table_created)
+        ctrl.project_reset.connect(self._on_project_reset)
 
         # FilterPanel -> Controller
         self._filter_panel.filters_changed.connect(
@@ -517,12 +518,11 @@ class MainWindow(QMainWindow):
         gallery  = gallery or self._main_gallery
         selected = gallery.get_selected_row_ids()
         if len(selected) > 1 and clicked_ids[0] in selected:
-            # Preserve gallery order so panels read left-to-right the
-            # same way the tiles do.
-            ordered = [
-                rid for rid in gallery._row_ids
-                if rid in selected
-            ]
+            # Order the selection by the controller's visible order so the
+            # panels read left-to-right the same way the tiles do, without
+            # reaching into gallery internals.
+            visible = self._controller.get_visible_row_ids()
+            ordered = [rid for rid in visible if rid in selected]
             self._detail_widget.show_rows(ordered)
             self._right_tabs.setCurrentWidget(self._detail_widget)
         else:
@@ -551,6 +551,16 @@ class MainWindow(QMainWindow):
         if row_id:
             self._detail_widget.show_rows([row_id])
             self._right_tabs.setCurrentWidget(self._detail_widget)
+
+    def _on_project_reset(self) -> None:
+        """
+        Clears per-project UI state when a new project starts loading,
+        before its gallery arrives. The detail panel is emptied so it
+        can't keep showing a row from the previous project; gallery tiles
+        and selection are refreshed by the gallery_updated signal that
+        follows this one.
+        """
+        self._detail_widget.clear()
 
     def _on_gallery_updated(self, row_ids: list[str]) -> None:
         """
@@ -658,10 +668,13 @@ class MainWindow(QMainWindow):
 
     def _collect_visible_row_ids(self) -> list[str]:
         """
-        Returns the visible row_ids across every live gallery, in order
-        and de-duplicated (used as the 'visible' operator scope).
+        Returns the visible row_ids in display order, straight from the
+        controller — the authoritative source (used for the status-bar
+        count and the operator 'visible' scope). Selection, by contrast,
+        is genuinely gallery-local and still read from the galleries via
+        _collect_selected_row_ids.
         """
-        return self._collect_row_ids(lambda g: g._row_ids)
+        return self._controller.get_visible_row_ids()
 
     def _collect_row_ids(self, getter) -> list[str]:
         """Flattens getter(gallery) over self._galleries, keeping order
@@ -847,7 +860,7 @@ class MainWindow(QMainWindow):
 
     def _on_save_filtered_set(self) -> None:
         """Saves the currently visible rows as a new permanent table."""
-        visible_ids = self._main_gallery._row_ids
+        visible_ids = self._controller.get_visible_row_ids()
         if not visible_ids:
             QMessageBox.information(
                 self,

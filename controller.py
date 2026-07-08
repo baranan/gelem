@@ -49,6 +49,10 @@ class AppController(QObject):
         display_result_ready:    Result dict from a create_display
                                  operator, for ResultsPanel.
         table_created:           Name of a newly created table.
+        project_reset:           A new project is being loaded; UI panels
+                                 should clear per-project state (detail
+                                 view, selection) before the new gallery
+                                 arrives.
     """
 
     gallery_updated          = Signal(list)
@@ -65,6 +69,7 @@ class AppController(QObject):
     error_occurred           = Signal(str)
     display_result_ready     = Signal(dict)
     table_created            = Signal(str)
+    project_reset            = Signal()
 
     def __init__(
         self,
@@ -104,6 +109,12 @@ class AppController(QObject):
         self._seed:           int | None = None
         self._group_by:       str | None = None
         self._visible_cols:   list[str]  = []
+
+        # The row_ids currently on screen, in display order, refreshed on
+        # every query. This is the single source of truth for "what's
+        # visible" — the UI asks for it via get_visible_row_ids() rather
+        # than reconstructing it from gallery widgets.
+        self._visible_row_ids: list[str] = []
 
     # ── Queue draining (main thread) ──────────────────────────────────
 
@@ -271,6 +282,10 @@ class AppController(QObject):
                     randomise=self._randomise,
                     seed=self._seed,
                 )
+                # The visible set is every group's rows in group order,
+                # de-duplicated, so it matches the top-to-bottom reading
+                # order of the stacked group galleries.
+                self._visible_row_ids = self._flatten_grouped(grouped)
                 self.grouped_gallery_updated.emit(grouped)
             else:
                 row_ids = self._query.apply(
@@ -281,10 +296,49 @@ class AppController(QObject):
                     randomise=self._randomise,
                     seed=self._seed,
                 )
+                self._visible_row_ids = list(row_ids)
                 self.gallery_updated.emit(row_ids)
 
         except Exception as e:
+            self._visible_row_ids = []
             self.error_occurred.emit(f"Gallery refresh error: {e}")
+
+    @staticmethod
+    def _flatten_grouped(grouped: dict) -> list[str]:
+        """Flattens a {group_value: [row_ids]} dict into one ordered list,
+        dropping duplicates while preserving first-seen order."""
+        flat: list[str] = []
+        seen: set[str] = set()
+        for row_ids in grouped.values():
+            for row_id in row_ids:
+                if row_id not in seen:
+                    seen.add(row_id)
+                    flat.append(row_id)
+        return flat
+
+    def _reset_project_state(self) -> None:
+        """
+        Clears all per-project state before a new project is loaded.
+
+        This is the single reset path shared by load_folder,
+        load_csv_as_primary and load_project so a new project can never
+        inherit the previous one's filters, grouping, visible-column
+        choice, cached visible set, or — crucially — its registered
+        column types (a folder registers full_path as media; a later
+        image-less CSV must not keep showing image tiles for it).
+
+        Emits project_reset so UI panels (detail view, selection) drop
+        their stale contents before the new gallery arrives.
+        """
+        self._store.reset()
+        self._active_filters  = []
+        self._group_by        = None
+        self._visible_cols    = []
+        self._visible_row_ids = []
+        # Drop column types from the previous project. Dataset re-registers
+        # the new project's columns during its own load call below.
+        self._registry.clear_columns()
+        self.project_reset.emit()
 
     # ── Public API ────────────────────────────────────────────────────
 
@@ -297,10 +351,7 @@ class AppController(QObject):
             folder_path: Path to the folder containing media files.
         """
         try:
-            self._store.reset()
-            self._active_filters = []
-            self._group_by       = None
-            self._visible_cols   = []
+            self._reset_project_state()
 
             self._dataset.load_folder(folder_path)
             df = self._dataset.get_table("frames")
@@ -331,10 +382,7 @@ class AppController(QObject):
             image_column: Optional column containing media file paths.
         """
         try:
-            self._store.reset()
-            self._active_filters = []
-            self._group_by       = None
-            self._visible_cols   = []
+            self._reset_project_state()
 
             self._dataset.load_csv_as_primary(csv_path, image_column)
             df = self._dataset.get_table("frames")
@@ -436,6 +484,18 @@ class AppController(QObject):
     def get_visible_columns(self) -> list[str]:
         """Returns the currently selected visible columns."""
         return list(self._visible_cols)
+
+    def get_visible_row_ids(self) -> list[str]:
+        """
+        Returns the row_ids currently on screen, in display order.
+
+        This is the authoritative visible set — the same rows most
+        recently emitted on ``gallery_updated`` / ``grouped_gallery_updated``
+        (flattened in group order for the grouped view). The UI uses it for
+        the status-bar count, the operator "Visible" scope, and multi-item
+        open ordering instead of reconstructing it from gallery widgets.
+        """
+        return list(self._visible_row_ids)
 
     def select_row(self, row_id: str) -> None:
         """
@@ -683,6 +743,8 @@ class AppController(QObject):
             project_path: Path to an existing project folder.
         """
         try:
+            self._reset_project_state()
+
             self._dataset.load(project_path)
             self._store.load_index(project_path)
             self.tables_updated.emit(self._dataset.list_tables())
