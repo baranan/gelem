@@ -524,6 +524,15 @@ class DetailWidget(QWidget):
         table.resizeColumnsToContents()
         return table
 
+    def clear(self) -> None:
+        """
+        Public reset entry point — empties the detail view back to its
+        'nothing selected' state. Called by MainWindow on project_reset
+        so a new project doesn't inherit the previous item's media and
+        metadata. Mirrors the toolbar's × button.
+        """
+        self._clear()
+
     # ── Internal helpers ──────────────────────────────────────────────
 
     def _clear(self) -> None:
