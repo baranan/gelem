@@ -186,7 +186,12 @@ class GalleryWidget(QWidget):
         self._controller    = controller
         self._row_ids:      list[str] = []
         self._tile_size:    int       = 150
-        self._visible_cols: list[str] = []
+        # None  -> researcher hasn't set a preference; fall back to the
+        #          dataset's default visual column (full_path) when present.
+        # []    -> researcher explicitly unchecked every visible column;
+        #          show the "No visual column selected" placeholder.
+        # [...] -> use the listed columns.
+        self._visible_cols: list[str] | None = None
         self._selected_ids: set[str]  = set()
 
         # Virtual-scrolling state.
@@ -300,11 +305,23 @@ class GalleryWidget(QWidget):
         Updates which columns are shown in each tile.
         One column -> ImageTile per item.
         Multiple columns -> GridTile per item.
+        An empty list is treated as an explicit "no visible column"
+        choice and shows the placeholder rather than falling back to
+        full_path; pass None to clear the preference instead.
 
         Args:
             column_names: Ordered list of column names to display.
         """
         self._visible_cols = column_names
+        self._relayout()
+
+    def clear_visible_columns_preference(self) -> None:
+        """
+        Clears the visible-column preference so the gallery returns to
+        its default-fallback behaviour (full_path when registered as
+        visual, placeholder otherwise). Use this on project reset.
+        """
+        self._visible_cols = None
         self._relayout()
 
     def on_row_updated(self, row_id: str) -> None:
@@ -369,13 +386,16 @@ class GalleryWidget(QWidget):
         tiles that fall inside the viewport. Called whenever the data
         set, tile size, visible columns, or viewport size change.
 
-        Also resolves which columns each tile will display. If the
-        researcher has chosen visible columns, those are used. Otherwise
-        the gallery falls back to "full_path" — but only when Dataset
-        has registered it as visual. When neither yields a visual column
-        (e.g. a CSV-only project where the researcher picked "(none)"),
-        the gallery shows a single "No visual column selected"
-        placeholder instead of building broken tiles.
+        Also resolves which columns each tile will display.
+        Three states for self._visible_cols:
+          * a non-empty list -> use those columns.
+          * an empty list    -> researcher explicitly unchecked every
+            column; show the "No visual column selected" placeholder
+            regardless of whether full_path is registered as visual.
+          * None             -> no preference set yet; fall back to
+            "full_path" when Dataset has registered it as visual, or
+            to the placeholder when it has not (e.g. a CSV-only
+            project where the researcher picked "(none)").
         """
         for tw in self._mounted.values():
             self._grid_layout.removeWidget(tw)
@@ -386,17 +406,24 @@ class GalleryWidget(QWidget):
         self._clear_placeholder()
 
         # Resolve which columns each tile will display.
-        columns = self._visible_cols
-        if not columns:
+        if self._visible_cols == []:
+            # Researcher explicitly chose "no visible column".
+            columns: list[str] | None = None
+        elif self._visible_cols is None:
+            # No preference yet — fall back to full_path if it is
+            # registered as visual.
             visual = self._controller.get_visual_column_names()
-            if "full_path" not in visual:
-                self._tile_columns = None
-                if self._row_ids:
-                    self._show_no_visual_column_placeholder()
-                self._top_spacer.setFixedHeight(0)
-                self._bot_spacer.setFixedHeight(0)
-                return
-            columns = ["full_path"]
+            columns = ["full_path"] if "full_path" in visual else None
+        else:
+            columns = self._visible_cols
+
+        if columns is None:
+            self._tile_columns = None
+            if self._row_ids:
+                self._show_no_visual_column_placeholder()
+            self._top_spacer.setFixedHeight(0)
+            self._bot_spacer.setFixedHeight(0)
+            return
         self._tile_columns = columns
 
         self._cols  = self._columns_per_row()

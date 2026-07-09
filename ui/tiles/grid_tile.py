@@ -83,42 +83,6 @@ class GridTile(BaseTile):
         Returns:
             A QPixmap containing all children composited together,
             or None if rendering fails.
-
-        TODO (Student A): Implement this method.
-
-        Suggested approach using QPainter:
-
-            1. Return cached pixmap if size has not changed.
-
-            2. Calculate child size:
-               n = len(self._children)
-               child_size = size // n
-
-            3. Create a blank QPixmap of size x size:
-               from PySide6.QtGui import QPixmap
-               result = QPixmap(size, size)
-               result.fill(Qt.GlobalColor.white)
-
-            4. Create a QPainter on the result pixmap:
-               from PySide6.QtGui import QPainter
-               painter = QPainter(result)
-
-            5. For each child, render it and draw it at the right offset.
-               Horizontal layout passes (child_size, height); vertical
-               passes (width, child_size), so each child fills its slot:
-                   for i, child in enumerate(self._children):
-                       if self._direction == 'horizontal':
-                           child_pixmap = child.render(child_size, height)
-                           painter.drawPixmap(i * child_size, 0, child_pixmap)
-                       else:
-                           child_pixmap = child.render(width, child_size)
-                           painter.drawPixmap(0, i * child_size, child_pixmap)
-
-            6. End the painter and cache the result:
-               painter.end()
-               self._cached_pixmap = result
-               self._cached_size   = size
-               return result
         """
         if self._cached_pixmap is not None and self._cached_size == (width, height):
             return self._cached_pixmap
