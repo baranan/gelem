@@ -339,7 +339,7 @@ class MainWindow(QMainWindow):
         """
         self._columns_combo.set_items(
             self._controller.get_visual_column_names(),
-            checked=self._controller.get_visible_columns(),
+            checked=self._controller.get_effective_visible_columns(),
         )
 
     def _apply_visible_columns(self, column_names: list[str]) -> None:
@@ -683,6 +683,13 @@ class MainWindow(QMainWindow):
         """Refreshes filter panel and columns combo when columns change."""
         self._filter_panel.refresh_columns(column_names)
         self._refresh_columns_combo()
+        # If the controller has no explicit preference (fresh load or
+        # table switch), reset every existing gallery's own local
+        # visible-columns state too, so it doesn't keep showing
+        # columns chosen on a previous table.
+        if not self._controller.has_visible_columns_preference():
+            for gallery in self._galleries:
+                gallery.clear_visible_columns_preference()
 
     def _on_tables_updated(self, table_names: list[str]) -> None:
         """Updates the table selector combo when tables change."""

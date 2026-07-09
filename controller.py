@@ -25,6 +25,7 @@ import pandas as pd
 
 from PySide6.QtCore import QObject, Signal, QTimer
 
+DEFAULT_MEDIA_COLUMN_NAME = "full_path"
 
 class AppController(QObject):
     """
@@ -451,6 +452,25 @@ class AppController(QObject):
         the two states apart).
         """
         return list(self._visible_cols) if self._visible_cols else []
+    
+    def get_effective_visible_columns(self) -> list[str]:
+        """
+        Returns the columns that should actually be displayed right now --
+        the single source of truth for both the gallery and the Columns
+        checkbox, so they can never show two different states.
+
+        Returns:
+            - The stored preference, if one has been explicitly set
+            (including an explicit empty list).
+            - Otherwise, [DEFAULT_MEDIA_COLUMN_NAME] if that column exists
+            and is visual in the current table.
+            - Otherwise, an empty list.
+        """
+        if self.has_visible_columns_preference():
+            return list(self._visible_cols)
+        if DEFAULT_MEDIA_COLUMN_NAME in self._registry.list_visual_columns():
+            return [DEFAULT_MEDIA_COLUMN_NAME]
+        return []
 
     def has_visible_columns_preference(self) -> bool:
         """

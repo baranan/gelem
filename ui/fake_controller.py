@@ -254,6 +254,16 @@ class FakeController(QObject):
 
     def get_visible_columns(self) -> list[str]:
         return list(self._visual_columns)
+    
+    def get_effective_visible_columns(self) -> list[str]:
+        """
+        Mirrors AppController.get_effective_visible_columns() so UI code
+        that calls it works in --fake-data mode too. The fake has no
+        None/[] ambiguity to resolve -- has_visible_columns_preference()
+        is always True here, so get_visible_columns() already is the
+        effective state.
+        """
+        return self.get_visible_columns()
 
     def has_visible_columns_preference(self) -> bool:
         return True
