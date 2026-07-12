@@ -81,6 +81,12 @@ def create_app(fake_data: bool = False):
     # TODO (OPTIONAL): let the researcher pick a custom destination per
     # extraction via a folder picker in the parameter dialog.
 
+    plots_dir = project_root / "gelem_project" / "plots"
+    # TODO: Same migration as artifacts_dir / frames_dir above — once
+    # Dataset.save() / load() define a real project folder, point
+    # plots_dir at it:
+    #     plots_dir = project_path / "plots"
+
     dataset           = Dataset()
     query_engine      = QueryEngine()
     artifact_store    = ArtifactStore(artifacts_dir)
@@ -95,7 +101,7 @@ def create_app(fake_data: bool = False):
     operator_registry.register(MeanFaceOperator())
     operator_registry.register(PlotOperator())
     operator_registry.register(SummaryStatsOperator())
-    operator_registry.register(PlotAdvancedOperator())
+    operator_registry.register(PlotAdvancedOperator(output_dir=plots_dir))
     operator_registry.register(StatsOperator())
     operator_registry.register(VideoFramesOperator(output_dir=frames_dir))
 

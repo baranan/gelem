@@ -26,6 +26,10 @@ operators:
     enabled: true
     description: "Generates a blendshape-over-time plot for each item."
 
+  plot_advanced:
+    enabled: true
+    description: "Interactive Plotly plot (scatter/line/bar/box/violin/histogram) for the selected rows."
+
   summary_stats:
     enabled: true
     description: "Computes descriptive statistics over a selection of rows."
