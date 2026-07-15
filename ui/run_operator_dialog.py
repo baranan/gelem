@@ -85,6 +85,9 @@ class RunOperatorDialog(QDialog):
         n_visible  = len(self._visible_ids)
         n_all      = len(self._all_ids)
 
+        # Row counts per button id, so Run can check the chosen scope.
+        self._counts = {0: n_selected, 1: n_visible, 2: n_all}
+
         # Selected rows option.
         self._radio_selected = QRadioButton(
             f"Selected rows ({n_selected})"
@@ -105,18 +108,31 @@ class RunOperatorDialog(QDialog):
         self._radio_all = QRadioButton(
             f"All rows in active table ({n_all})"
         )
+        self._radio_all.setEnabled(n_all > 0)
         self._button_group.addButton(self._radio_all, 2)
         scope_layout.addWidget(self._radio_all)
 
         layout.addWidget(scope_group)
 
-        # Set default selection.
+        # Shown when the table is empty, so Run being greyed out is clear.
+        self._warning = QLabel(
+            "⚠ No data to run on. Upload a CSV, images or videos first."
+        )
+        self._warning.setWordWrap(True)
+        self._warning.setStyleSheet(
+            "color: #B25000; font-size: 11px; padding: 2px;"
+        )
+        self._warning.setVisible(n_all == 0)
+        layout.addWidget(self._warning)
+
+        # Default to the first scope that has rows.
         if n_selected > 0:
             self._radio_selected.setChecked(True)
-        elif n_visible < n_all:
+        elif n_visible > 0 and n_visible < n_all:
             self._radio_visible.setChecked(True)
-        else:
+        elif n_all > 0:
             self._radio_all.setChecked(True)
+        # else: nothing is checked and Run stays disabled.
 
         # Buttons.
         btn_layout = QHBoxLayout()
@@ -126,12 +142,24 @@ class RunOperatorDialog(QDialog):
         cancel_btn.clicked.connect(self.reject)
         btn_layout.addWidget(cancel_btn)
 
-        run_btn = QPushButton("Run")
-        run_btn.setDefault(True)
-        run_btn.clicked.connect(self._on_run)
-        btn_layout.addWidget(run_btn)
+        self._run_btn = QPushButton("Run")
+        self._run_btn.setDefault(True)
+        self._run_btn.clicked.connect(self._on_run)
+        btn_layout.addWidget(self._run_btn)
 
         layout.addLayout(btn_layout)
+
+        # Disable Run unless the chosen scope has rows.
+        self._button_group.buttonToggled.connect(
+            lambda *_: self._update_run_enabled()
+        )
+        self._update_run_enabled()
+
+    def _update_run_enabled(self) -> None:
+        """Enable Run only when the chosen scope has rows."""
+        checked_id = self._button_group.checkedId()
+        has_rows   = checked_id != -1 and self._counts.get(checked_id, 0) > 0
+        self._run_btn.setEnabled(has_rows)
 
     def _on_run(self) -> None:
         """Stores the chosen row_ids and accepts the dialog."""
