@@ -1342,6 +1342,125 @@ run_test("save/load realistic merge round-trip preserves types", test_save_load_
 
 
 # ---------------------------------------------------------------------------
+# Section 9: QueryEngine.select_first_after()
+# ---------------------------------------------------------------------------
+
+section("9. QueryEngine.select_first_after()")
+
+def test_select_first_after_one_row_per_session():
+    from models.dataset import Dataset
+    from models.query_engine import QueryEngine
+    if not METADATA_CSV.exists():
+        return  # SKIP — metadata.csv not available
+    ds = Dataset()
+    ds.load_folder(TEST_IMAGES)
+    ds.confirm_merge(ds.merge_csv(METADATA_CSV, join_on="file_name"))
+    df = ds.get_table("frames")
+    row_ids = QueryEngine().select_first_after(
+        df, time_col="timestamp", threshold=15.0, group_col="session_id"
+    )
+    # Only sessions with a row at or above the threshold qualify.
+    expected = df[df["timestamp"] >= 15.0]["session_id"].nunique()
+    assert len(row_ids) == expected, (
+        f"expected one row_id per qualifying session ({expected}), got {len(row_ids)}"
+    )
+
+def test_select_first_after_picks_earliest_above_threshold():
+    from models.dataset import Dataset
+    from models.query_engine import QueryEngine
+    if not METADATA_CSV.exists():
+        return  # SKIP — metadata.csv not available
+    ds = Dataset()
+    ds.load_folder(TEST_IMAGES)
+    ds.confirm_merge(ds.merge_csv(METADATA_CSV, join_on="file_name"))
+    df = ds.get_table("frames")
+    row_ids  = QueryEngine().select_first_after(
+        df, time_col="timestamp", threshold=15.0, group_col="session_id"
+    )
+    above    = df[df["timestamp"] >= 15.0]
+    selected = df[df["row_id"].isin(row_ids)]
+    assert (selected["timestamp"] >= 15.0).all(), (
+        f"selected rows should all be at or above 15.0; "
+        f"got {list(selected['timestamp'])}"
+    )
+    for _, row in selected.iterrows():
+        earliest = above[above["session_id"] == row["session_id"]]["timestamp"].min()
+        assert row["timestamp"] == earliest, (
+            f"session {row['session_id']}: expected earliest {earliest}, "
+            f"got {row['timestamp']}"
+        )
+
+run_test("One row per session",            test_select_first_after_one_row_per_session)
+run_test("Earliest row above threshold",   test_select_first_after_picks_earliest_above_threshold)
+
+
+# ---------------------------------------------------------------------------
+# Section 10: Dataset.create_table_from_rows() and load_csv_as_primary()
+# ---------------------------------------------------------------------------
+
+section("10. Dataset.create_table_from_rows() and load_csv_as_primary()")
+
+def test_create_table_from_rows_row_count():
+    from models.dataset import Dataset
+    ds = Dataset()
+    ds.load_folder(TEST_IMAGES)
+    picked = list(ds.get_table("frames")["row_id"])[:3]
+    ds.create_table_from_rows("subset", picked)
+    assert len(ds.get_table("subset")) == len(picked), (
+        f"subset should hold {len(picked)} rows, got {len(ds.get_table('subset'))}"
+    )
+    assert "subset" in ds.list_tables(), "new table should be registered"
+
+def test_create_table_from_rows_keeps_source_row_ids():
+    # Copied rows keep their row_ids: ArtifactStore caches thumbnails by
+    # row_id, so fresh ids would orphan the cache.
+    from models.dataset import Dataset
+    ds = Dataset()
+    ds.load_folder(TEST_IMAGES)
+    rows_before = len(ds.get_table("frames"))
+    picked = list(ds.get_table("frames")["row_id"])[:3]
+    ds.create_table_from_rows("subset", picked)
+    assert list(ds.get_table("subset")["row_id"]) == picked, (
+        f"expected {picked}, got {list(ds.get_table('subset')['row_id'])}"
+    )
+    assert len(ds.get_table("frames")) == rows_before, (
+        "source table should be unchanged"
+    )
+
+def test_load_csv_as_primary_one_row_per_csv_row():
+    from models.dataset import Dataset
+    if not METADATA_CSV.exists():
+        return  # SKIP — metadata.csv not available
+    csv_df = pd.read_csv(METADATA_CSV)
+    ds = Dataset()
+    ds.load_csv_as_primary(METADATA_CSV)
+    df = ds.get_table("frames")
+    assert len(df) == len(csv_df), (
+        f"expected one row per CSV row ({len(csv_df)}), got {len(df)}"
+    )
+    for col in csv_df.columns:
+        assert col in df.columns, f"CSV column '{col}' missing after load"
+
+def test_load_csv_as_primary_row_ids_start_at_000001():
+    from models.dataset import Dataset
+    if not METADATA_CSV.exists():
+        return  # SKIP — metadata.csv not available
+    ds = Dataset()
+    ds.load_folder(TEST_IMAGES)          # prior state must not carry over
+    ds.load_csv_as_primary(METADATA_CSV)
+    row_ids = list(ds.get_table("frames")["row_id"])
+    assert row_ids[0] == "000001", (
+        f"row_ids should start at '000001', got {row_ids[0]}"
+    )
+    assert len(set(row_ids)) == len(row_ids), "row_ids should be unique"
+
+run_test("Subset table has correct row count",   test_create_table_from_rows_row_count)
+run_test("Subset keeps source row_ids",          test_create_table_from_rows_keeps_source_row_ids)
+run_test("One row per CSV row",                  test_load_csv_as_primary_one_row_per_csv_row)
+run_test("CSV row_ids start at 000001",          test_load_csv_as_primary_row_ids_start_at_000001)
+
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
