@@ -1454,10 +1454,52 @@ def test_load_csv_as_primary_row_ids_start_at_000001():
     )
     assert len(set(row_ids)) == len(row_ids), "row_ids should be unique"
 
+def test_load_csv_as_primary_clears_derived_tables():
+    from models.dataset import Dataset
+    if not METADATA_CSV.exists():
+        return  # SKIP — metadata.csv not available
+    ds = Dataset()
+    ds.load_folder(TEST_IMAGES)
+    ds._tables["leftover"] = pd.DataFrame({"row_id": ["999999"], "x": [1]})
+    ds.load_csv_as_primary(METADATA_CSV)
+    assert "leftover" not in ds.list_tables(), (
+        f"a fresh load should clear stale derived tables; got {ds.list_tables()}"
+    )
+
+def test_load_csv_as_primary_sets_full_path_from_image_column():
+    from models.dataset import Dataset
+    from column_types.registry import ColumnTypeRegistry
+    from artifacts.artifact_store import ArtifactStore
+    paths = [str(p) for p in sorted(TEST_IMAGES.glob("*.jpg"))[:3]]
+    if len(paths) < 3:
+        return  # SKIP — not enough test images
+    registry = ColumnTypeRegistry()
+    with tempfile.TemporaryDirectory() as d:
+        registry.setup_defaults(ArtifactStore(Path(d) / "artifacts"))
+        csv_path = Path(d) / "with_paths.csv"
+        pd.DataFrame({"image": paths, "score": [1, 2, 3]}).to_csv(csv_path, index=False)
+        ds = Dataset()
+        ds.set_registry(registry)
+        ds.load_csv_as_primary(csv_path, image_column="image")
+        df = ds.get_table("frames")
+    assert list(df["full_path"]) == paths, (
+        f"full_path should come from the image column; got {list(df['full_path'])}"
+    )
+    assert list(df["file_name"]) == [Path(p).name for p in paths], (
+        f"file_name should be the bare name; got {list(df['file_name'])}"
+    )
+    col_type = registry.get("full_path")
+    assert col_type is not None and col_type.tag == "media_path", (
+        f"full_path should be registered as media_path; got "
+        f"{col_type.tag if col_type else None}"
+    )
+
 run_test("Subset table has correct row count",   test_create_table_from_rows_row_count)
 run_test("Subset keeps source row_ids",          test_create_table_from_rows_keeps_source_row_ids)
 run_test("One row per CSV row",                  test_load_csv_as_primary_one_row_per_csv_row)
 run_test("CSV row_ids start at 000001",          test_load_csv_as_primary_row_ids_start_at_000001)
+run_test("CSV load clears derived tables",       test_load_csv_as_primary_clears_derived_tables)
+run_test("image_column sets full_path",          test_load_csv_as_primary_sets_full_path_from_image_column)
 
 
 # ---------------------------------------------------------------------------
