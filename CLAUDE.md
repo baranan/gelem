@@ -20,6 +20,7 @@ is over. Claude now does the implementation work.
 | `docs/architecture.md` | What is Gelem and how do its parts relate? |
 | `docs/media_architecture.md` | How do we handle video and scale? |
 | `operators/CLAUDE.md` | How do I write an operator? |
+| `docs/roadmap.md` | What are we building, why, and when is it usable? |
 
 **Filenames are exact.** `operators/CLAUDE.md` must have that name or Claude Code
 will not load it when working in that directory, and every operator rule will be
