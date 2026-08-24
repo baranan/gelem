@@ -295,8 +295,6 @@ class Dataset:
                           file paths to media files. If provided and the files
                           exist, full_path is set from this column so
                           thumbnails can be generated.
-
-        TODO (Student B): Implement this method.
         """
         # Reset all tables for a fresh load (not just 'frames') so old
         # derived tables don't linger.
@@ -305,7 +303,7 @@ class Dataset:
             "frames": pd.DataFrame(columns=self.FRAMES_REQUIRED_COLUMNS)
         }
 
-        # PLACEHOLDER: reads the CSV and creates rows.
+        # Read the CSV and build one row per CSV row.
         try:
             csv_df = pd.read_csv(csv_path)
         except Exception as e:
@@ -563,8 +561,6 @@ class Dataset:
             row_id:     The row to update.
             updates:    Dict of column name to new value.
             table_name: Table containing the row.
-
-        TODO (Student B): Implement this method.
         """
         df = self._tables[table_name]
         mask = df["row_id"] == row_id
