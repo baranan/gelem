@@ -152,27 +152,36 @@ itself an instance of the problem this file's status tags exist to fix.
 ### UI
 
 - **`[NOW]`** UI files never import pandas, PIL, numpy, mediapipe, or cv2.
-- **`[MIGRATING]`** UI never reads a DataFrame. Known violations:
-  `ui/main_window.py:377-378` and `400-401`.
+- **`[MIGRATING]`** UI never reads a DataFrame. Known violation:
+  `ui/main_window.py:401` (`columns=list(df.columns)`). *(Re-verified 24 Aug
+  2026: this used to be two sites; the second one merged into the citation
+  below and no longer separately reads a DataFrame.)*
 - **`[MIGRATING]`** UI never touches private controller attributes. Known
-  violations: `ui/main_window.py:276-278, 398, 437` (`_op_registry`),
-  `ui/main_window.py:377-378, 400-401` (`_dataset`, `_active_table`),
-  `ui/filter_panel.py:199` (`_registry`). Public equivalents already exist --
-  `get_all_row_ids()`, `get_column_type()`, `get_operator()` -- so these are
-  unfinished migrations, not missing API.
+  violations: `ui/main_window.py:276-278` (`_op_registry`),
+  `ui/main_window.py:396-397` (`_dataset`, `_active_table`). Public equivalents
+  already exist -- `get_all_row_ids()`, `get_column_type()`, `get_operator()` --
+  so these are unfinished migrations, not missing API. *(Re-verified 24 Aug
+  2026: `ui/filter_panel.py:199` no longer reaches into `_registry` -- it now
+  calls the public `controller.get_column_type()` -- so that citation is
+  removed. The `_op_registry` and `_dataset`/`_active_table` sites also
+  shrank from three occurrences each to one.)*
 - **`[MIGRATING]`** No widget reads another component's private state. Known
-  violations: `ui/main_window.py:527, 668, 854` read `GalleryWidget._row_ids`,
+  violations: `ui/main_window.py:523, 668, 861` read `GalleryWidget._row_ids`,
   which creates a second source of truth for which rows are visible -- the
-  controller should own that order. `ui/main_window.py:438` reads
-  `operator._group_by` back off the operator instance, where `base.py:333` had
-  stored it with `setattr`.
+  controller should own that order. `ui/main_window.py:434` reads
+  `operator._group_by` back off the operator instance, where `base.py:331-334`
+  stores it with `setattr`. *(Line numbers re-verified 24 Aug 2026; the sites
+  themselves are unchanged, just shifted.)*
 - **`[NOW]`** Renderers may import PIL and cv2 -- they are not UI files. Renderers
   never import from `ui/`.
 - **`[NOW]`** Shared display components go in `shared_widgets/`, not inside `ui/`.
-- **`[MIGRATING]`** `None` and `[]` are different. For visible columns, `None`
-  means "no preference set" and `[]` means "the user chose zero columns". Testing
-  with `if not columns` conflates them. Known violation:
-  `ui/gallery_widget.py:390`.
+- **`[NOW]`** `None` and `[]` are different. For visible columns, `None` means "no
+  preference set" and `[]` means "the user chose zero columns".
+  `GalleryWidget._relayout()` (`ui/gallery_widget.py:408-419`) now distinguishes
+  the two explicitly and correctly. *(Re-verified 24 Aug 2026: this was
+  `[MIGRATING]` with a known violation at `ui/gallery_widget.py:390`; the
+  violation is fixed. No guardrail test exists yet for the distinction, though
+  -- writing one is a Phase 0 task per the status-tag rule above.)*
 
 ### Media
 
@@ -257,8 +266,21 @@ Run with `python -m pytest`. Environment is a `(gelem)` virtualenv activated via
 path, so allow a moment after branch checkouts before running tests.
 
 **The baseline must be green before Phase 0 starts.** `tests/test_renderer.py`
-currently has two collection errors from functions named `test_*` that are really
-manual checks; rename or convert them.
+used to have two collection errors from functions named `test_*` that were really
+manual checks (`test_thumbnail`, `test_detail`, each requiring positional
+arguments pytest tried to treat as fixtures). Fixed 24 Aug 2026 by renaming them
+to `check_thumbnail` / `check_detail` -- the file is a standalone manual-check
+script, not a pytest module, so nothing inside it should match `test_*`.
+
+`python -m pytest` now collects cleanly (no errors), but is not fully green: three
+pre-existing failures in `tests/test_dataset.py`
+(`test_add_computed_column_correct_values`, `test_apply_sort`,
+`test_apply_grouped_all_rows_accounted`) are caused by an **untracked** stray file,
+`test_images/boxtest.png`, which matches `Dataset.load_folder()`'s image
+extensions and adds a 21st row with no matching `metadata.csv` entry. This file
+does not exist on a fresh clone, so those three tests pass there; locally, either
+remove `boxtest.png` from `test_images/` or give it an extension `load_folder()`
+does not treat as media.
 
 ---
 
@@ -373,8 +395,8 @@ code to match a document without saying so.
 
 ## Known defects
 
-Verified against the code on 4 Aug 2026. Each should become a failing test before
-or as it is fixed.
+Verified against the code on 4 Aug 2026; re-verified against `main` on 24 Aug
+2026 (P0.1). Each should become a failing test before or as it is fixed.
 
 **Wrong output, not just slow:**
 
@@ -415,8 +437,6 @@ or as it is fixed.
 - `operators_config.yaml` claims to control which operators are enabled. `main.py`
   registers them manually and never reads the file. `StatsOperator` is registered
   in code and absent from the YAML.
-- `operators/CLAUDE.md` says operators write to `self.output_dir`; every
-  implementation uses `self._output_dir`.
 - `operators/base.py` documents a `plot_html` result key; `ResultsPanel` and
   `PlotAdvancedOperator` use `html_path`.
 - `Dataset.load_folder()` never registers `file_name` in the registry, unlike the
@@ -424,4 +444,10 @@ or as it is fixed.
 - `_id_counter` assumes `row_id` parses as an int. No stale-file cleanup on
   re-save.
 - Many module docstrings still assign files to Student A, B, or C. Remove as those
-  files are touched.
+  files are touched. *(Done in `tests/test_renderer.py` 24 Aug 2026, the only
+  file touched this session.)*
+
+*(Re-verified 24 Aug 2026: the `self.output_dir` vs `self._output_dir` bullet
+that used to be here is removed -- `operators/CLAUDE.md` no longer makes that
+claim; it already documents `self._output_dir` and notes `self.output_dir`
+"never existed". The other bullets in this section are still true as written.)*

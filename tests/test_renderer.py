@@ -2,14 +2,19 @@
 tests/test_renderer.py
 
 Tests the column type renderers by rendering sample values and saving
-the output as PNG files. Run this to verify your render functions
-produce correct visual output without needing the full application.
+the output as PNG files. Run this to verify render functions produce
+correct visual output without needing the full application.
+
+This is a standalone manual-check script, not a pytest test module --
+it is named test_*.py only because it lives alongside the automated
+suite. check_thumbnail() and check_detail() are prefixed "check_", not
+"test_", so pytest does not try to collect them as test functions.
 
 Usage:
     python tests/test_renderer.py
 
 Output images are saved to tests/renderer_output/
-Student A should inspect these images to verify their renderers work.
+Inspect them by eye to verify the renderers work.
 
 What this tests:
     - media_path renderer (thumbnail mode) for images
@@ -52,7 +57,7 @@ _passed = 0
 _failed = 0
 
 
-def test_thumbnail(column_name: str, value, filename: str) -> None:
+def check_thumbnail(column_name: str, value, filename: str) -> None:
     """
     Renders a value in thumbnail mode and saves it as a PNG file.
     A QPixmap is expected.
@@ -69,7 +74,7 @@ def test_thumbnail(column_name: str, value, filename: str) -> None:
         _failed += 1
 
 
-def test_detail(column_name: str, value, label: str) -> None:
+def check_detail(column_name: str, value, label: str) -> None:
     """
     Renders a value in detail mode and checks that a QWidget is returned.
     Does not save to disk (widgets can't be saved as PNG directly).
@@ -97,8 +102,8 @@ test_images += list((project_root / "test_images").glob("*.png"))
 if test_images:
     # Register full_path as media_path so the renderer is found.
     registry.register_by_tag("full_path", "media_path")
-    test_thumbnail("full_path", str(test_images[0]), "test_image_thumbnail.png")
-    test_detail("full_path", str(test_images[0]), "image detail mode")
+    check_thumbnail("full_path", str(test_images[0]), "test_image_thumbnail.png")
+    check_detail("full_path", str(test_images[0]), "image detail mode")
 else:
     print("  SKIP  image tests — no .jpg/.png files found in test_images/")
 
@@ -111,8 +116,8 @@ test_videos = list((project_root / "test_images").glob("*.mp4"))
 test_videos += list((project_root / "test_images").glob("*.mov"))
 
 if test_videos:
-    test_thumbnail("full_path", str(test_videos[0]), "test_video_thumbnail.png")
-    test_detail("full_path", str(test_videos[0]), "video detail mode")
+    check_thumbnail("full_path", str(test_videos[0]), "test_video_thumbnail.png")
+    check_detail("full_path", str(test_videos[0]), "video detail mode")
 else:
     print("  SKIP  video tests — no .mp4/.mov files found in test_images/")
     print("        Add a short video to test_images/ to test video rendering.")
@@ -125,9 +130,9 @@ print("── numeric ───────────────────�
 registry.register_by_tag("some_number",  "numeric")
 registry.register_by_tag("some_integer", "numeric")
 
-test_thumbnail("some_number",  3.14159, "test_numeric_float.png")
-test_thumbnail("some_integer", 42,      "test_numeric_int.png")
-test_detail("some_number", 3.14159, "numeric detail mode")
+check_thumbnail("some_number",  3.14159, "test_numeric_float.png")
+check_thumbnail("some_integer", 42,      "test_numeric_int.png")
+check_detail("some_number", 3.14159, "numeric detail mode")
 
 # ── text renderer ─────────────────────────────────────────────────────────
 
@@ -137,9 +142,9 @@ print("── text ────────────────────�
 registry.register_by_tag("condition",  "text")
 registry.register_by_tag("long_label", "text")
 
-test_thumbnail("condition",  "positive", "test_text_short.png")
-test_thumbnail("long_label", "A very long label that might overflow", "test_text_long.png")
-test_detail("condition", "positive", "text detail mode")
+check_thumbnail("condition",  "positive", "test_text_short.png")
+check_thumbnail("long_label", "A very long label that might overflow", "test_text_long.png")
+check_detail("condition", "positive", "text detail mode")
 
 # ── boolean_flag renderer ─────────────────────────────────────────────────
 
@@ -148,9 +153,9 @@ print("── boolean_flag ─────────────────�
 
 registry.register_by_tag("is_valid",   "boolean_flag")
 
-test_thumbnail("is_valid", True,  "test_boolean_true.png")
-test_thumbnail("is_valid", False, "test_boolean_false.png")
-test_detail("is_valid", True, "boolean_flag detail mode")
+check_thumbnail("is_valid", True,  "test_boolean_true.png")
+check_thumbnail("is_valid", False, "test_boolean_false.png")
+check_detail("is_valid", True, "boolean_flag detail mode")
 
 # ── placeholder cases ─────────────────────────────────────────────────────
 
@@ -158,10 +163,10 @@ print()
 print("── placeholders ────────────────────────────────────────────────")
 
 # Unknown column — not registered with registry.
-test_thumbnail("unknown_column", "some_value", "test_unknown_column.png")
+check_thumbnail("unknown_column", "some_value", "test_unknown_column.png")
 
 # None value — registered column but value is None.
-test_thumbnail("full_path", None, "test_none_value.png")
+check_thumbnail("full_path", None, "test_none_value.png")
 
 # ── ZoomableImageView import (regression after move to shared_widgets) ────────
 
