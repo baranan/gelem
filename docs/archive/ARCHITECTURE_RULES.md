@@ -1,3 +1,5 @@
+*SUPERSEDED -- see docs/media_architecture.md*
+
 # Gelem Architecture Rules
 
 This is the one-page rule reference for all contributors.

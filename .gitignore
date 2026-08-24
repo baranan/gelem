@@ -20,3 +20,20 @@ Gelem_*.docx
 test_plots/
 
 setup.ps1
+
+# Research media -- never commit participant recordings
+vids/
+
+# Generated exports and scratch diffs
+gelem_codebase_for_claude.txt
+/archive/
+controller_full_diff.txt
+tree.txt
+
+# Generated outputs
+gelem_project/
+tests/renderer_output/
+.pytest_cache/
+
+# Editor
+.vscode/
