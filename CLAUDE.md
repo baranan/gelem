@@ -71,6 +71,9 @@ membership can change; the ID does not. The order of work is in
 component reaches into another's internals. This is the goal, not the present
 state -- the violation sites are listed under "UI" below. Stating it untagged was
 itself an instance of the problem this file's status tags exist to fix.
+*(Re-verified 26 Aug 2026: this rule carries no violation list of its own --
+it points at the three `[MIGRATING]` rules under "UI" below, which are each
+re-verified there.)*
 
 ---
 
@@ -92,7 +95,10 @@ itself an instance of the problem this file's status tags exist to fix.
   **Operator runs are not**, so provenance is not yet sufficient to reproduce an
   analysis. See `docs/architecture.md` §8. Also: `save()` writes `provenance.json`
   before recording the save, so the save action is absent from the file it just
-  wrote.
+  wrote. *(Re-verified 26 Aug 2026: every `provenance.record()` call still lives
+  in `models/dataset.py` -- none in `operators/` or `controller.py` -- and
+  `save()` at `models/dataset.py:790-793` still writes the file before recording
+  the save.)*
 - **`[NOW]`** Paths **inside the project folder** are stored relative to it, so
   projects stay portable. Paths outside it stay absolute unless the user
   explicitly imports or copies the file into the project.
@@ -103,7 +109,9 @@ itself an instance of the problem this file's status tags exist to fix.
   carries no meaning: do not parse it, sort by it, or infer anything from it.
   Known violation: `Dataset.load()` restores `_id_counter` with
   `int(df["row_id"].astype(int).max())`, which parses it. The counter should be
-  stored in the project rather than recovered from the ids.
+  stored in the project rather than recovered from the ids. *(Re-verified 26 Aug
+  2026: still the only site -- `models/dataset.py:842`. No other file parses,
+  sorts by, or infers meaning from `row_id`.)*
 - **`[NOW]`** `row_id` is unique **within a table**. It is not unique across
   tables: `create_table_from_rows()` deliberately keeps ids when copying rows.
 - **`[NOW]`** Row ids **are preserved by project save and load** -- `save()` writes
@@ -142,6 +150,12 @@ itself an instance of the problem this file's status tags exist to fix.
   Known violations: `controller.py` `_on_operator_setup_error` and
   `_on_operator_row_errors` both call `self._op_registry.get()` from the worker
   thread to look up a label. The label should travel with the error instead.
+  *(Re-verified 26 Aug 2026: both are still called from
+  `OperatorRegistry._run_create_columns_worker`, which runs on a
+  `threading.Thread`; every other worker-bound controller callback
+  -- `_on_item_complete`, `_on_progress`, `_on_create_columns_complete`,
+  `_on_create_table_complete`, `_on_create_display_complete` -- only appends to a
+  queue and reads no state, so the list is still closed at these two.)*
 - **`[NOW]`** Worker callbacks **are** bound controller methods. This is correct
   and deliberate. An earlier version of this file said workers "never touch the
   controller," which forbade the actual design.
@@ -156,7 +170,10 @@ itself an instance of the problem this file's status tags exist to fix.
 - **`[MIGRATING]`** UI never reads a DataFrame. Known violation:
   `ui/main_window.py:401` (`columns=list(df.columns)`). *(Re-verified 24 Aug
   2026: this used to be two sites; the second one merged into the citation
-  below and no longer separately reads a DataFrame.)*
+  below and no longer separately reads a DataFrame.)* *(Re-verified 26 Aug 2026:
+  line and content unchanged; still the only `.columns`/`.iloc`/`.loc`/`DataFrame`
+  site under `ui/` outside `ui/fake_controller.py`, which is excluded from the
+  UI import guardrail because it stands in for `AppController`, not a widget.)*
 - **`[MIGRATING]`** UI never touches private controller attributes. Known
   violations: `ui/main_window.py:276-278` (`_op_registry`),
   `ui/main_window.py:396-397` (`_dataset`, `_active_table`). Public equivalents
@@ -165,14 +182,22 @@ itself an instance of the problem this file's status tags exist to fix.
   2026: `ui/filter_panel.py:199` no longer reaches into `_registry` -- it now
   calls the public `controller.get_column_type()` -- so that citation is
   removed. The `_op_registry` and `_dataset`/`_active_table` sites also
-  shrank from three occurrences each to one.)*
+  shrank from three occurrences each to one.)* *(Re-verified 26 Aug 2026: lines
+  unchanged -- `_op_registry` at 276-278, `_dataset`/`_active_table` at 396-397.
+  No other file under `ui/` (excluding `fake_controller.py`'s own
+  internal `self` references, which are not cross-component access) reads
+  `controller._` anything.)*
 - **`[MIGRATING]`** No widget reads another component's private state. Known
   violations: `ui/main_window.py:523, 668, 861` read `GalleryWidget._row_ids`,
   which creates a second source of truth for which rows are visible -- the
   controller should own that order. `ui/main_window.py:434` reads
   `operator._group_by` back off the operator instance, where `base.py:331-334`
   stores it with `setattr`. *(Line numbers re-verified 24 Aug 2026; the sites
-  themselves are unchanged, just shifted.)*
+  themselves are unchanged, just shifted.)* *(Re-verified 26 Aug 2026: same
+  three `ui/main_window.py` lines (523, 668, 861) read `GalleryWidget._row_ids`
+  via `gallery._row_ids` or the `lambda g: g._row_ids` at 668; no other widget
+  reads another widget's private attribute. Line 434 and `base.py:331-334` are
+  unchanged.)*
 - **`[NOW]`** Renderers may import PIL and cv2 -- they are not UI files. Renderers
   never import from `ui/`.
 - **`[NOW]`** Shared display components go in `shared_widgets/`, not inside `ui/`.
@@ -286,7 +311,13 @@ arguments pytest tried to treat as fixtures). Fixed 24 Aug 2026 by renaming them
 to `check_thumbnail` / `check_detail` -- the file is a standalone manual-check
 script, not a pytest module, so nothing inside it should match `test_*`.
 
-`python -m pytest` now collects cleanly (no errors), but make sure it indeed fully green as I deleted an image that Claude-Desktop identified as the culprit. 
+**Verified green 26 Aug 2026 (P0.1).** `python -m pytest` collects 91 items with
+zero collection errors and zero failures. Deleting the stray untracked
+`test_images/boxtest.png` (a 21st image with no matching `metadata.csv` row) fixed
+the three `tests/test_dataset.py` failures this section used to describe; run
+individually, `test_add_computed_column_correct_values`, `test_apply_sort`, and
+`test_apply_grouped_all_rows_accounted` all pass. `test_images/` currently holds
+exactly 20 `.jpg` files against 20 `metadata.csv` rows, so nothing stray remains.
 
 ---
 
