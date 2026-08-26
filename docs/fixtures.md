@@ -48,8 +48,10 @@ files are here.
   reads its input, so this file is untouched by that use.
 - The legacy file is **mpeg4**, a third codec family alongside h264 and hevc. The
   resolver must not assume the corpus is H.264/H.265. Its 3200x1200 frame is almost
-  certainly two cameras side by side, which makes §3.6 item 5 (crop coordinates,
-  pixels versus normalised) a real workflow rather than a hypothetical.
+  certainly two cameras side by side -- exactly the "splitting a side-by-side
+  recording into two rows" scenario §3.6 decision 5 names as a likely future
+  source of a region address, though as of 26 Aug 2026 nothing in Gelem produces
+  one and none is scheduled.
 - The phone file carries `rotation=90`: recorded portrait, stored landscape. Its
   video stream has **no** edit list. Its **audio** stream has an edit list whose
   first entry is empty (`media time: -1`), so audio and video begin at different
@@ -99,6 +101,61 @@ this one is a controlled companion.
 
 ---
 
+## Lossless known-frame fixture (P0.3)
+
+Required by `media_architecture.md` §7 for an equivalence reference that a lossy
+codec cannot serve: every frame's pixels report their own frame index, exactly,
+with no colour conversion in the way. It is small (a few KB), synthetic, and
+contains no participants, so per the dividing line above it is **generated on
+demand by the test fixture itself** (`tests/test_media_address.py`,
+`_generate_known_frame_video`) rather than committed.
+
+64x64, grayscale (`-pix_fmt gray`, so there is no RGB/YUV conversion to
+introduce doubt), 25 fps, 2 s -- 50 frames, each comfortably under 256 so no
+wraparound is needed. FFV1 is lossless. `geq=lum='N'` sets every pixel of frame
+`N` to the value `N`.
+
+```powershell
+ffmpeg -hide_banner -y -f lavfi -i "color=c=black:s=64x64:r=25:d=2" -vf "format=gray,geq=lum='N'" -pix_fmt gray -c:v ffv1 known_frames.mkv
+```
+
+The self-check decodes it back with a plain `ffmpeg ... -f rawvideo -pix_fmt gray -`
+pipe (no PyAV, no OpenCV -- nothing beyond ffmpeg itself, which fixture
+generation already requires) and asserts every byte of frame `N` equals `N`.
+Frame-selection tests that resolve addresses *against* this fixture belong to
+P1.2, which has a resolver to decode with; P0.3's own test of it is only this
+self-check.
+
+## Video-stream edit list attempt (P0.3, decision 12)
+
+No file in the set above has an edit list on its *video* stream (see Known
+gaps, historically). `media_architecture.md` §3.6 item 12 needed one to test
+against. Attempted by stream-copying a non-keyframe-aligned cut of the real
+Zoom recording -- `-ss` lands 0.3 s past the nearest keyframe (keyframes are at
+even seconds in that file), so a stream-copy trim cannot start exactly there
+and must either drop the pre-roll or hide it with an edit list:
+
+```powershell
+ffmpeg -hide_banner -y -ss 10.3 -i "$env:GELEM_FIXTURES\sid89_video.mp4" -t 3 -c copy -map 0:v:0 elst_attempt.mp4
+```
+
+**Outcome: it worked, verified 26 Aug 2026.** `ffprobe -v debug` on the result
+reports a genuine edit list on stream 0 (the mapped, and therefore only,
+stream -- video): `Processing st: 0, edit list 0 - media time: 9000, duration:
+90600` at the file's 1/30000 time base, i.e. a 0.3 s pre-roll -- matching the
+0.3 s offset requested, and reproduced on a second independent run of the same
+command. This is not assumed from the command succeeding; it is read back from
+the container the way `media_architecture.md` §3.6 warns to. The command and
+check are automated in `tests/test_media_address.py`
+(`test_decision12_edit_list_on_video_stream_attempt`), which skips rather than
+fails if `GELEM_FIXTURES` is unset or a future ffmpeg version stops
+reproducing this. The output file is generated into the test's own `tmp_path`
+and is not committed -- it is a three-second cut of a real, identifiable
+participant recording, not a synthetic fixture, so it belongs outside the repo
+like the recording it comes from.
+
+---
+
 ## Known gaps
 
 Recorded so that nobody mistakes absence of a test for a passing one.
@@ -106,9 +163,28 @@ Recorded so that nobody mistakes absence of a test for a passing one.
 | Gap | Consequence |
 |---|---|
 | No real H.265 file | H.265 is represented only by the two synthetic fixtures. One 30-second iPhone clip would close it, and would likely bring a video-stream edit list with it. |
-| No **video-stream** edit list anywhere in the set | §3.6 item 12 (frame ordinal after an edit list) is untested. Do not treat it as covered. |
-| No lossless known-frame fixture | Required by §7 for the equivalence test. Belongs to P0.3, not to the measurement pass. |
 | Source is soft, 0.86 Mbps for 1080p | Absolute decode times from the generated set will be optimistic. Acceptable: §11 already holds that absolute per-frame times do not generalise and must not drive design. Ratios are unaffected, since all five share the source. |
+
+**Closed 26 Aug 2026 (P0.3):**
+
+- No lossless known-frame fixture -- built above, generated on demand from
+  `ffmpeg` alone. Robustly closed: `test_lossless_known_frame_fixture_self_check`
+  runs (and can fail) in any environment with `ffmpeg` on PATH, including CI.
+
+**Closed on the author's machine only, 26 Aug 2026 (P0.3) -- not the same
+strength of closure as the row above:**
+
+- No **video-stream** edit list anywhere in the committed set -- §3.6 item 12
+  is verified against the generated attempt above, but
+  `test_decision12_edit_list_on_video_stream_attempt` is double-gated: it
+  needs both `ffmpeg`/`ffprobe` on PATH and `GELEM_FIXTURES` pointing at the
+  real, uncommitted recordings, which per this document's own opening section
+  exist only on Y B's machine and are never synced to the repo or Drive. On
+  any other checkout -- CI included -- this test unconditionally **skips**,
+  which looks identical to "not yet run" rather than "regressed". A future
+  ffmpeg version could stop reproducing the edit list and nothing would flag
+  it; re-run the test on `GELEM_FIXTURES` before trusting this line, rather
+  than trusting the line itself.
 
 ---
 
