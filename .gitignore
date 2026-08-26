@@ -19,6 +19,9 @@ Gelem_*.docx
 # Local test output
 test_plots/
 
+# Local diffs for reviews
+docs/review/
+
 # Local testing
 manual_testing/
 

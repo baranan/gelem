@@ -262,7 +262,9 @@ class AppController(QObject):
     def _refresh_gallery(self) -> None:
         """Re-runs the current query and emits the gallery signal."""
         try:
-            df = self._dataset.get_table(self._active_table)
+            # Read-only: QueryEngine never mutates what it is handed
+            # ([NOW] rule), so this does not need Dataset's own copy.
+            df = self._dataset.read_only_view(self._active_table)
 
             if self._group_by:
                 grouped = self._query.apply_grouped(
@@ -515,17 +517,15 @@ class AppController(QObject):
                         print(f"[Controller] Warning: {e}")
             operation_id = str(uuid.uuid4())
             table_name   = self._active_table
-            work_items   = [
-                {
-                    "row_id":     row_id,
-                    "table_name": table_name,
-                    "row_data":   self._dataset.get_row(row_id, table_name),
-                }
-                for row_id in row_ids
-            ]
+            # One snapshot of exactly the selected rows, taken once here
+            # on the main thread -- not one Dataset.get_row() call (and
+            # one full-table copy) per row.
+            snapshot = self._dataset.snapshot_rows(table_name, row_ids)
             self._op_registry.run_create_columns(
                 operator_name,
-                work_items,
+                snapshot,
+                row_ids,
+                table_name,
                 operation_id=operation_id,
                 on_item_complete=self._on_item_complete,
                 on_progress=self._on_progress,
@@ -553,8 +553,7 @@ class AppController(QObject):
             group_by:      Column or columns to group by.
         """
         try:
-            df          = self._dataset.get_table(self._active_table)
-            selected_df = df[df["row_id"].isin(row_ids)].copy()
+            selected_df = self._dataset.snapshot_rows(self._active_table, row_ids)
 
             self._op_registry.run_create_table(
                 operator_name,
@@ -581,8 +580,7 @@ class AppController(QObject):
             row_ids:       Rows to include in the DataFrame.
         """
         try:
-            df          = self._dataset.get_table(self._active_table)
-            selected_df = df[df["row_id"].isin(row_ids)].copy()
+            selected_df = self._dataset.snapshot_rows(self._active_table, row_ids)
 
             self._op_registry.run_create_display(
                 operator_name,
@@ -698,9 +696,7 @@ class AppController(QObject):
             row_ids: If provided, export only these rows.
         """
         try:
-            df = self._dataset.get_table(self._active_table)
-            if row_ids is not None:
-                df = df[df["row_id"].isin(row_ids)]
+            df = self._dataset.snapshot_rows(self._active_table, row_ids)
             df.to_csv(path, index=False)
         except Exception as e:
             self.error_occurred.emit(f"Failed to export CSV: {e}")
@@ -759,7 +755,7 @@ class AppController(QObject):
             Sorted list of unique values.
         """
         try:
-            df = self._dataset.get_table(self._active_table)
+            df = self._dataset.read_only_view(self._active_table)
             return self._query.get_group_values(df, column)
         except Exception:
             return []
@@ -850,7 +846,7 @@ class AppController(QObject):
             Ordered list of row_id strings.
         """
         name = table_name if table_name is not None else self._active_table
-        return list(self._dataset.get_table(name)["row_id"])
+        return list(self._dataset.read_only_view(name)["row_id"])
 
     def get_operator(self, operator_name: str):
         """

@@ -4,12 +4,21 @@ tests/test_operator_registry_boundaries.py
 Verifies that OperatorRegistry respects component boundaries:
 
   - No access to private Dataset attributes (dataset._registry etc.)
-  - run_create_columns receives pre-snapshotted work_items, not a live Dataset
+  - run_create_columns receives a pre-snapshotted DataFrame plus ordered
+    row_ids and a table_name, not a live Dataset
   - The background worker never reads from Dataset directly
 
 These are source-inspection tests (AST-based), so they run without Qt or
 real data. They will catch architectural drift the moment a student copies
 the old pattern.
+
+P0.2a note: run_create_columns used to take work_items: list[dict], one
+pre-built dict per row. That shape is exactly what P0.2a (see CLAUDE.md /
+docs/media_architecture.md §6.1 item 4) replaces, because building 530,000
+dicts before a run starts is the defect being fixed. The test that used to
+assert "work_items" is present was asserting the old shape, so it is
+updated here to assert the new one (snapshot DataFrame + row_ids +
+table_name) rather than kept passing vacuously under a repurposed name.
 
 Run with: pytest tests/test_operator_registry_boundaries.py
 """
@@ -50,7 +59,8 @@ def test_no_private_dataset_attribute_access():
 
 
 def test_run_create_columns_does_not_accept_dataset():
-    """run_create_columns must receive work_items, not a raw Dataset instance.
+    """run_create_columns must receive a pre-snapshotted DataFrame, not a
+    raw Dataset instance.
 
     Passing Dataset into the registry gives the worker thread access to live
     model state. AppController must snapshot rows on the main thread first.
@@ -59,18 +69,22 @@ def test_run_create_columns_does_not_accept_dataset():
     assert args is not None, "run_create_columns not found in operator_registry.py"
     assert "dataset" not in args, (
         "run_create_columns still accepts 'dataset' — "
-        "replace with work_items (pre-snapshotted by AppController)"
+        "replace with a snapshot DataFrame (pre-snapshotted by AppController)"
     )
 
 
-def test_run_create_columns_accepts_work_items():
-    """run_create_columns must accept work_items as its row input."""
+def test_run_create_columns_accepts_snapshot_row_ids_and_table_name():
+    """run_create_columns must accept a pre-snapshotted DataFrame plus
+    the ordered row_ids and table_name as its row input (P0.2a)."""
     args = _method_arg_names("run_create_columns")
     assert args is not None, "run_create_columns not found in operator_registry.py"
-    assert "work_items" in args, (
-        "run_create_columns does not have a 'work_items' parameter — "
-        "the worker should receive pre-snapshotted dicts, not row_ids + dataset"
-    )
+    for required in ("snapshot", "row_ids", "table_name"):
+        assert required in args, (
+            f"run_create_columns is missing '{required}' — "
+            f"the worker should receive one pre-snapshotted DataFrame "
+            f"plus ordered row_ids and table_name, not per-row dicts "
+            f"built in advance"
+        )
 
 
 def test_worker_does_not_call_dataset_get_row():
@@ -83,5 +97,5 @@ def test_worker_does_not_call_dataset_get_row():
     src = _source()
     assert "dataset.get_row" not in src, (
         "_run_create_columns_worker calls dataset.get_row() — "
-        "use the 'row_data' field from work_items instead"
+        "use the pre-snapshotted DataFrame passed to run_create_columns instead"
     )

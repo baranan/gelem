@@ -17,6 +17,7 @@ from __future__ import annotations
 from pathlib import Path
 from dataclasses import dataclass, field
 import json
+import weakref
 import pandas as pd
 
 
@@ -199,6 +200,13 @@ class Dataset:
         self._id_counter: int = 0
         self._registry = None
 
+        # row_id -> positional index, one dict per table. Lazily built and
+        # self-healing -- see _row_index_for().
+        self._row_index: dict[str, dict[str, int]] = {}
+        # table_name -> (row count, weakref to the DataFrame) the index
+        # above was built from. See _row_index_for() for how this is used.
+        self._row_index_stamp: dict[str, tuple[int, weakref.ReferenceType]] = {}
+
     def set_registry(self, registry) -> None:
         """
         Stores a reference to the ColumnTypeRegistry so Dataset can
@@ -226,6 +234,95 @@ class Dataset:
             self._registry.register_by_tag(column_name, col_type)
 
     # ------------------------------------------------------------------
+    # Row-id index (row_id -> positional index, per table)
+    # ------------------------------------------------------------------
+    #
+    # The index is self-healing rather than merely maintained. Several
+    # tests in tests/test_dataset.py assign straight to ds._tables[...],
+    # bypassing every Dataset method, so an index that trusted its own
+    # bookkeeping would go stale behind those writes and silently return
+    # rows from the wrong table -- worse than being slow. Instead, every
+    # lookup validates the cached index against a cheap stamp,
+    # (row count, weakref to the DataFrame), and rebuilds from the live
+    # frame whenever the stamp does not match, rather than assuming the
+    # cache is still good.
+    #
+    # The stamp holds a weakref, not id(df). id() is a bare memory
+    # address: it does not keep the old frame alive, so once it is freed
+    # Python is free to hand that same address to a later, unrelated
+    # DataFrame. Two table replacements with no lookup in between, plus a
+    # matching row count, would then make a stale stamp compare equal by
+    # coincidence -- get_row() silently returning positions from the
+    # wrong frame. A weakref cannot be fooled that way: once the frame it
+    # pointed to is gone, dereferencing it returns None forever, so the
+    # comparison correctly fails rather than accidentally matching a
+    # different object at the same address. It also does not keep a
+    # replaced table's memory alive the way storing the DataFrame itself
+    # would.
+    #
+    # This also means writers do not need to invalidate anything by hand.
+    # An in-place mutation that changes column values without touching
+    # row_id or row count (apply_row_updates, add_computed_column,
+    # add_column) leaves the stamp unchanged, which is correct -- row
+    # positions did not move, so the cached index is still exactly
+    # right. A write that replaces the table with a different DataFrame
+    # object (aggregate, create_table_from_df, confirm_merge, a test's
+    # direct ds._tables[...] = ... assignment) changes the stamp, so the
+    # very next lookup rebuilds rather than trusting stale positions.
+    # _set_table() and _reset_tables() below exist so every write goes
+    # through one obvious place, not because they need to do anything
+    # extra to keep the index correct.
+
+    def _get_stored_table(self, table_name: str) -> pd.DataFrame:
+        """Returns the live, stored DataFrame for table_name (no copy).
+        Internal only -- callers that need their own copy use get_table()
+        or snapshot_rows(); callers that only read use read_only_view()."""
+        if table_name not in self._tables:
+            raise KeyError(f"Table '{table_name}' does not exist in this project.")
+        return self._tables[table_name]
+
+    def _set_table(self, table_name: str, df: pd.DataFrame) -> None:
+        """The single place one stored table is written or replaced."""
+        self._tables[table_name] = df
+
+    def _reset_tables(self, tables: dict[str, pd.DataFrame]) -> None:
+        """The single place the whole _tables dict is replaced, e.g. by a
+        fresh load_folder(), load_csv_as_primary(), or load(). Clears the
+        index caches too -- not required for correctness (the stamp check
+        in _row_index_for would catch every one of these tables being a
+        new object anyway), but a table dropped by the reset (e.g. one
+        that existed only in the previous project) would otherwise leave
+        a dead entry sitting in these dicts forever."""
+        self._tables = tables
+        self._row_index.clear()
+        self._row_index_stamp.clear()
+
+    def _row_index_for(self, table_name: str) -> dict[str, int]:
+        """Returns the row_id -> positional-index mapping for one table,
+        rebuilding it first if the validity stamp no longer matches the
+        live table. See the section comment above for the design.
+
+        The stamp is checked by hand (length, then `ref() is df`) rather
+        than by comparing the (length, weakref) tuples with `==` -- a
+        tuple `==` would fall through to the weakrefs' own `__eq__`,
+        which compares referents with `==` too, and `DataFrame == DataFrame`
+        returns a DataFrame of booleans, not the single True/False a
+        cache check needs."""
+        df = self._get_stored_table(table_name)
+        cached = self._row_index_stamp.get(table_name)
+        is_valid = (
+            cached is not None
+            and cached[0] == len(df)
+            and cached[1]() is df
+        )
+        if not is_valid:
+            self._row_index[table_name] = {
+                row_id: pos for pos, row_id in enumerate(df["row_id"])
+            }
+            self._row_index_stamp[table_name] = (len(df), weakref.ref(df))
+        return self._row_index[table_name]
+
+    # ------------------------------------------------------------------
     # Loading
     # ------------------------------------------------------------------
 
@@ -247,9 +344,9 @@ class Dataset:
         # Reset all tables for a fresh load (not just 'frames') so old
         # derived tables don't linger.
         self._id_counter = 0
-        self._tables = {
+        self._reset_tables({
             "frames": pd.DataFrame(columns=self.FRAMES_REQUIRED_COLUMNS)
-        }
+        })
 
         # Scan the folder for supported media files and create rows.
         found_files = []
@@ -268,9 +365,9 @@ class Dataset:
 
         # If no media files found, create placeholder empty table with one row so the UI has something to show.
         if rows:
-            self._tables["frames"] = pd.DataFrame(rows)
+            self._set_table("frames", pd.DataFrame(rows))
         else:
-            self._tables["frames"] = pd.DataFrame(columns=self.FRAMES_REQUIRED_COLUMNS)
+            self._set_table("frames", pd.DataFrame(columns=self.FRAMES_REQUIRED_COLUMNS))
 
         
         # Register full_path as media_path — works for images and videos.
@@ -301,9 +398,9 @@ class Dataset:
         # Reset all tables for a fresh load (not just 'frames') so old
         # derived tables don't linger.
         self._id_counter = 0
-        self._tables = {
+        self._reset_tables({
             "frames": pd.DataFrame(columns=self.FRAMES_REQUIRED_COLUMNS)
-        }
+        })
 
         # PLACEHOLDER: reads the CSV and creates rows.
         try:
@@ -329,7 +426,7 @@ class Dataset:
 
             rows.append(row)
 
-        self._tables["frames"] = pd.DataFrame(rows)
+        self._set_table("frames", pd.DataFrame(rows))
 
         if image_column and image_column in csv_df.columns:
             self._register_column("full_path", "media_path")
@@ -480,7 +577,7 @@ class Dataset:
             report: The MergeReport returned by merge_csv().
         """
         if report._pending_df is not None:
-            self._tables["frames"] = report._pending_df.copy()
+            self._set_table("frames", report._pending_df.copy())
 
         for col in report._new_columns:
             if self._registry is not None:
@@ -514,9 +611,9 @@ class Dataset:
             col_type:   Column type tag. Defaults to 'numeric'.
             table_name: Which table to add the column to.
         """
-        df = self.get_table(table_name)
+        df = self._get_stored_table(table_name)
         df[name] = df.eval(expression)
-        self._tables[table_name] = df
+        self._set_table(table_name, df)
 
         self._register_column(name, col_type)
         self.provenance.record("add_computed_column", {
@@ -542,9 +639,9 @@ class Dataset:
             col_type:   Column type tag.
             table_name: Table to add the column to.
         """
-        df = self.get_table(table_name)
+        df = self._get_stored_table(table_name)
         df[name] = df["row_id"].map(values)
-        self._tables[table_name] = df
+        self._set_table(table_name, df)
         self._register_column(name, col_type)
 
     def update_row(
@@ -554,7 +651,8 @@ class Dataset:
         table_name: str = "frames",
     ) -> None:
         """
-        Updates a single row with new column values.
+        Updates a single row with new column values. A convenience
+        wrapper over apply_row_updates() for the one-row case.
         Called by AppController on the main thread to apply progressive
         operator results one item at a time.
         Never called from a background thread directly.
@@ -563,15 +661,54 @@ class Dataset:
             row_id:     The row to update.
             updates:    Dict of column name to new value.
             table_name: Table containing the row.
-
-        TODO (Student B): Implement this method.
         """
-        df = self._tables[table_name]
-        mask = df["row_id"] == row_id
-        for col, val in updates.items():
+        self.apply_row_updates(table_name, {row_id: updates})
+
+    def apply_row_updates(
+        self,
+        table_name: str,
+        updates: dict[str, dict],
+    ) -> None:
+        """
+        Applies a batch of per-row updates in one call. This is the
+        primary write path; update_row() is a one-item convenience over
+        it.
+
+        Uses the row-id index (see _row_index_for) to place each row's
+        values by position, so this costs one dict lookup per row rather
+        than a full-column scan per update.
+
+        Args:
+            table_name: Table containing the rows.
+            updates:    Dict mapping row_id to a dict of column name to
+                        new value. A row_id not present in the table is
+                        silently skipped, matching update_row()'s prior
+                        behaviour (a no-op mask match). A column that
+                        does not exist yet is created first and every
+                        row not covered by this batch gets None/NaN in
+                        it, matching update_row()'s prior behaviour too.
+        """
+        df    = self._get_stored_table(table_name)
+        index = self._row_index_for(table_name)
+
+        # Create every new column up front so the per-row loop below is
+        # pure positional writes, not repeated column creation.
+        touched_columns: set[str] = set()
+        for col_updates in updates.values():
+            touched_columns.update(col_updates.keys())
+        for col in touched_columns:
             if col not in df.columns:
                 df[col] = None
-            df.loc[mask, col] = val
+        col_locs = {col: df.columns.get_loc(col) for col in touched_columns}
+
+        for row_id, col_updates in updates.items():
+            pos = index.get(row_id)
+            if pos is None:
+                continue
+            for col, val in col_updates.items():
+                df.iat[pos, col_locs[col]] = val
+
+        self._set_table(table_name, df)
 
     # ------------------------------------------------------------------
     # Aggregation
@@ -603,7 +740,7 @@ class Dataset:
         agg_df["row_id"] = [self._next_id() for _ in range(len(agg_df))]
 
         # Step 3: Store the new table.
-        self._tables[name] = agg_df
+        self._set_table(name, agg_df)
 
         # Step 4: Register the column types for the new table.
         for col in agg_df.columns:
@@ -642,7 +779,7 @@ class Dataset:
         source_df = self.get_table(source_table)
         subset = source_df[source_df["row_id"].isin(row_ids)].copy()
         subset = subset.reset_index(drop=True)
-        self._tables[name] = subset
+        self._set_table(name, subset)
         self.provenance.record("create_table_from_rows", {
             "name":         name,
             "source_table": source_table,
@@ -670,7 +807,7 @@ class Dataset:
             "row_id",
             [self._next_id() for _ in range(len(result))],
         )
-        self._tables[name] = result
+        self._set_table(name, result)
 
         if self._registry is not None:
             for col in result.columns:
@@ -702,9 +839,88 @@ class Dataset:
         Raises:
             KeyError: If the table name does not exist.
         """
-        if name not in self._tables:
-            raise KeyError(f"Table '{name}' does not exist in this project.")
-        return self._tables[name].copy()
+        return self._get_stored_table(name).copy()
+
+    def read_only_view(self, table_name: str = "frames") -> pd.DataFrame:
+        """
+        Returns the stored table itself, with no copy, for callers that
+        only read.
+
+        Do not mutate the returned DataFrame under any circumstances --
+        this may be Dataset's own live, stored table, not a copy. This is
+        safe for QueryEngine specifically because "QueryEngine never
+        mutates data" is a [NOW] rule (tests/test_dataset.py::
+        test_apply_does_not_modify_dataframe), and it is the right choice
+        for any other caller that only counts rows or lists columns.
+        get_table() remains the correct choice for a caller that needs to
+        mutate the result or hold its own copy.
+
+        Args:
+            table_name: Table name. Defaults to 'frames'.
+
+        Returns:
+            The live DataFrame for the named table -- not a copy.
+
+        Raises:
+            KeyError: If the table name does not exist.
+        """
+        return self._get_stored_table(table_name)
+
+    def snapshot_rows(
+        self,
+        table_name: str = "frames",
+        row_ids: list[str] | None = None,
+        columns: list[str] | None = None,
+    ) -> pd.DataFrame:
+        """
+        Returns one controlled copy of a defined set of rows, for handing
+        to a background worker (or any other caller that needs its own
+        copy of less than the whole project).
+
+        The returned DataFrame is the caller's own copy. Dataset never
+        sees it again, so the caller may read, mutate, or hold onto it
+        however it likes.
+
+        Args:
+            table_name: Table to read from. Defaults to 'frames'.
+            row_ids:    Which rows to include, and in what order. None
+                        means every row, in table order.
+            columns:    Which columns to include. None means every
+                        column.
+
+        Returns:
+            A new DataFrame containing exactly the requested rows, in
+            the requested order -- one row per entry in row_ids, same
+            length, same order. A caller that pairs this frame with
+            row_ids by position (as OperatorRegistry's worker does) can
+            rely on that.
+
+        Raises:
+            KeyError: If the table name does not exist, or if row_ids
+                names a row_id that is not in the table. Silently
+                dropping it here would leave the returned frame shorter
+                than row_ids, and a caller pairing the two by position
+                would then attribute every following row's data to the
+                wrong row_id -- wrong output with no error, not merely a
+                missing row. See docs/media_architecture.md section 3.6
+                decision 11 for the same refuse-rather-than-quietly-fix
+                principle applied to a malformed address.
+        """
+        df = self._get_stored_table(table_name)
+        if columns is not None:
+            df = df[columns]
+
+        if row_ids is None:
+            return df.copy()
+
+        index = self._row_index_for(table_name)
+        try:
+            positions = [index[rid] for rid in row_ids]
+        except KeyError as e:
+            raise KeyError(
+                f"snapshot_rows: row_id {e} is not in table '{table_name}'."
+            ) from None
+        return df.iloc[positions].copy()
 
     def list_tables(self) -> list[str]:
         """
@@ -730,12 +946,11 @@ class Dataset:
         Returns:
             Dict of column name to value. Empty dict if not found.
         """
-        df = self.get_table(table_name)
-        mask = df["row_id"] == row_id
-        rows = df[mask]
-        if rows.empty:
+        df  = self._get_stored_table(table_name)
+        pos = self._row_index_for(table_name).get(row_id)
+        if pos is None:
             return {}
-        return rows.iloc[0].to_dict()
+        return df.iloc[pos].to_dict()
 
     # ------------------------------------------------------------------
     # Save and load
@@ -825,7 +1040,7 @@ class Dataset:
         media_cols = {col for col, tag in column_types.items() if tag == "media_path"}
         media_cols.add("full_path")  # fallback if no sidecar (saved without registry)
 
-        self._tables = {}
+        new_tables: dict[str, pd.DataFrame] = {}
         for path in parquet_files:
             df = pd.read_parquet(path)
             for col in df.columns:
@@ -833,7 +1048,8 @@ class Dataset:
                     df[col] = df[col].apply(
                         lambda p: _abs_against(p, project_path)
                     )
-            self._tables[path.stem] = df
+            new_tables[path.stem] = df
+        self._reset_tables(new_tables)
 
         # Restore _id_counter (assumes int-parseable row_id from _next_id()).
         max_id = 0

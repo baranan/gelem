@@ -369,6 +369,8 @@ not volunteer it.
 
 ## Finishing a work item
 
+**Claude Code never commits, merges, or pushes.** Y B does all of that himself, one command at a time. Claude Code's job ends at a working tree and a generated diff. If a step seems to need a commit, say so and stop.
+
 **One work item per session, per branch, per PR.** Stop at the boundary. Do not
 roll into the next item because it looks small.
 

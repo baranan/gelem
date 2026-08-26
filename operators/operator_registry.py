@@ -10,10 +10,13 @@ It is the only component allowed to call operator code.
 The three operator modes and how they are run:
 
     create_columns:
-        Runs in a background thread, once per row_id. After each row
-        completes, calls on_item_complete(row_id, result_dict).
-        AppController applies the dict to Dataset.update_row() on the
-        main thread. The gallery tile repaints immediately.
+        Runs in a background thread, once per row_id, over a single
+        pre-snapshotted DataFrame (AppController takes one
+        Dataset.snapshot_rows() copy before the thread starts). After
+        each row completes, calls
+        on_item_complete(operation_id, table_name, row_id, result_dict).
+        AppController applies the dict to Dataset.apply_row_updates() on
+        the main thread. The gallery tile repaints immediately.
 
     create_table:
         Runs in a background thread with the full DataFrame. Returns a
@@ -50,9 +53,11 @@ class OperatorRegistry:
         registry = OperatorRegistry()
         registry.register(BlendshapeOperator())
 
-        # Run create_columns on a list of rows:
+        # Run create_columns on a list of rows. snapshot holds exactly
+        # these rows, in this order -- AppController builds it with one
+        # Dataset.snapshot_rows() call before calling this method.
         registry.run_create_columns(
-            "blendshapes", row_ids, dataset,
+            "blendshapes", snapshot, row_ids, table_name,
             on_item_complete=callback,
             on_progress=progress_callback,
             on_complete=done_callback,
@@ -153,7 +158,9 @@ class OperatorRegistry:
     def run_create_columns(
         self,
         operator_name: str,
-        work_items: list[dict],
+        snapshot: pd.DataFrame,
+        row_ids: list[str],
+        table_name: str,
         operation_id: str = "",
         on_item_complete=None,
         on_progress=None,
@@ -162,26 +169,32 @@ class OperatorRegistry:
         on_row_errors=None,
     ) -> None:
         """
-        Runs create_columns() on pre-snapshotted work items in a background
-        thread. AppController snapshots row data on the main thread before
-        calling this method, so the worker never reads from Dataset directly.
+        Runs create_columns() over an ordered group of rows in a
+        background thread. AppController takes one snapshot of the
+        selected rows (Dataset.snapshot_rows) on the main thread before
+        calling this method, so the worker never reads from Dataset
+        directly and never receives one dict per row built in advance.
 
-        Each work item is a dict:
-            {
-                "row_id":     str,
-                "table_name": str,
-                "row_data":   dict,   # snapshot of the row at launch time
-            }
+        snapshot holds exactly the rows named by row_ids, in the same
+        order, as a single DataFrame. The worker builds each row's
+        metadata dict from it as it reaches that row. AppController built
+        this DataFrame, not the worker, so per CLAUDE.md's data-ownership
+        rule it is not "a worker's own DataFrame" -- the worker must
+        treat it as read-only.
 
-        For each completed item, calls
+        For each completed row, calls
         on_item_complete(operation_id, table_name, row_id, result).
-        AppController routes this to Dataset.update_row() on the main thread.
+        AppController routes this to Dataset.apply_row_updates() on the
+        main thread.
 
         Args:
-            operator_name:    Name of the operator to run.
-            work_items:       Pre-snapshotted list of row inputs.
-            operation_id:     Unique ID for this run (reserved for
-                              future stale-result detection).
+            operator_name: Name of the operator to run.
+            snapshot:      DataFrame with one row per entry in row_ids,
+                           in the same order. Read-only.
+            row_ids:       Ordered row_ids matching snapshot's rows.
+            table_name:    Table the rows belong to.
+            operation_id:  Unique ID for this run (reserved for
+                           future stale-result detection).
             on_item_complete: Called after each row completes.
                               Signature: (operation_id, table_name,
                                           row_id, result)
@@ -202,6 +215,20 @@ class OperatorRegistry:
                               Signature: (operator_name: str,
                                           errors: list[tuple[str, str, str]])
                               Each tuple is (row_id, exc_type_name, message).
+
+        Raises:
+            ValueError: If snapshot does not have exactly one row per
+                        entry in row_ids. The worker pairs the two by
+                        position (snapshot.iloc[i] for row_ids[i]), so a
+                        length mismatch would silently attribute one
+                        row's data to a different row_id for every row
+                        from that point on -- wrong output, not a
+                        missing row, and with no error. Dataset.
+                        snapshot_rows() is the primary defence (it raises
+                        if it cannot find a requested row_id, so it
+                        cannot itself hand back a short frame); this is a
+                        second check against any other caller of this
+                        method.
         """
         operator = self._operators.get(operator_name)
         if operator is None:
@@ -215,10 +242,17 @@ class OperatorRegistry:
             )
             return
 
+        if len(snapshot) != len(row_ids):
+            raise ValueError(
+                f"run_create_columns: snapshot has {len(snapshot)} rows "
+                f"but row_ids has {len(row_ids)} -- the worker pairs them "
+                f"by position, so they must be the same length."
+            )
+
         thread = threading.Thread(
             target=self._run_create_columns_worker,
             args=(
-                operator, work_items, operation_id,
+                operator, snapshot, row_ids, table_name, operation_id,
                 on_item_complete, on_progress, on_complete,
                 on_setup_error, on_row_errors,
             ),
@@ -229,7 +263,9 @@ class OperatorRegistry:
     def _run_create_columns_worker(
         self,
         operator: BaseOperator,
-        work_items: list[dict],
+        snapshot: pd.DataFrame,
+        row_ids: list[str],
+        table_name: str,
         operation_id: str,
         on_item_complete,
         on_progress,
@@ -239,15 +275,15 @@ class OperatorRegistry:
     ) -> None:
         """
         Worker that runs create_columns() in the background thread.
-        Processes only the pre-snapshotted work items — never reads Dataset.
+        Builds each row's metadata dict from the pre-snapshotted
+        DataFrame as it reaches that row — never reads Dataset, and
+        never receives 530,000 dicts built in advance.
         """
-        total = len(work_items)
+        total = len(row_ids)
         row_errors: list[tuple[str, str, str]] = []
 
-        for i, item in enumerate(work_items):
-            row_id     = item["row_id"]
-            table_name = item["table_name"]
-            metadata   = item["row_data"]
+        for i, row_id in enumerate(row_ids):
+            metadata = snapshot.iloc[i].to_dict()
             try:
                 full_path = metadata.get("full_path", "")
 
