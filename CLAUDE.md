@@ -233,6 +233,18 @@ re-verified there.)*
 - **`[TARGET -> P0.5]`** Derived images are identified by **media address**, not by
   row. See `docs/media_architecture.md` §4.5. The row, table and column identify
   the UI subscriber waiting for the picture, never the picture itself.
+- **`[NOW]`** `media/media_address.py` gives the address grammar exact,
+  guarded-by-test meaning: escaping, canonical form, frame/time-point and
+  range semantics, region validation and pixel arithmetic, and which
+  malformed or degenerate values are refused. Each rule is `docs/media_architecture.md`
+  §3.6's authority; this file does not restate the decisions, only points at
+  them. Tests: `tests/test_media_address.py`.
+- **`[TARGET -> P1.2]`** What §3.6 settled but the resolver has not yet built:
+  orientation is applied before anything else sees a frame (decision 6), the
+  addressed stream is what actually gets decoded (decision 7), and a frame
+  ordinal is resolved against a file's real per-frame timings, never a nominal
+  frame rate (decision 8). `MediaAddress` only carries the address; nothing
+  today decodes one.
 
 ### Generality
 
@@ -251,14 +263,21 @@ re-verified there.)*
   `docs/media_architecture.md` §10.)* This rule covers two different things --
   a number that varies **by machine** needs a setting (worker count, cache
   size, both above); a number that varies **by file or dataset** needs a
-  runtime measurement instead, which is a different mechanism with no example
-  of its own here as of 26 Aug 2026. Per-file seek cost was considered as the
-  replacement, since the measurement pass found keyframe interval doesn't
-  predict it -- but seek cost isn't measured anywhere in the current plan
-  either; it only appears in `docs/media_architecture.md` §10 as what a future
-  revival of proxy-like work would need to measure, which isn't a live case
-  today. **The next feature that needs a runtime-measured per-file property
-  should cite itself here** rather than this rule citing a hypothetical.
+  runtime measurement instead, which is a different mechanism. Per-file seek
+  cost was considered as an example, since the measurement pass found
+  keyframe interval doesn't predict it -- but seek cost isn't measured
+  anywhere in the current plan either; it only appears in
+  `docs/media_architecture.md` §10 as what a future revival of proxy-like work
+  would need to measure, which isn't a live case today. **The next feature
+  that needs a runtime-measured per-file property should cite itself here**
+  rather than this rule citing a hypothetical.
+  **`[TARGET -> P1.2]`** The first real case, cited 26 Aug 2026: resolving
+  `#f=N` against a variable-frame-rate file (decision 8,
+  `docs/media_architecture.md` §3.6) needs a per-file index of frame
+  presentation times, built on first use, because no nominal frame rate is
+  trustworthy on VFR source. Not built yet -- `media/media_address.py`'s
+  `select_frame()` takes frame times as a plain argument and never measures
+  them itself; that measurement is the resolver's, in P1.2.
 
 ### Long-running work
 

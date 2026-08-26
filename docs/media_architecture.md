@@ -40,6 +40,13 @@
   machine, and raw numbers: `%USERPROFILE%\Documents\gelem.measure\RUNLOG.md`
   (outside the repo; see §6.0). MediaPipe measurements are unaffected and still
   outstanding, still gating Phase 2.
+- *26 Aug 2026 (c), P0.3:* §3.6's twelve open questions are settled and the
+  section renamed "Address semantics -- settled". `media/media_address.py`
+  implements the pure-logic half (parsing, canonical form, frame selection
+  given supplied timings, region-to-pixel arithmetic); `docs/fixtures.md`
+  gains the lossless known-frame fixture §7 needed and a video-stream
+  edit-list fixture for decision 12, both generated on demand rather than
+  committed. Tests: `tests/test_media_address.py`.
 
 ---
 
@@ -134,8 +141,22 @@ seek, decode.
 <path>#t=<sec>                one frame, by time in seconds
 <path>#t=<start>-<end>        a time range (a "clip")
 <path>#r=<x>,<y>,<w>,<h>      a rectangular region
-<path>#t=<a>-<b>&r=<x,y,w,h>  combined
+<path>#[v=<n>|a=<n>&](f=<int>|t=<sec>|t=<start>-<end>)[&r=<x,y,w,h>]   full form
 ```
+
+**Escaping (§3.6 decision 1).** Inside `<path>`, `%` is written `%25` and `#`
+is written `%23`. Nothing else is escaped. The fragment begins at the first
+`#` that is not part of that escaping.
+
+**Stream selector (§3.6 decision 7).** An optional `v=<n>` or `a=<n>` names a
+stream explicitly, by zero-based index within streams of that kind. Omitted,
+the default is the lowest-index stream of the requested type -- never the
+container's "best" stream.
+
+**Canonical component order (§3.6 decision 9).** When a fragment is written
+out, its components appear in this fixed order: stream selector, then `f=`
+or `t=`, then `r=`, joined by `&`. Parsing accepts any order; formatting
+always produces this one.
 
 A bare path is a valid address, so **existing data keeps working by
 construction**.
@@ -209,83 +230,225 @@ home instead of being scattered.
 - Only paths **inside** the project folder are made relative. External source
   paths stay absolute unless the user explicitly imports the file.
 
-### 3.6 Semantics to settle before writing the parser
+### 3.6 Address semantics -- settled
 
-**New, and blocking for P0.3.** The grammar in §3.2 says what an address looks
-like, not what it means. Each of the following silently returns the wrong frame if
-left to the implementer's judgement, and "wrong frame" in this application means
-wrong data in a published analysis.
+**Settled 26 August 2026. Each decision below has a test, or a recorded
+reason why it does not yet.** These were open questions whose common failure
+is a plausible but wrong frame rather than an error, which is why they were
+settled before the parser was written rather than during it.
 
-Decide and write down, with a test for each:
+Some decisions are pure logic and are tested by P0.3. Others describe what
+the resolver must do when it decodes, and their tests are owed by P1.2. Each
+decision says which.
 
-1. **Escaping.** Source paths may contain `#`, `&`, `,` or `-`. Define the escape
-   rule and round-trip it.
-2. **Time-point rounding.** Does `#t=3.5` select the nearest frame, the first frame
-   at or after 3.5 s, or the frame whose presentation interval contains 3.5 s?
-3. **Range endpoints.** Is `#t=a-b` half-open `[a, b)` or inclusive at both ends?
-4. **Representative frame for a range.** Which frame does a range resolve to for
-   display -- first, midpoint, or a named policy? Different policies produce
-   different thumbnails for the same segment, so this is part of the artifact
-   cache key.
-5. **Crop coordinates.** Pixels or normalised 0-1? Normalised survives any
-   resolution change; pixels do not.
-6. **Orientation.** How is container rotation metadata applied, and is `#r=`
-   expressed before or after rotation?
-7. **Multi-stream files.** How is the video or audio stream selected when a file
-   has several?
-8. **Frame identity.** Is a frame identified by ordinal, by presentation timestamp
-   (PTS), or both? **Variable-frame-rate files make ordinal and time disagree**,
-   and phone recordings are frequently VFR.
-9. **Canonical form.** Fixed ordering of components and fixed numeric formatting,
-   so that two addresses meaning the same thing hash the same. Required for the
-   cache to work at all.
-10. **Time origin.** Is `#t=0` the container's time zero, the stream's start time,
-    or the first presented frame? These differ routinely, and a stream start-time
-    offset produces a constant error across an entire video -- plausible, uniform,
-    and very hard to notice.
-11. **Degenerate intervals.** Negative, reversed (`#t=5-2`), empty (`#t=3-3`), and
-    out-of-range ranges. Each needs a defined behaviour: clamp, empty result, or
-    error. Silently clamping a reversed range is the dangerous option.
-12. **Frame ordinal after edit lists and stream selection.** Is the ordinal counted
-    in the selected stream, before or after any container edit list is applied?
-    A file with an edit list makes "frame 1450" ambiguous.
-13. **Where approximation is permitted.** *Simplified 26 Aug 2026: the exception
-    named here was the whole-video proxy layer, which is rejected (§10) after the
-    measurement pass. No caller anywhere in Gelem now produces an approximate
-    picture -- segment tiles resolve exactly (§4.1b), short-span decode caches real
-    frames (§4.1), and there is no third source.* **A point address always resolves
-    exactly, everywhere, with no permitted approximation.** State this as an
-    unconditional property of the address, so no future caller can quietly relax
-    it.
+**1. Escaping.** The fragment begins at the first `#` that is not part of an
+escape. Inside the path portion `%` is written `%25` and `#` is written
+`%23`, and nothing else is escaped: `&`, `,` and `-` carry meaning only
+after the `#`, so a path containing them needs no treatment. A filesystem
+path becomes an address only through `MediaAddress.from_path()`. No code
+builds an address by joining strings.
+*Why:* backslash escaping collides with Windows separators, and only two
+characters are genuinely ambiguous.
+*Tested by P0.3.*
+
+**2. Time point.** `#t=X` selects the frame whose presentation interval
+contains X -- the frame being displayed at that moment. The final frame's
+interval runs to the end of the stream.
+*Why:* the only rule that still works when frame durations vary, and it
+matches what a person means by "what is on screen then".
+*Tested by P0.3 against supplied frame timings; end-to-end test owed by P1.2.*
+
+**3. Range endpoints.** Half-open. `#t=a-b` contains a frame whose
+presentation time p satisfies `a <= p < b`.
+*Why:* adjacent ranges then tile exactly. Inclusive ends place a boundary
+frame in two ranges, so it is counted twice in both of their averages.
+*Tested by P0.3 against supplied frame timings.*
+
+**4. Representative frame for a range.** A named policy, default `first`. A
+bare video path is treated as the range covering the whole file, so one
+policy governs both cases. **Corrected 26 Aug 2026 (P0.3 amendment):** both
+policies choose only from the frames the range actually contains under
+decision 3 -- never a frame from outside it, even one whose display interval
+still overlaps the range's start. `first` is the earliest frame in the
+range. `midpoint` is the frame in the range nearest to `a + (b-a)/2`, ties
+going to the earlier frame. A range containing no frame at all raises rather
+than falling back to a frame outside it (decision 11). The policy is **not
+part of the address string**. It is an argument at resolve time and part of
+the artifact cache key (section 4.5).
+*Why:* the original definition of `first` -- the frame selected by decision
+2 at the range's start -- silently violated section 7's own invariant that a
+segment's thumbnail comes from inside that segment's own time range,
+whenever the range's start did not land exactly on a frame's own timestamp.
+That is the common case: start times come from a data file, not from frame
+arithmetic. Choosing only from the range's own members is what makes
+decisions 3 and 4 agree, and the first frame still assumes nothing about the
+content and needs no seek beyond the range's own start. Because the policy
+is part of the cache key, changing the default later is safe -- existing
+pictures are simply not reused.
+*Tested by P0.3 for policy selection, and for the invariant that either
+policy's choice is always a member of decision 3's own range.*
+`canonical_key()` (decision 9) supplies only the address component of the
+artifact cache key -- folding `policy` into the *full* key alongside the
+other components section 4.5 lists (source fingerprint, purpose/variant,
+cache version) is P0.5's job, not this module's, so "key distinctness" is
+not something P0.3 can test and is not claimed here.
+*Picture-level test owed by P1.2.*
+
+**5. Region.** `#r=x,y,w,h`, four numbers in the closed interval 0 to 1,
+expressed as fractions of the **upright** frame (decision 6). Conversion to
+pixels rounds the four edges, not the origin and size separately: the left
+edge is `round(x*W)`, the right edge is `round((x+w)*W)`, and the width is
+their difference. Values outside 0 to 1, a zero or negative width or height,
+or `x+w > 1` are errors.
+*Why:* the same address must mean the same region whatever size the frame is
+decoded at, so a region marked on a small preview is exact at full
+resolution. Rounding edges rather than widths makes two adjacent regions
+rejoin with no seam and no overlap.
+*Note:* nothing in Gelem currently produces a region address. The likely
+future sources are marking a region by hand, splitting a side-by-side
+recording into two rows, and cropping to a detected face before analysis.
+None is scheduled.
+*Tested by P0.3 for parsing, validation and the pixel arithmetic;
+picture-level test owed by P1.2.*
+
+**6. Orientation.** The resolver always returns display-oriented frames,
+applying the container's display matrix, for analysis exactly as for
+display. Frame dimensions it reports are post-rotation. Regions are
+expressed on the upright frame. Quarter turns and horizontal mirroring are
+supported; any other display matrix raises rather than being ignored.
+*Why:* a landmark model shown a sideways face returns garbage. Applying
+rotation in exactly one place is the only way it is never forgotten. Note
+that PyAV does not apply rotation automatically the way the ffmpeg command
+line does; this is real work in the resolver.
+*Fixture:* the phone recording (`docs/fixtures.md`) carries `rotation=90` --
+stored landscape, displayed portrait -- so this is a real input, not a
+hypothetical, once P1.2 exists to test against it.
+*Owed by P1.2.*
+
+**7. Stream selection.** The default is the **lowest-index stream** of the
+requested type, not the container's "best" stream. An address may name
+another explicitly with `&v=<n>` or `&a=<n>`. The canonical form omits the
+selector when it names the default. Frame ordinals and times are counted
+within the selected stream.
+*Why:* "best stream" is a library heuristic that can change between library
+versions, which would quietly change which camera was analysed.
+*Tested by P0.3 for parsing and canonical form; selection test owed by P1.2.*
+
+**8. Frame identity.** `#f=N` is the zero-based ordinal of a frame in
+**presentation order** of the selected stream, counted after any edit list
+(decision 12). `#t=` is a time. **The parser never converts between them**;
+conversion requires the file and belongs to the resolver. Two addresses are
+equal only if their canonical strings are equal, so `#f=100` and `#t=4.0`
+are different addresses even on a file where they resolve to the same frame.
+The cost is a duplicate cached picture, never a wrong one.
+*Why:* multiplying a time by the nominal frame rate is the most likely
+wrong-frame bug there is, and it is always wrong on phone video. Forbidding
+the conversion in pure logic is what prevents it.
+*Consequence for P1.2:* resolving `#f=N` on a variable-frame-rate file
+requires a per-file index of frame times, built on first use. Per CLAUDE.md's
+generality rule, this is the first feature needing a runtime-measured
+per-file property, and that rule should cite it.
+*Fixture:* the phone recording (`docs/fixtures.md`) is variable frame rate
+with 98 distinct frame durations, so it is a real input for the per-file
+index P1.2 must build, not a hypothetical.
+*Tested by P0.3.*
+
+**9. Canonical form.** Components appear in a fixed order: stream selector,
+then `f` or `t`, then `r`, joined by `&`. Paths use forward slashes. Case is
+**not** folded -- on Windows two spellings of one path therefore produce two
+cache entries, which wastes space and never produces a wrong picture, and
+that trade is accepted deliberately. Times are parsed as exact integer
+microseconds and written with six decimal places; more than six decimal
+places is an error rather than a rounding, because silently rounding a time
+is the failure this section exists to prevent. Frame numbers are plain
+integers with no sign and no leading zeros. Region values carry six decimal
+places. An empty fragment (`path#`) is an error.
+Two forms exist and must not be confused. `format()` produces the **stored**
+form, whose path may be relative to the project. `canonical_key(project_root)`
+produces the **key** form, with the path resolved and absolute, and that is
+what the artifact cache hashes.
+*Why:* two spellings of one address must hash identically or the cache
+silently keeps two copies of every picture.
+*Tested by P0.3.*
+
+**10. Time origin.** **One clock per file.** Its zero is the first presented
+frame of the primary video stream, meaning the lowest-index video stream.
+Audio times are expressed on that same clock. `PlaybackAdapter` converts to
+whatever the player expects. Times in an address are never negative.
+*Why:* the phone recording in docs/fixtures.md has an edit list on its audio
+stream, so its sound and picture do not begin together. Two clocks would put
+them permanently out of step by a constant -- uniform, plausible, and very
+hard to notice.
+*Future need, not built:* if a study's recorded times are counted from
+something other than the file's first frame, that offset is a fact about the
+data and belongs in an ordinary column, never inside the meaning of an
+address. Gelem holds no opinion about what a study's clock started from.
+Nothing in the current plan applies such an offset.
+*Tested by P0.3 for the rejection of negative times; the rest owed by P1.2.*
+
+**11. Degenerate values.** Refused when the address is read: a reversed range
+(`#t=5-2`), a zero-length range (`#t=3-3`), a negative time, a negative frame
+number, and a region outside 0 to 1 or with zero area. Each raises with a
+message naming the problem. **A reversed range is never reordered and a value
+is never clamped**, because quietly correcting a broken data file makes it
+produce plausible output forever.
+Refused when the address is resolved: a start beyond the end of the stream,
+a frame ordinal beyond the last frame, and a well-formed range (start < end)
+that, against the file's real frame times, contains no frame at all --
+distinct from the zero-length range above, which is refused earlier, at
+parse. These raise for that row only; other rows are unaffected, which the
+progressive result path already supports.
+*Behaviour at row creation, documented here and built in P1.6, not now:* the
+operator that creates range rows checks them against the files, reports how
+many do not fit, and offers to use what exists or to cancel. If the user
+proceeds, the **shortened range is written into the row**, so the stored
+address states what will actually be read, and the row records that it was
+shortened. The resolver itself never shortens anything.
+*Why:* a row whose range overruns the recording still produces a
+perfectly good-looking tile, because the tile shows the first frame. Only
+the analysis is short. The problem is invisible unless something checks.
+*Tested by P0.3 for the parse-time refusals and for the empty-range
+resolve-time refusal.*
+
+**12. Frame ordinal after an edit list.** The ordinal counts presented frames
+of the selected stream, after the edit list is applied. Frame 0 and time 0
+are therefore the same frame.
+*Why:* any other choice puts frame numbers and times a constant distance
+apart, which is decision 10's failure in a different disguise.
+**Coverage, verified on the author's machine 26 Aug 2026 -- not verifiable on
+every checkout.** No file in the committed fixture set has an edit list on
+its video stream, so P0.3 attempts to produce one on demand: a
+non-keyframe-aligned stream-copy cut of the Zoom recording
+(`docs/fixtures.md`), checked afterwards with `ffprobe -v debug` rather than
+assumed to have worked. On this attempt it did: the cut carries a genuine
+video-stream edit list (`media time: 9000, duration: 90600` at the file's
+1/30000 time base -- a 0.3 s pre-roll, matching the 0.3 s the requested start
+sits past the nearest keyframe). This confirms a fixture with a video-stream
+edit list can be produced and detected; it is **not** an end-to-end test
+that frame numbering is correct against one, which still requires the
+resolver and is owed by P1.2.
+**This verification is weaker than the other twelve decisions'.** The test
+needs `GELEM_FIXTURES` pointing at the real, uncommitted recordings
+(`docs/fixtures.md`'s opening section: local disk only, never synced), so on
+any other checkout -- CI included -- it unconditionally skips, which looks
+identical to "not yet run" rather than "regressed". If this attempt stops
+reproducing on a future ffmpeg version, nothing forces this note to be
+corrected back to unverified; treat "Coverage, verified" here as true only
+as of a run against `GELEM_FIXTURES` on this machine, not as a standing
+guarantee the way the other decisions' test coverage is.
+
+**13. Where approximation is permitted.** *Simplified 26 Aug 2026: the exception
+named here was the whole-video proxy layer, which is rejected (§10) after the
+measurement pass. No caller anywhere in Gelem now produces an approximate
+picture -- segment tiles resolve exactly (§4.1b), short-span decode caches real
+frames (§4.1), and there is no third source.* **A point address always resolves
+exactly, everywhere, with no permitted approximation.** State this as an
+unconditional property of the address, so no future caller can quietly relax
+it.
 
 **Internally, prefer integer microseconds or rational PTS to floating-point
 seconds.** Float seconds accumulate error across a long video and make two
 addresses that should be identical compare unequal.
-
-Items 10 to 13 were added in the second review round. All four produce **plausible
-but incorrect frame selection** rather than an error, which is the failure mode
-this section exists to prevent.
-
-**Test material, as of 26 Aug 2026.** The fixture set built for §6.0
-(`docs/fixtures.md`) covers several of these directly, and the gaps are as
-informative as the coverage:
-
-- **Item 5 (crop coordinates)** has a real case. The legacy study recording is
-  3200x1200, almost certainly two cameras side by side, so "read a region" is an
-  actual workflow on existing data rather than a hypothetical.
-- **Item 6 (orientation)** and **item 8 (frame identity under VFR)** have real
-  inputs. The phone recording is variable frame rate with 98 distinct frame
-  durations and carries `rotation=90`, so its stored frame is landscape while its
-  displayed frame is portrait.
-- **Item 10 (time origin)** has a real case, but on the audio side. That file's
-  audio stream carries an edit list whose first entry is empty (`media time: -1`),
-  so audio and video begin at different times. This is the exact class of constant,
-  plausible, uniform error the item warns about, and it will matter as soon as
-  §3.3's `decode_audio_span` exists.
-- **Item 12 (frame ordinal after edit lists)** is **not covered.** No fixture yet
-  has an edit list on its *video* stream. Do not treat this item as tested.
-- The lossless known-frame fixture that §7 requires does not exist yet either.
-  Both gaps belong to P0.3, not to the measurement pass.
 
 ---
 
@@ -343,7 +506,7 @@ going to drive a decision, not only to media. See §10 for the full proxy record
 and for why the *specific* signal proposed here (keyframe interval, as a proxy for
 seek cost) turned out not to predict what it was chosen to predict.
 
-**(b) Segment thumbnails -- for tiles representing clips or trials.**
+**(b) Segment thumbnails -- for a media cell holding a time range.**
 **Rewritten 4 Aug 2026, then again 26 Aug 2026.**
 
 The previous version said the segment operator should capture each representative
@@ -743,6 +906,11 @@ optional.
 8. Propagate `operation_id` through progress, completion, cancellation and
    stale-result rejection. It is generated and then discarded today.
 9. Add `table_name` to `row_updated` and to artifact notifications.
+10. Handle the address grammar in the project-relative path rewriting of
+    `_rel_if_inside` / `_abs_against`, so a saved project reopens with its
+    addresses intact (section 3.5). Uses the module built in P0.3.
+
+**P0.2 therefore runs after P0.3** -- item 10 needs `MediaAddress` to exist.
 
 **P0.3 Address semantics and the `MediaAddress` module.** *(was P1.1)* Settle §3.6
 first, then grammar, `parse`, `format`, `MediaAddress`. Pure logic, no I/O, no
@@ -988,7 +1156,8 @@ document.** Extend the existing pattern in `tests/test_architecture_imports.py`,
 - **A segment's thumbnail comes from inside that segment's own time range.**
 - Creating a frame table writes **zero** files.
 - Save project -> load project -> all addresses still resolve, including relative
-  rewriting of the path portion.
+  rewriting of the path portion. **Owed by P0.2**, item 10 (§6.1) -- P0.3 supplies
+  the address grammar this rewriting must handle, but does not do the rewriting.
 
 **Boundaries:**
 
