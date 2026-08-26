@@ -19,6 +19,9 @@ Gelem_*.docx
 # Local test output
 test_plots/
 
+# Local testing
+manual_testing/
+
 setup.ps1
 
 # Research media -- never commit participant recordings
