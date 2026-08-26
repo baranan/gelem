@@ -282,27 +282,44 @@ windowed analyses need it.
 
 ### Segment thumbnails are not the operator's job
 
-**Revised 4 Aug 2026.** An earlier version said a segment operator must capture
-each segment's representative frame "during the sequential pass it is already
-making." That assumed segmentation decodes video. **A metadata-driven segmentation
--- start and end columns from a trial CSV, which is the common case -- decodes
-nothing.** There is no pass to piggyback on.
+**Revised 4 Aug 2026, then again 26 Aug 2026 -- see `docs/media_architecture.md`
+§4.1b, which is authoritative on this mechanism; the summary below points at it
+rather than restating it in full.** An earlier version said a segment operator
+must capture each segment's representative frame "during the sequential pass it
+is already making." That assumed segmentation decodes video. **A metadata-driven
+segmentation -- start and end columns from a trial CSV, which is the common
+case -- decodes nothing.** There is no pass to piggyback on.
 
-So exact segment thumbnails are an **ArtifactStore batch job**, ordered by source
-file and time so it costs one sequential pass per video rather than a seek per
-segment. An operator that happens to be decoding anyway may *offer* a decoded
-representative frame, but never writes into ArtifactStore itself.
+A later version said this batch job should make one full sequential decode pass
+per video instead, on the assumption that seeking to each segment separately
+would be far more expensive. The measurement pass (26 Aug 2026) found the
+opposite by two to three orders of magnitude at any realistic trial density --
+see `docs/media_architecture.md` §4.1b and §10 for the numbers.
+
+So exact segment thumbnails are an **ArtifactStore batch job**: collect the
+outstanding segments, sort by source file and start time, and **seek to each
+representative frame**. No full sequential pass. An operator that happens to be
+decoding anyway may *offer* a decoded representative frame, but never writes
+into ArtifactStore itself.
 
 The requirement is unchanged and still guarded by a test: **a segment's thumbnail
-must come from inside that segment's own time range.** A proxy thumbnail from a
-neighbouring trial looks entirely plausible and would otherwise go unnoticed.
+must come from inside that segment's own time range.** A frame from the wrong
+segment -- from a sorting or off-by-one bug in which seek result gets attached to
+which segment -- looks entirely plausible and would otherwise go unnoticed.
 
 ### Walk media in order
 
 Sequential passes over a video are roughly an order of magnitude faster than
-seeking to individual frames. Operators that process video should walk it in order
-rather than requesting frames one at a time. This is what `iter_column_updates`
-exists for.
+seeking to individual frames -- **when the operator needs every frame, or most of
+them, in a contiguous span.** Operators that process video that way should walk
+it in order rather than requesting frames one at a time. This is what
+`iter_column_updates` exists for.
+
+**This is not the segment-thumbnail case above, and the two should not be
+conflated.** A segment-thumbnail batch job wants one frame per segment, often
+scattered widely across an hour-long video -- a much sparser access pattern, and
+measurement (§4.1b) found seeking wins there, sharply. The rule of thumb is about
+density of frames actually needed, not about video decoding in general.
 
 Read `docs/media_architecture.md` before writing anything that touches video.
 

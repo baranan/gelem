@@ -18,6 +18,28 @@
   not the row (§4.5, new); address semantics must be settled before the parser is
   written (§3.6, new); the JPEG equivalence test was an invalid reference (§7).
   The measurement pass is unchanged and still runs first.
+- *26 Aug 2026 (a):* the measurement pass has started. The video fixture set is
+  built and verified; contents and generation commands are in `docs/fixtures.md`.
+  First result recorded: keyframe intervals in all three real recordings are dense
+  (0.6 s to 2.0 s), which **weakens** the case for P1.3 rather than strengthening
+  it (§6.0). Two §11 rows are now measured. No timing measurement has run yet.
+- *26 Aug 2026 (b):* the video measurement pass completed (§6.0, §11). **P1.3 (the
+  proxy layer) is rejected**, on the fill-time rule agreed before any number was
+  seen -- moved to §10 with the full record needed to reverse it. **P1.7a
+  (segment-thumbnail batch job) is rewritten**: sorted per-trial seeking replaces
+  the full sequential decode pass, which the same measurement showed to be two to
+  three orders of magnitude more expensive at any realistic trial density (§4.1b,
+  §6.2). **§4.1a is folded into §10** -- the keyframe-gap signal it proposed
+  measuring did not predict seek cost on the real recordings, and one sentence of
+  the surviving principle (measure per file at load time; do not assume) stays in
+  §4.1. **The §4.3 batching claim is downgraded to an open question**: no benefit
+  was measured, but the method's mandatory warm-cache protocol cannot see the
+  cold-cache effect the claim is actually about. **Approximation is removed from
+  the design entirely**: with no proxy, no thumbnail source is approximate any
+  longer, which simplifies §3.6 item 13 and the §4 opening table. Full method,
+  machine, and raw numbers: `%USERPROFILE%\Documents\gelem.measure\RUNLOG.md`
+  (outside the repo; see §6.0). MediaPipe measurements are unaffected and still
+  outstanding, still gating Phase 2.
 
 ---
 
@@ -205,7 +227,7 @@ Decide and write down, with a test for each:
    display -- first, midpoint, or a named policy? Different policies produce
    different thumbnails for the same segment, so this is part of the artifact
    cache key.
-5. **Crop coordinates.** Pixels or normalised 0-1? Normalised survives a proxy
+5. **Crop coordinates.** Pixels or normalised 0-1? Normalised survives any
    resolution change; pixels do not.
 6. **Orientation.** How is container rotation metadata applied, and is `#r=`
    expressed before or after rotation?
@@ -227,10 +249,14 @@ Decide and write down, with a test for each:
 12. **Frame ordinal after edit lists and stream selection.** Is the ordinal counted
     in the selected stream, before or after any container edit list is applied?
     A file with an edit list makes "frame 1450" ambiguous.
-13. **Where approximation is permitted.** A point address must always resolve
-    exactly. Approximation is confined to whole-video proxy browsing (§4.1a) and is
-    never used for a segment tile (§4.1b) or for analysis. State this as a property
-    of the address, so no future caller can quietly relax it.
+13. **Where approximation is permitted.** *Simplified 26 Aug 2026: the exception
+    named here was the whole-video proxy layer, which is rejected (§10) after the
+    measurement pass. No caller anywhere in Gelem now produces an approximate
+    picture -- segment tiles resolve exactly (§4.1b), short-span decode caches real
+    frames (§4.1), and there is no third source.* **A point address always resolves
+    exactly, everywhere, with no permitted approximation.** State this as an
+    unconditional property of the address, so no future caller can quietly relax
+    it.
 
 **Internally, prefer integer microseconds or rational PTS to floating-point
 seconds.** Float seconds accumulate error across a long video and make two
@@ -240,6 +266,27 @@ Items 10 to 13 were added in the second review round. All four produce **plausib
 but incorrect frame selection** rather than an error, which is the failure mode
 this section exists to prevent.
 
+**Test material, as of 26 Aug 2026.** The fixture set built for §6.0
+(`docs/fixtures.md`) covers several of these directly, and the gaps are as
+informative as the coverage:
+
+- **Item 5 (crop coordinates)** has a real case. The legacy study recording is
+  3200x1200, almost certainly two cameras side by side, so "read a region" is an
+  actual workflow on existing data rather than a hypothetical.
+- **Item 6 (orientation)** and **item 8 (frame identity under VFR)** have real
+  inputs. The phone recording is variable frame rate with 98 distinct frame
+  durations and carries `rotation=90`, so its stored frame is landscape while its
+  displayed frame is portrait.
+- **Item 10 (time origin)** has a real case, but on the audio side. That file's
+  audio stream carries an edit list whose first entry is empty (`media time: -1`),
+  so audio and video begin at different times. This is the exact class of constant,
+  plausible, uniform error the item warns about, and it will matter as soon as
+  §3.3's `decode_audio_span` exists.
+- **Item 12 (frame ordinal after edit lists)** is **not covered.** No fixture yet
+  has an edit list on its *video* stream. Do not treat this item as tested.
+- The lossless known-frame fixture that §7 requires does not exist yet either.
+  Both gaps belong to P0.3, not to the measurement pass.
+
 ---
 
 ## 4. Display, playback, analysis are three different paths
@@ -248,15 +295,29 @@ They have opposite requirements and must not share a mechanism.
 
 | | Resolution | Access pattern | Caching | Tolerates approximation |
 |---|---|---|---|---|
-| **Display** | low (tile size) | random | aggressive | **yes** |
+| **Display** | low (tile size) | random | aggressive | **no** *(was yes; see below)* |
 | **Playback** | full | sequential | none (player's job) | n/a |
 | **Analysis** | full | strictly sequential | none | **no** |
 
-The guiding principle: **display tolerates approximation, analysis does not.** A
-thumbnail can be the nearest available sampled frame. A blendshape must come from
-the exact frame, decoded properly.
+*Changed 26 Aug 2026.* The original guiding principle was **display tolerates
+approximation, analysis does not**: a thumbnail could be the nearest available
+sampled frame, where a blendshape had to come from the exact frame, decoded
+properly. That distinction existed only to permit one thing -- the whole-video
+proxy layer's nearest-keyframe substitution (§4.1a) -- and the proxy is rejected
+after measurement (§10). With no proxy, nothing in Gelem produces an approximate
+picture any more: segment tiles resolve to an exact frame inside their own time
+range (§4.1b), and short-span decode caches real, exactly-decoded frames (§4.1).
+The distinction in this table is now the same as §3.6 item 13's: a point address
+always resolves exactly, for display exactly as much as for analysis. If a future
+feature reintroduces an approximate display path, it must re-earn a "yes" here
+explicitly, not inherit one left over from this table's original design.
 
-### 4.1 Display -- why a proxy layer is required
+### 4.1 Display -- two exact thumbnail sources
+
+**Rewritten 26 Aug 2026, after the measurement pass.** This section described a
+required whole-video proxy layer and its interaction with two other thumbnail
+sources. The proxy is rejected on measurement (§10); there are now **two exact
+thumbnail sources**, not three, and neither approximates.
 
 Video stores complete images only occasionally (every 1-10 s) and only differences
 in between. Producing frame N means jumping to the last complete image before it
@@ -265,37 +326,25 @@ and replaying forward.
 - **Frames near each other** (all frames of one 3 s trial): one forward pass, a few
   ms per frame. Fast.
 - **Frames scattered across a long video** (first frame of each of 150 trials
-  across an hour): a separate seek each, 50-200 ms apiece. Filling one screen of
-  thumbnails takes 10-30 seconds. **Unacceptable, and it is the most common
-  browsing action.**
+  across an hour): a separate seek each. **This was assumed to cost 50-200 ms per
+  seek**, unacceptable at gallery scale, and was the reason a proxy layer was
+  proposed. **Measured 26 Aug 2026** (§11): scattered-seek cost on Y B's three real
+  recordings is 25-113 ms, and filling one screen of 30 tiles measures 0.4-1.7 s
+  with the worker pool in §4.4, not the 10-30 s this section originally assumed.
+  See §10 for the full record.
 
-So there are **three thumbnail sources**, all feeding one cache. Which one is
-correct depends on what is being shown, and using the wrong one produces wrong
-pictures, not just slow ones.
-
-**(a) Proxy layer -- for scrubbing across long videos only.**
-Small thumbnails extracted **only at the video's own keyframes**, which decoders
-can do while skipping all intermediate frames. Roughly 100x faster than full
-decoding. Positions are irregular; show the nearest.
-
-- Packed **one file per video plus an index**, never loose files. 864,000
-  thumbnails as loose files would be fatal, especially on the Google Drive
-  Streaming path. ~6 KB each, ~20 MB per hour of video.
-- Built lazily per video, in the background, resumable.
-
-**Keyframe interval is a property of the file, not an assumption.** The resolver
-measures it per video on first access and decides **per video** whether a proxy is
-worth building. Dense keyframes get a proxy; sparse ones skip it and fall back to
-(c). A single global assumption about keyframe spacing would be wrong for some
-user's files by construction. See §11 on which measurements generalise.
+**(a) What's left of the proxy layer: one surviving principle.** *Folded into §10,
+26 Aug 2026 -- this letter is kept only so `§4.1a` still resolves to something,
+since `§4.1b` and `§4.1c` below are cited elsewhere in this document and are not
+renumbered.* Measuring a property of a file at load time -- as the rejected
+proxy's keyframe-interval check did -- is more robust than any global assumption
+baked into the code, and that pattern applies wherever a per-file property is
+going to drive a decision, not only to media. See §10 for the full proxy record
+and for why the *specific* signal proposed here (keyframe interval, as a proxy for
+seek cost) turned out not to predict what it was chosen to predict.
 
 **(b) Segment thumbnails -- for tiles representing clips or trials.**
-**Rewritten 4 Aug 2026 (b).**
-
-**The proxy must not be used for this.** Keyframes may be seconds apart; a 3 s
-trial may contain no keyframe at all, so the nearest proxy thumbnail can come from
-a neighbouring trial. That is a wrong picture, not a slow one, and it would be
-easy to miss because the tile still looks plausible.
+**Rewritten 4 Aug 2026, then again 26 Aug 2026.**
 
 The previous version said the segment operator should capture each representative
 frame "during the sequential pass it is already making". **That assumed
@@ -303,10 +352,23 @@ segmentation decodes video.** A metadata-driven segmentation -- start and end
 columns from a trial CSV, which is the common workflow -- decodes nothing. There
 is no pass to piggyback on.
 
+The version after that said this batch job should make one full sequential decode
+pass per video, sorted by source file and start time, on the assumption that
+seeking to each trial separately would be far more expensive. **Measurement 26
+Aug 2026 showed the opposite**, sharply: on all three real recordings, sorted
+per-trial seeking is cheaper than one full sequential pass by two to three orders
+of magnitude at any realistic trial count. The crossover -- the trial density
+above which a full pass would actually win -- is 16,800 to 58,600 trials **per
+hour of video**, depending on the file. At 3,000 trials per hour, seeking is
+about five times cheaper on the least favourable recording measured; at 300 per
+hour, about fifty times. A sequential pass becomes correct again only above
+roughly seventeen thousand trials in a single hour of recording -- a trial every
+fifth of a second. No study drives anywhere near that. Full numbers:
+`%USERPROFILE%\Documents\gelem.measure\section11_table.md`.
+
 So exact segment thumbnails are an **ArtifactStore batch job**: collect the
-outstanding segments, sort by source file and start time, and make one sequential
-pass per video. This preserves the reason the original design was cheap (one pass,
-not one seek per segment) without requiring an operator to have made it.
+outstanding segments, sort by source file and start time, and **seek to each
+representative frame**. No full sequential pass.
 
 An operator that *is* decoding anyway may offer a decoded representative frame as
 a hint. It never writes into ArtifactStore itself.
@@ -315,10 +377,11 @@ The guardrail test is unchanged: **a segment's thumbnail comes from inside that
 segment's own time range.**
 
 **(c) Short-span decode -- for frame-level browsing inside a clip.**
-The proxy is far too coarse to browse individual frames of a 3 s trial. Decode the
-whole span once (~90 frames, a fraction of a second), cache every frame's
-thumbnail. Prefetch when a trial is selected. Browsing within that trial is then
-instant.
+Neither of the sources above suits browsing individual frames of a 3 s trial: (a)
+no longer exists, and (b) gives one representative frame per segment, not every
+frame in it. Decode the whole span once (~90 frames, a fraction of a second),
+cache every frame's thumbnail. Prefetch when a trial is selected. Browsing within
+that trial is then instant.
 
 ### 4.2 Playback -- keep it out of Python
 
@@ -335,9 +398,22 @@ handful of simultaneous players is fine; dozens are not.
 - Keep a small **LRU pool of open decoders** keyed by file. *Provisional default
   4-8 handles* -- a setting, not an architectural constant. Open file handles and
   decoder memory are machine-dependent.
-- **Batch requests by source file and sort by frame index** before decoding. Thirty
-  frames of one clip is one sequential pass, not thirty seeks. This is the single
-  biggest lever for scroll smoothness.
+- **Batch requests by source file** before decoding, so repeated calls for the same
+  file share one open container. Within a batch, decoding frames that are near
+  each other in one forward pass rather than seeking to each is fast and
+  uncontested -- thirty frames of one clip is one sequential pass, not thirty
+  seeks (§4.1c).
+- **Open question, downgraded 26 Aug 2026: does *sorting scattered requests* by
+  frame index before servicing them add anything beyond that?** This document
+  previously claimed it was "the single biggest lever for scroll smoothness" and
+  was untested. Measured 26 Aug 2026 (§11): sorted order was 0.5-2.9% faster than
+  scattered (random) order across all eight fixtures -- one file measured 7.4%
+  *slower* sorted -- no meaningful benefit, under the warm-cache protocol the
+  measurement pass required. **That protocol removes exactly the disk-I/O
+  locality effect sorting is meant to exploit, so this result is silent on the
+  cold-cache and Google Drive Streaming case the claim is actually about -- it is
+  not a refutation.** Do not build scheduling complexity around this claim until
+  a cold-cache variant tests it properly (outstanding, §6.0).
 
 ### 4.4 Replace thread-per-request with a bounded pool
 
@@ -383,7 +459,7 @@ That is wrong on at least five counts:
 ```
 canonical media address
 + source fingerprint          (size and mtime; a stronger hash where needed)
-+ artifact purpose / variant  (thumbnail, preview, proxy frame)
++ artifact purpose / variant  (thumbnail, preview, segment thumbnail)
 + requested resolution or representative-frame policy
 + renderer / decoder cache version
 ```
@@ -524,29 +600,93 @@ frame rate, short and long GOP, and at least one phone recording. One video guid
 the immediate implementation; it does not settle a ratio for every user's data.
 See §11.
 
+*Status 26 Aug 2026: built and verified.* Eight files. Three real recordings -- a
+Zoom study recording (h264, 1080p25), a legacy study recording (**mpeg4**, a third
+codec family, 3200x1200 at 20 fps) and a phone recording (h264, variable frame
+rate, `rotation=90`, audio-stream edit list). Five generated from a 20-minute
+normalised excerpt of the Zoom file, crossing codec (h264 / hevc) with GOP length
+(1 s / 10 s) at constant frame rate, plus one variable-frame-rate long-GOP file
+whose keyframe gaps run from 10 s to 49 s.
+
+Every generated file was verified against the container rather than trusted from
+the encoder log. Contents, measured properties, generation commands and the
+verification block are in `docs/fixtures.md`. The media itself is kept on local
+disk outside the repo -- it contains participants and runs to about 2 GB -- and is
+located through a `GELEM_FIXTURES` environment variable.
+
 See §11 for which of these generalise beyond Y B's machine and which do not. In
 brief: the ratios test structural properties of codecs and libraries and do
 generalise; absolute per-frame times do not and must not drive design.
 
-**Video and decoder -- gates Phase 1:**
+**Video and decoder -- gates Phase 1. Done, 26 Aug 2026.**
 
-- keyframe-only extraction versus full decode (claimed ~100x)
-- seeking to scattered frames (claimed 50-200 ms each)
-- frames inside an already-decoded span (claimed 2-5 ms)
-- **keyframe interval in the actual recordings.** Not a value to hardcode -- see
-  §4.1a, the resolver measures this per video at runtime. What Y B's files tell us
-  is how common each case is, which decides whether the proxy layer (P1.3) is a
-  Phase 1 item or a later optimisation.
+- **keyframe-only extraction versus full decode** (claimed ~100x). **Done.** Ratio
+  tracks `gap_frames` closely, but with a fitted k of 1.1-1.35 across all three
+  codec families -- well below the pre-registered guess of k = 2-5, because
+  JPEG-encode cost (paid on both sides of the comparison, by design) dominates
+  and compresses the ratio toward the theoretical ceiling. Full account, and why
+  this is not a measurement error, in §11.
+- **seeking to scattered frames** (claimed 50-200 ms each). **Done.** 25-113 ms on
+  Y B's three real recordings, up to 199 ms on the sparsest synthetic fixture --
+  not the flat 50-200 ms this document assumed for all cases. The fixed cost of a
+  seek (index lookup, decoder flush/reinit) is 64% of total seek time on
+  dense-keyframe files and 15% on sparse ones (§11).
+- **frames inside an already-decoded span** (claimed 2-5 ms). **Done.** 5.5-15.9
+  ms/frame (analysis mode, no encode) on the three real recordings -- higher than
+  claimed, and not explained by resolution: the phone recording, not the
+  higher-resolution legacy one, is the outlier (§11).
+- **keyframe interval in the actual recordings. Done, 26 Aug 2026.** Not a value
+  to hardcode -- §4.1a records the surviving principle that this kind of
+  property is measured per file, not assumed. What Y B's files tell us is how
+  common each case is.
 
-**MediaPipe -- gates Phase 2:**
+  *Result.* All three real recordings are dense. Legacy study (mpeg4, 20 fps):
+  0.600 s, perfectly uniform, 3582 keyframes. Phone (h264, VFR): 1.002 s mean,
+  179 keyframes. Zoom (h264, 25 fps): 2.000 s mean, minimum 0.760 s because scene
+  detection is active, 1338 keyframes.
+
+  *Reading, decided 26 Aug 2026 once the seek and fill-time measurements
+  completed.* **P1.3 is not built** (§10). All three real recordings measure well
+  inside the "not built" bands of the fill-time rule agreed before any number was
+  seen, and two of the three independently trip the 240-hour-corpus disk gate.
+  What changed across this measurement pass is the answer, not just the prior.
+
+  *One further observation.* No real recording in this corpus has a long GOP. The
+  two long-GOP fixtures therefore represent **some other user's data, not Y B's**.
+  Their job is to prove Gelem neither breaks nor shows wrong pictures on such
+  files, not to serve as a performance baseline for this study.
+
+**New, added 26 Aug 2026: sorted-versus-scattered batching benefit.** §4.3's
+claim that sorting requests by frame index is "the single biggest lever for
+scroll smoothness" was tested and no benefit was observed (0.5-2.9%, one file
+slower sorted) -- but under the mandatory warm-cache protocol, which cannot see
+the cold-cache disk-locality effect the claim is actually about. **Outstanding:**
+a cold-cache variant is needed before that claim can be trusted either way (§4.3,
+§11).
+
+**MediaPipe -- outstanding, gates Phase 2 only.** Not yet run. **Note added
+26 Aug 2026:** when these are eventually measured, take them **against whatever
+MediaPipe version Phase 2 actually uses**, not against whatever version happens
+to be installed at measurement time -- P2.2 makes model version part of the
+result-cache identity, so a number measured against one version is not a
+substitute for measuring against another, and stale numbers here would be
+easy to mistake for current ones.
 
 - does inference parallelise across threads? Time 200 frames on 1 thread, then 4.
   This is a property of whether the library releases the GIL, so it generalises.
+  **Still gates Phase 2** -- decides threads versus processes (P2.3).
 - tracking mode versus per-image: how much faster, and **how far do the numbers
   diverge**. The second half is a reproducibility question, not a speed one.
-- per-frame time on this machine. **Operational only.** It tells Y B whether his
-  study is a 4-hour or a 40-hour run, which is worth knowing. No architectural
-  decision depends on it, and it must not become a constant.
+  **Still gates Phase 2** -- decides whether tracking is safe to default to
+  (P2.4).
+- per-frame time on this machine. **No longer operational, and no current
+  decision depends on it.** This was going to tell Y B whether his driving
+  study (§2) was a 4-hour or a 40-hour run -- moot, since that study's
+  blendshapes are already extracted. Kept as an outstanding item because a
+  future study will want the planning number, not because anything gates on
+  it now. See §11 for the per-frame-cost row and the two run-time estimates
+  that follow from it, all now marked as unverified estimates that no current
+  decision depends on.
 
 **If a measurement comes back ambiguous** -- 8x where the plausible answers were
 100x or 3x -- it has not settled the question. Say so rather than rounding toward
@@ -567,7 +707,7 @@ Five items:
 | P0.2 | Dataset access paths and result delivery | Every operator run and every progressive update goes through these |
 | P0.3 | Address semantics and `MediaAddress` | P0.5 keys on a canonical address, which does not exist until this does |
 | P0.4 | Controller ownership of visible row order | P0.5 must know what is on screen to prioritise and cancel |
-| P0.5 | ArtifactStore identity and demand-driven display | The proxy, segment thumbnails and every tile attach here |
+| P0.5 | ArtifactStore identity and demand-driven display | Segment thumbnails and every tile attach here |
 
 *Round-two corrections.* P0.3 was P1.1 and P0.4 was part of P1.13. Both were moved
 after the reviewer pointed out that the original P0.3 (ArtifactStore) depended on
@@ -631,8 +771,8 @@ stays in Phase 1.
 Implement §4.5 and §4.6. Address-based keys, `ArtifactCodec` separated from source
 decoding (§7), bounded worker pool with priority and cancellation, no decoding in a
 paint path, clear the memory cache on project load, cache size becomes a setting.
-This fixes the avatar-tile bug and is the foundation the proxy and segment
-thumbnails attach to.
+This fixes the avatar-tile bug and is the foundation segment thumbnails and
+every tile attach to.
 
 ### 6.2 Phase 1 -- media foundation
 
@@ -677,15 +817,17 @@ resolver and ProjectPaths exist there is, and the segment and frame operators be
 need both -- plus cancellation, since they are the first operators that can run
 long enough to want stopping.
 
-**P1.3 Proxy layer.** Keyframe-only extraction, packed one file per video with an
-index, lazy and resumable, **built only for videos whose measured keyframe interval
-makes it worthwhile**. Scope depends on §6.0.
+**P1.3 Proxy layer -- rejected 26 Aug 2026 on measurement.** See §10 for the full
+record. This ID is retired, not reassigned.
 
 **P1.4 Short-span decode cache** for frame-level browsing inside clips, with
 prefetch on selection.
 
-**P1.7a Segment thumbnail batch job** in ArtifactStore, ordered by source and time
-(§4.1b).
+**P1.7a Segment thumbnail batch job** in ArtifactStore: collect outstanding
+segments, sort by source file and start time, **seek to each representative
+frame** (§4.1b). *Rewritten 26 Aug 2026 -- was one full sequential decode pass per
+video; measurement showed sorted seeking cheaper by two to three orders of
+magnitude at any realistic trial density. See §4.1b and §10.*
 
 **P1.5 Generalise merging.** `Dataset.merge_csv` hardcodes a join onto `frames`
 against `file_name` and rejects one-to-many joins. Trial data is inherently
@@ -833,6 +975,15 @@ document.** Extend the existing pattern in `tests/test_architecture_imports.py`,
   separate tests for PTS and frame selection, colour channel order, orientation,
   and crops. The old extraction path may stay temporarily as a *display*
   compatibility check, not as the analysis reference.
+- **Fixture location, and why it is a rule rather than a detail.** The real
+  fixtures contain participants and run to about 2 GB, so they are not in the repo
+  and must not be. Tests locate them through a `GELEM_FIXTURES` environment
+  variable and **skip rather than fail** when it is unset, so a student's checkout
+  stays green without the media. The small synthetic lossless fixture is the
+  opposite case: reproducible from a command and containing no participants, so it
+  is generated on demand by the test fixture itself and may live in the repo. The
+  dividing line is generated-and-small in the repo, real-and-large outside it. See
+  `docs/fixtures.md`.
 - Every §3.6 semantic decision has a test.
 - **A segment's thumbnail comes from inside that segment's own time range.**
 - Creating a frame table writes **zero** files.
@@ -1000,61 +1151,329 @@ externally, which is fine for getting moving. But once addresses express time
 ranges, a clip need not be a file, and the external step becomes optional. Do not
 build anything that assumes clips are files on disk.
 
+**P1.3, the whole-video proxy layer. Rejected 26 Aug 2026, on the measurement
+pass, against a rule agreed before any number was seen.** Full raw numbers, run
+log and scripts: `%USERPROFILE%\Documents\gelem.measure\` (outside the repo;
+`section11_table.md` and `RUNLOG.md`). Summary numbers are also in §11.
+
+The rule: time to fill thirty tiles at a never-visited scroll position. Under
+1 s -> not built, comfortable. 1-6 s -> not built, accepted as a deliberate
+trade against the proxy's total cost. Over 6 s -> reconsider, after trying more
+workers, reduced-resolution decode for the mpeg4 file, and prefetching ahead of
+the scroll. Two gates defer it regardless of the time: build cost over 3 minutes
+per hour of video, or proxy disk over 2 GB across a 240-hour corpus.
+
+Measured fill times: **0.41 s** (Zoom recording), **0.37 s** (legacy mpeg4
+recording), **1.65 s** (phone recording). All three land in the "not built"
+bands.
+
+Proxy disk across a 240-hour corpus, extrapolated from each recording's own
+measured keyframe density and JPEG size: **0.93 GB** if the corpus looked like
+the Zoom recording, **2.81 GB** if it looked like the legacy recording, **2.20
+GB** if it looked like the phone recording. Two of the three real recording
+types individually exceed the 2 GB gate on their own.
+
+**K** -- how many approximate thumbnails a video's proxy would need to serve
+before it repaid its own construction cost -- is **837** (Zoom), **5,093**
+(legacy), **665** (phone). Even where the fill-time rule alone would already
+say "not built" (as it does here), K says the payback bar for reviving this is
+high: a proxy would need to be reused hundreds to thousands of times per hour of
+source video.
+
+**Costs beyond development time, weighed against a benefit that is at most
+1.6 s of scroll comfort on this corpus:**
+
+- **Disk.** Up to ~2.8 GB per real recording type, per the figures above, for a
+  cache that exists solely to make an already-sub-2-second wait shorter.
+- **Background decoding that competes with analysis runs.** Building a proxy
+  means decoding video on a background worker while blendshape extraction wants
+  the same CPU. That contention is real cost on top of the disk.
+- **A permanent hazard, not a one-time one.** Every approximate picture is a
+  chance it reaches a caller that needed an exact one. §3.6 item 13 and the §4
+  display/analysis table exist specifically to police that boundary. Removing
+  the proxy removes the hazard entirely rather than requiring it be policed
+  forever.
+
+**Condition for revisiting:** a corpus with genuinely long-GOP video (this
+corpus has none -- see §6.0's "further observation" on the two synthetic
+long-GOP fixtures), or a UI that draws thousands of approximate thumbnails from
+a single video, such as a timeline scrubber. Neither exists in the plan today.
+If one is proposed, re-run the measurement pass against it rather than assuming
+these numbers still hold -- they are this corpus's numbers, not a general
+result (§11).
+
+**§4.1a, the keyframe-interval-decides-per-video-proxy signal. Folded into this
+entry, 26 Aug 2026, because its only purpose was deciding P1.3.** One sentence
+of the surviving principle -- measure a per-file property at load time rather
+than assume it globally -- stays in §4.1a, because that pattern outlives the
+proxy it was built for.
+
+**The specific signal §4.1a proposed measuring does not predict what it was
+chosen to predict.** It proposed classifying a video as cheap or expensive to
+seek by its keyframe gap: dense gets a proxy, sparse falls back to (c). Measured
+against the three real recordings, that ordering is wrong:
+
+| Recording | Keyframe gap | Scattered-seek median |
+|---|---|---|
+| legacy (mpeg4) | 12 frames (0.6 s) -- densest | 25.2 ms -- cheapest |
+| Zoom (h264) | 50 frames (2.0 s) -- sparsest of the three | 28.4 ms -- second cheapest |
+| phone (h264, VFR) | 30 frames (~1.0 s) -- in between | **113.3 ms -- 4x either** |
+
+The phone recording has a smaller keyframe gap than the Zoom recording --
+denser, by this rule's own logic it should seek cheaper -- yet costs four times
+as much per seek. Bitrate (20 Mbps against 0.86-2.98 Mbps for the other two)
+looks like the better predictor on this evidence, though three files is not
+enough to establish a replacement rule with confidence. **Anyone reviving a
+proxy-like decision must measure seek cost directly, per file, rather than infer
+it from keyframe spacing.** Full numbers and reasoning:
+`%USERPROFILE%\Documents\gelem.measure\section11_table.md`.
+
 ---
 
 ## 11. Numbers, and which of them generalise
 
-**All performance figures below are estimates until §6.0 runs. Replace them with
-measured values and mark them as measured.**
+*Status 26 Aug 2026, measurement pass.* All rows below are **measured 26 Aug
+2026 on Y B's machine** (Intel Core i9-14900K, 24C/32T, 128 GB RAM, Windows 11
+Pro 10.0.26200, PyAV 18.1.0 / ffmpeg libs per `RUNLOG.md`), replacing the
+estimate rows below with measured ones. Every timing is warm-cache: each
+measurement unit ran twice per file, first discarded, second reported;
+the first operation after every container open was separately discarded.
+Full method, raw numbers, and two implementation bugs found and fixed during
+this pass are in `%USERPROFILE%\Documents\gelem.measure\RUNLOG.md` and
+`results_raw.json` (outside the repo; see §6.0). MediaPipe rows below remain
+unmeasured estimates. The two structural questions (parallelism, tracking
+divergence) still gate Phase 2; the per-frame-cost row and the two estimates
+that follow from it do not gate anything currently -- see §6.0 for why.
 
-The distinction matters more than the numbers. A measurement taken on one machine
-with one dataset can support a design decision only if what it tests is structural.
+**Pre-registered prediction, and what actually happened.** The prediction was
+that the keyframe-only/full-decode ratio would be roughly `gap_frames / k`
+with k between 2 and 5. The measured ratio does track `gap_frames`
+closely and consistently across all eight files and three codec families --
+**the mechanism is confirmed** -- but the fitted k is **1.1 to 1.35**, well
+below the predicted range, meaning the achieved speedup sits much closer to
+the theoretical ceiling (proportional to `gap_frames`) than expected. Two
+causes were checked, per the method rules, before accepting this:
 
-**Mechanism generalises; the ratio does not.** *Revised in the second review round,
-which was right that the first version overclaimed.* The reason keyframe-skipping
-is fast is structural and holds everywhere. **The measured ratio still varies with
-codec, GOP length, container, storage device, library version and platform.** So a
-single file supports a decision of the form "is this mechanism worth building" and
-does **not** establish a number that holds for any user's data.
+- **`skip_frame` not taking effect?** No. Keyframe counts recovered in the
+  3-minute window match `docs/fixtures.md`'s stated values almost exactly
+  (e.g. the phone file: 179 keyframes measured against 179 stated; the
+  1 s-GOP pair: 181 measured against an expected 180; the 10 s-GOP pair: 19
+  measured against an expected 18).
+- **JPEG encoding dominating and swamping the decode difference?** Yes, in
+  part, and this is the actual explanation for the low k. Measurement 3's
+  display/analysis split shows resize+JPEG-encode is **59-73% of total
+  per-frame cost** for the constant-frame-rate files (e.g. h265 1 s-GOP:
+  22.4 ms display vs 6.0 ms analysis-only). Because this pass produces
+  *identical output* on both the keyframe-only and full-decode sides (as the
+  method requires, so the ratio isn't an artifact of unequal work), the
+  shared encode cost is paid once per frame on both sides and compresses the
+  ratio toward the frame-count ceiling. This is not a measurement error --
+  it is the actual cost of the actual pipeline Gelem would run to build a
+  proxy -- but it means k is a property of *this* pipeline (decode -> scale
+  150 px -> JPEG q80), not of decode alone. A decode-only k would likely sit
+  closer to the originally-guessed 2-5.
 
-Where practical, measure across a few representative fixtures rather than one:
-H.264 and H.265; constant and variable frame rate; short and long GOP; and at least
-one phone recording, since phone files are both common in this work and the most
-likely to be VFR.
+### Structural, generalises
 
-Runtime adaptation remains the stronger design in every case: measuring a property
-per file at load time (§4.1a) is more robust than any benchmark, however many
-fixtures it used.
-
-| Quantity | Estimate | Why it generalises |
+| Quantity | Measured 26 Aug 2026 (Y B's machine) | Why it generalises |
 |---|---|---|
-| Keyframe-only extraction vs full decode | ~100x | Skipping intermediate-frame decode is inherent to inter-frame compression |
-| Seek to a scattered frame | 50-200 ms | Same mechanism, any machine |
-| Sequential frame in a decoded span | 2-5 ms | Same |
-| MediaPipe parallelises across threads? | unknown | Depends on whether the library releases the GIL |
-| Tracking vs per-image output divergence | unknown | A property of the model |
+| Keyframe-only vs full decode | ratio ≈ `gap_frames / k`. k = 1.15-1.35 (h264, n=5), 1.10-1.22 (hevc, n=2), 1.17 (mpeg4, n=1). Tracks `gap_frames` consistently across all 8 files. | Skipping inter-frame decode is inherent to how any decoder implements a predictive codec -- the mechanism holds on any machine. The *specific* k value does not generalise: it is bound to this pipeline's encode-dominated cost structure (see above), not to decode cost alone. |
+| Seek fixed cost F0 (as a share of total scattered-seek time) | h264: F0 = 23.4 ms = **64%** of seek time on the dense (1 s-GOP) file, **15%** on the sparse (10 s-GOP) file. hevc: F0 = 14.5 ms, same 64%/15% split. | F0 is index lookup + decoder flush/reinit, a structural cost of any seek in any container/decoder. That it dominates for dense-keyframe files and shrinks proportionally for sparse ones is a property of the mechanism. The absolute F0 value (14-23 ms) is machine- and library-specific and will not generalise numerically. |
+| Does PyAV release the GIL during decode? | **Yes, confirmed.** W > 1 at every worker count tested (never ≈1.0, which would mean no parallelism). Sub-linear: same-file W = 1.60 (2 workers) / 2.06 (4 workers, of ideal 4.0); different-files W = 1.36 / 1.72 (5-repeat median, tight range -- see `RUNLOG.md`). | Whether the C library releases the GIL during its C-level decode call is a fact about the binding, true on any machine. That scaling is sub-linear, and further reduced when threads decode different files/codecs simultaneously rather than one shared file, is a real, reproduced effect -- but the exact multipliers are this CPU's core count and scheduler, and will not generalise numerically. |
+| Sorted vs scattered batching benefit | **0.5-2.9% faster sorted**, one file (h265 1 s-GOP) measured 7.4% *slower* sorted -- within noise. No meaningful benefit observed. | **Does not generalise, and cannot be read as "batching doesn't help."** The method's mandatory warm-cache protocol (discard first pass, report second) removes exactly the disk-I/O locality effect that sequential access is supposed to exploit. This result says the batching benefit is not visible *once the OS page cache is already warm* -- it is silent on the cold-cache / Google-Drive-Streaming case §4.3 is actually written for. A cold-cache variant would be needed to test the claim as stated. |
+| MediaPipe parallelises across threads? | unknown -- not yet measured | Depends on whether the library releases the GIL; still gates Phase 2 (§6.0) |
+| Tracking vs per-image output divergence | unknown -- not yet measured | A property of the model; still gates Phase 2 (§6.0) |
 
-**Does not generalise -- must become a setting or a runtime measurement.**
+### Machine and file specific, must not become a constant
 
-| Quantity | Estimate | Handling |
-|---|---|---|
-| Keyframe interval | 1-10 s | Measured per video at runtime (§4.1a) |
-| MediaPipe per frame, CPU | ~25 ms | Operational only; no decision depends on it |
-| Worker count | -- | Setting, default low |
-| Thumbnail cache size | 500 MB | Setting |
+| File | Codec | Open cost (median, ms) | Scattered seek (median / IQR / max, ms) | Sorted seek (median, ms) | Sequential display (median / IQR, ms/frame) | Sequential analysis (median / IQR, ms/frame) | Proxy build cost (s/hour) | Proxy size (MB/hour) | T (s) | G\* (frames) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sid89_video.mp4 (Zoom) | h264 | 10.0 | 28.4 / [18.4, 31.7] / 57.3 | 27.8 | 20.64 / [18.89, 23.81] | 5.50 / [5.22, 6.42] | 23.8 | 3.95 | 0.41 | 1.4 |
+| PID_031...mp4 (legacy) | mpeg4 | 3.2 | 25.2 / [23.8, 27.0] / 33.9 | 24.7 | 30.66 / [29.01, 33.18] | 6.65 / [6.42, 7.18] | 128.3 | 12.0 | 0.37 | 0.8 |
+| VID_20260826...mp4 (phone) | h264 | 12.7 | 113.3 / [84.1, 147.5] / 203.5 | 112.7 | 27.32 / [25.72, 30.18] | 15.85 / [13.96, 18.82] | 75.4 | 9.40 | 1.65 | 4.1 |
+| h264_cfr_gop1s.mp4 | h264 | 6.5 | 36.8 / [30.6, 40.8] / 67.2 | 36.9 | 22.09 / [20.33, 25.24] | 9.13 / [7.54, 12.01] | 53.4 | 7.06 | 0.54 | 1.7 |
+| h264_cfr_gop10s.mp4 | h264 | 7.1 | 157.5 / [94.6, 220.4] / 347.8 | 153.0 | 21.81 / [20.21, 24.96] | 8.06 / [7.10, 10.50] | 6.3 | 0.72 | 2.29 | 7.2 |
+| h265_cfr_gop1s.mp4 | hevc | 1.6 | 22.6 / [17.7, 26.7] / 34.2 | 24.3 | 22.40 / [20.30, 26.28] | 6.00 / [5.57, 6.81] | 47.0 | 7.06 | 0.33 | 1.0 |
+| h265_cfr_gop10s.mp4 | hevc | 1.7 | 96.1 / [58.4, 130.9] / 186.6 | 95.1 | 22.54 / [20.32, 25.89] | 5.90 / [5.54, 6.54] | 5.2 | 0.72 | 1.40 | 4.3 |
+| h264_vfr_longgop.mp4 | h264 (VFR) | 7.4 | 199.3 / [126.0, 266.0] / 386.7 | 195.5 | 21.23 / [19.89, 23.41] | 7.71 / [7.04, 9.34] | 4.3 | 0.47 | 2.90 | 9.4 |
 
-**Corpus and storage figures -- arithmetic, not measurement.**
+Each depends on: keyframe density and codec (seek and build cost), frame
+resolution and bitrate/entropy (sequential decode cost -- see the phone-file
+note below), and this machine's single-thread decode speed and disk cache
+state (all of it). None of it should become a setting default or a hardcoded
+threshold without re-measuring on the machine and files it will actually run
+against.
+
+**Unexpected: the phone file, not the legacy file, is the outlier.** The
+prediction was that the legacy 3200x1200 recording would differ sharply from
+the 1080p files at full resolution. It doesn't -- its analysis-mode cost
+(6.65 ms) is close to the Zoom file's (5.50 ms) despite ~1.85x the pixels.
+The phone file's analysis-mode cost (15.85 ms) is the actual outlier, roughly
+2.5x every other file including the higher-resolution legacy one. The phone
+file is also the only one recorded at high bitrate (20 Mbps vs 0.86-2.98 Mbps
+for the others) with real, irregular VFR -- entropy/bitrate, not resolution,
+looks like the dominant driver of decode cost here, at least on this small
+set. Worth another look before anything is built on the resolution-scales-cost
+assumption.
+
+**Full decode of 1 hour of video (decode-only: full-resolution decode plus RGB
+conversion, no scaling, no encoding).** Corrected 26 Aug 2026. This lived in
+the arithmetic table below as a ~2-6 min pre-registered estimate; moved here
+because it is a measured, file-specific decode speed, not arithmetic, and does
+not generalise across machines or codecs any more than the rest of this table
+does. Same source as the decode-only full-pass figures in the P1.7a crossover
+table (§4.1b): analysis-mode per-frame cost above, extrapolated to one hour at
+each recording's own frame rate.
+
+| Recording | Full decode of 1 h (decode-only) |
+|---|---|
+| sid89_video.mp4 (Zoom, 25 fps) | **8.2 min** |
+| PID_031...mp4 (legacy, mpeg4, 20 fps) | **8.0 min** |
+| VID_20260826...mp4 (phone, ~29.9 fps VFR) | **28.4 min** |
+
+Measured on the three real recordings only -- not extrapolated to the five
+synthetic fixtures, which is why this is a three-row table rather than a
+column on the eight-row one above.
+
+### Arithmetic, not measurement
 
 | Quantity | Value |
 |---|---|
 | Common-case corpus | 20-120 videos, 10-120 min → up to ~240 h |
 | Frames in 240 h @ 30 fps | ~26 M (never materialise all of these) |
 | Realistic frame table (Y B's study) | ~530 k rows, ~300 MB |
-| Thumbnail, 150 px JPEG | ~6 KB |
-| Proxy layer per hour of video | ~20 MB |
-| Full decode of 1 h video | ~2-6 min |
-| Y B's study, every frame, 1 thread | ~4.4 h (follows from 25 ms/frame) |
-| Same, with tracking + 6 workers | ~30-45 min (follows from the above) |
+| Thumbnail, 150 px JPEG | **Measured 26 Aug 2026: 2.0-2.6 KB** across the three real recordings (`section11_table.md`'s `avg_jpeg_bytes`), not ~6 KB. These recordings are visually soft, which is most of the gap. This number feeds the thumbnail cache size setting below -- **the setting's default assumption was too pessimistic by roughly a factor of three.** |
+| Proxy disk, 240 h corpus, if entirely Zoom-like (sid89 density) | 0.93 GB |
+| Proxy disk, 240 h corpus, if entirely legacy-like (PID_031 density) | **2.81 GB** |
+| Proxy disk, 240 h corpus, if entirely phone-like (VID_20260826 density) | **2.20 GB** |
+| Proxy disk, 240 h corpus, if entirely h264 1 s-GOP density | 1.65 GB |
+| Proxy disk, 240 h corpus, if entirely h264/h265 10 s-GOP density | 0.17 GB |
+| Proxy disk, 240 h corpus, if entirely VFR-longgop density | 0.11 GB |
+| K (build cost per hour ÷ scattered seek time), sid89 | 837 |
+| K, legacy (PID_031) | 5093 |
+| K, phone | 665 |
+| K, h264 1 s-GOP | 1451 |
+| K, h264 10 s-GOP | 40 |
+| K, h265 1 s-GOP | 2079 |
+| K, h265 10 s-GOP | 54 |
+| K, VFR-longgop | 22 |
+| MediaPipe per frame, CPU | ~25 ms. **Unverified estimate; no current decision depends on it.** *(Status changed 26 Aug 2026.)* Was operational-only -- it would have told Y B whether his driving study (§2) was a 4-hour or 40-hour run -- but that reason is gone too: the blendshapes for that study are already extracted. Kept only as a placeholder until Phase 2 measures it for real, against whatever MediaPipe version Phase 2 actually uses (§6.0). |
+| Y B's study, every frame, 1 thread | ~4.4 h. **Unverified estimate; no current decision depends on it, same status as the row above** -- the study it would have planned is already done. Also, independent of that: **this omits decode cost entirely.** Decode in analysis mode measured 5.5-15.9 ms/frame on the real recordings (table above), so this row would understate total per-frame cost by roughly 20 to 60 percent if it were still being used for planning. |
+| Same, with tracking + 6 workers | ~30-45 min. **Unverified estimate; no current decision depends on it, same status as the two rows above.** Also, independent of that: it **assumes near-linear thread scaling across 6 workers**. PyAV, the one comparable measurement available, showed 2.06x at 4 workers, not 4x. That contradiction is noted, not corrected, since it's MediaPipe threads being assumed here, not PyAV's, and MediaPipe's thread scaling has not been measured. |
+| Worker count | -- (setting, default low) |
+| Thumbnail cache size | 500 MB (setting; see the corrected thumbnail-size row above for why its sizing assumption was too pessimistic) |
 
-The last two inherit the per-frame estimate, so they are operational planning
-figures for Y B's machine, not design inputs.
+K is "how many thumbnails must be drawn from one hour of video before a
+prepared cache repays its own construction." For every real recording, K is
+in the hundreds to low thousands -- a proxy would need to be reused hundreds
+to thousands of times per hour of source video before it pays for itself.
+Under the T-driven verdict below this doesn't matter (P1.3 isn't being built
+regardless), but if that verdict is revisited later, K is the number that
+says the payback bar is high.
+
+The real-corpus proxy-disk figure is not a single number: Y B's actual 240 h
+corpus is presumably a mix of these three densities, not uniformly one type,
+and its composition wasn't measured. **Two of the three real recording types
+(legacy and phone) individually exceed the 2 GB gate on their own; only the
+Zoom-density type does not.** A realistic mixed corpus is not comfortably
+under the gate -- see the verdict below.
+
+**The last three rows are unverified estimates that no current decision
+depends on.** *(Changed 26 Aug 2026.)* They used to be operational planning
+figures for Y B's machine -- how long his driving study's extraction would
+take. That question is closed: the study's blendshapes are already extracted,
+so there is nothing left for these numbers to plan. They stay in this table
+only as a placeholder pending Phase 2 (§6.0), and must be re-measured against
+whatever MediaPipe version Phase 2 actually uses before being trusted for
+anything -- P2.2 makes model version part of the result-cache identity, so an
+estimate taken against one version is not evidence about another.
+
+---
+
+### Verdict, stated mechanically
+
+**Rule:** T < 1 s -> not built, comfortable. T in [1, 6] s -> not built,
+accepted trade-off. T > 6 s -> reconsider (more workers / reduced-res decode
+for mpeg4 / prefetch). Two gates defer P1.3 regardless of T: build cost > 180
+s/hour, or 240 h-corpus proxy disk > 2 GB.
+
+| Real recording | T | Band | Build-cost gate (>180 s/h)? | Proxy-disk gate (>2 GB @240h)? |
+|---|---|---|---|---|
+| sid89_video.mp4 (Zoom) | 0.41 s | **under 1 s** | No (23.8 s/h) | No (0.93 GB) |
+| PID_031...mp4 (legacy, mpeg4) | 0.37 s | **under 1 s** | No (128.3 s/h) | **Yes (2.81 GB)** |
+| VID_20260826...mp4 (phone) | 1.65 s | **1-6 s** | No (75.4 s/h) | **Yes (2.20 GB)** |
+
+**P1.3 is not built.** All three real recordings land in the "not built"
+bands on T alone (two comfortably under 1 s, the phone recording in the
+accepted 1-6 s trade-off band). The disk gate independently confirms this for
+two of the three recording types, and is ambiguous rather than clearly clear
+for a realistic mixed corpus (see above) -- it does not change the verdict,
+since T already settles it, but it removes any temptation to treat "T is
+fine" as the last word if T is revisited later on a different machine. Full
+record, including the reasoning for the rejection, is in §10.
+
+No band is close enough to a boundary to flag as fragile except the phone
+file's T = 1.65 s, which sits inside the 1-6 s band regardless of the exact
+value -- moving W (the parallelism speedup used in T's denominator) between
+the two measured values in this pass (2.06 vs the earlier noisy 3.31) moved T
+between 1.03 s and 1.65 s without changing the band. The verdict is robust to
+that noise; a specific point estimate of T for the phone file is not.
+
+---
+
+### Contradictions with the plan, found during this pass
+
+**P1.7a (trial-thumbnail batch job, §4.1b) was contradicted, sharply, for all
+three real recordings, and has been rewritten (§4.1b, §6.2).** The crossover --
+how many trials per hour of video before a full sequential decode pass beats
+sorted per-trial seeking -- comes out at:
+
+| File | Full sequential pass (s/hour, decode-only) | Sorted seek, seek-only component (ms) | Crossover N\* (trials/hour) |
+|---|---|---|---|
+| sid89_video.mp4 | 494.7 | 17.55 | **~28,200** |
+| PID_031...mp4 (legacy) | 478.7 | 8.16 | **~58,600** |
+| VID_20260826...mp4 (phone) | 1705.8 | 101.68 | **~16,800** |
+
+(Method: sorted-seek total time was split into its seek-only and JPEG-encode
+components using measurement 2's own per-operation fields, since a
+sequential pass only has to pay the encode cost at the N representative
+frames it actually captures, not at every frame it decodes through. N\* =
+full-pass decode-only cost ÷ (sorted-seek time − encode-only time). Full
+detail in `analyze.py`.)
+
+No real study has 16,000-59,000 trials in one hour of video: **for any
+realistic trial count, sorted per-trial seeking beats a full sequential
+decode.** Stated at specific, checkable densities rather than dramatised: at
+3,000 trials per hour of video, seeking is about five times cheaper on the
+phone recording (the least favourable of the three); at 300 per hour, about
+fifty times. A full sequential pass would only become the right choice again
+above roughly seventeen thousand trials in a single hour of recording -- a
+trial every fifth of a second. §4.1b and P1.7a (§6.2) have been rewritten to
+seek to each representative frame instead.
+
+**§4.1a's dense-keyframes-get-a-proxy rule does not track which files
+actually have expensive seeks.** The rule sorts files by keyframe gap and
+expects seek cost to follow. It doesn't, for the three real recordings:
+
+| File | Keyframe gap | Scattered seek median |
+|---|---|---|
+| PID_031 (legacy) | 12 frames (0.6 s) -- densest | 25.2 ms -- cheapest |
+| sid89 (Zoom) | 50 frames (2.0 s) -- sparsest of the three | 28.4 ms -- second cheapest |
+| VID_20260826 (phone) | 30 frames (~1.0 s) -- in between | 113.3 ms -- **4x more expensive than either** |
+
+The phone file has a *smaller* keyframe gap than the Zoom recording (denser,
+by the rule's own logic it should seek cheaper) yet costs four times as much
+per seek. Bitrate looks like the better predictor on this evidence: the phone
+file is encoded at 20 Mbps against 0.86-2.98 Mbps for the other two, meaning
+substantially more entropy-coded data to parse per frame regardless of how
+close the nearest keyframe is. **§4.1a's binary dense/sparse-by-keyframe-gap
+rule would classify the phone file as cheap to seek (it's reasonably dense)
+when it is in fact the most expensive file in the entire eight-file set.**
+This doesn't necessarily mean measuring a per-video property at load time is
+the wrong general approach -- it already avoids hardcoding a global
+assumption, and that principle survives in §4.1a -- but the specific signal
+it proposed measuring (keyframe interval alone) missed the dominant cost
+driver on this evidence. Three real files is not enough to replace "keyframe
+gap" with "bitrate" as the decision signal with confidence; it is enough to
+say gap alone is not sufficient, and that this wasn't tested before now. Full
+record: §10.

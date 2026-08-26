@@ -215,12 +215,25 @@ itself an instance of the problem this file's status tags exist to fix.
   hardcoded 300-1500 ms window, a seven-emotion assumption, or a
   blendshape-specific branch inside a generic component is a leak. Before building
   a feature, name the parameter that makes it general.
-- **`[TARGET -> P0.5, P1.3]`** **A number that does not generalise across machines
+- **`[TARGET -> P0.5]`** **A number that does not generalise across machines
   or datasets must become a setting or a runtime measurement -- never a constant in
-  the code.** Worker count, cache size, and keyframe interval are all of this kind.
-  Measuring one on Y B's machine tells you the shape of the common case, not a
-  value to hardcode. Not true today: `DEFAULT_CACHE_MAX_BYTES` is a hardcoded
-  500 MB, and there is no worker pool to have a count.
+  the code.** Worker count and cache size are both of this kind. Measuring one on
+  Y B's machine tells you the shape of the common case, not a value to hardcode.
+  Not true today: `DEFAULT_CACHE_MAX_BYTES` is a hardcoded 500 MB, and there is no
+  worker pool to have a count. *(Keyframe interval was the third example here
+  until 26 Aug 2026: it was measured per video specifically to decide whether to
+  build a whole-video proxy layer, and that proxy is rejected -- see
+  `docs/media_architecture.md` §10.)* This rule covers two different things --
+  a number that varies **by machine** needs a setting (worker count, cache
+  size, both above); a number that varies **by file or dataset** needs a
+  runtime measurement instead, which is a different mechanism with no example
+  of its own here as of 26 Aug 2026. Per-file seek cost was considered as the
+  replacement, since the measurement pass found keyframe interval doesn't
+  predict it -- but seek cost isn't measured anywhere in the current plan
+  either; it only appears in `docs/media_architecture.md` §10 as what a future
+  revival of proxy-like work would need to measure, which isn't a live case
+  today. **The next feature that needs a runtime-measured per-file property
+  should cite itself here** rather than this rule citing a hypothetical.
 
 ### Long-running work
 
@@ -273,15 +286,7 @@ arguments pytest tried to treat as fixtures). Fixed 24 Aug 2026 by renaming them
 to `check_thumbnail` / `check_detail` -- the file is a standalone manual-check
 script, not a pytest module, so nothing inside it should match `test_*`.
 
-`python -m pytest` now collects cleanly (no errors), but is not fully green: three
-pre-existing failures in `tests/test_dataset.py`
-(`test_add_computed_column_correct_values`, `test_apply_sort`,
-`test_apply_grouped_all_rows_accounted`) are caused by an **untracked** stray file,
-`test_images/boxtest.png`, which matches `Dataset.load_folder()`'s image
-extensions and adds a 21st row with no matching `metadata.csv` entry. This file
-does not exist on a fresh clone, so those three tests pass there; locally, either
-remove `boxtest.png` from `test_images/` or give it an extension `load_folder()`
-does not treat as media.
+`python -m pytest` now collects cleanly (no errors), but make sure it indeed fully green as I deleted an image that Claude-Desktop identified as the culprit. 
 
 ---
 
@@ -353,7 +358,7 @@ mechanical ones -- the tests are the check there.
 | P0.2 | **yes** | every operator run and progressive update goes through it |
 | P0.3 | **yes, narrowly** | review the §3.6 semantic decisions, not the parser code |
 | P0.4 | no | small and well specified |
-| P0.5 | **yes** | the proxy, segment thumbnails and every tile attach here |
+| P0.5 | **yes** | segment thumbnails and every tile attach here |
 | P1.8, P1.12 | **yes** | schema roles and the operator contract are contracts |
 | everything else | judgement | apply the same test |
 
