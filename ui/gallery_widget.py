@@ -150,6 +150,14 @@ class TileWidget(QLabel):
         self.double_clicked.emit(self._tile.get_row_ids())
         event.accept()
 
+    def get_row_ids(self) -> list[str]:
+        """
+        Returns the row_ids this tile shows. Forwards to the wrapped
+        BaseTile so callers never reach into the private _tile
+        attribute -- guarded by tests/test_ui_private_access.py.
+        """
+        return self._tile.get_row_ids()
+
 
 class GalleryWidget(QWidget):
     """
@@ -170,6 +178,17 @@ class GalleryWidget(QWidget):
     # Signal emitted when the user double-clicks a tile.
     tile_double_clicked = Signal(list)
 
+    # Signal emitted when the mounted window of tiles changes -- i.e. the
+    # gallery now shows a different slice of the controller's flat order.
+    # Carries ABSOLUTE half-open indices [start, stop) into that order
+    # (not indices local to this gallery's own slice), plus the
+    # result_id this gallery was given in set_range(). The gallery
+    # stamps the report itself so a stale range from a superseded
+    # result cannot be re-stamped with the current id by a third party.
+    # MainWindow adds only the viewport key it owns; the gallery never
+    # learns that keys exist.
+    displayed_range_changed = Signal(int, int, str)
+
     _SPACING     = 4   # gap between adjacent tiles, in pixels
     _MARGIN      = 4   # padding around the whole grid, in pixels
     _BUFFER_ROWS = 1   # rows above and below the viewport kept mounted
@@ -184,7 +203,19 @@ class GalleryWidget(QWidget):
         """
         super().__init__(parent)
         self._controller    = controller
-        self._row_ids:      list[str] = []
+        # This gallery paints one contiguous slice of the controller's
+        # flat order: absolute half-open range [_range_start, _range_stop).
+        # In the flat view that is the whole order; in the grouped view
+        # each per-group gallery gets its own group's span. The gallery
+        # holds NO row ids of its own -- it fetches the ids it needs from
+        # the controller, one batch call per viewport update.
+        self._range_start:  int        = 0
+        self._range_stop:   int        = 0
+        self._result_id:    str | None = None
+        # Last (start, stop, result_id) triple we reported via
+        # displayed_range_changed, so scrolling within the same window
+        # does not re-emit an identical report.
+        self._last_reported_range: tuple[int, int, str] | None = None
         self._tile_size:    int       = 150
         # None  -> researcher hasn't set a preference; fall back to the
         #          dataset's default visual column (full_path) when present.
@@ -209,8 +240,10 @@ class GalleryWidget(QWidget):
         self._tile_columns: list[str] | None = None
         # Placeholder shown when the active table has no visual column.
         self._placeholder_label: QLabel | None = None
-        # Index of the last plain- or ctrl-clicked tile in self._row_ids.
-        # Acts as the anchor for shift+click range selection.
+        # ABSOLUTE index (into the controller's flat order) of the last
+        # plain- or ctrl-clicked tile. Acts as the anchor for shift+click
+        # range selection. Absolute, not local to this gallery's slice,
+        # so a shift range can be resolved through the controller.
         self._last_clicked_index: int | None = None
 
         # Main layout.
@@ -274,20 +307,31 @@ class GalleryWidget(QWidget):
 
     # ── Public API ────────────────────────────────────────────────────
 
-    def set_row_ids(self, row_ids: list[str]) -> None:
+    def set_range(self, start: int, stop: int, result_id: str) -> None:
         """
-        Updates the gallery with a new ordered list of row_ids.
-        Resets selection and scroll position, then re-mounts the
-        visible viewport.
+        Points the gallery at the half-open slice [start, stop) of the
+        controller's flat order for the result identified by result_id.
+        Resets selection, the click anchor and scroll position, then
+        re-mounts the visible viewport -- exactly what set_row_ids() did
+        before P0.4, minus ever holding the row ids.
 
         Args:
-            row_ids: Ordered list of row_ids to display.
+            start:     Absolute inclusive start index into the flat order.
+            stop:      Absolute exclusive stop index into the flat order.
+            result_id: Id of the result this slice belongs to.
         """
-        self._row_ids = row_ids
+        self._range_start = start
+        self._range_stop = stop
+        self._result_id = result_id
         self._selected_ids.clear()
         self._last_clicked_index = None
+        self._last_reported_range = None
         self._relayout()
         self._scroll.verticalScrollBar().setValue(0)
+
+    def _local_count(self) -> int:
+        """Number of rows in this gallery's own slice of the flat order."""
+        return max(0, self._range_stop - self._range_start)
 
     def set_tile_size(self, size: int) -> None:
         """
@@ -336,7 +380,7 @@ class GalleryWidget(QWidget):
             row_id: The row whose data changed.
         """
         for tw in self._mounted.values():
-            if row_id in tw._tile.get_row_ids():
+            if row_id in tw.get_row_ids():
                 tw.invalidate()
 
     def on_thumbnail_ready(self, row_id: str) -> None:
@@ -351,12 +395,16 @@ class GalleryWidget(QWidget):
 
     def get_selected_row_ids(self) -> list[str]:
         """
-        Returns the currently selected row_ids.
+        Returns the currently selected row_ids, in the controller's flat
+        order rather than set order. Selection is stored as a set here,
+        so an order-sensitive caller (the "Selected" operator scope,
+        opening several items side by side) would otherwise get an
+        arbitrary order.
 
         Returns:
-            List of selected row_id strings.
+            List of selected row_id strings, in flat-order sequence.
         """
-        return list(self._selected_ids)
+        return self._controller.order_by_result(list(self._selected_ids))
 
     def get_visible_count(self) -> int:
         """
@@ -364,7 +412,7 @@ class GalleryWidget(QWidget):
         (after any active filter). Gallery-local introspection — e.g. a
         header or label that wants this gallery's item count.
         """
-        return len(self._row_ids)
+        return self._local_count()
 
     # ── Internal helpers ──────────────────────────────────────────────
 
@@ -419,7 +467,7 @@ class GalleryWidget(QWidget):
 
         if columns is None:
             self._tile_columns = None
-            if self._row_ids:
+            if self._local_count() > 0:
                 self._show_no_visual_column_placeholder()
             self._top_spacer.setFixedHeight(0)
             self._bot_spacer.setFixedHeight(0)
@@ -450,16 +498,26 @@ class GalleryWidget(QWidget):
 
     def _update_visible_tiles(self) -> None:
         """
-        Computes which row_id indices fall inside (or near) the
-        viewport, drops mounted tiles that are no longer needed back
-        into the free pool, mounts tiles for newly-visible indices,
-        and updates the top/bottom spacer heights so the scrollbar
-        range and position stay correct.
+        Computes which rows of this gallery's slice fall inside (or near)
+        the viewport, drops mounted tiles that are no longer needed back
+        into the free pool, mounts tiles for newly-visible rows, updates
+        the top/bottom spacer heights so the scrollbar range and
+        position stay correct, and reports the mounted window to the
+        controller.
+
+        Tile indices here (`first_idx`, `last_idx`, `needed`, the keys of
+        `self._mounted`) are LOCAL to this gallery's slice: 0 is the
+        first row of [_range_start, _range_stop). They are turned into
+        absolute flat-order indices only when talking to the controller
+        (fetching row ids) or the outside world (displayed_range_changed).
         """
-        n = len(self._row_ids)
+        n = self._local_count()
         if n == 0 or self._tile_columns is None:
             self._top_spacer.setFixedHeight(0)
             self._bot_spacer.setFixedHeight(0)
+            # An empty gallery shows nothing; report a zero-width window
+            # at its slice start so a stale range is not left behind.
+            self._maybe_report_range(self._range_start, self._range_start)
             return
 
         total_rows = (n + self._cols - 1) // self._cols
@@ -492,14 +550,27 @@ class GalleryWidget(QWidget):
 
             columns = self._tile_columns
 
+            # Fetch every row id we are about to mount in ONE batch call,
+            # not one call per tile. batch[k] is the row at local index
+            # first_idx + k.
+            batch = self._controller.get_row_ids_in_range(
+                self._range_start + first_idx,
+                self._range_start + last_idx + 1,
+            )
+
             # Mount tiles for newly-visible indices, placed at their
-            # absolute (row, col) in the QGridLayout. Empty rows above
-            # collapse to zero height; the top_spacer below provides
-            # the visual offset.
+            # (row, col) in the QGridLayout. Empty rows above collapse to
+            # zero height; the top_spacer below provides the visual
+            # offset.
             for idx in needed:
                 if idx in self._mounted:
                     continue
-                row_id = self._row_ids[idx]
+                offset = idx - first_idx
+                if offset < 0 or offset >= len(batch):
+                    # The result shrank under us between the range
+                    # computation and this fetch; skip what is gone.
+                    continue
+                row_id = batch[offset]
                 tile   = self._make_tile(row_id, columns)
                 if self._free_pool:
                     tw = self._free_pool.pop()
@@ -526,6 +597,29 @@ class GalleryWidget(QWidget):
         self._bot_spacer.setFixedHeight(
             max(0, (total_rows - bottom_row - 1) * row_h + self._v_gap)
         )
+
+        # Tell the controller which absolute slice of the flat order is
+        # on screen. _maybe_report_range de-dupes, so this is cheap to
+        # call on every scroll tick even though it only emits on change.
+        self._maybe_report_range(
+            self._range_start + first_idx,
+            self._range_start + last_idx + 1,
+        )
+
+    def _maybe_report_range(self, start: int, stop: int) -> None:
+        """
+        Emits displayed_range_changed with the absolute [start, stop)
+        window and this gallery's own result_id, but only when the
+        (window, result_id) triple differs from the last one reported,
+        so scrolling within one mounted window does not flood the
+        controller with identical reports.
+        """
+        result_id = self._result_id or ""
+        window = (start, stop, result_id)
+        if window == self._last_reported_range:
+            return
+        self._last_reported_range = window
+        self.displayed_range_changed.emit(start, stop, result_id)
 
     def _show_no_visual_column_placeholder(self) -> None:
         """
@@ -602,15 +696,14 @@ class GalleryWidget(QWidget):
         if not row_ids:
             return
 
-        # Locate the clicked tile in self._row_ids. Tiles always group
-        # by row_id (one row_id per tile for ImageTile, or a list of
-        # ImageTiles for the same row_id in GridTile), so the first
-        # row_id is enough to identify the tile's position.
+        # Locate the clicked tile in the controller's flat order. Tiles
+        # always group by row_id (one row_id per tile for ImageTile, or a
+        # list of ImageTiles for the same row_id in GridTile), so the
+        # first row_id is enough to identify the tile's position. The
+        # index is absolute, so a shift range can span whatever the
+        # gallery has not mounted.
         clicked_id = row_ids[0]
-        try:
-            clicked_idx = self._row_ids.index(clicked_id)
-        except ValueError:
-            clicked_idx = None
+        clicked_idx = self._controller.get_result_index(clicked_id)
 
         have_anchor = (self._last_clicked_index is not None
                        and clicked_idx is not None)
@@ -618,7 +711,7 @@ class GalleryWidget(QWidget):
         if shift_held and have_anchor:
             lo = min(self._last_clicked_index, clicked_idx)
             hi = max(self._last_clicked_index, clicked_idx)
-            range_ids = set(self._row_ids[lo:hi + 1])
+            range_ids = set(self._controller.get_row_ids_in_range(lo, hi + 1))
             if ctrl_held:
                 # Ctrl+Shift — extend the existing selection with the range.
                 self._selected_ids |= range_ids
@@ -651,7 +744,7 @@ class GalleryWidget(QWidget):
         for tw in self._mounted.values():
             is_selected = any(
                 r in self._selected_ids
-                for r in tw._tile.get_row_ids()
+                for r in tw.get_row_ids()
             )
             tw.set_selected(is_selected)
 

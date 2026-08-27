@@ -43,8 +43,15 @@ class MainWindow(QMainWindow):
     The gallery area is a QStackedWidget with two pages: a flat view
     (a single GalleryWidget) and a grouped view (one GalleryWidget per
     group value, stacked vertically in a shared scroll area). The
-    controller decides which to show by emitting gallery_updated or
-    grouped_gallery_updated.
+    controller decides which to show by emitting result_changed with a
+    ResultLayout: layout.groups is None selects the flat view, otherwise
+    one section per GroupSection.
+
+    Each gallery paints a slice of the controller's flat order and
+    reports the index range it currently shows back to the controller
+    (displayed_range_changed). MainWindow owns the "viewport key" each
+    gallery reports under -- "flat" for the main gallery, one stable key
+    per group for the rest -- so GalleryWidget never learns keys exist.
     """
 
     # Height of each per-group gallery in the grouped view. Bounded so
@@ -62,6 +69,11 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._controller = controller
         self._galleries: list[GalleryWidget] = []
+        # Viewport keys for the per-group galleries currently mounted,
+        # so they can be cleared on the controller when torn down. Each
+        # gallery stamps its own displayed-range reports with the
+        # result_id it was given, so MainWindow only supplies the key.
+        self._grouped_viewport_keys: list[str] = []
         # Current tile size, mirrored from the filter panel so new
         # per-group galleries can be created at the right size.
         self._tile_size = 150
@@ -455,8 +467,7 @@ class MainWindow(QMainWindow):
         ctrl = self._controller
 
         # Controller -> UI
-        ctrl.gallery_updated.connect(self._on_gallery_updated)
-        ctrl.grouped_gallery_updated.connect(self._on_grouped_gallery_updated)
+        ctrl.result_changed.connect(self._on_result_changed)
         ctrl.columns_updated.connect(self._on_columns_updated)
         ctrl.tables_updated.connect(self._on_tables_updated)
         ctrl.active_table_changed.connect(self._on_active_table_changed)
@@ -495,6 +506,16 @@ class MainWindow(QMainWindow):
         self._main_gallery.tile_double_clicked.connect(
             self._on_tile_double_clicked
         )
+        # The flat main gallery reports its on-screen index range under
+        # the fixed key "flat". The gallery supplies start, stop and the
+        # result_id it holds; MainWindow adds only the key. Per-group
+        # galleries get their own keys in _build_group_section.
+        self._main_gallery.displayed_range_changed.connect(
+            lambda start, stop, result_id:
+            self._controller.report_displayed_range(
+                "flat", start, stop, result_id
+            )
+        )
 
     def _on_tile_double_clicked(
         self, clicked_ids: list[str], gallery: GalleryWidget | None = None
@@ -517,12 +538,9 @@ class MainWindow(QMainWindow):
         gallery  = gallery or self._main_gallery
         selected = gallery.get_selected_row_ids()
         if len(selected) > 1 and clicked_ids[0] in selected:
-            # Preserve gallery order so panels read left-to-right the
-            # same way the tiles do.
-            ordered = [
-                rid for rid in gallery._row_ids
-                if rid in selected
-            ]
+            # Preserve flat-order sequence so panels read left-to-right
+            # the same way the tiles do. The controller owns that order.
+            ordered = self._controller.order_by_result(selected)
             self._detail_widget.show_rows(ordered)
             self._right_tabs.setCurrentWidget(self._detail_widget)
         else:
@@ -552,76 +570,90 @@ class MainWindow(QMainWindow):
             self._detail_widget.show_rows([row_id])
             self._right_tabs.setCurrentWidget(self._detail_widget)
 
-    def _on_gallery_updated(self, row_ids: list[str]) -> None:
+    def _on_result_changed(self, layout) -> None:
         """
-        Shows the flat view: a single gallery of all visible rows.
+        Shows the new ordered query result. layout is a ResultLayout,
+        which carries no row ids: how many rows, and where the group
+        boundaries fall.
 
-        Tears down any per-group galleries left over from grouped mode
-        and points broadcasts back at the main gallery.
+        layout.groups is None       -> flat view: the main gallery gets
+                                       the whole [0, total) range.
+        layout.groups is a tuple    -> grouped view: one section per
+                                       GroupSection, each gallery given
+                                       its group's absolute range. An
+                                       empty tuple is a valid grouped
+                                       result with zero groups.
         """
-        self._clear_grouped_galleries()
-        self._galleries = [self._main_gallery]
-        self._main_gallery.set_row_ids(row_ids)
-        self._gallery_stack.setCurrentWidget(self._main_gallery)
-        self._refresh_status_bar()
+        if layout.groups is None:
+            self._clear_grouped_galleries()
+            self._galleries = [self._main_gallery]
+            self._main_gallery.set_range(0, layout.total, layout.result_id)
+            self._gallery_stack.setCurrentWidget(self._main_gallery)
+        else:
+            self._rebuild_grouped_galleries(layout)
+            self._gallery_stack.setCurrentWidget(self._grouped_scroll)
 
-    def _on_grouped_gallery_updated(self, grouped: dict) -> None:
-        """
-        Shows the grouped view: one gallery per group value, stacked
-        vertically in the shared scroll area.
-
-        Args:
-            grouped: Maps each group value to its ordered list of row_ids.
-        """
-        self._rebuild_grouped_galleries(grouped)
-        self._gallery_stack.setCurrentWidget(self._grouped_scroll)
         self._refresh_status_bar()
 
     # ── Grouped-view construction ─────────────────────────────────────
 
-    def _rebuild_grouped_galleries(self, grouped: dict) -> None:
+    def _rebuild_grouped_galleries(self, layout) -> None:
         """
-        Replaces the grouped view's sections with one per group.
+        Replaces the grouped view's sections with one per GroupSection.
 
         Updates self._galleries so thumbnail, row-update and tile-size
         broadcasts reach every visible group gallery. Falls back to the
         main gallery when there are no groups.
+
+        Args:
+            layout: the ResultLayout whose groups drive the sections.
         """
         self._clear_grouped_galleries()
 
         galleries: list[GalleryWidget] = []
-        for group_value, row_ids in grouped.items():
-            section, gallery = self._build_group_section(group_value, row_ids)
+        for index, section in enumerate(layout.groups):
+            # Per-group viewport key. Keyed by the section's position in
+            # the layout, not its label: two group values can stringify
+            # to the same label, which would collide. Position is unique
+            # within a result and the keys are cleared on every rebuild.
+            key = f"group:{index}"
+            section_widget, gallery = self._build_group_section(
+                section, layout.result_id, key
+            )
             # Insert before the trailing stretch so sections stay top-aligned.
             self._grouped_layout.insertWidget(
-                self._grouped_layout.count() - 1, section
+                self._grouped_layout.count() - 1, section_widget
             )
-            gallery.set_row_ids(row_ids)
+            gallery.set_range(section.start, section.stop, layout.result_id)
             galleries.append(gallery)
+            self._grouped_viewport_keys.append(key)
 
         self._galleries = galleries or [self._main_gallery]
 
     def _build_group_section(
-        self, group_value, row_ids: list[str]
+        self, section, result_id: str, viewport_key: str
     ) -> tuple[QWidget, GalleryWidget]:
         """
         Builds one grouped-view section: a header label plus a
-        bounded-height gallery for the group's rows.
+        bounded-height gallery for the group's slice of the flat order.
 
         Args:
-            group_value: The group's value (used in the header label).
-            row_ids:     The row_ids belonging to this group.
+            section:      the GroupSection (label + [start, stop) span).
+            result_id:    id of the result this section belongs to.
+            viewport_key: the key this gallery reports its displayed
+                          range under.
 
         Returns:
             (section_widget, gallery) — the gallery is returned so the
-            caller can register it for broadcasts and load its rows.
+            caller can register it for broadcasts and give it its range.
         """
-        section = QWidget()
-        layout  = QVBoxLayout(section)
+        section_widget = QWidget()
+        layout  = QVBoxLayout(section_widget)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
 
-        header = QLabel(f"{group_value}  ({len(row_ids)})")
+        count = section.stop - section.start
+        header = QLabel(f"{section.label}  ({count})")
         header.setStyleSheet("font-weight: bold; padding: 2px 4px;")
         layout.addWidget(header)
 
@@ -632,18 +664,33 @@ class MainWindow(QMainWindow):
         # would clobber the new gallery's "no preference" default and
         # show the placeholder where the fallback to full_path is wanted.
         if self._controller.has_visible_columns_preference():
-            gallery.set_visible_columns(self._controller.get_visible_columns())
+            gallery.set_visible_columns(
+                self._controller.get_effective_visible_columns()
+            )
         gallery.set_tile_size(self._tile_size)
         gallery.tile_double_clicked.connect(
             lambda ids, g=gallery: self._on_tile_double_clicked(ids, g)
         )
         gallery.selection_changed.connect(self._on_selection_changed)
+        # MainWindow owns the viewport key; the gallery emits absolute
+        # [start, stop) indices plus the result_id it holds, and never
+        # learns keys exist.
+        gallery.displayed_range_changed.connect(
+            lambda start, stop, result_id, k=viewport_key:
+            self._controller.report_displayed_range(
+                k, start, stop, result_id
+            )
+        )
         layout.addWidget(gallery)
 
-        return section, gallery
+        return section_widget, gallery
 
     def _clear_grouped_galleries(self) -> None:
-        """Removes all group sections, leaving the trailing stretch."""
+        """Removes all group sections, leaving the trailing stretch, and
+        tells the controller to forget every per-group viewport key."""
+        for key in self._grouped_viewport_keys:
+            self._controller.clear_displayed_range(key)
+        self._grouped_viewport_keys = []
         while self._grouped_layout.count() > 1:
             item   = self._grouped_layout.takeAt(0)
             widget = item.widget()
@@ -662,10 +709,14 @@ class MainWindow(QMainWindow):
 
     def _collect_visible_row_ids(self) -> list[str]:
         """
-        Returns the visible row_ids across every live gallery, in order
-        and de-duplicated (used as the 'visible' operator scope).
+        Returns every visible row_id in flat order (used as the 'visible'
+        operator scope and for the status bar). The controller owns this
+        order now -- one flat sequence that covers both the flat and the
+        grouped view -- so there is no per-gallery flattening to do. The
+        old version de-duplicated across galleries, but groups never
+        overlap, so that was a no-op.
         """
-        return self._collect_row_ids(lambda g: g._row_ids)
+        return self._controller.get_visible_row_ids()
 
     def _collect_row_ids(self, getter) -> list[str]:
         """Flattens getter(gallery) over self._galleries, keeping order
@@ -858,7 +909,10 @@ class MainWindow(QMainWindow):
 
     def _on_save_filtered_set(self) -> None:
         """Saves the currently visible rows as a new permanent table."""
-        visible_ids = self._main_gallery._row_ids
+        # Ask the controller, not a gallery. In grouped mode the main
+        # gallery is empty, so reading its rows made "Save filtered set"
+        # wrongly report "No rows visible" whenever grouping was on.
+        visible_ids = self._controller.get_visible_row_ids()
         if not visible_ids:
             QMessageBox.information(
                 self,

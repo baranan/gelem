@@ -47,6 +47,14 @@
   gains the lossless known-frame fixture §7 needed and a video-stream
   edit-list fixture for decision 12, both generated on demand rather than
   committed. Tests: `tests/test_media_address.py`.
+- *27 Aug 2026, P0.4:* §6.1's P0.4 done. The controller owns one flat ordered
+  query result plus group-boundary spans (`models/query_result.py`); the
+  gallery holds no row ids and is given an index range into that order,
+  reporting the range it displays back as absolute indices. Grouped mode is
+  one flat order plus boundaries, not a separate structure. `result_changed`
+  replaces the `gallery_updated` / `grouped_gallery_updated` signal pair;
+  `save_filtered_as_table()` reuses the owned order instead of re-querying.
+  Tests: `tests/test_visible_row_order.py`, `tests/test_ui_private_access.py`.
 
 ---
 
@@ -940,6 +948,27 @@ So a render request is "rows `[i, j)` of the current result, plus a prefetch
 margin", which the controller can resolve without knowing anything about tiles.
 Includes the `None` versus `[]` fix in `_relayout()`. Everything else in P1.13
 stays in Phase 1.
+
+**Done, 27 August 2026.** The controller owns a single `QueryResult`
+(`models/query_result.py`): one flat ordered sequence of row ids plus, in
+grouped mode, a tuple of `GroupSection(label, start, stop)` spans into that same
+sequence. **Grouped mode does not change which rows are visible, only how they
+are stacked**, so one flat order serves both views; the flat order in grouped
+mode is `QueryEngine.apply_grouped()`'s dict concatenated in its existing order,
+never a second `apply()` call. The UI is handed a `ResultLayout` that carries
+`total` and the group spans but **no row ids**. Each gallery is given an
+absolute half-open index range into the flat order and fetches the ids it needs
+in one batch call per viewport update; it reports the range it currently shows
+back as absolute indices plus its own `result_id` (`displayed_range_changed`),
+under a viewport key `MainWindow` owns. The reported range is the **mounted**
+window, which includes `GalleryWidget._BUFFER_ROWS` above and below the strictly
+visible rows -- it is a superset of what is literally on screen, so P0.5 should
+not add its own prefetch margin on top without accounting for this one. Every recompute mints a new `result_id`; a viewport report
+naming a superseded id is dropped, and `get_displayed_ranges()` exposes what is
+on screen for P0.5 to prioritise against. `save_filtered_as_table()` lost its
+duplicate query entirely -- it now stores `QueryResult.row_ids` directly, so a
+randomised on-screen order is saved as shown. Tests:
+`tests/test_visible_row_order.py`, `tests/test_ui_private_access.py`.
 
 **P0.5 ArtifactStore identity and demand-driven display.** *(was P0.3)*
 Implement §4.5 and §4.6. Address-based keys, `ArtifactCodec` separated from source

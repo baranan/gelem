@@ -175,46 +175,52 @@ re-verified there.)*
 
 - **`[NOW]`** UI files never import pandas, PIL, numpy, mediapipe, or cv2.
 - **`[MIGRATING]`** UI never reads a DataFrame. Known violation:
-  `ui/main_window.py:401` (`columns=list(df.columns)`). *(Re-verified 24 Aug
+  `ui/main_window.py:415` (`columns=list(df.columns)`). *(Re-verified 24 Aug
   2026: this used to be two sites; the second one merged into the citation
-  below and no longer separately reads a DataFrame.)* *(Re-verified 26 Aug 2026:
-  line and content unchanged; still the only `.columns`/`.iloc`/`.loc`/`DataFrame`
-  site under `ui/` outside `ui/fake_controller.py`, which is excluded from the
-  UI import guardrail because it stands in for `AppController`, not a widget.)*
+  below and no longer separately reads a DataFrame.)* *(Re-verified 27 Aug 2026
+  (P0.4): still the only `.columns`/`.iloc`/`.loc`/`DataFrame` site under `ui/`
+  outside `ui/fake_controller.py`. Line moved from 401 to 415 as P0.4 added
+  code above it; the site itself is unchanged and still belongs to P1.13.)*
 - **`[MIGRATING]`** UI never touches private controller attributes. Known
-  violations: `ui/main_window.py:276-278` (`_op_registry`),
-  `ui/main_window.py:396-397` (`_dataset`, `_active_table`). Public equivalents
+  violations: `ui/main_window.py:290-292` (`_op_registry`),
+  `ui/main_window.py:410-411` (`_dataset`, `_active_table`). Public equivalents
   already exist -- `get_all_row_ids()`, `get_column_type()`, `get_operator()` --
   so these are unfinished migrations, not missing API. *(Re-verified 24 Aug
   2026: `ui/filter_panel.py:199` no longer reaches into `_registry` -- it now
   calls the public `controller.get_column_type()` -- so that citation is
   removed. The `_op_registry` and `_dataset`/`_active_table` sites also
-  shrank from three occurrences each to one.)* *(Re-verified 26 Aug 2026: lines
-  unchanged -- `_op_registry` at 276-278, `_dataset`/`_active_table` at 396-397.
-  No other file under `ui/` (excluding `fake_controller.py`'s own
-  internal `self` references, which are not cross-component access) reads
-  `controller._` anything.)*
+  shrank from three occurrences each to one.)* *(Re-verified 27 Aug 2026
+  (P0.4): still one occurrence each, unchanged in content. Line numbers moved
+  (`_op_registry` 276-278 -> 290-292, `_dataset`/`_active_table` 396-397 ->
+  410-411) because P0.4 added code above them. These two sites are on the
+  closed allowlist in `tests/test_ui_private_access.py`, which fails on any
+  other foreign private read under `ui/`.)*
 - **`[MIGRATING]`** No widget reads another component's private state. Known
-  violations: `ui/main_window.py:523, 668, 861` read `GalleryWidget._row_ids`,
-  which creates a second source of truth for which rows are visible -- the
-  controller should own that order. `ui/main_window.py:434` reads
-  `operator._group_by` back off the operator instance, where `base.py:331-334`
-  stores it with `setattr`. *(Line numbers re-verified 24 Aug 2026; the sites
-  themselves are unchanged, just shifted.)* *(Re-verified 26 Aug 2026: same
-  three `ui/main_window.py` lines (523, 668, 861) read `GalleryWidget._row_ids`
-  via `gallery._row_ids` or the `lambda g: g._row_ids` at 668; no other widget
-  reads another widget's private attribute. Line 434 and `base.py:331-334` are
-  unchanged.)*
+  violation: `ui/main_window.py:448` reads `operator._group_by` back off the
+  operator instance, where `base.py:331-334` stores it with `setattr`. This is
+  the last site; P1.12 removes it when parameters stop being stored on the
+  operator instance. *(P0.4, 27 Aug 2026: the three `ui/main_window.py` sites
+  that read `GalleryWidget._row_ids` are gone -- the controller now owns the
+  ordered result and the gallery is given an index range into it, holding no
+  row ids. `GalleryWidget` also used to read `TileWidget._tile` at two sites;
+  an earlier revision of this rule wrongly claimed "no other widget reads
+  another widget's private attribute". That was false and is now fixed:
+  `TileWidget` has a public `get_row_ids()`. The guard is
+  `tests/test_ui_private_access.py`, an AST check with a closed allowlist of
+  `_op_registry`, `_dataset`, `_active_table` and `_group_by`.)*
 - **`[NOW]`** Renderers may import PIL and cv2 -- they are not UI files. Renderers
   never import from `ui/`.
 - **`[NOW]`** Shared display components go in `shared_widgets/`, not inside `ui/`.
 - **`[NOW]`** `None` and `[]` are different. For visible columns, `None` means "no
   preference set" and `[]` means "the user chose zero columns".
-  `GalleryWidget._relayout()` (`ui/gallery_widget.py:408-419`) now distinguishes
-  the two explicitly and correctly. *(Re-verified 24 Aug 2026: this was
+  `GalleryWidget._relayout()` (`ui/gallery_widget.py:453-463`) now distinguishes
+  the two explicitly and correctly, and `AppController.get_effective_visible_columns()`
+  /`has_visible_columns_preference()` carry the same distinction on the
+  controller side. Guarded by
+  `tests/test_visible_row_order.py::test_visible_columns_none_versus_empty`
+  (added in P0.4, 27 Aug 2026). *(Re-verified 24 Aug 2026: this was
   `[MIGRATING]` with a known violation at `ui/gallery_widget.py:390`; the
-  violation is fixed. No guardrail test exists yet for the distinction, though
-  -- writing one is a Phase 0 task per the status-tag rule above.)*
+  violation is fixed.)*
 
 ### Media
 
@@ -337,13 +343,16 @@ arguments pytest tried to treat as fixtures). Fixed 24 Aug 2026 by renaming them
 to `check_thumbnail` / `check_detail` -- the file is a standalone manual-check
 script, not a pytest module, so nothing inside it should match `test_*`.
 
-**Verified green 26 Aug 2026 (P0.1).** `python -m pytest` collects 91 items with
-zero collection errors and zero failures. Deleting the stray untracked
+**Verified green 26 Aug 2026 (P0.1).** Deleting the stray untracked
 `test_images/boxtest.png` (a 21st image with no matching `metadata.csv` row) fixed
 the three `tests/test_dataset.py` failures this section used to describe; run
 individually, `test_add_computed_column_correct_values`, `test_apply_sort`, and
 `test_apply_grouped_all_rows_accounted` all pass. `test_images/` currently holds
 exactly 20 `.jpg` files against 20 `metadata.csv` rows, so nothing stray remains.
+
+**Verified green 27 Aug 2026 (P0.4).** `python -m pytest` collects 174 items with
+zero collection errors and zero failures. (The 91 this section reported at P0.1
+grew as P0.2a, P0.2c, P0.3 and now P0.4 each added their own test files.)
 
 ---
 
@@ -374,6 +383,21 @@ not volunteer it.
 
 ---
 
+## Starting a work item
+
+**Before your first edit, check the current branch.** Each work item has its
+own branch, created by Y B with `Start-Item <branch-name>`.
+
+- If the branch is already the work item's branch, proceed.
+- **If the branch is `main`, stop.** Do not edit a single file. Tell Y B to run
+  `Start-Item <branch-name>` and wait.
+
+**One work item per session, per branch.** The work-item prompt names the
+branch it expects; if `git rev-parse --abbrev-ref HEAD` does not print that
+name, something is wrong -- ask rather than guessing.
+
+---
+
 ## Finishing a work item
 
 **Claude Code never commits, merges, or pushes.** Y B does all of that himself, one command at a time. Claude Code's job ends at a working tree and a generated diff. If a step seems to need a commit, say so and stop.
@@ -392,9 +416,13 @@ completed work item with exactly this block, filled in:
 - three bullets, maximum
 
 **Verify it yourself**
-- the exact commands to run, and what a pass looks like
-- if there is something to check by eye in the app, say which screen and
-  what should be different
+- the **actual** final lines of the `python -m pytest` run, pasted verbatim
+  (the collected count and the pass/fail summary), not a prediction of them --
+  a reviewer must be able to tell what Claude observed from what it expects
+- the exact commands for Y B to re-run, and what a pass looks like
+- if there is something to check by eye in the app, an exact click list:
+  which screen, which controls, and for each step what a pass looks like --
+  cover every path that no automated test covers
 
 **Diff**
 git diff main > docs/review/<id>.diff
@@ -418,7 +446,7 @@ mechanical ones -- the tests are the check there.
 | P0.2c | no | a save/load path fix behind an already-reviewed module |
 | P0.2b | **yes** | result delivery -- every progressive update goes through it |
 | P0.3 | **yes, narrowly** | review the §3.6 semantic decisions, not the parser code |
-| P0.4 | no | small and well specified |
+| P0.4 | **yes** | well specified but not small; establishes the result-ownership contract P0.5 builds on |
 | P0.5 | **yes** | segment thumbnails and every tile attach here |
 | P1.8, P1.12 | **yes** | schema roles and the operator contract are contracts |
 | everything else | judgement | apply the same test |

@@ -25,6 +25,8 @@ import pandas as pd
 
 from PySide6.QtCore import QObject, Signal, QTimer
 
+from models.query_result import QueryResult, ResultLayout, GroupSection
+
 DEFAULT_MEDIA_COLUMN_NAME = "full_path"
 
 class AppController(QObject):
@@ -36,8 +38,11 @@ class AppController(QObject):
     happen on the main thread.
 
     Signals:
-        gallery_updated:         Flat ordered list of row_ids.
-        grouped_gallery_updated: Dict of group_value -> list[row_ids].
+        result_changed:          ResultLayout describing the new ordered
+                                 query result: how many rows, and where
+                                 the group boundaries fall. Carries no
+                                 row ids -- the UI fetches those from the
+                                 controller as it paints.
         row_selected:            Metadata dict for the selected row.
         columns_updated:         List of all registered column names.
         tables_updated:          List of all table names in the project.
@@ -52,8 +57,7 @@ class AppController(QObject):
         table_created:           Name of a newly created table.
     """
 
-    gallery_updated          = Signal(list)
-    grouped_gallery_updated  = Signal(dict)
+    result_changed           = Signal(object)
     row_selected             = Signal(dict)
     columns_updated          = Signal(list)
     tables_updated           = Signal(list)
@@ -96,6 +100,21 @@ class AppController(QObject):
         self._timer.setInterval(50)
         self._timer.timeout.connect(self._drain_queues)
         self._timer.start()
+
+        # The ordered query result the controller owns (P0.4). The
+        # gallery holds no row ids of its own -- it is given an index
+        # range into this order and fetches the ids it needs to paint.
+        #   _result          -- the current QueryResult, or None before
+        #                       the first query.
+        #   _result_index    -- row_id -> position in _result.row_ids,
+        #                       rebuilt whenever _result is rebuilt.
+        #   _displayed_ranges-- viewport_key -> (start, stop) half-open
+        #                       absolute index range that a gallery says
+        #                       it is currently showing. P0.5 reads this
+        #                       to prioritise and cancel renders.
+        self._result:           QueryResult | None      = None
+        self._result_index:     dict[str, int]          = {}
+        self._displayed_ranges: dict[str, tuple[int, int]] = {}
 
         self._active_table:   str        = "frames"
         self._active_filters: list       = []
@@ -223,7 +242,7 @@ class AppController(QObject):
             operator_name = payload
             self.operator_complete.emit(operator_name)
             self.columns_updated.emit(self._registry.list_all_columns())
-            self._refresh_gallery()
+            self._refresh_result()
 
         elif mode == "create_table":
             operator_name, result_df = payload
@@ -257,16 +276,33 @@ class AppController(QObject):
             self.error_occurred.emit(message)
             self.operator_complete.emit(operator_name)
 
-    # ── Gallery refresh ───────────────────────────────────────────────
+    # ── Result refresh ───────────────────────────────────────────────
 
-    def _refresh_gallery(self) -> None:
-        """Re-runs the current query and emits the gallery signal."""
+    def _refresh_result(self) -> None:
+        """
+        Re-runs the current query, stores the result as the single
+        source of truth for row order, and emits result_changed with a
+        row-id-free ResultLayout.
+
+        The query itself is unchanged from before P0.4 -- same
+        QueryEngine call, same arguments. What changed is that the
+        result is now kept (as a QueryResult) rather than emitted and
+        thrown away, and grouped mode builds one flat order plus group
+        boundaries instead of a dict the UI has to flatten itself.
+        """
         try:
             # Read-only: QueryEngine never mutates what it is handed
             # ([NOW] rule), so this does not need Dataset's own copy.
             df = self._dataset.read_only_view(self._active_table)
 
             if self._group_by:
+                # Grouped mode: run the grouped query, then build the
+                # flat order by concatenating the groups in the order
+                # apply_grouped() returns them, recording each group's
+                # [start, stop) span as we go. We never re-run apply()
+                # to get the flat order -- that would be two
+                # computations of the same thing with different
+                # arguments, the exact defect P0.4 removes.
                 grouped = self._query.apply_grouped(
                     df,
                     group_by=self._group_by,
@@ -276,8 +312,17 @@ class AppController(QObject):
                     randomise=self._randomise,
                     seed=self._seed,
                 )
-                self.grouped_gallery_updated.emit(grouped)
+                flat_order: list[str] = []
+                sections: list[GroupSection] = []
+                for label, ids in grouped.items():
+                    start = len(flat_order)
+                    flat_order.extend(ids)
+                    stop = len(flat_order)
+                    sections.append(GroupSection(label=str(label), start=start, stop=stop))
+                row_ids = flat_order
+                groups: tuple[GroupSection, ...] | None = tuple(sections)
             else:
+                # Flat mode: the query result is already the flat order.
                 row_ids = self._query.apply(
                     df,
                     filters=self._active_filters,
@@ -286,10 +331,139 @@ class AppController(QObject):
                     randomise=self._randomise,
                     seed=self._seed,
                 )
-                self.gallery_updated.emit(row_ids)
+                groups = None
+
+            # Store the new result with a fresh id, rebuild the
+            # row_id -> index lookup, and drop any displayed ranges --
+            # they point into an order that no longer exists.
+            result_id = str(uuid.uuid4())
+            self._result = QueryResult(
+                result_id=result_id,
+                table_name=self._active_table,
+                row_ids=tuple(row_ids),
+                groups=groups,
+            )
+            self._result_index = {rid: i for i, rid in enumerate(row_ids)}
+            self._displayed_ranges = {}
+
+            self.result_changed.emit(self._result.layout())
 
         except Exception as e:
-            self.error_occurred.emit(f"Gallery refresh error: {e}")
+            # The query failed. Do not leave the previous result
+            # standing: after a failed set_active_table() its
+            # table_name would disagree with _active_table, and a
+            # "Visible" operator run would then feed old-table row ids
+            # against the new table. Publish an empty result for the
+            # current table instead, so the gallery clears and the
+            # error shows next to it.
+            self._result = QueryResult(
+                result_id=str(uuid.uuid4()),
+                table_name=self._active_table,
+                row_ids=(),
+                groups=None,
+            )
+            self._result_index = {}
+            self._displayed_ranges = {}
+            self.result_changed.emit(self._result.layout())
+            self.error_occurred.emit(f"Could not compute the visible rows: {e}")
+
+    # ── Ordered-result accessors (the P0.4 seam) ─────────────────────
+
+    def get_result_layout(self) -> ResultLayout:
+        """
+        Returns the current ResultLayout. Before the first query this is
+        an empty flat layout so the UI always has something to lay out.
+        """
+        if self._result is None:
+            return ResultLayout(
+                result_id="",
+                table_name=self._active_table,
+                total=0,
+                groups=None,
+            )
+        return self._result.layout()
+
+    def get_visible_row_ids(self) -> list[str]:
+        """
+        Returns the whole flat order -- every row that matches the
+        current filters, in display order. In grouped mode this is the
+        groups concatenated in their on-screen sequence.
+        """
+        if self._result is None:
+            return []
+        return list(self._result.row_ids)
+
+    def get_row_ids_in_range(self, start: int, stop: int) -> list[str]:
+        """
+        Returns the row ids at flat-order positions [start, stop).
+
+        Out-of-range indices are clamped rather than raising: a gallery
+        can legitimately ask for a range that a just-arrived smaller
+        result no longer covers.
+        """
+        if self._result is None:
+            return []
+        n = len(self._result.row_ids)
+        lo = max(0, min(start, n))
+        hi = max(lo, min(stop, n))
+        return list(self._result.row_ids[lo:hi])
+
+    def get_result_index(self, row_id: str) -> int | None:
+        """Returns row_id's position in the flat order, or None."""
+        return self._result_index.get(row_id)
+
+    def order_by_result(self, row_ids: list[str]) -> list[str]:
+        """
+        Puts an arbitrary collection of row ids into the current
+        result's order. Ids not in the result are silently dropped.
+
+        Sorts the given ids by their flat-order position rather than
+        scanning the whole flat order, so this stays cheap on a
+        530k-row result -- it is called once per gallery on every
+        selection change.
+        """
+        if self._result is None:
+            return []
+        placed = [
+            (self._result_index[rid], rid)
+            for rid in row_ids
+            if rid in self._result_index
+        ]
+        placed.sort(key=lambda pair: pair[0])
+        return [rid for _, rid in placed]
+
+    def report_displayed_range(
+        self,
+        viewport_key: str,
+        start: int,
+        stop: int,
+        result_id: str,
+    ) -> None:
+        """
+        Records that the gallery keyed by viewport_key is currently
+        showing flat-order positions [start, stop).
+
+        A call whose result_id does not match the current result is
+        ignored -- it describes an order that no longer exists. This is
+        the same staleness discipline P0.2b applies to operator results.
+        """
+        if self._result is None or result_id != self._result.result_id:
+            return
+        self._displayed_ranges[viewport_key] = (start, stop)
+
+    def clear_displayed_range(self, viewport_key: str) -> None:
+        """Forgets the displayed range for viewport_key, if any."""
+        self._displayed_ranges.pop(viewport_key, None)
+
+    def get_displayed_ranges(self) -> list[tuple[int, int]]:
+        """
+        Returns every reported displayed range, sorted by start.
+
+        P0.4 only makes this information available. Prefetch margins,
+        priorities and cancellation are P0.5's work and are not built
+        here.
+        """
+        return sorted(self._displayed_ranges.values(), key=lambda r: r[0])
 
     # ── Public API ────────────────────────────────────────────────────
 
@@ -318,7 +492,7 @@ class AppController(QObject):
 
             self.columns_updated.emit(self._registry.list_all_columns())
             self.tables_updated.emit(self._dataset.list_tables())
-            self._refresh_gallery()
+            self._refresh_result()
 
         except Exception as e:
             self.error_occurred.emit(f"Failed to load folder: {e}")
@@ -354,7 +528,7 @@ class AppController(QObject):
 
             self.columns_updated.emit(self._registry.list_all_columns())
             self.tables_updated.emit(self._dataset.list_tables())
-            self._refresh_gallery()
+            self._refresh_result()
 
         except Exception as e:
             self.error_occurred.emit(f"Failed to load CSV: {e}")
@@ -389,7 +563,7 @@ class AppController(QObject):
         try:
             self._dataset.confirm_merge(report)
             self.columns_updated.emit(self._registry.list_all_columns())
-            self._refresh_gallery()
+            self._refresh_result()
         except Exception as e:
             self.error_occurred.emit(f"Failed to confirm merge: {e}")
 
@@ -416,7 +590,7 @@ class AppController(QObject):
         self._ascending      = ascending
         self._randomise      = randomise
         self._seed           = seed
-        self._refresh_gallery()
+        self._refresh_result()
 
     def set_group_by(self, column_name: str | None) -> None:
         """
@@ -426,7 +600,7 @@ class AppController(QObject):
             column_name: Column to group by, or None to clear.
         """
         self._group_by = column_name
-        self._refresh_gallery()
+        self._refresh_result()
 
     def set_visible_columns(self, column_names: list[str]) -> None:
         """
@@ -439,22 +613,13 @@ class AppController(QObject):
             column_names: Ordered list of column names to display.
         """
         self._visible_cols = column_names
-        self._refresh_gallery()
+        self._refresh_result()
 
     def clear_visible_columns_preference(self) -> None:
         """Clears the visible-column preference back to its unset state."""
         self._visible_cols = None
-        self._refresh_gallery()
+        self._refresh_result()
 
-    def get_visible_columns(self) -> list[str]:
-        """
-        Returns the currently selected visible columns (empty when
-        the researcher has unchecked every column OR has not made a
-        choice yet — call has_visible_columns_preference() to tell
-        the two states apart).
-        """
-        return list(self._visible_cols) if self._visible_cols else []
-    
     def get_effective_visible_columns(self) -> list[str]:
         """
         Returns the columns that should actually be displayed right now --
@@ -612,7 +777,7 @@ class AppController(QObject):
                 name, expression, col_type, self._active_table
             )
             self.columns_updated.emit(self._registry.list_all_columns())
-            self._refresh_gallery()
+            self._refresh_result()
         except Exception as e:
             self.error_occurred.emit(f"Failed to add column: {e}")
 
@@ -656,28 +821,34 @@ class AppController(QObject):
             self._visible_cols   = None
             self.active_table_changed.emit(name)
             self.columns_updated.emit(self._registry.list_all_columns())
-            self._refresh_gallery()
+            self._refresh_result()
         except KeyError as e:
             self.error_occurred.emit(f"Table not found: {e}")
 
     def save_filtered_as_table(self, name: str) -> None:
         """
-        Creates a new permanent table from the currently visible rows.
+        Creates a new permanent table from the currently visible rows,
+        in exactly the order they are on screen.
+
+        Before P0.4 this re-ran QueryEngine.apply() with the filters and
+        sort but without randomise and seed, so with randomise on it
+        saved a different order from the one displayed, and it copied the
+        whole table to do it. Now it uses the flat order the controller
+        already owns -- no second query, no full-table copy.
 
         Args:
             name: Name for the new table.
         """
-        try:
-            visible_row_ids = self._query.apply(
-                self._dataset.get_table(self._active_table),
-                filters=self._active_filters,
-                sort_by=self._sort_by,
-                ascending=self._ascending,
+        if self._result is None:
+            self.error_occurred.emit(
+                "Failed to save filtered set: there is no active result yet."
             )
+            return
+        try:
             self._dataset.create_table_from_rows(
                 name,
-                visible_row_ids,
-                source_table=self._active_table,
+                list(self._result.row_ids),
+                source_table=self._result.table_name,
             )
             self.tables_updated.emit(self._dataset.list_tables())
         except Exception as e:
@@ -726,7 +897,7 @@ class AppController(QObject):
             self._store.load_index(project_path)
             self.tables_updated.emit(self._dataset.list_tables())
             self.columns_updated.emit(self._registry.list_all_columns())
-            self._refresh_gallery()
+            self._refresh_result()
         except Exception as e:
             self.error_occurred.emit(f"Failed to load project: {e}")
 

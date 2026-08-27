@@ -18,8 +18,11 @@ from __future__ import annotations
 from pathlib import Path
 import threading
 import tempfile
+import uuid
 
 from PySide6.QtCore import QObject, Signal, QTimer
+
+from models.query_result import GroupSection, QueryResult
 
 
 class FakeController(QObject):
@@ -34,8 +37,7 @@ class FakeController(QObject):
     """
 
     # ── Signals — identical to AppController ─────────────────────────
-    gallery_updated          = Signal(list)
-    grouped_gallery_updated  = Signal(dict)
+    result_changed           = Signal(object)
     row_selected             = Signal(dict)
     columns_updated          = Signal(list)
     tables_updated           = Signal(list)
@@ -123,6 +125,13 @@ class FakeController(QObject):
         self._visual_columns: list[str] = ["full_path"]
         self._visible_ids:    list[str] = list(self._row_ids)
 
+        # P0.4: the fake owns the ordered result the same way the real
+        # controller does. _result is a real QueryResult; the accessors
+        # below are small real implementations, not stubs.
+        self._result:           QueryResult | None       = None
+        self._result_index:     dict[str, int]           = {}
+        self._displayed_ranges: dict[str, tuple[int, int]] = {}
+
         self._thumb_dir = Path(tempfile.gettempdir()) / "gelem_fake_thumbs"
         self._thumb_dir.mkdir(exist_ok=True)
         self._thumb_cache: dict[str, object] = {}
@@ -141,10 +150,80 @@ class FakeController(QObject):
         """Emits initial signals to populate the UI."""
         self.columns_updated.emit(list(self._column_types.keys()))
         self.tables_updated.emit(["frames"])
-        self.gallery_updated.emit(self._visible_ids)
+        self._emit_result(self._visible_ids)
 
         for row_id in self._row_ids:
             self._request_thumbnail(row_id)
+
+    # ── Ordered result (P0.4) ────────────────────────────────────────
+
+    def _emit_result(self, flat_order, groups=None) -> None:
+        """
+        Stores a fresh QueryResult and emits result_changed with its
+        layout -- the fake's equivalent of AppController._refresh_result.
+        """
+        row_ids = list(flat_order)
+        self._result = QueryResult(
+            result_id=str(uuid.uuid4()),
+            table_name=self.__active_table,
+            row_ids=tuple(row_ids),
+            groups=groups,
+        )
+        self._result_index = {rid: i for i, rid in enumerate(row_ids)}
+        self._displayed_ranges = {}
+        self.result_changed.emit(self._result.layout())
+
+    def _emit_grouped_result(self, grouped: dict) -> None:
+        """Builds one flat order plus group spans from a group->ids dict."""
+        flat_order: list[str] = []
+        sections: list[GroupSection] = []
+        for label, ids in grouped.items():
+            start = len(flat_order)
+            flat_order.extend(ids)
+            sections.append(GroupSection(str(label), start, len(flat_order)))
+        self._emit_result(flat_order, tuple(sections))
+
+    def get_result_layout(self):
+        if self._result is None:
+            from models.query_result import ResultLayout
+            return ResultLayout("", self.__active_table, 0, None)
+        return self._result.layout()
+
+    def get_visible_row_ids(self) -> list[str]:
+        return list(self._result.row_ids) if self._result else []
+
+    def get_row_ids_in_range(self, start: int, stop: int) -> list[str]:
+        if self._result is None:
+            return []
+        n = len(self._result.row_ids)
+        lo = max(0, min(start, n))
+        hi = max(lo, min(stop, n))
+        return list(self._result.row_ids[lo:hi])
+
+    def get_result_index(self, row_id: str):
+        return self._result_index.get(row_id)
+
+    def order_by_result(self, row_ids: list[str]) -> list[str]:
+        if self._result is None:
+            return []
+        placed = [
+            (self._result_index[rid], rid)
+            for rid in row_ids
+            if rid in self._result_index
+        ]
+        placed.sort(key=lambda pair: pair[0])
+        return [rid for _, rid in placed]
+
+    def report_displayed_range(self, viewport_key, start, stop, result_id) -> None:
+        if self._result is None or result_id != self._result.result_id:
+            return
+        self._displayed_ranges[viewport_key] = (start, stop)
+
+    def clear_displayed_range(self, viewport_key) -> None:
+        self._displayed_ranges.pop(viewport_key, None)
+
+    def get_displayed_ranges(self) -> list[tuple[int, int]]:
+        return sorted(self._displayed_ranges.values(), key=lambda r: r[0])
 
     # ── Thumbnail generation ──────────────────────────────────────────
 
@@ -216,7 +295,7 @@ class FakeController(QObject):
 
     def confirm_merge(self, report) -> None:
         self.columns_updated.emit(list(self._column_types.keys()))
-        self.gallery_updated.emit(self._visible_ids)
+        self._emit_result(self._visible_ids)
 
     def load_csv_as_primary(self, csv_path: Path, image_column=None) -> None:
         print("[FakeController] load_csv_as_primary — not supported in fake mode")
@@ -233,11 +312,11 @@ class FakeController(QObject):
             self._visible_ids = self._row_ids[::2]
         else:
             self._visible_ids = list(self._row_ids)
-        self.gallery_updated.emit(self._visible_ids)
+        self._emit_result(self._visible_ids)
 
     def set_group_by(self, column_name) -> None:
         if column_name is None:
-            self.gallery_updated.emit(self._visible_ids)
+            self._emit_result(self._visible_ids)
         else:
             n     = len(self._visible_ids)
             third = max(1, n // 3)
@@ -246,31 +325,28 @@ class FakeController(QObject):
                 "negative": self._visible_ids[third:2*third],
                 "neutral":  self._visible_ids[2*third:],
             }
-            self.grouped_gallery_updated.emit(grouped)
+            self._emit_grouped_result(grouped)
 
     def set_visible_columns(self, column_names: list[str]) -> None:
         self._visual_columns = column_names
-        self.gallery_updated.emit(self._visible_ids)
+        self._emit_result(self._visible_ids)
 
-    def get_visible_columns(self) -> list[str]:
-        return list(self._visual_columns)
-    
     def get_effective_visible_columns(self) -> list[str]:
         """
         Mirrors AppController.get_effective_visible_columns() so UI code
         that calls it works in --fake-data mode too. The fake has no
         None/[] ambiguity to resolve -- has_visible_columns_preference()
-        is always True here, so get_visible_columns() already is the
-        effective state.
+        is always True here, so the current visible columns already are
+        the effective state.
         """
-        return self.get_visible_columns()
+        return list(self._visual_columns)
 
     def has_visible_columns_preference(self) -> bool:
         return True
 
     def clear_visible_columns_preference(self) -> None:
         self._visual_columns = ["full_path"]
-        self.gallery_updated.emit(self._visible_ids)
+        self._emit_result(self._visible_ids)
 
     def select_row(self, row_id: str) -> None:
         metadata = self._metadata.get(row_id, {"row_id": row_id})
@@ -349,7 +425,7 @@ class FakeController(QObject):
 
     def set_active_table(self, name: str) -> None:
         self.__active_table = name
-        self.gallery_updated.emit(self._visible_ids[:5])
+        self._emit_result(self._visible_ids[:5])
 
     def save_filtered_as_table(self, name: str) -> None:
         print(f"[FakeController] save_filtered_as_table({name}) — fake")

@@ -91,9 +91,12 @@ def main():
     # Change this line to test a different widget.
     widget = GalleryWidget(controller)
 
-    # Connect any signals your widget needs.
-    # GalleryWidget needs gallery_updated and thumbnail_ready.
-    controller.gallery_updated.connect(widget.set_row_ids)
+    # Connect any signals your widget needs. Since P0.4 the gallery is
+    # given an index range into the controller's flat order, not a list
+    # of row_ids, so result_changed drives it via set_range().
+    controller.result_changed.connect(
+        lambda layout: widget.set_range(0, layout.total, layout.result_id)
+    )
     controller.thumbnail_ready.connect(widget.on_thumbnail_ready)
     controller.row_updated.connect(widget.on_row_updated)
 

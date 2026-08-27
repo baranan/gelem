@@ -854,9 +854,15 @@ class Dataset:
             row_ids:      List of row_ids to include.
             source_table: Name of the source table.
         """
-        source_df = self.get_table(source_table)
-        subset = source_df[source_df["row_id"].isin(row_ids)].copy()
-        subset = subset.reset_index(drop=True)
+        # Read-only access to the stored table, then one copy of just
+        # the subset -- not a full-table copy (P0.2a / P0.4). The rows
+        # are returned in the caller's order, because the controller now
+        # owns row order (P0.4) and "save filtered set" must store what
+        # is on screen, including a randomised order.
+        source_df = self.read_only_view(source_table)
+        by_id = source_df.set_index("row_id", drop=False)
+        present = [rid for rid in row_ids if rid in by_id.index]
+        subset = by_id.loc[present].reset_index(drop=True)
         self._set_table(name, subset)
         self.provenance.record("create_table_from_rows", {
             "name":         name,
