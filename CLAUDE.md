@@ -86,8 +86,11 @@ re-verified there.)*
   `Dataset` accepts it.
 - **`[NOW]`** `get_table()` returns a copy. Modifying it does not modify the stored
   table.
-- **`[TARGET -> P0.2]`** Reading one row must not copy the whole table.
-  `get_row()` currently calls `get_table()`, which copies everything.
+- **`[NOW]`** Reading one row must not copy the whole table. `get_row()` reads
+  through a per-table row-id index and returns just that row. Made true by P0.2a.
+  Tests: `tests/test_dataset_access_paths.py`
+  (`test_get_row_does_not_call_get_table`,
+  `test_run_create_columns_does_not_copy_table_per_row`).
 - **`[NOW]`** Operators never access `Dataset` or `AppController`. They receive the
   data they need as arguments and return results.
 - **`[MIGRATING]`** Every structural operation is recorded in
@@ -101,7 +104,11 @@ re-verified there.)*
   the save.)*
 - **`[NOW]`** Paths **inside the project folder** are stored relative to it, so
   projects stay portable. Paths outside it stay absolute unless the user
-  explicitly imports or copies the file into the project.
+  explicitly imports or copies the file into the project. The rewriting parses
+  each media cell as an address and moves only the path portion -- the fragment
+  (`#f=`, `#t=`, `#r=`, stream selector) is preserved exactly. P0.2c made it
+  address-aware. `docs/media_architecture.md` §3.5 is the authority for the
+  address-survival rule; tests: `tests/test_dataset_address_paths.py`.
 
 ### Row identity and lineage
 
@@ -123,7 +130,7 @@ re-verified there.)*
   were globally unique and never reused, which was too strong; a previous revision
   then said they were "not stable across a reload", which was too weak and wrong
   about save/load.
-- **`[TARGET -> P0.2]`** Any public reference to a row -- signal, artifact request,
+- **`[TARGET -> P0.2b]`** Any public reference to a row -- signal, artifact request,
   controller method -- identifies it as `(table_name, row_id)`. `row_updated` and
   `thumbnail_ready` currently carry a bare `row_id`, so the UI cannot tell which
   table changed.
@@ -159,7 +166,7 @@ re-verified there.)*
 - **`[NOW]`** Worker callbacks **are** bound controller methods. This is correct
   and deliberate. An earlier version of this file said workers "never touch the
   controller," which forbade the actual design.
-- **`[TARGET -> P0.2]`** Draining the result queues is bounded -- a fixed time or
+- **`[TARGET -> P0.2b]`** Draining the result queues is bounded -- a fixed time or
   item budget per timer tick. `_drain_queues()` currently empties every queue in
   one tick, which stalls the main thread during a large run, and uses `list.pop(0)`
   which is linear in queue length.
@@ -371,7 +378,7 @@ not volunteer it.
 
 **Claude Code never commits, merges, or pushes.** Y B does all of that himself, one command at a time. Claude Code's job ends at a working tree and a generated diff. If a step seems to need a commit, say so and stop.
 
-**One work item per session, per branch, per PR.** Stop at the boundary. Do not
+**One work item per session, per branch.** Stop at the boundary. Do not
 roll into the next item because it looks small.
 
 **Never end with just "done".** Y B is working across three tools and will not
@@ -390,7 +397,7 @@ completed work item with exactly this block, filled in:
   what should be different
 
 **Diff**
-git diff main...HEAD > docs/review/<id>.diff
+git diff main > docs/review/<id>.diff
 (state whether this has already been run)
 
 **Review**
@@ -407,7 +414,9 @@ mechanical ones -- the tests are the check there.
 | Item | Review? | Why |
 |---|---|---|
 | P0.1 | no | mechanical; the tests are the check |
-| P0.2 | **yes** | every operator run and progressive update goes through it |
+| P0.2a | **yes** | Dataset access paths -- every operator run goes through them |
+| P0.2c | no | a save/load path fix behind an already-reviewed module |
+| P0.2b | **yes** | result delivery -- every progressive update goes through it |
 | P0.3 | **yes, narrowly** | review the §3.6 semantic decisions, not the parser code |
 | P0.4 | no | small and well specified |
 | P0.5 | **yes** | segment thumbnails and every tile attach here |

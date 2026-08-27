@@ -223,10 +223,13 @@ home instead of being scattered.
   ("Export frames as files", "Export clips"), never a side effect of analysis.
 - `VideoFramesOperator` is demoted to that export action. It is no longer how
   frame tables are made.
-- Addresses must survive project save/load. `models/dataset.py` already rewrites
-  paths relative to the project root (`_rel_if_inside` / `_abs_against`); the
-  address grammar must be handled there, not just the bare path portion. **This is
-  easy to miss and will silently break saved projects.**
+- Addresses survive project save/load. `models/dataset.py`'s `_rewrite_media_cell`
+  parses each media cell as an address, moves only the path portion
+  (relative-if-inside on save, absolute on load), and re-formats, so an address
+  survives a project round trip with its fragment (`#f=`, `#t=`, `#r=`, stream
+  selector) intact. The path arithmetic is `media/media_address.py`'s
+  `absolutise` / `relativise`. Built in P0.2c; tests
+  `tests/test_dataset_address_paths.py`.
 - Only paths **inside** the project folder are made relative. External source
   paths stay absolute unless the user explicitly imports the file.
 
@@ -906,9 +909,12 @@ optional.
 8. Propagate `operation_id` through progress, completion, cancellation and
    stale-result rejection. It is generated and then discarded today.
 9. Add `table_name` to `row_updated` and to artifact notifications.
-10. Handle the address grammar in the project-relative path rewriting of
-    `_rel_if_inside` / `_abs_against`, so a saved project reopens with its
-    addresses intact (section 3.5). Uses the module built in P0.3.
+10. Handle the address grammar in the project-relative path rewriting, so a
+    saved project reopens with its addresses intact (section 3.5). Uses the
+    module built in P0.3. **Done, P0.2c:** `models/dataset.py`'s
+    `_rewrite_media_cell` parses each cell and moves only the path portion,
+    using `media/media_address.py`'s `absolutise` / `relativise`; tests
+    `tests/test_dataset_address_paths.py`.
 
 **P0.2 therefore runs after P0.3** -- item 10 needs `MediaAddress` to exist.
 
