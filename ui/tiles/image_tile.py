@@ -144,8 +144,8 @@ class ImageTile(BaseTile):
     def invalidate_cache(self) -> None:
         """
         Clears the cached pixmap so the tile re-renders on next paint.
-        Called by GalleryWidget when row_updated or thumbnail_ready
-        signal is received for this tile's row_id.
+        Called by GalleryWidget when a rows_updated or thumbnails_ready
+        batch includes this tile's row_id.
         """
         self._cached_pixmap = None
         self._cached_size   = None

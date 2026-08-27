@@ -154,7 +154,7 @@ class GridTile(BaseTile):
     def invalidate_cache(self) -> None:
         """
         Clears this tile's cache and all children's caches.
-        Called when row_updated signal arrives for any row in this tile.
+        Called when a rows_updated batch includes any row in this tile.
         """
         self._cached_pixmap = None
         self._cached_size   = None

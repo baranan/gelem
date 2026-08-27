@@ -23,6 +23,7 @@ import uuid
 from PySide6.QtCore import QObject, Signal, QTimer
 
 from models.query_result import GroupSection, QueryResult
+from models.notifications import ThumbnailsReady
 
 
 class FakeController(QObject):
@@ -42,8 +43,8 @@ class FakeController(QObject):
     columns_updated          = Signal(list)
     tables_updated           = Signal(list)
     active_table_changed     = Signal(str)
-    thumbnail_ready          = Signal(str)
-    row_updated              = Signal(str)
+    thumbnails_ready         = Signal(object)
+    rows_updated             = Signal(object)
     operator_progress        = Signal(int)
     operator_complete        = Signal(str)
     merge_report_ready       = Signal(object)
@@ -274,9 +275,18 @@ class FakeController(QObject):
             print(f"[FakeController] Thumbnail error for {row_id}: {e}")
 
     def _drain_thumb_queue(self) -> None:
+        # Drain the whole queue into one ThumbnailsReady batch, mirroring
+        # the real controller's batched notification.
+        ready: list[str] = []
         while self._thumb_queue:
-            row_id = self._thumb_queue.pop(0)
-            self.thumbnail_ready.emit(row_id)
+            ready.append(self._thumb_queue.pop(0))
+        if ready:
+            self.thumbnails_ready.emit(
+                ThumbnailsReady(
+                    table_name=self.__active_table,
+                    row_ids=tuple(ready),
+                )
+            )
 
     # ── Public API — same signatures as AppController ─────────────────
 
@@ -442,6 +452,10 @@ class FakeController(QObject):
 
     def get_table_names(self) -> list[str]:
         return ["frames"]
+
+    def get_active_table(self) -> str:
+        """Mirrors AppController.get_active_table()."""
+        return self.__active_table
 
     def get_column_names(self) -> list[str]:
         return list(self._column_types.keys())

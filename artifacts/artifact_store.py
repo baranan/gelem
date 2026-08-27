@@ -121,14 +121,28 @@ class ArtifactStore:
         self._add_to_cache(key, image)
         return image
 
-    def request_thumbnail(self, row_id: str, full_path: Path) -> None:
+    def request_thumbnail(
+        self,
+        row_id: str,
+        full_path: Path,
+        table_name: str,
+    ) -> None:
         """
         Queues thumbnail and preview generation for an item in a
         background thread. Handles both image and video source files.
 
         Args:
-            row_id:    The item to generate thumbnails for.
-            full_path: Path to the full-resolution source file.
+            row_id:     The item to generate thumbnails for.
+            full_path:  Path to the full-resolution source file.
+            table_name: Table the row belongs to. Held here and echoed
+                        back through on_thumbnail_ready(table_name,
+                        row_id) so the controller can tag the ready
+                        notification without remembering the table on
+                        the side (CLAUDE.md: the table travels with the
+                        request).
+
+        The one-thread-per-request model is unchanged -- a bounded
+        worker pool is P0.5.
         """
         if (self.get(row_id, "thumbnail") is not None and
                 self.get(row_id, "preview") is not None):
@@ -136,7 +150,7 @@ class ArtifactStore:
 
         thread = threading.Thread(
             target=self._generate_thumbnails,
-            args=(row_id, full_path),
+            args=(row_id, full_path, table_name),
             daemon=True,
         )
         thread.start()
@@ -185,18 +199,25 @@ class ArtifactStore:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _generate_thumbnails(self, row_id: str, full_path: Path) -> None:
+    def _generate_thumbnails(
+        self,
+        row_id: str,
+        full_path: Path,
+        table_name: str,
+    ) -> None:
         """
         Runs in a background thread. Generates thumbnail and preview
         images from the source file (image or video) and saves them
-        to disk. Calls on_thumbnail_ready when done.
+        to disk. Calls on_thumbnail_ready(table_name, row_id) when done.
 
         For image files: loads via PIL.
         For video files: extracts the first frame via OpenCV.
 
         Args:
-            row_id:    The item being processed.
-            full_path: Path to the source media file.
+            row_id:     The item being processed.
+            full_path:  Path to the source media file.
+            table_name: Table the row belongs to, echoed back to the
+                        ready callback.
         """
         try:
             if not full_path.exists():
@@ -230,7 +251,7 @@ class ArtifactStore:
 
         print(f"[ArtifactStore] Thumbnail ready for {row_id}")
         if self.on_thumbnail_ready is not None:
-            self.on_thumbnail_ready(row_id)
+            self.on_thumbnail_ready(table_name, row_id)
 
     def _first_frame_as_pil(self, video_path: Path) -> Image.Image | None:
         """

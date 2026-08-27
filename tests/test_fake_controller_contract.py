@@ -15,9 +15,16 @@
 # have surfaced later as crashes-on-use. These two tests turn both kinds of
 # silent drift into a clear, named test failure.
 
+import ast
+import pathlib
+
 from PySide6.QtCore import QObject, Signal
 from controller import AppController
 from ui.fake_controller import FakeController
+
+_ROOT = pathlib.Path(__file__).parent.parent
+_CONTROLLER_FILE = _ROOT / "controller.py"
+_FAKE_FILE = _ROOT / "ui" / "fake_controller.py"
 
 
 # ── Helper: collect the Signal members declared on a class ────────────────
@@ -71,4 +78,52 @@ def test_fake_controller_exposes_all_real_public_methods():
         f"FakeController is missing public methods that AppController defines: "
         f"{sorted(missing)}. Add matching stubs to ui/fake_controller.py so "
         f"--fake-data keeps working."
+    )
+
+
+# ── Test 3: signal SIGNATURE parity (not just names) ─────────────────────
+#
+# Tests 1 and 2 compare names only. That misses a signal whose payload
+# type drifted: changing `Signal(str)` to `Signal(object)` in the real
+# controller but not the fake (or vice versa) leaves the names equal and
+# the wiring subtly broken -- MainWindow would hand a payload object to a
+# slot the fake still declares as `Signal(str)`. This test compares the
+# argument list of each `Signal(...)` between the two files.
+
+def _signal_arg_lists(path: pathlib.Path) -> dict[str, list[str]]:
+    """{signal_name: [unparsed Signal() args]} for class-body Signals."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    specs: dict[str, list[str]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        value = node.value
+        if not isinstance(value, ast.Call):
+            continue
+        func = value.func
+        if not (isinstance(func, ast.Name) and func.id == "Signal"):
+            continue
+        arg_srcs = [ast.unparse(a) for a in value.args]
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                specs[target.id] = arg_srcs
+    return specs
+
+
+def test_signal_signatures_match_between_real_and_fake_controller():
+    real = _signal_arg_lists(_CONTROLLER_FILE)
+    fake = _signal_arg_lists(_FAKE_FILE)
+
+    common = set(real) & set(fake)
+    assert common, "no signals found in common -- parser or file path is wrong"
+
+    mismatched = {
+        name: {"controller.py": real[name], "fake_controller.py": fake[name]}
+        for name in sorted(common)
+        if real[name] != fake[name]
+    }
+    assert not mismatched, (
+        f"Signal payload types differ between the real and fake controller: "
+        f"{mismatched}. They must be declared identically or --fake-data "
+        f"wiring breaks silently."
     )

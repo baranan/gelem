@@ -123,7 +123,7 @@ class TileWidget(QLabel):
     def invalidate(self) -> None:
         """
         Clears the tile's cache and re-renders.
-        Called when row_updated signal arrives for this tile's row.
+        Called when a rows_updated batch includes this tile's row.
         """
         if hasattr(self._tile, "invalidate_cache"):
             self._tile.invalidate_cache()
@@ -368,30 +368,37 @@ class GalleryWidget(QWidget):
         self._visible_cols = None
         self._relayout()
 
-    def on_row_updated(self, row_id: str) -> None:
+    def on_rows_updated(self, row_ids) -> None:
         """
-        Called when a row's data has changed (e.g. operator result
-        arrived). Finds the mounted tile for this row, if any, and
-        invalidates it so it re-renders with the new value. Tiles that
-        are not currently mounted will pick up the new value naturally
+        Called when a batch of rows has changed (e.g. a tick's worth of
+        operator results arrived). Makes ONE pass over the mounted tiles,
+        invalidating any tile whose row is in the batch, rather than one
+        pass per row. Tiles not currently mounted pick up the new value
         the next time they scroll into view.
 
+        MainWindow has already filtered the batch down to this gallery's
+        table, so this takes a plain collection of row_ids, not the
+        notification payload object.
+
         Args:
-            row_id: The row whose data changed.
+            row_ids: The rows whose data changed.
         """
+        changed = set(row_ids)
+        if not changed:
+            return
         for tw in self._mounted.values():
-            if row_id in tw.get_row_ids():
+            if any(rid in changed for rid in tw.get_row_ids()):
                 tw.invalidate()
 
-    def on_thumbnail_ready(self, row_id: str) -> None:
+    def on_thumbnails_ready(self, row_ids) -> None:
         """
-        Called when a thumbnail has been generated for row_id.
-        Finds the corresponding mounted tile and repaints it.
+        Called when thumbnails for a batch of rows are available.
+        Repaints the mounted tiles for those rows in one pass.
 
         Args:
-            row_id: The item whose thumbnail is now available.
+            row_ids: The rows whose thumbnail is now available.
         """
-        self.on_row_updated(row_id)
+        self.on_rows_updated(row_ids)
 
     def get_selected_row_ids(self) -> list[str]:
         """

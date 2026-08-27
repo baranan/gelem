@@ -97,8 +97,12 @@ def main():
     controller.result_changed.connect(
         lambda layout: widget.set_range(0, layout.total, layout.result_id)
     )
-    controller.thumbnail_ready.connect(widget.on_thumbnail_ready)
-    controller.row_updated.connect(widget.on_row_updated)
+    controller.thumbnails_ready.connect(
+        lambda payload: widget.on_thumbnails_ready(payload.row_ids)
+    )
+    controller.rows_updated.connect(
+        lambda payload: widget.on_rows_updated(payload.row_ids)
+    )
 
     # Set a reasonable window size and show the widget.
     widget.resize(900, 600)

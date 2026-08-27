@@ -12,20 +12,26 @@ components instead.
 Threading model:
     AppController lives on the main thread.
     Operator results arrive from background threads via callbacks.
-    AppController routes all callbacks to the main thread using a
-    queue drained by a QTimer every 50ms.
+    Each worker-bound callback only puts a result onto a queue (or, for
+    progress, overwrites a single latest value under a lock). The
+    QTimer-driven drain on the main thread is the only place those
+    results are turned into Dataset writes and Qt signals, and it
+    processes a bounded number of items per tick.
 
 This file is written centrally (not by a student).
 """
 
 from __future__ import annotations
 from pathlib import Path
+import queue
+import threading
 import uuid
 import pandas as pd
 
 from PySide6.QtCore import QObject, Signal, QTimer
 
 from models.query_result import QueryResult, ResultLayout, GroupSection
+from models.notifications import RowsUpdated, ThumbnailsReady
 
 DEFAULT_MEDIA_COLUMN_NAME = "full_path"
 
@@ -46,8 +52,12 @@ class AppController(QObject):
         row_selected:            Metadata dict for the selected row.
         columns_updated:         List of all registered column names.
         tables_updated:          List of all table names in the project.
-        thumbnail_ready:         row_id whose thumbnail is now available.
-        row_updated:             row_id whose data has changed.
+        thumbnails_ready:        ThumbnailsReady payload -- a table name
+                                 and the tuple of row_ids whose
+                                 thumbnail is now available.
+        rows_updated:            RowsUpdated payload -- a table name and
+                                 the tuple of row_ids whose data changed
+                                 in this drain tick.
         operator_progress:       Integer 0-100 progress percentage.
         operator_complete:       Name of the operator that finished.
         merge_report_ready:      MergeReport object for display.
@@ -62,8 +72,8 @@ class AppController(QObject):
     columns_updated          = Signal(list)
     tables_updated           = Signal(list)
     active_table_changed     = Signal(str)
-    thumbnail_ready          = Signal(str)
-    row_updated              = Signal(str)
+    thumbnails_ready         = Signal(object)
+    rows_updated             = Signal(object)
     operator_progress        = Signal(int)
     operator_complete        = Signal(str)
     merge_report_ready       = Signal(object)
@@ -78,6 +88,7 @@ class AppController(QObject):
         artifact_store,
         registry,
         operator_registry,
+        drain_budget: int = 200,
     ):
         super().__init__()
 
@@ -90,11 +101,63 @@ class AppController(QObject):
         self._dataset.set_registry(registry)
         self._store.on_thumbnail_ready = self._on_thumbnail_ready
 
-        self._thumbnail_queue:   list[str]   = []
-        self._item_result_queue: list[tuple] = []
-        self._complete_queue:    list[tuple] = []
-        self._progress_queue:    list[int]   = []
-        self._error_queue:       list[str]   = []
+        # Result queues. Each is drained by at most self._drain_budget
+        # items per timer tick (see _drain_queues), so a large operator
+        # run cannot empty thousands of results into one main-thread
+        # tick. Worker threads only ever put onto these; nothing reads
+        # controller state from a worker.
+        #
+        # queue.SimpleQueue is used rather than a list so there is no
+        # list.pop(0) (linear in queue length) anywhere on the path.
+        self._thumbnail_queue:   queue.SimpleQueue = queue.SimpleQueue()
+        self._item_result_queue: queue.SimpleQueue = queue.SimpleQueue()
+        # Completions, setup errors, per-row-error summaries and
+        # create_table/display errors all share one queue so they are
+        # processed in the order they happened, on the main thread.
+        self._complete_queue:    queue.SimpleQueue = queue.SimpleQueue()
+
+        # Progress is not a queue. A run can emit hundreds of progress
+        # values between two ticks and only the last one matters, so the
+        # worker overwrites a single latest value under a lock and the
+        # drain emits operator_progress at most once per tick. This
+        # coalesces at the source and is bounded by construction.
+        self._progress_lock = threading.Lock()
+        self._latest_progress: int | None = None
+
+        # How many items to take from each queue per tick. The same
+        # budget is applied to each queue independently. A constructor
+        # parameter rather than a module constant so a test can drive a
+        # small deterministic budget and a future setting can raise it;
+        # CLAUDE.md's "no machine-dependent constant" rule is
+        # [TARGET -> P0.5], and this at least does not add a new
+        # violation.
+        self._drain_budget: int = drain_budget
+
+        # Live operator runs, keyed by operation_id. Each value carries
+        # what the completion path needs on the main thread: the
+        # operator's display label, the table it targets, the count of
+        # per-row results already applied, and the list of row_ids
+        # apply_row_updates() could not place.
+        #
+        #   - Registered in run_create_columns / run_create_table /
+        #     run_create_display when the run starts.
+        #   - Deregistered when its completion or error is processed by
+        #     the drain -- for create_columns, only once every per-row
+        #     result it emitted has been applied.
+        #   - The whole dict is cleared by load_folder(),
+        #     load_csv_as_primary() and load_project() -- and by nothing
+        #     else. In particular NOT by set_active_table(): a result
+        #     carries its own table_name and belongs in that table
+        #     whatever is on screen.
+        #
+        # Supersession is deliberately not tracked here. Two runs over
+        # the same rows may overlap and last-write-wins. Detecting "this
+        # value was superseded by a newer run" needs per-row per-column
+        # versioning, which is over-engineering; the place to prevent it
+        # is refusing to start the second run, which is P1.12's
+        # cancellation work. Removing an entry from this dict is exactly
+        # the shape a future cancellation will use.
+        self._live_runs: dict[str, dict] = {}
 
         self._timer = QTimer(self)
         self._timer.setInterval(50)
@@ -127,125 +190,321 @@ class AppController(QObject):
         # list means the researcher explicitly unchecked every column.
         self._visible_cols:   list[str] | None = None
 
+    # ── Run registry ─────────────────────────────────────────────────
+
+    def _register_run(
+        self,
+        operation_id: str,
+        label: str,
+        table_name: str,
+    ) -> None:
+        """Records a started operator run as live. See _live_runs."""
+        self._live_runs[operation_id] = {
+            "label":       label,
+            "table_name":  table_name,
+            "applied":     0,
+            "unplaceable": [],
+        }
+
+    def _deregister_run(self, operation_id: str) -> None:
+        """Drops a run from the live set. Idempotent."""
+        self._live_runs.pop(operation_id, None)
+
     # ── Queue draining (main thread) ──────────────────────────────────
 
     def _drain_queues(self) -> None:
-        """Called on the main thread every 50ms. Drains all queues."""
-        while self._thumbnail_queue:
-            row_id = self._thumbnail_queue.pop(0)
-            self.thumbnail_ready.emit(row_id)
+        """
+        Called on the main thread every 50ms. Orchestrates the bounded
+        drain of each result queue and the single coalesced progress
+        emission. Each helper takes at most self._drain_budget items
+        from its own queue, so a large run is spread over several ticks
+        instead of stalling one.
+        """
+        self._drain_thumbnails()
+        self._drain_item_results()
+        self._emit_progress_if_changed()
+        self._drain_completions()
 
-        while self._item_result_queue:
-            operation_id, table_name, row_id, result = self._item_result_queue.pop(0)
-            self._dataset.update_row(row_id, result, table_name)
-            self.row_updated.emit(row_id)
+    def _drain_thumbnails(self) -> None:
+        """
+        Emits one ThumbnailsReady per table for up to _drain_budget
+        queued thumbnails, so the gallery makes one pass over its
+        mounted tiles per table rather than one per thumbnail.
+        """
+        by_table: dict[str, list[str]] = {}
+        for _ in range(self._drain_budget):
+            try:
+                table_name, row_id = self._thumbnail_queue.get_nowait()
+            except queue.Empty:
+                break
+            by_table.setdefault(table_name, []).append(row_id)
 
-        while self._progress_queue:
-            percent = self._progress_queue.pop(0)
+        for table_name, row_ids in by_table.items():
+            self.thumbnails_ready.emit(
+                ThumbnailsReady(table_name=table_name, row_ids=tuple(row_ids))
+            )
+
+    def _drain_item_results(self) -> None:
+        """
+        Applies up to _drain_budget per-row operator results. Results
+        from a run that is no longer live are dropped silently -- the
+        rows they targeted no longer mean anything after a project
+        reload, and a per-row drop is not worth a dialog.
+
+        A tick's surviving results are grouped by table and applied with
+        one Dataset.apply_row_updates() call per table, followed by one
+        rows_updated emission per table. Row ids that could not be
+        placed are attributed back to the run that produced them, for
+        the completion path to report.
+        """
+        batches: dict[str, dict[str, dict]] = {}
+        row_owner: dict[tuple[str, str], str] = {}
+
+        for _ in range(self._drain_budget):
+            try:
+                operation_id, table_name, row_id, result = \
+                    self._item_result_queue.get_nowait()
+            except queue.Empty:
+                break
+            run = self._live_runs.get(operation_id)
+            if run is None:
+                # Result from a dead run -- drop silently.
+                continue
+            # Count every live result taken off the queue, placed or
+            # not. The create_columns completion is held back until this
+            # reaches the number of results the worker said it emitted,
+            # so a fast concurrent run cannot make this run's completion
+            # wait on the shared queue as a whole.
+            run["applied"] += 1
+            batches.setdefault(table_name, {})[row_id] = result
+            row_owner[(table_name, row_id)] = operation_id
+
+        for table_name, updates in batches.items():
+            unplaceable = self._dataset.apply_row_updates(table_name, updates)
+            unplaceable_set = set(unplaceable)
+            for row_id in unplaceable_set:
+                operation_id = row_owner.get((table_name, row_id))
+                run = self._live_runs.get(operation_id)
+                if run is not None:
+                    run["unplaceable"].append(row_id)
+
+            placed = tuple(
+                rid for rid in updates if rid not in unplaceable_set
+            )
+            if placed:
+                self.rows_updated.emit(
+                    RowsUpdated(table_name=table_name, row_ids=placed)
+                )
+
+    def _emit_progress_if_changed(self) -> None:
+        """
+        Emits operator_progress once if a worker pushed a new progress
+        value since the last tick. The value is coalesced at the source
+        (the worker just overwrites it), so this is bounded by
+        construction and needs no budget.
+        """
+        with self._progress_lock:
+            percent = self._latest_progress
+            self._latest_progress = None
+        if percent is not None:
             self.operator_progress.emit(percent)
 
-        while self._complete_queue:
-            operator_name, payload = self._complete_queue.pop(0)
-            self._on_operator_complete(operator_name, payload)
+    def _drain_completions(self) -> None:
+        """
+        Processes up to _drain_budget completion-queue items.
 
-        while self._error_queue:
-            message = self._error_queue.pop(0)
-            self.error_occurred.emit(message)
+        A create_columns completion is deferred while its run still has
+        per-row results working through the bounded item drain
+        (run["applied"] < the count the worker emitted). Deregistering
+        the run before its last results land would make those results
+        look like they came from a dead run and be dropped. The wait is
+        on this run's own outstanding count, not on the shared queue
+        being empty, so a second fast run cannot starve it.
+        """
+        deferred: list[tuple] = []
+        for _ in range(self._drain_budget):
+            try:
+                mode, payload = self._complete_queue.get_nowait()
+            except queue.Empty:
+                break
+            if mode == "create_columns":
+                operation_id, _operator_name, emitted = payload
+                run = self._live_runs.get(operation_id)
+                if run is not None and run["applied"] < emitted:
+                    deferred.append((mode, payload))
+                    continue
+            self._on_operator_complete(mode, payload)
+
+        for item in deferred:
+            self._complete_queue.put(item)
 
     # ── Background thread callbacks ───────────────────────────────────
+    # Each of these runs on a worker thread and does nothing but put a
+    # result onto a queue (or overwrite the latest progress value). None
+    # reads controller or component state.
 
-    def _on_thumbnail_ready(self, row_id: str) -> None:
-        self._thumbnail_queue.append(row_id)
+    def _on_thumbnail_ready(self, table_name: str, row_id: str) -> None:
+        self._thumbnail_queue.put((table_name, row_id))
 
-    def _on_item_complete(self, operation_id: str, table_name: str, row_id: str, result: dict) -> None:
-        self._item_result_queue.append((operation_id, table_name, row_id, result))
+    def _on_item_complete(
+        self,
+        operation_id: str,
+        table_name: str,
+        row_id: str,
+        result: dict,
+    ) -> None:
+        self._item_result_queue.put((operation_id, table_name, row_id, result))
 
     def _on_progress(self, percent: int) -> None:
-        self._progress_queue.append(percent)
+        with self._progress_lock:
+            self._latest_progress = percent
 
-    def _on_create_columns_complete(self, operator_name: str) -> None:
-        self._complete_queue.append(("create_columns", operator_name))
-
-    def _on_operator_setup_error(self, operator_name: str, message: str) -> None:
-        # Called from the worker thread when an operator raises
-        # OperatorSetupError. Looks up the operator's user-facing label so
-        # the dialog reads naturally, then queues the message for emission
-        # on the main thread via error_occurred.
-        operator = self._op_registry.get(operator_name)
-        label = (
-            getattr(operator, "create_columns_label", None)
-            or getattr(operator, "create_table_label", None)
-            or getattr(operator, "create_display_label", None)
-            or operator_name
+    def _on_create_columns_complete(
+        self,
+        operation_id: str,
+        operator_name: str,
+        emitted: int,
+    ) -> None:
+        # `emitted` is how many per-row results the worker handed to
+        # on_item_complete. The drain holds this completion back until it
+        # has applied that many for this run.
+        self._complete_queue.put(
+            ("create_columns", (operation_id, operator_name, emitted))
         )
-        self._error_queue.append(
-            f'Cannot run operator "{label}"\n\n{message}'
+
+    def _on_operator_setup_error(
+        self,
+        operation_id: str,
+        label: str,
+        message: str,
+    ) -> None:
+        # The label is computed by the operator itself
+        # (BaseOperator.display_label) and passed in, so this callback
+        # reads no component state from the worker thread.
+        self._complete_queue.put(
+            ("setup_error", (operation_id, label, message))
         )
 
     def _on_operator_row_errors(
         self,
-        operator_name: str,
+        operation_id: str,
+        label: str,
         errors: list[tuple[str, str, str]],
     ) -> None:
-        # Called from the worker thread once at the end of a run if any rows
-        # raised an unexpected exception. Group by exception type with a
-        # representative message so the dialog stays compact, then queue the
-        # summary for emission on the main thread via error_occurred.
-        operator = self._op_registry.get(operator_name)
-        label = (
-            getattr(operator, "create_columns_label", None)
-            or getattr(operator, "create_table_label", None)
-            or getattr(operator, "create_display_label", None)
-            or operator_name
-        )
-        counts: dict[str, int] = {}
-        first_msg: dict[str, str] = {}
-        for _row_id, exc_type, msg in errors:
-            counts[exc_type] = counts.get(exc_type, 0) + 1
-            first_msg.setdefault(exc_type, msg)
-        lines = [
-            f'  - {t} (x{counts[t]}) - "{first_msg[t]}"'
-            for t in sorted(counts, key=lambda k: -counts[k])
-        ]
-        self._error_queue.append(
-            f'"{label}" finished, but {len(errors)} row(s) hit unexpected '
-            f"errors.\n\nError types seen:\n"
-            + "\n".join(lines)
-            + "\n\nThe affected rows have no values for the new columns."
+        # As above: the label travels with the error, so nothing is
+        # looked up from a worker thread.
+        self._complete_queue.put(
+            ("row_errors", (operation_id, label, errors))
         )
 
     def _on_create_table_complete(
         self,
+        operation_id: str,
         operator_name: str,
         result_df: pd.DataFrame,
     ) -> None:
-        self._complete_queue.append(("create_table", (operator_name, result_df)))
+        self._complete_queue.put(
+            ("create_table", (operation_id, operator_name, result_df))
+        )
 
     def _on_create_display_complete(
         self,
+        operation_id: str,
         operator_name: str,
         result: dict,
     ) -> None:
-        self._complete_queue.append(("create_display", (operator_name, result)))
+        self._complete_queue.put(
+            ("create_display", (operation_id, operator_name, result))
+        )
 
-    def _on_operator_error(self, operator_name: str, message: str) -> None:
+    def _on_operator_error(
+        self,
+        operation_id: str,
+        operator_name: str,
+        message: str,
+    ) -> None:
         """Background-thread callback for operator errors. Marshals
         the error onto the main thread via _complete_queue."""
-        self._complete_queue.append(("error", (operator_name, message)))
+        self._complete_queue.put(
+            ("error", (operation_id, operator_name, message))
+        )
 
     def _on_operator_complete(self, mode: str, payload) -> None:
         """
-        Called on the main thread when any operator finishes.
-        Routes the result to the appropriate destination.
+        Called on the main thread from the completion-queue drain.
+        Routes the result to the appropriate destination and, for the
+        modes that own a live run, deregisters it.
         """
         if mode == "create_columns":
-            operator_name = payload
+            operation_id, operator_name, _emitted = payload
+            run = self._live_runs.get(operation_id)
+            if run is None:
+                # The project was replaced while this run was in flight.
+                # Its per-row results were already dropped silently by
+                # the item drain (a per-row drop after a reload is not
+                # worth a dialog). Still emit operator_complete -- like
+                # every other mode does for a dead run -- so a progress
+                # or "running" UI clears; just skip the columns refresh,
+                # which would be work for a run that changed nothing.
+                self.operator_complete.emit(operator_name)
+                return
+            if run["unplaceable"]:
+                n = len(run["unplaceable"])
+                self.error_occurred.emit(
+                    f'"{run["label"]}" finished, but {n} result row(s) '
+                    f'could not be matched to a row in table '
+                    f'"{run["table_name"]}" and were discarded.'
+                )
+            self._deregister_run(operation_id)
             self.operator_complete.emit(operator_name)
             self.columns_updated.emit(self._registry.list_all_columns())
             self._refresh_result()
 
+        elif mode == "setup_error":
+            # A run that aborted before finishing. Rows processed before
+            # the abort still produced results that are queued behind
+            # this message; the create_columns completion that follows
+            # owns deregistration once they have landed, so this branch
+            # only surfaces the message.
+            _operation_id, label, message = payload
+            self.error_occurred.emit(
+                f'Cannot run operator "{label}"\n\n{message}'
+            )
+
+        elif mode == "row_errors":
+            # An additional end-of-run summary. Deregistration and the
+            # unplaceable report belong to the create_columns completion
+            # that still follows, so this branch does not deregister.
+            _operation_id, label, errors = payload
+            counts: dict[str, int] = {}
+            first_msg: dict[str, str] = {}
+            for _row_id, exc_type, msg in errors:
+                counts[exc_type] = counts.get(exc_type, 0) + 1
+                first_msg.setdefault(exc_type, msg)
+            lines = [
+                f'  - {t} (x{counts[t]}) - "{first_msg[t]}"'
+                for t in sorted(counts, key=lambda k: -counts[k])
+            ]
+            self.error_occurred.emit(
+                f'"{label}" finished, but {len(errors)} row(s) hit '
+                f"unexpected errors.\n\nError types seen:\n"
+                + "\n".join(lines)
+                + "\n\nThe affected rows have no values for the new columns."
+            )
+
         elif mode == "create_table":
-            operator_name, result_df = payload
+            operation_id, operator_name, result_df = payload
+            was_live = operation_id in self._live_runs
+            self._deregister_run(operation_id)
+            if not was_live:
+                # Minutes of compute that arrived after the project
+                # changed. Do not store it; say so rather than dropping
+                # it silently.
+                self.error_occurred.emit(
+                    f'The "{operator_name}" table result arrived after the '
+                    f"project changed and was discarded."
+                )
+                return
             table_name = f"{operator_name}_result"
             try:
                 self._dataset.create_table_from_df(table_name, result_df)
@@ -256,6 +515,7 @@ class AppController(QObject):
                         self._store.request_thumbnail(
                             row["row_id"],
                             Path(str(full_path)),
+                            table_name,
                         )
                 self.tables_updated.emit(self._dataset.list_tables())
                 self.table_created.emit(table_name)
@@ -266,13 +526,22 @@ class AppController(QObject):
                 )
 
         elif mode == "create_display":
-            operator_name, result = payload
+            operation_id, operator_name, result = payload
+            was_live = operation_id in self._live_runs
+            self._deregister_run(operation_id)
+            if not was_live:
+                self.error_occurred.emit(
+                    f'The "{operator_name}" result arrived after the '
+                    f"project changed and was discarded."
+                )
+                return
             result["operator_name"] = operator_name
             self.display_result_ready.emit(result)
             self.operator_complete.emit(operator_name)
 
         elif mode == "error":
-            operator_name, message = payload
+            operation_id, operator_name, message = payload
+            self._deregister_run(operation_id)
             self.error_occurred.emit(message)
             self.operator_complete.emit(operator_name)
 
@@ -477,6 +746,10 @@ class AppController(QObject):
         """
         try:
             self._store.reset()
+            # The dataset is being replaced: every in-flight operator run
+            # now targets rows that will not exist. Drop them so a late
+            # result cannot write onto the new folder's rows.
+            self._live_runs.clear()
             self._active_filters = []
             self._group_by       = None
             self._visible_cols   = None
@@ -488,6 +761,7 @@ class AppController(QObject):
                 self._store.request_thumbnail(
                     row["row_id"],
                     Path(row["full_path"]),
+                    "frames",
                 )
 
             self.columns_updated.emit(self._registry.list_all_columns())
@@ -511,6 +785,9 @@ class AppController(QObject):
         """
         try:
             self._store.reset()
+            # See load_folder(): the dataset is being replaced, so no
+            # in-flight run's results are valid any more.
+            self._live_runs.clear()
             self._active_filters = []
             self._group_by       = None
             self._visible_cols   = None
@@ -524,6 +801,7 @@ class AppController(QObject):
                     self._store.request_thumbnail(
                         row["row_id"],
                         Path(full_path),
+                        "frames",
                     )
 
             self.columns_updated.emit(self._registry.list_all_columns())
@@ -674,30 +952,46 @@ class AppController(QObject):
         """
         try:
             operator = self._op_registry.get(operator_name)
-            if operator is not None:
-                for col_name, col_type in operator.output_columns:
-                    try:
-                        self._registry.register_by_tag(col_name, col_type)
-                    except KeyError as e:
-                        print(f"[Controller] Warning: {e}")
+            if operator is None or operator.create_columns_label is None:
+                self.error_occurred.emit(
+                    f'Operator "{operator_name}" cannot add columns.'
+                )
+                return
+            for col_name, col_type in operator.output_columns:
+                try:
+                    self._registry.register_by_tag(col_name, col_type)
+                except KeyError as e:
+                    print(f"[Controller] Warning: {e}")
             operation_id = str(uuid.uuid4())
             table_name   = self._active_table
             # One snapshot of exactly the selected rows, taken once here
             # on the main thread -- not one Dataset.get_row() call (and
             # one full-table copy) per row.
             snapshot = self._dataset.snapshot_rows(table_name, row_ids)
-            self._op_registry.run_create_columns(
-                operator_name,
-                snapshot,
-                row_ids,
-                table_name,
-                operation_id=operation_id,
-                on_item_complete=self._on_item_complete,
-                on_progress=self._on_progress,
-                on_complete=self._on_create_columns_complete,
-                on_setup_error=self._on_operator_setup_error,
-                on_row_errors=self._on_operator_row_errors,
-            )
+            self._register_run(operation_id, operator.display_label, table_name)
+            try:
+                started = self._op_registry.run_create_columns(
+                    operator_name,
+                    snapshot,
+                    row_ids,
+                    table_name,
+                    operation_id=operation_id,
+                    on_item_complete=self._on_item_complete,
+                    on_progress=self._on_progress,
+                    on_complete=self._on_create_columns_complete,
+                    on_setup_error=self._on_operator_setup_error,
+                    on_row_errors=self._on_operator_row_errors,
+                )
+            except Exception:
+                # The run never started, so no callback will ever
+                # deregister it. Drop the entry here.
+                self._deregister_run(operation_id)
+                raise
+            if not started:
+                # Registry declined the run (unknown operator / wrong
+                # mode) without raising and without a callback. Same
+                # cleanup.
+                self._deregister_run(operation_id)
         except Exception as e:
             self.error_occurred.emit(
                 f"Failed to start create_columns operator: {e}"
@@ -718,15 +1012,30 @@ class AppController(QObject):
             group_by:      Column or columns to group by.
         """
         try:
-            selected_df = self._dataset.snapshot_rows(self._active_table, row_ids)
-
-            self._op_registry.run_create_table(
-                operator_name,
-                selected_df,
-                group_by,
-                on_complete=self._on_create_table_complete,
-                on_error=self._on_operator_error,
-            )
+            operator = self._op_registry.get(operator_name)
+            if operator is None or operator.create_table_label is None:
+                self.error_occurred.emit(
+                    f'Operator "{operator_name}" cannot create a table.'
+                )
+                return
+            operation_id = str(uuid.uuid4())
+            table_name   = self._active_table
+            selected_df  = self._dataset.snapshot_rows(table_name, row_ids)
+            self._register_run(operation_id, operator.display_label, table_name)
+            try:
+                started = self._op_registry.run_create_table(
+                    operator_name,
+                    selected_df,
+                    group_by,
+                    operation_id=operation_id,
+                    on_complete=self._on_create_table_complete,
+                    on_error=self._on_operator_error,
+                )
+            except Exception:
+                self._deregister_run(operation_id)
+                raise
+            if not started:
+                self._deregister_run(operation_id)
         except Exception as e:
             self.error_occurred.emit(
                 f"Failed to start create_table operator: {e}"
@@ -745,14 +1054,29 @@ class AppController(QObject):
             row_ids:       Rows to include in the DataFrame.
         """
         try:
-            selected_df = self._dataset.snapshot_rows(self._active_table, row_ids)
-
-            self._op_registry.run_create_display(
-                operator_name,
-                selected_df,
-                on_complete=self._on_create_display_complete,
-                on_error=self._on_operator_error,
-            )
+            operator = self._op_registry.get(operator_name)
+            if operator is None or operator.create_display_label is None:
+                self.error_occurred.emit(
+                    f'Operator "{operator_name}" cannot show a result.'
+                )
+                return
+            operation_id = str(uuid.uuid4())
+            table_name   = self._active_table
+            selected_df  = self._dataset.snapshot_rows(table_name, row_ids)
+            self._register_run(operation_id, operator.display_label, table_name)
+            try:
+                started = self._op_registry.run_create_display(
+                    operator_name,
+                    selected_df,
+                    operation_id=operation_id,
+                    on_complete=self._on_create_display_complete,
+                    on_error=self._on_operator_error,
+                )
+            except Exception:
+                self._deregister_run(operation_id)
+                raise
+            if not started:
+                self._deregister_run(operation_id)
         except Exception as e:
             self.error_occurred.emit(
                 f"Failed to start create_display operator: {e}"
@@ -809,6 +1133,11 @@ class AppController(QObject):
     def set_active_table(self, name: str) -> None:
         """
         Switches the active table.
+
+        Deliberately does NOT touch self._live_runs: an in-flight run
+        carries its own table_name and its results belong in that table
+        whatever is on screen. Staleness is keyed on run liveness, never
+        on the active table.
 
         Args:
             name: Table name to activate.
@@ -893,6 +1222,9 @@ class AppController(QObject):
             project_path: Path to an existing project folder.
         """
         try:
+            # The dataset is being replaced: drop every in-flight run so
+            # a late result cannot land in the newly loaded project.
+            self._live_runs.clear()
             self._dataset.load(project_path)
             self._store.load_index(project_path)
             self.tables_updated.emit(self._dataset.list_tables())
@@ -906,6 +1238,17 @@ class AppController(QObject):
     def get_table_names(self) -> list[str]:
         """Returns all table names in the current project."""
         return self._dataset.list_tables()
+
+    def get_active_table(self) -> str:
+        """
+        Returns the name of the currently active table.
+
+        MainWindow uses this to decide whether a rows_updated /
+        thumbnails_ready notification is for the table on screen. That
+        "is it visible?" check lives in MainWindow, once -- not in the
+        controller and not in each gallery.
+        """
+        return self._active_table
 
     def get_column_names(self) -> list[str]:
         """Returns all registered column names."""

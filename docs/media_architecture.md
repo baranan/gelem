@@ -924,6 +924,34 @@ optional.
     using `media/media_address.py`'s `absolutise` / `relativise`; tests
     `tests/test_dataset_address_paths.py`.
 
+**Done, P0.2b (27 August 2026)** -- items 6-9. The five list queues became four
+`queue.SimpleQueue`s plus a single lock-guarded latest-progress value; each
+queue is drained by at most `AppController._drain_budget` items per 50 ms tick
+(a constructor parameter, not a constant), and a tick's per-row results are
+grouped by table and applied with **one** `Dataset.apply_row_updates()` call and
+**one** `rows_updated` emission per table. One `operation_id` is minted per run
+in all three `run_*` methods and travels through every completion and error
+callback. The controller keeps a registry of live runs keyed by `operation_id`,
+cleared only by `load_folder()`, `load_csv_as_primary()` and `load_project()` --
+**not** by `set_active_table()`. **"Stale" means the run is no longer live, never
+"the user switched tables":** a result carries its own `table_name` and lands in
+that table whatever is on screen. A per-row result from a dead run is dropped
+silently; a `create_table` / `create_display` result from a dead run is not
+stored and raises `error_occurred`. `apply_row_updates()` now returns the
+row_ids it could not place; the controller accumulates them per run and reports
+the count at completion. Notifications are frozen payloads (`RowsUpdated`,
+`ThumbnailsReady` in `models/notifications.py`, no pandas/numpy/PIL import) and
+the signals were renamed to the plural `rows_updated` / `thumbnails_ready`.
+`ArtifactStore.request_thumbnail()` takes the table name and echoes it back.
+`MainWindow` is the single place that checks a payload's table against
+`AppController.get_active_table()` before repainting; each gallery makes one pass
+over its mounted tiles per batch. The two `[MIGRATING]` worker-thread label
+lookups are gone -- `BaseOperator.display_label` owns that chain. Supersession
+of one run by another is deliberately not detected (that is P1.12). Tests:
+`tests/test_result_delivery.py`, rewritten
+`tests/test_controller_async_contracts.py`, and a signal-signature check added
+to `tests/test_fake_controller_contract.py`.
+
 **P0.2 therefore runs after P0.3** -- item 10 needs `MediaAddress` to exist.
 
 **P0.3 Address semantics and the `MediaAddress` module.** *(was P1.1)* Settle §3.6
@@ -975,7 +1003,12 @@ Implement §4.5 and §4.6. Address-based keys, `ArtifactCodec` separated from so
 decoding (§7), bounded worker pool with priority and cancellation, no decoding in a
 paint path, clear the memory cache on project load, cache size becomes a setting.
 This fixes the avatar-tile bug and is the foundation segment thumbnails and
-every tile attach to.
+every tile attach to. **The thumbnail path still carries the project-reload
+identity bug that P0.2b fixed for operator results:** an in-flight
+`_generate_thumbnails` thread writes into the index after `reset()`, and
+`load_folder()` re-mints the same row ids, so an old project's picture can appear
+under a new project's row. §4.5 owns this; the pointer here is so the P0.2b
+"Done" paragraph above is not read as covering it.
 
 ### 6.2 Phase 1 -- media foundation
 

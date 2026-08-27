@@ -166,6 +166,27 @@ class BaseOperator:
     so it sets requires_image = False.
     """
 
+    # ── Identity ──────────────────────────────────────────────────────
+
+    @property
+    def display_label(self) -> str:
+        """
+        The operator's user-facing name for dialogs and error messages.
+
+        One operator can expose up to three menu actions with three
+        labels; this picks whichever is set, falling back to the
+        internal name. It lives here so that OperatorRegistry can pass a
+        ready label into its error callbacks and the controller never
+        rebuilds this chain on a worker thread just to phrase an error
+        (a CLAUDE.md threading rule).
+        """
+        return (
+            self.create_columns_label
+            or self.create_table_label
+            or self.create_display_label
+            or self.name
+        )
+
     # ── Core methods ──────────────────────────────────────────────────
 
     def create_columns(
@@ -179,10 +200,10 @@ class BaseOperator:
         Called by OperatorRegistry once per row in a background thread.
 
         This is how new columns get added to the table progressively.
-        OperatorRegistry calls this once per row, and after each call
-        AppController applies the returned dict to Dataset.update_row()
-        on the main thread. The gallery tile for that row repaints
-        immediately with the new values.
+        OperatorRegistry calls this once per row; AppController collects
+        a timer tick's worth of returned dicts and applies them with one
+        Dataset.apply_row_updates() call per table on the main thread,
+        then repaints the affected gallery tiles.
 
         Args:
             row_id:   The unique identifier of the row being processed.

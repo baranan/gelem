@@ -264,7 +264,10 @@ class MainWindow(QMainWindow):
         across every group gallery.
         """
         selected = len(self._collect_selected_row_ids())
-        visible  = len(self._collect_visible_row_ids())
+        # O(1): the controller already knows the flat-order length. The
+        # old code copied every row id just to count them, on every
+        # selection change (P0.4 follow-up 2).
+        visible  = self._controller.get_result_layout().total
         if selected:
             text = f"{selected} of {visible} selected"
         else:
@@ -471,8 +474,8 @@ class MainWindow(QMainWindow):
         ctrl.columns_updated.connect(self._on_columns_updated)
         ctrl.tables_updated.connect(self._on_tables_updated)
         ctrl.active_table_changed.connect(self._on_active_table_changed)
-        ctrl.thumbnail_ready.connect(self._on_thumbnail_ready)
-        ctrl.row_updated.connect(self._on_row_updated)
+        ctrl.thumbnails_ready.connect(self._on_thumbnails_ready)
+        ctrl.rows_updated.connect(self._on_rows_updated)
         ctrl.row_selected.connect(self._on_row_selected)
         ctrl.display_result_ready.connect(self._on_display_result)
         ctrl.error_occurred.connect(self._on_error)
@@ -764,15 +767,31 @@ class MainWindow(QMainWindow):
             self._table_combo.setCurrentIndex(idx)
         self._table_combo.blockSignals(False)
 
-    def _on_thumbnail_ready(self, row_id: str) -> None:
-        """Repaints the tile for row_id when its thumbnail arrives."""
-        for gallery in self._galleries:
-            gallery.on_thumbnail_ready(row_id)
+    def _on_thumbnails_ready(self, payload) -> None:
+        """
+        A batch of thumbnails for payload.table_name is ready. Repaint
+        those tiles only if that table is the one on screen.
 
-    def _on_row_updated(self, row_id: str) -> None:
-        """Repaints the tile for row_id when its data changes."""
+        This "is it the visible table?" check lives here, once. Not in
+        the controller (which would drag display logic in) and not in
+        each gallery (which would duplicate one decision across widgets
+        -- the defect pattern this repo has already hit twice).
+        """
+        if payload.table_name != self._controller.get_active_table():
+            return
         for gallery in self._galleries:
-            gallery.on_row_updated(row_id)
+            gallery.on_thumbnails_ready(payload.row_ids)
+
+    def _on_rows_updated(self, payload) -> None:
+        """
+        A batch of rows in payload.table_name changed. Repaint those
+        tiles only if that table is on screen. See _on_thumbnails_ready
+        for why the check is here.
+        """
+        if payload.table_name != self._controller.get_active_table():
+            return
+        for gallery in self._galleries:
+            gallery.on_rows_updated(payload.row_ids)
 
     def _on_tile_size_changed(self, size: int) -> None:
         """Updates tile size across all galleries."""

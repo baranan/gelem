@@ -130,10 +130,28 @@ re-verified there.)*
   were globally unique and never reused, which was too strong; a previous revision
   then said they were "not stable across a reload", which was too weak and wrong
   about save/load.
-- **`[TARGET -> P0.2b]`** Any public reference to a row -- signal, artifact request,
-  controller method -- identifies it as `(table_name, row_id)`. `row_updated` and
-  `thumbnail_ready` currently carry a bare `row_id`, so the UI cannot tell which
-  table changed.
+- **`[NOW]`** Every **signal and artifact request** that refers to a row
+  identifies it as `(table_name, row_id)`. Made true by P0.2b: `rows_updated`
+  and `thumbnails_ready` carry a frozen payload (`models/notifications.py`)
+  with `table_name` and a tuple of `row_ids`;
+  `ArtifactStore.request_thumbnail(row_id, full_path, table_name)` holds the
+  table and echoes it back as `on_thumbnail_ready(table_name, row_id)`.
+  `MainWindow` -- not the controller, not each gallery -- is the single place
+  that checks the payload's table against `AppController.get_active_table()`.
+  Tests: `tests/test_result_delivery.py`
+  (`test_rows_updated_is_a_batched_payload_with_table_name`,
+  `test_live_result_lands_in_its_own_table_after_table_switch`),
+  `tests/test_fake_controller_contract.py`
+  (`test_signal_signatures_match_between_real_and_fake_controller`).
+- **`[MIGRATING]`** The same `(table_name, row_id)` discipline for **controller
+  methods** that take a bare `row_id`. Known remaining set, closed:
+  `select_row(row_id)`, `get_artifact_pixmap(row_id, artifact_type)`,
+  `get_result_index(row_id)` and `get_row(row_id, table_name=None)`. Each
+  defaults to `self._active_table`, so a caller that has switched tables since
+  it captured the id reads or selects the wrong row. P0.2b did not touch these
+  and its tests do not cover them; an earlier revision of the rule above
+  claimed "controller method" was already done, which overreached -- only the
+  signals and the artifact request were.
 - **`[NOW]`** **Lineage is carried by ordinary data columns, not by surrogate
   pointers.** When an operator turns one row into many -- a video into segments, a
   segment into frames -- it carries the source's identifying columns down and adds
@@ -152,24 +170,33 @@ re-verified there.)*
 
 - **`[NOW]`** Tables owned by `Dataset` are mutated on the main thread only.
 - **`[NOW]`** Background workers never call Qt and never create a `QPixmap`.
-- **`[MIGRATING]`** Workers communicate only by placing results into the
-  controller's result queues. They do not read controller or component state.
-  Known violations: `controller.py` `_on_operator_setup_error` and
-  `_on_operator_row_errors` both call `self._op_registry.get()` from the worker
-  thread to look up a label. The label should travel with the error instead.
-  *(Re-verified 26 Aug 2026: both are still called from
-  `OperatorRegistry._run_create_columns_worker`, which runs on a
-  `threading.Thread`; every other worker-bound controller callback
-  -- `_on_item_complete`, `_on_progress`, `_on_create_columns_complete`,
-  `_on_create_table_complete`, `_on_create_display_complete` -- only appends to a
-  queue and reads no state, so the list is still closed at these two.)*
+- **`[NOW]`** Workers communicate only by placing results into the
+  controller's result queues (or, for progress, overwriting a single latest
+  value under a lock). They do not read controller or component state. The
+  violation list is now **empty**: P0.2b closed the last two sites
+  (`_on_operator_setup_error` and `_on_operator_row_errors` used to call
+  `self._op_registry.get()` from the worker thread to build a display label).
+  `BaseOperator.display_label` now owns that fallback chain and
+  `OperatorRegistry` passes the ready label into the callbacks, so no
+  worker-bound callback reads component state. Guarded by
+  `tests/test_controller_async_contracts.py::test_worker_callbacks_touch_no_component_state`,
+  an AST check that every worker-invoked controller callback reaches only
+  a queue (`OperatorRegistry` boundaries are separately guarded by
+  `tests/test_operator_registry_boundaries.py`).
 - **`[NOW]`** Worker callbacks **are** bound controller methods. This is correct
   and deliberate. An earlier version of this file said workers "never touch the
   controller," which forbade the actual design.
-- **`[TARGET -> P0.2b]`** Draining the result queues is bounded -- a fixed time or
-  item budget per timer tick. `_drain_queues()` currently empties every queue in
-  one tick, which stalls the main thread during a large run, and uses `list.pop(0)`
-  which is linear in queue length.
+- **`[NOW]`** Draining the result queues is bounded -- at most
+  `AppController._drain_budget` items are taken from each queue per timer tick,
+  and whatever is left is picked up on the next tick. Made true by P0.2b: the
+  queues are `queue.SimpleQueue` (no `list.pop(0)`), progress is coalesced to a
+  single latest value rather than queued, and per-row results for a tick are
+  applied with one `Dataset.apply_row_updates()` call per table. `_drain_budget`
+  is a constructor parameter, not a module constant. Tests:
+  `tests/test_result_delivery.py` (`test_drain_is_bounded`,
+  `test_drain_completes_over_later_ticks`, `test_progress_is_coalesced`,
+  `test_no_drain_method_uses_pop_zero`),
+  `tests/test_controller_async_contracts.py`.
 
 ### UI
 
@@ -350,9 +377,14 @@ individually, `test_add_computed_column_correct_values`, `test_apply_sort`, and
 `test_apply_grouped_all_rows_accounted` all pass. `test_images/` currently holds
 exactly 20 `.jpg` files against 20 `metadata.csv` rows, so nothing stray remains.
 
-**Verified green 27 Aug 2026 (P0.4).** `python -m pytest` collects 174 items with
+**Verified green 27 Aug 2026 (P0.4).** `python -m pytest` collected 174 items with
 zero collection errors and zero failures. (The 91 this section reported at P0.1
 grew as P0.2a, P0.2c, P0.3 and now P0.4 each added their own test files.)
+
+**Verified green 27 Aug 2026 (P0.2b).** `python -m pytest` now collects **193**
+items, zero collection errors, zero failures. P0.2b added `tests/test_result_delivery.py`
+and grew `tests/test_controller_async_contracts.py` and
+`tests/test_fake_controller_contract.py`.
 
 ---
 
@@ -422,7 +454,11 @@ completed work item with exactly this block, filled in:
 - the exact commands for Y B to re-run, and what a pass looks like
 - if there is something to check by eye in the app, an exact click list:
   which screen, which controls, and for each step what a pass looks like --
-  cover every path that no automated test covers
+  cover every path that no automated test covers. **A by-eye check must not
+  exercise a stubbed `FakeController` method -- name real data instead.**
+  Several `FakeController` methods (`set_active_table`, `save_filtered_as_table`,
+  ...) only print or return canned rows, so a click list that runs through them
+  proves nothing.
 
 **Diff**
 git diff main > docs/review/<id>.diff
@@ -516,12 +552,16 @@ Verified against the code on 4 Aug 2026; re-verified against `main` on 24 Aug
 
 **Non-functional at target scale:**
 
-- `Dataset.get_row()` calls `get_table()`, which copies the entire table.
-  `AppController.run_create_columns()` calls `get_row()` once per selected row, so
-  starting an operator over a 530k-row table performs 530k full-table copies.
-- `Dataset.update_row()` scans the whole `row_id` column per result.
 - `ArtifactStore.request_thumbnail()` spawns one raw `threading.Thread` per call.
-- Controller result queues are lists drained with `pop(0)`, unbounded per tick.
+
+*(Two bullets removed 27 Aug 2026, P0.2b: "`Dataset.get_row()` calls
+`get_table()` ... 530k full-table copies" and "`Dataset.update_row()` scans the
+whole `row_id` column per result" were both false since P0.2a -- `get_row()`
+reads through the row-id index and `update_row()` is a wrapper over
+`apply_row_updates()`, which uses that index. The "Controller result queues are
+lists drained with `pop(0)`, unbounded per tick" bullet is fixed by P0.2b: the
+queues are `queue.SimpleQueue` and each drain is bounded by
+`AppController._drain_budget`.)*
 
 **Dead or inconsistent:**
 

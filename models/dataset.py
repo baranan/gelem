@@ -731,9 +731,12 @@ class Dataset:
         """
         Updates a single row with new column values. A convenience
         wrapper over apply_row_updates() for the one-row case.
-        Called by AppController on the main thread to apply progressive
-        operator results one item at a time.
-        Never called from a background thread directly.
+
+        As of P0.2b, AppController no longer calls this -- it batches a
+        whole timer tick's operator results into one apply_row_updates()
+        call per table. This method is kept as a legitimate one-row API
+        (tests and any future single-row caller use it); it is not dead
+        code, it simply has no caller in the app right now.
 
         Args:
             row_id:     The row to update.
@@ -746,7 +749,7 @@ class Dataset:
         self,
         table_name: str,
         updates: dict[str, dict],
-    ) -> None:
+    ) -> list[str]:
         """
         Applies a batch of per-row updates in one call. This is the
         primary write path; update_row() is a one-item convenience over
@@ -759,12 +762,16 @@ class Dataset:
         Args:
             table_name: Table containing the rows.
             updates:    Dict mapping row_id to a dict of column name to
-                        new value. A row_id not present in the table is
-                        silently skipped, matching update_row()'s prior
-                        behaviour (a no-op mask match). A column that
-                        does not exist yet is created first and every
-                        row not covered by this batch gets None/NaN in
-                        it, matching update_row()'s prior behaviour too.
+                        new value. A column that does not exist yet is
+                        created first and every row not covered by this
+                        batch gets None/NaN in it.
+
+        Returns:
+            The list of row_ids that could not be placed because they
+            are not in the table -- empty when every update landed.
+            Previously such a row_id was skipped silently; the caller
+            (AppController) now accumulates these per operation_id and
+            tells the user how many results a run could not place.
         """
         df    = self._get_stored_table(table_name)
         index = self._row_index_for(table_name)
@@ -779,14 +786,17 @@ class Dataset:
                 df[col] = None
         col_locs = {col: df.columns.get_loc(col) for col in touched_columns}
 
+        unplaceable: list[str] = []
         for row_id, col_updates in updates.items():
             pos = index.get(row_id)
             if pos is None:
+                unplaceable.append(row_id)
                 continue
             for col, val in col_updates.items():
                 df.iat[pos, col_locs[col]] = val
 
         self._set_table(table_name, df)
+        return unplaceable
 
     # ------------------------------------------------------------------
     # Aggregation
