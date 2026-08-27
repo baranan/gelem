@@ -356,6 +356,12 @@ class GalleryWidget(QWidget):
         Args:
             column_names: Ordered list of column names to display.
         """
+        # A relayout tears down every mounted tile and re-fetches the
+        # visible row ids, and _on_result_changed re-pushes the current
+        # preference on every filter tick. Skip the work when nothing
+        # actually changed.
+        if column_names == self._visible_cols:
+            return
         self._visible_cols = column_names
         self._relayout()
 
@@ -365,6 +371,8 @@ class GalleryWidget(QWidget):
         its default-fallback behaviour (full_path when registered as
         visual, placeholder otherwise). Use this on project reset.
         """
+        if self._visible_cols is None:
+            return
         self._visible_cols = None
         self._relayout()
 
@@ -478,6 +486,14 @@ class GalleryWidget(QWidget):
                 self._show_no_visual_column_placeholder()
             self._top_spacer.setFixedHeight(0)
             self._bot_spacer.setFixedHeight(0)
+            # A gallery with no visual column shows nothing, but it must
+            # still report a range: emit a zero-width window at this
+            # gallery's own slice start, the same thing the empty case
+            # in _update_visible_tiles does. Returning here without a
+            # report would leave a stale reported range standing --
+            # benign today, but in P0.5 that means render work queued
+            # for rows nobody is looking at.
+            self._maybe_report_range(self._range_start, self._range_start)
             return
         self._tile_columns = columns
 

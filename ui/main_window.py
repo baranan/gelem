@@ -591,6 +591,28 @@ class MainWindow(QMainWindow):
             self._clear_grouped_galleries()
             self._galleries = [self._main_gallery]
             self._main_gallery.set_range(0, layout.total, layout.result_id)
+            # Re-sync the flat gallery's visible-columns state with the
+            # controller. While grouping is on self._galleries holds the
+            # group galleries and not this one, so neither
+            # _apply_visible_columns() nor _on_columns_updated() reaches
+            # the flat gallery: a columns change or a preference reset
+            # made during grouping would otherwise leave it painting a
+            # stale local choice until the Columns combo was next
+            # touched. Mirror both directions --
+            #   * a real preference (including an explicit empty list)
+            #     is pushed, exactly as _build_group_section does;
+            #   * no preference clears the gallery's local choice back to
+            #     None so it falls back to full_path, rather than being
+            #     handed [] which would wrongly show the placeholder.
+            # None vs [] is a [NOW] rule in CLAUDE.md. Both gallery calls
+            # are no-ops when the value is unchanged, so the common
+            # filter-tick path still does a single relayout.
+            if self._controller.has_visible_columns_preference():
+                self._main_gallery.set_visible_columns(
+                    self._controller.get_effective_visible_columns()
+                )
+            else:
+                self._main_gallery.clear_visible_columns_preference()
             self._gallery_stack.setCurrentWidget(self._main_gallery)
         else:
             self._rebuild_grouped_galleries(layout)
