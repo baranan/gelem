@@ -1053,8 +1053,14 @@ def test_save_load_full_path_roundtrips():
         ds2 = Dataset()
         ds2.load(project)
         after = list(ds2.get_table("frames")["full_path"])
-        assert before == after, (
-            f"full_path values should round-trip identically; "
+        # Compare file identity, not string spelling. Since P0.2c, load()
+        # returns the canonical POSIX form (media_architecture.md decision 9,
+        # "paths use forward slashes"), not str(root / p); this test was
+        # asserting the implementation's separator, not the spec. The
+        # forward-slash spelling itself is checked in
+        # tests/test_dataset_address_paths.py.
+        assert [Path(p).resolve() for p in before] == [Path(p).resolve() for p in after], (
+            f"full_path values should round-trip to the same files; "
             f"before sample={before[:2]}, after sample={after[:2]}"
         )
 
@@ -1088,8 +1094,12 @@ def test_save_uses_relative_path_when_images_inside_project():
         ds2 = Dataset()
         ds2.load(project)
         loaded = list(ds2.get_table("frames")["full_path"])
-        assert loaded == [str(img1), str(img2)], (
-            f"loaded paths should match the originals; got {loaded}"
+        # Compare file identity, not string spelling. Since P0.2c, load()
+        # returns the canonical POSIX form (media_architecture.md decision 9),
+        # not str(root / p); the assertion above already checks that the
+        # STORED form is relative and POSIX-spelled, which is the spec point.
+        assert [Path(p).resolve() for p in loaded] == [Path(img1).resolve(), Path(img2).resolve()], (
+            f"loaded paths should resolve to the originals; got {loaded}"
         )
 
 def test_save_load_preserves_provenance():
@@ -1225,8 +1235,12 @@ def test_save_load_relativizes_all_media_path_columns():
         ds2.set_registry(registry2)
         ds2.load(project)
         loaded = ds2.get_table("frames")["avatar_path"].iloc[0]
-        assert loaded == str(avatar_file), (
-            f"avatar_path should resolve back to original absolute; got {loaded}"
+        # Compare file identity, not string spelling. Since P0.2c, load()
+        # returns the canonical POSIX form (media_architecture.md decision 9),
+        # not str(root / p). The "stored relative" assertion above is the
+        # spec point this test guards.
+        assert Path(loaded).resolve() == Path(avatar_file).resolve(), (
+            f"avatar_path should resolve back to the original file; got {loaded}"
         )
 
 run_test("save/load relativizes all media_path columns", test_save_load_relativizes_all_media_path_columns)

@@ -20,6 +20,14 @@ import json
 import weakref
 import pandas as pd
 
+from media.media_address import (
+    MediaAddressError,
+    absolutise,
+    relativise,
+)
+from media.media_address import parse as parse_address
+from media.media_address import format as format_address
+
 
 # ---------------------------------------------------------------------------
 # Media extensions supported by Gelem
@@ -154,22 +162,92 @@ class ProvenanceLog:
 # Path helpers for save() / load()
 # ---------------------------------------------------------------------------
 
-def _rel_if_inside(p: str, root: Path) -> str:
-    """Return p as a path relative to root if it lives inside; else unchanged.
-    Uses POSIX-style "/" so stored paths are cross-OS portable."""
-    if not p or pd.isna(p):
-        return p
+def _is_blank_cell(cell) -> bool:
+    """True for a cell that carries no address at all: an empty string, a
+    non-string value, or NaN. Such a cell is returned unchanged by both
+    rewrite directions below."""
+    if not isinstance(cell, str):
+        return True
+    if cell == "":
+        return True
+    # A non-empty string is never NaN, but keep the guard explicit and
+    # parallel with the old _rel_if_inside / _abs_against null check.
+    return bool(pd.isna(cell))
+
+
+def _rewrite_media_cell(cell, project_root: Path, *, to_stored: bool, working_dir):
+    """Rewrite the path portion of one media cell. The single place a media
+    cell is parsed during save or load.
+
+    A media cell is an address (docs/media_architecture.md section 3.2), and
+    a bare path is a valid address, so plain-path cells are handled by
+    construction. On save (to_stored=True):
+
+      1. parse the cell into a MediaAddress (parse() normalises the path
+         portion to forward slashes, P0.2c).
+      2. absolutise against `working_dir` -- the current working directory,
+         read once by the caller and passed in. This preserves save()'s
+         historical behaviour of anchoring a relative input to the working
+         directory, which test_save_load_relative_source_path_resolves_correctly
+         locks. It is passed as an argument, never read here, so
+         models/dataset.py stays the only file that touches ambient state --
+         the same reason absolutise() takes its base as an argument.
+      3. relativise against project_root, so a path inside the project
+         folder is stored relative and stays portable (CLAUDE.md's [NOW]
+         rule); a path outside it is left absolute by relativise().
+      4. format back to the canonical stored string.
+
+    On load (to_stored=False) step 1 is the same, then the path is
+    absolutised against project_root and formatted -- no relativise, and
+    `working_dir` is unused (pass None).
+
+    The address fragment (#f=, #t=, #r=, stream selector) is preserved
+    exactly; only the path portion moves.
+
+    Returns (new_cell, was_unparseable). A blank cell (empty, non-string or
+    NaN) is returned unchanged with was_unparseable False. A cell that will
+    not parse is returned VERBATIM with was_unparseable True rather than
+    raising: one bad cell must not make the whole project unsaveable, and an
+    untouched string round-trips exactly. The caller counts the True cases
+    into the provenance entry.
+    """
+    if _is_blank_cell(cell):
+        return cell, False
     try:
-        return Path(p).relative_to(root).as_posix()
-    except ValueError:
-        return p
+        addr = parse_address(cell)
+    except MediaAddressError:
+        return cell, True
+    if to_stored:
+        addr = absolutise(addr, working_dir)
+        addr = relativise(addr, str(project_root))
+    else:
+        addr = absolutise(addr, str(project_root))
+    return format_address(addr), False
 
 
-def _abs_against(p: str, root: Path) -> str:
-    """If p is relative, resolve it against root; if absolute, return as-is."""
-    if not p or pd.isna(p):
-        return p
-    return p if Path(p).is_absolute() else str(root / p)
+def _rewrite_media_column(values, project_root: Path, to_stored: bool):
+    """Apply _rewrite_media_cell to every cell in `values`, once each.
+
+    Returns (new_values, unparseable_count). A cell that will not parse as
+    an address is passed through unchanged and counted -- never raised on,
+    so a single bad cell cannot block save or load. The count is reported in
+    the provenance "save" / "load" entry rather than swallowed silently.
+    """
+    # Read the working directory once per column, not once per cell -- a
+    # 530k-row table must not perform 530k getcwd calls during save().
+    # Only the to_stored (save) direction anchors relative inputs to it.
+    working_dir = str(Path.cwd()) if to_stored else None
+
+    new_values = []
+    unparseable = 0
+    for cell in values:
+        new_cell, was_unparseable = _rewrite_media_cell(
+            cell, project_root, to_stored=to_stored, working_dir=working_dir
+        )
+        new_values.append(new_cell)
+        if was_unparseable:
+            unparseable += 1
+    return new_values, unparseable
 
 
 # ---------------------------------------------------------------------------
@@ -975,6 +1053,10 @@ class Dataset:
                 if ct is not None and ct.tag == "media_path":
                     media_cols.add(col)
 
+        # Count media cells that will not parse as an address, across every
+        # table, so the "save" provenance entry can report them.
+        unparseable_media_cells = 0
+
         for name, df in self._tables.items():
             df_out = df
             cols_to_rewrite = [c for c in df.columns if c in media_cols]
@@ -982,12 +1064,16 @@ class Dataset:
                 # Copy so we only rewrite paths on disk, not in memory.
                 df_out = df_out.copy()
                 for col in cols_to_rewrite:
-                    df_out[col] = df_out[col].apply(
-                        lambda p: p if not p or pd.isna(p)
-                                  else _rel_if_inside(
-                                      str(Path(p).absolute()), project_path
-                                  )
+                    # Each cell: parse -> absolutise against the working
+                    # directory (anchors a relative input, as save() always
+                    # has) -> relativise against the project -> format. See
+                    # _rewrite_media_cell. The address fragment is preserved;
+                    # only the path portion moves.
+                    new_values, bad = _rewrite_media_column(
+                        list(df_out[col]), project_path, to_stored=True
                     )
+                    df_out[col] = new_values
+                    unparseable_media_cells += bad
             df_out.to_parquet(project_path / f"{name}.parquet")
 
         # Store the column -> tag map so load() restores types exactly.
@@ -1005,7 +1091,15 @@ class Dataset:
         (project_path / "provenance.json").write_text(
             json.dumps(self.provenance.to_list(), indent=2)
         )
-        self.provenance.record("save", {"project_path": str(project_path)})
+        # NOTE: provenance.json is written just above, before this record()
+        # call, so this particular "save" entry is not in the file it just
+        # wrote -- a pre-existing known defect (CLAUDE.md, "Data ownership").
+        # The unparseable count is still correct in the in-memory log and in
+        # the next save.
+        self.provenance.record("save", {
+            "project_path": str(project_path),
+            "unparseable_media_cells": unparseable_media_cells,
+        })
 
     def load(self, project_path: Path) -> None:
         """
@@ -1041,13 +1135,19 @@ class Dataset:
         media_cols.add("full_path")  # fallback if no sidecar (saved without registry)
 
         new_tables: dict[str, pd.DataFrame] = {}
+        unparseable_media_cells = 0
         for path in parquet_files:
             df = pd.read_parquet(path)
             for col in df.columns:
                 if col in media_cols:
-                    df[col] = df[col].apply(
-                        lambda p: _abs_against(p, project_path)
+                    # Each cell: parse -> absolutise against the project
+                    # root -> format. See _rewrite_media_cell. The address
+                    # fragment is preserved; only the path portion moves.
+                    new_values, bad = _rewrite_media_column(
+                        list(df[col]), project_path, to_stored=False
                     )
+                    df[col] = new_values
+                    unparseable_media_cells += bad
             new_tables[path.stem] = df
         self._reset_tables(new_tables)
 
@@ -1073,4 +1173,7 @@ class Dataset:
                 # No sidecar — fall back to load_folder's default tagging.
                 self._register_column("full_path", "media_path")
 
-        self.provenance.record("load", {"project_path": str(project_path)})
+        self.provenance.record("load", {
+            "project_path": str(project_path),
+            "unparseable_media_cells": unparseable_media_cells,
+        })

@@ -41,6 +41,8 @@ __all__ = [
     "from_path",
     "parse",
     "format",
+    "absolutise",
+    "relativise",
     "canonical_key",
     "select_frame",
     "frames_in_range",
@@ -218,6 +220,20 @@ def _to_posix(path) -> str:
     return pathlib.PureWindowsPath(path).as_posix()
 
 
+def _normalise_path_portion(path: str) -> str:
+    """Apply decision 9's forward-slash normalisation to a path string,
+    while leaving an empty string empty.
+
+    `pathlib.PureWindowsPath("")` is `.`, which is not what an empty path
+    portion means -- an address like `#f=1` with no path, or a genuinely
+    blank media cell, must stay blank rather than turning into the current
+    directory.
+    """
+    if path == "":
+        return ""
+    return _to_posix(path)
+
+
 def from_path(path) -> MediaAddress:
     """Turn a filesystem path into a bare-path MediaAddress.
 
@@ -225,7 +241,7 @@ def from_path(path) -> MediaAddress:
     to forward slashes (decision 9's canonical form), so drive letters and
     UNC paths survive intact.
     """
-    return MediaAddress(path=_to_posix(path))
+    return MediaAddress(path=_normalise_path_portion(str(path)))
 
 
 # ---------------------------------------------------------------------------
@@ -285,13 +301,18 @@ def parse(address_string: str) -> MediaAddress:
     of one address parse to equal MediaAddress values.
     """
     if "#" not in address_string:
-        return MediaAddress(path=_unescape_path(address_string))
+        # Unescape first (decision 1), then apply decision 9's forward-slash
+        # normalisation to the path portion -- exactly what from_path() does,
+        # so parse(format(a)) == a holds for any address however it was built,
+        # including one whose path was spelled with backslashes.
+        return MediaAddress(path=_normalise_path_portion(_unescape_path(address_string)))
 
     # The first literal '#' is always the fragment delimiter: any '#' that
     # was part of the original path has already been escaped to '%23' by
     # from_path() before this string was ever built (decision 1).
     raw_path, fragment = address_string.split("#", 1)
-    path = _unescape_path(raw_path)
+    # Same unescape-then-normalise the no-fragment branch does.
+    path = _normalise_path_portion(_unescape_path(raw_path))
 
     if fragment == "":
         raise MediaAddressError("an empty fragment ('#' with nothing after it) is an error")
@@ -411,16 +432,26 @@ def format(addr: MediaAddress) -> str:
 
 
 # ---------------------------------------------------------------------------
-# canonical_key() -- the artifact-cache key form (decision 9).
+# absolutise() / relativise() -- swapping the path portion against a base.
+#
+# Both are pure and take their base as an argument: nothing here reads
+# Path.cwd() or the environment. models/dataset.py is where an ambient
+# directory (the working directory, the project root) is read and passed
+# in -- see decision 1's "no code builds an address by joining strings" and
+# the P0.2c work item.
+#
+# Both swap the path portion with dataclasses.replace and never touch the
+# fragment (frame ordinal, time, range, region, stream selector).
 # ---------------------------------------------------------------------------
 
 _DRIVE_LETTER_PATH = re.compile(r"^[A-Za-z]:/")
 
 
 def _is_absolute_posix_style(path: str) -> bool:
-    """True for a posix-style absolute path, a UNC path, or a drive-letter
-    path such as 'C:/Users/x' -- all of which format() may hold, since
-    from_path() only normalises the separator, not the path's OS flavour.
+    """True for a posix-style absolute path, a UNC path (spelled '//server/
+    share/...' after normalisation), or a drive-letter path such as
+    'C:/Users/x'. All three are forms an address path may hold, since
+    normalisation fixes the separator but not the path's OS flavour.
     """
     if path.startswith("/"):
         return True
@@ -429,23 +460,89 @@ def _is_absolute_posix_style(path: str) -> bool:
     return False
 
 
-def _make_absolute(path: str, project_root: str) -> str:
-    if _is_absolute_posix_style(path):
-        return path
-    root = _to_posix(project_root)
-    joined = posixpath.join(root, path)
-    return posixpath.normpath(joined).replace("\\", "/")
+def absolutise(addr: MediaAddress, base: str) -> MediaAddress:
+    """Return `addr` with its path portion made absolute against `base`.
 
+    If the path is already absolute (a POSIX root, a UNC path, or a
+    drive-letter path), `addr` is returned unchanged. Otherwise the path is
+    resolved against `base` and a copy is returned. The path portion is
+    normalised to forward slashes first, defensively, in case the caller
+    built the address by hand rather than through parse() or from_path().
+    """
+    # Defensive normalisation -- parse()/from_path() already do this, but a
+    # hand-built MediaAddress might carry backslashes.
+    posix_path = _normalise_path_portion(addr.path)
+
+    if _is_absolute_posix_style(posix_path):
+        # Already absolute. Only spend a dataclasses.replace if the
+        # normalisation actually changed the spelling.
+        if posix_path == addr.path:
+            return addr
+        return dataclasses.replace(addr, path=posix_path)
+
+    # Relative: join onto the normalised base and collapse any '..'.
+    root = _normalise_path_portion(base)
+    joined = posixpath.join(root, posix_path)
+    resolved = posixpath.normpath(joined).replace("\\", "/")
+    return dataclasses.replace(addr, path=resolved)
+
+
+def relativise(addr: MediaAddress, project_root: str) -> MediaAddress:
+    """Return `addr` with its path portion made relative to `project_root`
+    when it lies inside it; otherwise return `addr` unchanged.
+
+    The containment test is `PureWindowsPath.relative_to`, which raises for
+    anything that is not a subpath -- a sibling directory, a parent, or a
+    different drive letter. That raise IS CLAUDE.md's [NOW] rule "only paths
+    inside the project folder become relative": relative_to decides, this
+    function does not re-implement the check.
+
+    Note: PureWindowsPath comparison is case-insensitive, so a cell spelled
+    'c:/proj/x.mp4' under project root 'C:/proj' relativises, and on the way
+    back through absolutise() comes back carrying the project's case
+    ('C:/proj/x.mp4'). This is intentional -- it makes two spellings of one
+    in-project file converge on a single artifact-cache key. It does not
+    conflict with decision 9's "case is not folded", which is about the key
+    form of paths that stay absolute (paths outside the project, which this
+    function returns unchanged).
+    """
+    posix_path = _normalise_path_portion(addr.path)
+
+    # A path with no root cannot be measured against project_root -- leave
+    # it. (relative_to would treat it as relative to the anchor and could
+    # succeed misleadingly.)
+    if not _is_absolute_posix_style(posix_path):
+        return addr
+
+    try:
+        # PureWindowsPath so drive letters and UNC roots are understood the
+        # same way on every OS this test might run on, and so a different
+        # drive raises here rather than silently joining.
+        relative = pathlib.PureWindowsPath(posix_path).relative_to(
+            pathlib.PureWindowsPath(project_root)
+        )
+    except ValueError:
+        # Not a subpath of project_root -- a sibling, a parent, or a
+        # different drive. The address stays absolute.
+        return addr
+
+    return dataclasses.replace(addr, path=relative.as_posix())
+
+
+# ---------------------------------------------------------------------------
+# canonical_key() -- the artifact-cache key form (decision 9).
+# ---------------------------------------------------------------------------
 
 def canonical_key(addr: MediaAddress, project_root: str) -> str:
     """The artifact-cache key form: like format(), but with the path
     resolved to absolute against project_root. Case is not folded
     (decision 9) -- two spellings differing only in case hash differently,
     deliberately, in exchange for never risking a wrong picture.
+
+    Expressed as format(absolutise(...)) so there is exactly one definition
+    of "make absolute", shared with models/dataset.py's save/load path.
     """
-    absolute_path = _make_absolute(addr.path, project_root)
-    key_addr = dataclasses.replace(addr, path=absolute_path)
-    return format(key_addr)
+    return format(absolutise(addr, project_root))
 
 
 # ---------------------------------------------------------------------------

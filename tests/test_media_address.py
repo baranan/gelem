@@ -34,12 +34,14 @@ from media.media_address import (
     MediaAddressError,
     Region,
     StreamSelector,
+    absolutise,
     canonical_key,
     format,
     frames_in_range,
     from_path,
     parse,
     region_to_pixels,
+    relativise,
     select_frame,
 )
 
@@ -548,3 +550,137 @@ def test_decision12_edit_list_on_video_stream_attempt(tmp_path):
     # Reaching here means has_video_stream_elst is already True -- the
     # skip above is this test's only real check; there is nothing further
     # to assert.
+
+
+# ---------------------------------------------------------------------------
+# P0.2c -- address-aware project paths.
+#
+# parse() now applies decision 9's forward-slash normalisation to the path
+# portion (previously only from_path() did), and two new pure functions,
+# absolutise() and relativise(), swap the path portion of an address
+# against a base without ever touching the fragment.
+#
+# Written from the P0.2c work-item specification, not from the
+# implementation. Each test is designed to fail against a media_address.py
+# that predates P0.2c.
+# ---------------------------------------------------------------------------
+
+# Every grammar form from section 3.2, as keyword arguments to
+# dataclasses.replace() on a bare-path address. Used by the round-trip
+# identity test so no form is left unchecked.
+_GRAMMAR_FORMS = {
+    "bare path": {},
+    "frame ordinal (#f=)": {"frame": 1234},
+    "time point (#t=point)": {"time_us": 1_500_000},
+    "time range (#t=range)": {"time_range_us": (1_000_000, 4_000_000)},
+    "region (#r=)": {"region": Region(x=100_000, y=200_000, w=300_000, h=400_000)},
+    "full form with a stream selector": {
+        "stream": StreamSelector(kind="v", index=1),
+        "frame": 50,
+        "region": Region(x=0, y=0, w=500_000, h=1_000_000),
+    },
+}
+
+
+def test_p02c_parse_normalises_a_backslash_spelled_path_without_a_fragment():
+    # parse() must apply the same _to_posix() normalisation from_path()
+    # applies, so parse(format(a)) == a holds however the address was built.
+    addr = parse(r"C:\videos\p1.mp4")
+    assert addr.path == "C:/videos/p1.mp4"
+
+
+def test_p02c_parse_normalises_a_backslash_spelled_path_with_a_fragment():
+    # The path portion is normalised; the fragment is parsed as before.
+    addr = parse(r"C:\videos\p1.mp4#t=1.500000")
+    assert addr.path == "C:/videos/p1.mp4"
+    assert addr.time_us == 1_500_000
+
+
+def test_p02c_parse_leaves_an_empty_path_empty_rather_than_making_it_dot():
+    # PureWindowsPath("") is ".", which is not what an empty path portion
+    # means -- parse() must guard that case.
+    assert parse("").path == ""
+
+
+def test_p02c_parse_of_a_backslash_absolute_path_round_trips_through_format():
+    original = parse(r"D:\study\clips\trial 3.mov")
+    assert parse(format(original)) == original
+
+
+def test_p02c_absolutise_is_a_noop_on_an_already_absolute_path_all_three_forms():
+    # POSIX root, UNC, and drive-letter are all "already absolute" and must
+    # come back unchanged (same canonical string) whatever base is passed.
+    base = "C:/some/other/place"
+    for already_absolute in ("/mnt/data/p1.mp4", "//server/share/p1.mp4", "E:/media/p1.mp4"):
+        addr = from_path(already_absolute)
+        result = absolutise(addr, base)
+        assert result == addr, f"absolutise changed an already-absolute path: {already_absolute!r}"
+        assert result.path == already_absolute
+
+
+def test_p02c_absolutise_resolves_a_relative_path_against_its_base():
+    addr = dataclasses.replace(from_path("videos/p1.mp4"), time_us=2_000_000)
+    result = absolutise(addr, "C:/projects/study1")
+    assert result.path == "C:/projects/study1/videos/p1.mp4"
+    # The fragment is untouched.
+    assert result.time_us == 2_000_000
+
+
+def test_p02c_relativise_leaves_an_external_path_untouched():
+    # A sibling directory of the project root is not inside it.
+    project_root = "C:/projects/study1"
+    external = from_path("C:/projects/study2/p1.mp4")
+    assert relativise(external, project_root) == external
+
+
+def test_p02c_relativise_leaves_a_different_drive_untouched():
+    # PureWindowsPath.relative_to raises for a different drive letter; that
+    # raise is the [NOW] rule "only paths inside the project folder become
+    # relative", so relativise must hand the address straight back.
+    project_root = "C:/projects/study1"
+    other_drive = from_path("D:/projects/study1/p1.mp4")
+    assert relativise(other_drive, project_root) == other_drive
+
+
+def test_p02c_relativise_of_an_already_relative_path_is_a_noop():
+    addr = from_path("videos/p1.mp4")
+    assert relativise(addr, "C:/projects/study1") == addr
+
+
+def test_p02c_relativise_then_absolutise_is_the_identity_for_every_grammar_form():
+    # An address whose path lies inside the project root: relativising it
+    # and then absolutising against the same root must reproduce it exactly,
+    # fragment and all. MediaAddress equality is canonical-string equality,
+    # so this pins the fragment.
+    project_root = "C:/projects/study1"
+    for form_name, fragment in _GRAMMAR_FORMS.items():
+        inside = dataclasses.replace(
+            from_path("C:/projects/study1/videos/p1.mp4"), **fragment
+        )
+        round_tripped = absolutise(relativise(inside, project_root), project_root)
+        assert round_tripped == inside, f"identity failed for {form_name}"
+
+
+def test_p02c_a_literal_hash_and_percent_survive_relativise_and_absolutise():
+    # The path portion carries a literal '#' and a literal '%'. Neither the
+    # rewriting nor the escaping may corrupt them.
+    project_root = "C:/projects/study1"
+    original = dataclasses.replace(
+        from_path("C:/projects/study1/weird #1/100% done.mp4"),
+        time_us=3_000_000,
+    )
+    round_tripped = absolutise(relativise(original, project_root), project_root)
+    assert round_tripped == original
+    # The stored string escapes '#' and '%'; parsing it recovers the exact
+    # path, literal characters intact.
+    stored = format(relativise(original, project_root))
+    assert "%23" in stored and "%25" in stored
+    assert parse(stored).path == "weird #1/100% done.mp4"
+
+
+def test_p02c_canonical_key_is_format_of_absolutise():
+    # canonical_key() must have exactly one definition of "make absolute" --
+    # absolutise() -- so the two never drift apart.
+    addr = dataclasses.replace(from_path("videos/p1.mp4"), time_us=1_000_000)
+    project_root = "C:/projects/study1"
+    assert canonical_key(addr, project_root) == format(absolutise(addr, project_root))
