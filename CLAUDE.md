@@ -200,6 +200,22 @@ re-verified there.)*
   `test_drain_completes_over_later_ticks`, `test_progress_is_coalesced`,
   `test_no_drain_method_uses_pop_zero`),
   `tests/test_controller_async_contracts.py`.
+- **`[NOW]`** `ArtifactStore` serves thumbnail requests on a **bounded**
+  `WorkerPool` (`artifacts/worker_pool.py`), not a thread per call. Worker
+  count is a keyword-only `ArtifactStore` constructor parameter with a low
+  default (2) -- no longer a module constant, though wiring it to a real
+  setting is still P0.5b-2ii (see the Generality `[TARGET -> P0.5b-2]` rule,
+  which does not flip here). Requests naming the same canonical address are
+  coalesced to one job with many subscribers; `reset()` bumps a generation
+  counter. A job made stale by that bump is **guaranteed** to leave no index
+  entry, no fingerprint-memo entry and to send no notification -- the job
+  encodes into local variables and writes the index and memo in one
+  generation-checked lock hold. What is **not** guaranteed: a stale job that
+  had already encoded its JPEG leaves that file on disk with nothing pointing
+  at it -- reclaiming it is P0.5b-2ii (see the append-only-disk-cache defect).
+  Made true by P0.5b-2i. `docs/media_architecture.md` §4.4 is the authority.
+  Priority ordering and viewport cancellation are P0.5b-3. Tests:
+  `tests/test_request_queue.py`.
 
 ### UI
 
@@ -257,7 +273,8 @@ re-verified there.)*
 - **`[TARGET -> P1.2]`** **Only the media resolver decodes *source* media.** No
   `cv2.VideoCapture`, `av.open`, or `Image.open` **of a user's media file**
   anywhere else. Three places do today: `BaseOperator.load_image`,
-  `column_types/renderers.py`, and `ArtifactStore._generate_thumbnails`.
+  `column_types/renderers.py`, and `ArtifactStore._decode_source` (was
+  `_generate_thumbnails` before P0.5b-2i split the decode out).
 - **`[NOW]`** **Reading and writing Gelem's own derived artifacts is a different
   operation and is not covered by that rule.** `ArtifactStore` reads back the JPEGs
   it wrote, and must keep being able to. A guardrail that bans `Image.open`
@@ -271,7 +288,7 @@ re-verified there.)*
   `[TARGET -> P1.2]` The matching half -- source decoding confined to the
   resolver, so that *nothing else opens an image at all* -- waits on the
   resolver. Until then `column_types/renderers.py` (`_render_image` fallback) and
-  `ArtifactStore._generate_thumbnails` still decode source media directly.
+  `ArtifactStore._decode_source` still decode source media directly.
 - **`[TARGET -> P1.10]`** Native playback is the explicit exception. `QMediaPlayer`
   receives a file path and a time range directly. It shares the address **parser**
   with the resolver but not the decoding path.
@@ -293,8 +310,10 @@ re-verified there.)*
   disk and persists by it; a fingerprint memo keeps the paint-path lookup off
   `stat()`. The memo has three states -- absent (a lookup misses),
   seeded-unverified from `load_index` (served, and the next `request_thumbnail`
-  re-stats it), verified from a fresh `refresh_fingerprint` (served, and a
-  duplicate request short-circuits). See `docs/media_architecture.md` §4.5.
+  re-stats it), verified from a fresh stat this session (served, and a
+  duplicate request short-circuits). *(P0.5b-2i: the fresh stat and the memo
+  write moved into `_run_job`'s generation-checked commit; the standalone
+  `refresh_fingerprint` method is gone.)* See `docs/media_architecture.md` §4.5.
   Tests: `tests/test_artifact_identity.py`
   (`test_second_media_column_gets_its_own_cached_artifact`,
   `test_same_file_two_tables_share_one_cache_entry`,
@@ -330,11 +349,14 @@ re-verified there.)*
   never a constant in the code.** Worker count and cache size are both of this
   kind. Measuring one on Y B's machine tells you the shape of the common case,
   not a value to hardcode. Not true today: `DEFAULT_CACHE_MAX_BYTES` is a
-  hardcoded 500 MB, and there is no worker pool to have a count. `THUMBNAIL_SIZE`
+  hardcoded 500 MB. Worker count became an `ArtifactStore` **constructor
+  parameter** (default 2) in P0.5b-2i -- no longer a module constant, but not
+  yet wired to a user setting or a measurement either; that last step is
+  P0.5b-2ii, and this tag does not flip until then. `THUMBNAIL_SIZE`
   / `PREVIEW_SIZE` / `_PREVIEW_SIZE_THRESHOLD` are the same kind of constant and
   stay module-level for now -- P0.5b-1 makes the resolution enter the artifact
   key **as a value** rather than be assumed by the reader, but turning these
-  into settings is P0.5b-2, with worker count. *(Keyframe interval was the third example here
+  into settings is P0.5b-2ii, with worker count. *(Keyframe interval was the third example here
   until 26 Aug 2026: it was measured per video specifically to decide whether to
   build a whole-video proxy layer, and that proxy is rejected -- see
   `docs/media_architecture.md` §10.)* This rule covers two different things --
@@ -580,15 +602,25 @@ Verified against the code on 4 Aug 2026; re-verified against `main` on 24 Aug
 
 **Non-functional at target scale:**
 
-- `ArtifactStore.request_thumbnail()` spawns one raw `threading.Thread` per call.
+- ~~`ArtifactStore.request_thumbnail()` spawns one raw `threading.Thread` per
+  call.~~ *(Fixed P0.5b-2i: requests run on a bounded `WorkerPool`
+  (`artifacts/worker_pool.py`, default 2 workers, a keyword-only
+  `ArtifactStore` constructor parameter), coalesced by canonical address, and
+  cancelled by a generation counter that `reset()` bumps. Tests:
+  `tests/test_request_queue.py`.)*
 - **The on-disk artifact cache (`%TEMP%\gelem_artifacts`, from `main.py`) is
   append-only.** P0.5b-1's content-addressed filenames (`{key.stable_hash()}.jpg`)
   removed the accidental overwrite bound the old `{row_id}_{artifact_type}.jpg`
   naming provided -- a changed source fingerprint, a `RENDERER_CACHE_VERSION`
-  bump, `reset()`, and `load_index()` discarding an old-format index all leave
-  their JPEGs on disk. The memory cache has a ceiling and LRU eviction; the disk
-  cache has neither. Assign to **P0.5b-2**, with cache size becoming a setting
-  and `main.py`'s TODO about moving the folder inside the project.
+  bump, `reset()`, `load_index()` discarding an old-format index, and (P0.5b-2i)
+  a job cancelled by `reset()` after it had already encoded its JPEG all leave
+  their JPEGs on disk. That last case is routine now: every project switch
+  cancels in-flight thumbnail jobs, and because no index entry ever points at
+  those files, index-driven eviction can never reclaim them -- P0.5b-2ii needs
+  a directory sweep, not just an index pass. The memory cache has a ceiling and
+  LRU eviction; the disk cache has neither. Assign to **P0.5b-2ii**, with cache
+  size becoming a setting and `main.py`'s TODO about moving the folder inside
+  the project.
 
 *(Two bullets removed 27 Aug 2026, P0.2b: "`Dataset.get_row()` calls
 `get_table()` ... 530k full-table copies" and "`Dataset.update_row()` scans the
@@ -605,17 +637,15 @@ project's pictures" are both fixed. Artifacts are now keyed by `ArtifactKey`
 (media address + fingerprint + purpose + resolution + policy + version), so two
 media columns on one row and two projects no longer collide, and `load_project()`
 calls `_store.reset()` before `load_index()`. Tests:
-`tests/test_artifact_identity.py`. `request_thumbnail()` still spawns a raw
-thread per call -- that bullet stays; the bounded pool is P0.5b-2.)*
+`tests/test_artifact_identity.py`. `request_thumbnail()` still spawned a raw
+thread per call after P0.5b-1 -- that bullet was closed by P0.5b-2i, below.)*
 
 **Dead or inconsistent:**
 
-- `operators/thumbnail.py` is dead code. Its docstring says
-  `ArtifactStore.request_thumbnail()` calls it; `_generate_thumbnails()`
-  reimplements the whole thing inline and never touches it. Delete it and make a
-  real operator the reference. *(P0.5b-1: it also now calls `ArtifactStore.put`
-  with the old `(row_id, artifact_type, image)` signature -- harmless while
-  nothing invokes it; P1.11 deletes the file.)*
+- ~~`operators/thumbnail.py` is dead code.~~ *(Deleted P0.5b-2i, together with
+  its `main.py` import + registration and its `operators_config.yaml` entry.
+  `ArtifactStore._run_job` was always the real path. Promoting a genuine
+  reference operator in its place stays with P1.11.)*
 - `operators_config.yaml` claims to control which operators are enabled. `main.py`
   registers them manually and never reads the file. `StatsOperator` is registered
   in code and absent from the YAML.
@@ -646,7 +676,10 @@ claim; it already documents `self._output_dir` and notes `self.output_dir`
 "never existed". The other bullets in this section are still true as written.)*
 
 *(30 Aug 2026, P0.5b-1-followups: the purpose -> resolution and `_POLICIES`
-bullets above are fixed and struck through. The `operators/thumbnail.py` bullet
-was NOT actioned -- `main.py:57,98` still import and register `ThumbnailOperator`,
-so deleting the file needs `main.py` changed too; left for P1.11 as the review
-brief instructed. All other bullets in this section are unchanged and still true.)*
+bullets above are fixed and struck through. All other bullets in this section
+are unchanged and still true.)*
+
+*(30 Aug 2026, P0.5b-2i: the thread-per-request bullet and the
+`operators/thumbnail.py` bullet are both fixed and struck through -- the file
+is deleted and its three registration sites with it. The disk-cache
+append-only bullet is untouched (P0.5b-2ii).)*

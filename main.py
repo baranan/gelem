@@ -54,7 +54,6 @@ def create_app(fake_data: bool = False):
     from artifacts.artifact_store import ArtifactStore
     from column_types.registry import ColumnTypeRegistry
     from operators.operator_registry import OperatorRegistry
-    from operators.thumbnail import ThumbnailOperator
     from operators.blendshapes import BlendshapeOperator
     from operators.blendshape_avatar import BlendshapeAvatarOperator
     from operators.mean_face import MeanFaceOperator
@@ -95,7 +94,6 @@ def create_app(fake_data: bool = False):
 
     registry.setup_defaults(artifact_store)
 
-    operator_registry.register(ThumbnailOperator())
     operator_registry.register(BlendshapeOperator())
     operator_registry.register(BlendshapeAvatarOperator())
     operator_registry.register(MeanFaceOperator())

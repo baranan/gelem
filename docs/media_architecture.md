@@ -202,7 +202,8 @@ route through the resolver:
 1. `BaseOperator.load_image` -- analysis path
 2. `column_types/renderers.py` (`_render_image`, `_video_first_frame_pixmap`) --
    display path
-3. `ArtifactStore._generate_thumbnails` / `_first_frame_as_pil`
+3. `ArtifactStore._decode_source` / `_first_frame_as_pil` (was
+   `_generate_thumbnails` until P0.5b-2i split out the decode)
 
 ### 3.4 Playback is the one explicit exception
 
@@ -590,6 +591,18 @@ handful of simultaneous players is fine; dozens are not.
   a cold-cache variant tests it properly (outstanding, §6.0).
 
 ### 4.4 Replace thread-per-request with a bounded pool
+
+*Partly done, P0.5b-2i (30 Aug 2026).* `ArtifactStore.request_thumbnail` no
+longer spawns a raw thread per call. It runs jobs on a bounded `WorkerPool`
+(`artifacts/worker_pool.py`), coalesces requests by canonical address (one
+decode, many `(table, row)` subscribers), and cancels via a generation counter
+that `reset()` bumps -- a stale job is guaranteed to leave no index entry, no
+fingerprint-memo entry and to send no notification (a JPEG it had already
+encoded can linger on disk with nothing pointing at it -- reclaiming it is
+P0.5b-2ii). Worker count is a keyword-only `ArtifactStore` constructor
+parameter, default 2. **Still outstanding, P0.5b-3:** priority ordering
+(`get_displayed_ranges()` has no caller yet) and viewport cancellation. Tests:
+`tests/test_request_queue.py`.
 
 `ArtifactStore.request_thumbnail` currently spawns a raw `threading.Thread` per
 call. At gallery scale that is thousands of threads. Replace with:
@@ -1003,12 +1016,14 @@ Implement §4.5 and §4.6. Address-based keys, `ArtifactCodec` separated from so
 decoding (§7), bounded worker pool with priority and cancellation, no decoding in a
 paint path, clear the memory cache on project load, cache size becomes a setting.
 This fixes the avatar-tile bug and is the foundation segment thumbnails and
-every tile attach to. **The thumbnail path still carries the project-reload
-identity bug that P0.2b fixed for operator results:** an in-flight
-`_generate_thumbnails` thread writes into the index after `reset()`, and
-`load_folder()` re-mints the same row ids, so an old project's picture can appear
-under a new project's row. §4.5 owns this; the pointer here is so the P0.2b
-"Done" paragraph above is not read as covering it.
+every tile attach to. **The thumbnail path used to carry the project-reload
+identity bug that P0.2b fixed for operator results** -- an in-flight worker
+writing into the index after `reset()` while `load_folder()` re-minted the same
+row ids. *Fixed P0.5b-2i:* `reset()` bumps a generation counter and a job does
+its I/O into locals, committing the index and fingerprint memo in one
+generation-checked lock hold, so a job `reset()` raced past commits nothing.
+Address+fingerprint keying (P0.5b-1) already meant a straggler could not show a
+wrong picture; P0.5b-2i means it also leaves no stale index or memo entry.
 
 ### 6.2 Phase 1 -- media foundation
 
@@ -1093,9 +1108,9 @@ sharing the parser and not the decoder.
 **P1.11 Operator registration and output contract.** Make
 `operators_config.yaml` drive registration or delete it. Register the missing type
 tags (`avatar_path`, `plot_image`) or map them to `media_address`. Settle
-`html_path` versus `plot_html`. Delete the dead `operators/thumbnail.py` and
-promote a real operator as the reference. Fix `self.output_dir` versus
-`self._output_dir` in the docs.
+`html_path` versus `plot_html`. Promote a real operator as the thumbnail-era
+reference (`operators/thumbnail.py` itself was deleted in P0.5b-2i). Fix
+`self.output_dir` versus `self._output_dir` in the docs.
 
 **P1.13 Remaining UI boundary cleanup.** Replace the private-attribute access
 listed in `CLAUDE.md` with the public methods that already exist -- `_op_registry`,

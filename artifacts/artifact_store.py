@@ -19,9 +19,13 @@ tables pointing at one file, behave correctly.
 Fingerprint memo (a design decision for P0.5b-1, not spelled out in 4.5).
 The fingerprint is part of the key, but a cache lookup on the paint path
 must not call `stat()`. So ArtifactStore keeps a memo of
-`canonical address -> (size, mtime)`. A `stat()` only ever happens on the
-request path (`refresh_fingerprint`, from `request_thumbnail`'s worker),
-never in a lookup. An address in the memo is one of three states:
+`canonical address -> (size, mtime)`. Nothing in THIS file stats a source
+on a cache lookup: the source stat happens only on a worker thread, inside
+`_run_job` (via `_stat_fingerprint`). (`AppController._request_thumbnail_
+for_cell` does an `exists()` check on the main thread before it calls
+`request_thumbnail`, which is a separate concern -- this file's lookups
+and short-circuit touch the filesystem for nothing.) An address in the
+memo is one of three states:
 
   * **absent** -- a lookup misses. Nothing is served.
   * **seeded-unverified** -- put there by `load_index` from the persisted
@@ -31,9 +35,9 @@ never in a lookup. An address in the memo is one of three states:
     source changed since the save; the next `request_thumbnail` for that
     address re-stats, gets a different fingerprint, and regenerates. For
     display (not analysis) that trade is deliberate.
-  * **verified** -- put there by a fresh `refresh_fingerprint` this
+  * **verified** -- written by `_run_job`'s commit after a fresh stat this
     session. A lookup is served, and a duplicate `request_thumbnail`
-    short-circuits without spawning a worker.
+    short-circuits synchronously without queuing a worker.
 
 `load_index`'s docstring is the authority on the seeded-unverified case.
 
@@ -41,8 +45,20 @@ Reading and writing the JPEGs themselves goes through `ArtifactCodec`,
 which is the boundary `CLAUDE.md`'s media rules name: derived artifacts
 are encoded and read back only by the codec. The matching half -- source
 media decoded only by the resolver, so nothing else opens an image at all
--- waits on P1.2; until then `_generate_thumbnails` still decodes source
-media here.
+-- waits on P1.2; until then `_decode_source` still decodes source media
+here.
+
+Request queue (P0.5b-2i, docs/media_architecture.md section 4.4). A
+request is served off a bounded `WorkerPool` rather than a raw thread per
+call. Requests naming the same canonical address before the first
+finishes are coalesced -- one decode, every waiting (table, row) a
+subscriber. `reset()` bumps a generation counter; a job whose captured
+generation is stale commits nothing -- no index entry, no fingerprint-memo
+entry, no notification (a JPEG already encoded to disk can linger, with
+nothing pointing at it -- P0.5b-2ii). Priority and viewport cancellation
+are P0.5b-3 and have
+no producer in the repo yet. Disk-cache eviction and the memory LRU
+ceiling are P0.5b-2ii.
 
 This file is written centrally (not by a student).
 """
@@ -57,6 +73,7 @@ import numpy as np
 from PIL import Image
 
 from artifacts.artifact_codec import ArtifactCodec, ArtifactCodecError
+from artifacts.worker_pool import WorkerPool
 from media.artifact_key import ArtifactKey, SourceFingerprint
 
 # Import the extension sets from dataset so they stay in sync.
@@ -96,7 +113,7 @@ class ArtifactStore:
     thumbnails are generated from the first frame.
     """
 
-    def __init__(self, artifacts_dir: Path):
+    def __init__(self, artifacts_dir: Path, *, worker_count: int = 2):
         self._dir = artifacts_dir
         self._dir.mkdir(parents=True, exist_ok=True)
         self._codec = ArtifactCodec(self._dir)
@@ -106,18 +123,42 @@ class ArtifactStore:
         self._index: dict[ArtifactKey, Path] = {}
         self._fingerprints: dict[str, SourceFingerprint] = {}
         # Addresses whose memo fingerprint came from a fresh stat this
-        # session (refresh_fingerprint), as opposed to being seeded from a
-        # persisted index by load_index (which may be stale). A request
-        # for an unverified address always spawns a worker so the source
-        # is re-stat-ed, rather than short-circuiting on a maybe-stale
-        # fingerprint.
+        # session (written by _run_job's commit), as opposed to being
+        # seeded from a persisted index by load_index (which may be
+        # stale). A request for an unverified address always queues a
+        # worker so the source is re-stat-ed, rather than short-circuiting
+        # on a maybe-stale fingerprint.
         self._verified: set[str] = set()
         self._lock = threading.Lock()
 
+        # Bounded worker pool that runs thumbnail/preview generation off
+        # the main thread, replacing the old raw thread-per-request. The
+        # worker count is a constructor parameter with a low default, not
+        # a module constant -- it is machine dependent (CLAUDE.md's
+        # no-machine-dependent-constant rule, [TARGET -> P0.5b-2]). Same
+        # precedent as AppController's drain_budget. Keyword-only so the
+        # positional ArtifactStore(dir) construction in main.py and the
+        # tests keeps working unchanged.
+        self._pool = WorkerPool(worker_count=worker_count)
+
+        # Request coalescing and cancellation state, all guarded by
+        # _lock.
+        #   _inflight maps (generation, canonical address) to the list of
+        #     (table_name, row_id) subscribers waiting on that job. One
+        #     job runs per key; a later request for the same address
+        #     joins the list instead of starting a second job, and every
+        #     subscriber on the list is notified when the job finishes.
+        #   _generation is bumped by reset(). A job captures it in its
+        #     key when enqueued; a job whose captured generation is no
+        #     longer current is dropped -- no JPEG, no index entry, no
+        #     notification.
+        self._inflight: dict[tuple[int, str], list[tuple[str, str]]] = {}
+        self._generation: int = 0
+
         # The in-memory LRU is populated only by get_pixmap(), on the main
-        # thread, so it needs no lock. put() (worker thread) writes the
-        # index and disk only; the first paint after generation reads the
-        # JPEG back through the codec and fills this cache.
+        # thread, so it needs no lock. A worker (_run_job) writes the JPEG
+        # to disk and the index only; the first paint after generation
+        # reads the JPEG back through the codec and fills this cache.
         self._cache: OrderedDict[ArtifactKey, Image.Image] = OrderedDict()
         self._cache_bytes: int = 0
         self._cache_max_bytes: int = DEFAULT_CACHE_MAX_BYTES
@@ -185,25 +226,21 @@ class ArtifactStore:
     # Fingerprint memo
     # ------------------------------------------------------------------
 
-    def refresh_fingerprint(
-        self,
-        canonical_address: str,
-        source_path: Path,
-    ) -> SourceFingerprint | None:
-        """Stat the source file and record its fingerprint in the memo.
+    @staticmethod
+    def _stat_fingerprint(source_path: Path) -> SourceFingerprint | None:
+        """Stat the source file and return its fingerprint, or None if it
+        cannot be stat-ed.
 
-        Called from the request path (request_thumbnail and its worker),
-        never from a lookup. Returns None if the file cannot be stat-ed.
+        Pure -- touches no store state. `_run_job` stats through this and
+        then writes the memo (`_fingerprints` + `_verified`) inside its
+        one generation-checked commit, so a job from a torn-down project
+        that reset() raced past writes nothing to the next project's memo.
         """
         try:
             stat = Path(source_path).stat()
         except OSError:
             return None
-        fingerprint = SourceFingerprint(size=stat.st_size, mtime_ns=stat.st_mtime_ns)
-        with self._lock:
-            self._fingerprints[canonical_address] = fingerprint
-            self._verified.add(canonical_address)
-        return fingerprint
+        return SourceFingerprint(size=stat.st_size, mtime_ns=stat.st_mtime_ns)
 
     # ------------------------------------------------------------------
     # Public API
@@ -235,22 +272,12 @@ class ArtifactStore:
         with self._lock:
             return self._index.get(key, None)
 
-    def put(self, key: ArtifactKey, image: np.ndarray) -> Path:
-        """
-        Stores an artifact and updates the index.
-
-        Args:
-            key:   The full ArtifactKey identifying the picture.
-            image: An RGB uint8 numpy array.
-
-        Returns:
-            The Path where the artifact was saved.
-        """
-        dest = self._dir / f"{key.stable_hash()}.jpg"
-        self._codec.write_jpeg(dest, image)
-        with self._lock:
-            self._index[key] = dest
-        return dest
+    # There is no public `put()`. The only writer is `_run_job`, which
+    # encodes JPEGs into local variables and then writes `_index` inside
+    # one generation-checked lock hold, so a job reset() raced past
+    # indexes nothing. A future writer (P1.7a's segment-thumbnail batch
+    # job) adds what it needs against that same generation gate rather
+    # than through an unguarded helper.
 
     def get_pixmap(
         self,
@@ -302,8 +329,8 @@ class ArtifactStore:
         table_name: str,
     ) -> None:
         """
-        Queues thumbnail and preview generation for a picture in a
-        background thread. Handles both image and video source files.
+        Queues thumbnail and preview generation for a picture on the
+        bounded worker pool. Handles both image and video source files.
 
         Args:
             row_id:      The row whose tile is waiting -- echoed back
@@ -317,38 +344,62 @@ class ArtifactStore:
             table_name:  Table the row belongs to. Echoed back so the
                          controller can tag the ready notification.
 
-        Short-circuit: if the address already has both a thumbnail and a
-        preview in the index (checked against the memo), nothing is
-        queued. It does NOT detect that a worker for the same key is
-        already running, so two rapid requests still spawn two threads --
-        request coalescing is P0.5b-2.
+        Delivery contract (P0.5b-2i -- recorded here because it is
+        written down nowhere else):
 
-        The one-thread-per-request model is unchanged -- a bounded worker
-        pool is P0.5b-2.
+          * Every accepted request delivers one
+            on_thumbnail_ready(table_name, row_id) callback with ITS OWN
+            (table_name, row_id) -- never a different subscriber's.
+          * When several requests name the same canonical address before
+            the first has finished, ONE job runs and decodes once; every
+            waiting request is a subscriber to that job and gets its own
+            callback. A request that joins an in-flight job is a
+            subscriber, not a discarded request. (Two requests for the
+            same (table_name, row_id) therefore deliver two callbacks --
+            one per accepted request; the callback is idempotent so the
+            caller need not care.)
+          * Two cases deliver no callback, matching the pre-queue
+            behaviour: the source cannot be decoded, or reset() has
+            bumped the store generation since the request was accepted
+            (the row's project is being torn down).
+
+        Short-circuit: if the address already has both a thumbnail and a
+        preview in the index under a fingerprint that was stat-ed THIS
+        session ("verified"), the subscriber is notified synchronously on
+        the caller's thread and no job is queued. This path performs no
+        stat() -- the caller is the main thread. An UNVERIFIED
+        (load_index-seeded) fingerprint always falls through to a worker,
+        which re-stats the source and regenerates if it changed since the
+        project was saved.
         """
+        address = str(address)
+
         with self._lock:
+            generation = self._generation
             fingerprint = self._fingerprints.get(address)
             verified = address in self._verified
         if verified and fingerprint is not None and self._both_present(
             address, fingerprint
         ):
-            # The picture is already cached under a freshly-stat-ed
-            # fingerprint (an earlier row this session referenced the same
-            # file). Still tell the subscriber -- the async path does the
-            # same via _notify_ready, and once the renderer's direct
-            # fallback goes away (P0.5b-3) this is the only signal the tile
-            # gets to repaint. An UNVERIFIED (load-seeded) fingerprint
-            # falls through to the worker, which re-stats and regenerates
-            # if the source changed since the project was saved.
             self._notify_ready(table_name, row_id)
             return
 
-        thread = threading.Thread(
-            target=self._generate_thumbnails,
-            args=(row_id, address, Path(source_path), table_name),
-            daemon=True,
-        )
-        thread.start()
+        job_key = (generation, address)
+        with self._lock:
+            if generation != self._generation:
+                # reset() ran while we were checking the short-circuit;
+                # the row belongs to a project being torn down. Drop it.
+                return
+            waiting = self._inflight.get(job_key)
+            if waiting is not None:
+                # A job for this address is already queued or running.
+                # Join it as a subscriber rather than starting a second
+                # job -- this is the coalescing.
+                waiting.append((table_name, row_id))
+                return
+            self._inflight[job_key] = [(table_name, row_id)]
+
+        self._pool.submit(lambda: self._run_job(job_key, Path(source_path)))
 
     def _both_present(self, address: str, fingerprint: SourceFingerprint) -> bool:
         thumb_key = self._key(
@@ -458,27 +509,36 @@ class ArtifactStore:
             self._verified = set()
 
     def reset(self) -> None:
-        """Clears the index, the memory cache and the fingerprint memo.
+        """Clears the index, the memory cache, the fingerprint memo and
+        the in-flight subscriber map, and bumps the worker generation.
 
         load_project() must call this BEFORE load_index(): otherwise a new
         project's index lands on top of the previous project's live image
         cache and fingerprint memo, and an old picture can appear under a
         new row (docs/media_architecture.md section 4.5).
 
-        It does NOT cancel in-flight _generate_thumbnails workers from the
-        previous project -- there is no cancellation in the thread-per-
-        request model (that is P0.5b-2). A straggler can still write its
-        key into the fresh index. Address+fingerprint keying makes that
-        harmless for display: the new project looks up its own addresses
-        and never matches the straggler's key, so no wrong picture is
-        shown. The stale entry is only dead weight (it can get written to
-        the new project's saved index and reloaded, but its address is
-        never requested there).
+        Cancellation (P0.5b-2i). Bumping the generation drops every job
+        still queued or running for the previous project. Each job does
+        all its I/O into local variables and commits the memo and index
+        entries in one lock hold that re-checks the generation first, so
+        a job this call races past commits nothing -- no index entry, no
+        fingerprint-memo entry, no notification. A JPEG it had already
+        encoded to disk can linger (the append-only disk cache is
+        P0.5b-2ii); no index entry points at it.
         """
         with self._lock:
+            self._generation += 1
             self._index.clear()
             self._fingerprints.clear()
             self._verified.clear()
+            self._inflight.clear()
+            # Drop jobs still sitting in the pool queue. Inside the lock so
+            # no request_thumbnail can slip a current-generation job onto
+            # the queue between the bump and this clear and have it wiped
+            # (that would leak its _inflight entry). The generation bump
+            # already makes queued jobs no-ops; this just saves the
+            # workers pulling each stale closure off the queue first.
+            self._pool.clear_pending()
         self._cache.clear()
         self._cache_bytes = 0
 
@@ -486,67 +546,151 @@ class ArtifactStore:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _generate_thumbnails(
-        self,
-        row_id: str,
-        address: str,
-        source_path: Path,
-        table_name: str,
-    ) -> None:
+    def _run_job(self, job_key: tuple[int, str], source_path: Path) -> None:
         """
-        Runs in a background thread. Generates thumbnail and preview
-        images from the source file (image or video) and stores them
-        under their ArtifactKeys. Calls on_thumbnail_ready(table_name,
-        row_id) when done.
+        Runs on a worker thread. Generates the thumbnail and preview for
+        one canonical address and then notifies every subscriber that
+        joined this job.
 
-        For image files: loads via PIL.
-        For video files: extracts the first frame via OpenCV.
+        Generation gate. `job_key` is `(generation, address)`; the
+        generation was the store's when the job was enqueued. reset()
+        bumps that counter, so a job whose generation is no longer
+        current is cancelled: it adds no index entry, no fingerprint-memo
+        entry and sends no notification.
 
-        (Both are source-media decodes that P1.2 will route through the
-        resolver. This diff leaves them as they were.)
+        The gate matters because the job mutates shared store state
+        (`_index`, `_fingerprints`, `_verified`, `_inflight`), and reset()
+        clears all of it for the next project. So the job does its stat,
+        decode and resize without touching that state, encodes the two
+        JPEGs to disk, and only then -- in ONE lock hold that first
+        re-checks the generation -- writes the memo and index entries and
+        takes the subscriber list. A job that reset() raced past is
+        guaranteed to add no index entry, no memo entry and to notify
+        nobody. It is NOT guaranteed to leave the filesystem untouched:
+        a JPEG it encoded before the losing commit stays on disk with no
+        index entry pointing at it -- reclaiming that is P0.5b-2ii.
+
+        For image files the source is loaded via PIL; for video files the
+        first frame is extracted via OpenCV. Both are source-media
+        decodes that P1.2 will route through the resolver -- this diff
+        leaves them where they were, behind `_decode_source`.
         """
+        generation, address = job_key
+
+        # Cancelled before we even started (job picked up after reset()).
+        if self._is_stale(generation):
+            self._discard_subscribers(job_key)
+            return
+
         try:
-            if not source_path.exists():
-                return
-
-            fingerprint = self.refresh_fingerprint(address, source_path)
+            # One stat: _stat_fingerprint returns None for a missing or
+            # unreadable source, which is the same "nothing to do" case as
+            # a file that vanished.
+            fingerprint = self._stat_fingerprint(source_path)
             if fingerprint is None:
+                self._discard_subscribers(job_key)
                 return
 
-            # A concurrent request may already have produced both.
-            if self._both_present(address, fingerprint):
-                self._notify_ready(table_name, row_id)
-                return
+            thumb_key = self._key(
+                address, fingerprint, "thumbnail", THUMBNAIL_RESOLUTION
+            )
+            preview_key = self._key(
+                address, fingerprint, "preview", PREVIEW_RESOLUTION
+            )
 
-            suffix = source_path.suffix.lower()
-            if suffix in VIDEO_EXTENSIONS:
-                img = self._first_frame_as_pil(source_path)
-                if img is None:
+            # A concurrent job for the same address (same generation) may
+            # already have produced both pictures; if so, generate
+            # nothing and just notify from the commit below.
+            with self._lock:
+                already_have_both = (
+                    thumb_key in self._index and preview_key in self._index
+                )
+
+            pending_index: dict[ArtifactKey, Path] = {}
+            if not already_have_both:
+                image = self._decode_source(source_path)
+                if image is None:
+                    self._discard_subscribers(job_key)
                     return
-            else:
-                img = Image.open(source_path).convert("RGB")
 
-            thumb = img.copy()
-            thumb.thumbnail(THUMBNAIL_SIZE, Image.LANCZOS)
-            self.put(
-                self._key(address, fingerprint, "thumbnail", THUMBNAIL_RESOLUTION),
-                np.array(thumb, dtype=np.uint8),
-            )
+                # Courtesy check: skip the encode work if reset() has
+                # already happened. The commit below is the check that
+                # actually guarantees correctness.
+                if self._is_stale(generation):
+                    self._discard_subscribers(job_key)
+                    return
 
-            preview = img.copy()
-            preview.thumbnail(PREVIEW_SIZE, Image.LANCZOS)
-            self.put(
-                self._key(address, fingerprint, "preview", PREVIEW_RESOLUTION),
-                np.array(preview, dtype=np.uint8),
-            )
+                thumb = image.copy()
+                thumb.thumbnail(THUMBNAIL_SIZE, Image.LANCZOS)
+                thumb_dest = self._dir / f"{thumb_key.stable_hash()}.jpg"
+                self._codec.write_jpeg(thumb_dest, np.array(thumb, dtype=np.uint8))
+                pending_index[thumb_key] = thumb_dest
+
+                preview = image.copy()
+                preview.thumbnail(PREVIEW_SIZE, Image.LANCZOS)
+                preview_dest = self._dir / f"{preview_key.stable_hash()}.jpg"
+                self._codec.write_jpeg(
+                    preview_dest, np.array(preview, dtype=np.uint8)
+                )
+                pending_index[preview_key] = preview_dest
 
         except Exception as e:
             print(f"[ArtifactStore] Failed to generate thumbnails "
                   f"for {address}: {e}")
+            self._discard_subscribers(job_key)
             return
 
+        # Atomic commit: re-check the generation and, only if still
+        # current, write the memo and index entries and take the
+        # subscriber list -- all under one lock, so reset() cannot land
+        # between the check and the writes.
+        with self._lock:
+            if generation != self._generation:
+                self._inflight.pop(job_key, None)
+                return
+            self._fingerprints[address] = fingerprint
+            self._verified.add(address)
+            self._index.update(pending_index)
+            subscribers = self._inflight.pop(job_key, [])
+
         print(f"[ArtifactStore] Thumbnail ready for {address}")
-        self._notify_ready(table_name, row_id)
+        for table_name, row_id in subscribers:
+            # reset() may land mid-loop: stop notifying rows of a project
+            # that is being torn down. (The residual gap between this
+            # check and the callback is nanoseconds, and a spurious
+            # repaint is harmless -- the tile looks up its own current
+            # key -- but a dropped job should still send nothing.)
+            if self._is_stale(generation):
+                return
+            self._notify_ready(table_name, row_id)
+
+    def _decode_source(self, source_path: Path) -> Image.Image | None:
+        """Decode the source media file to one RGB PIL image -- the first
+        frame for a video, the whole image otherwise. Returns None if it
+        cannot be read.
+
+        The single source-media decode in this file. P1.2 routes it
+        through the resolver; until then it is a direct decode, exactly
+        as before the worker pool. It is its own method so a test can
+        hold a worker inside it while it exercises coalescing and
+        cancellation.
+        """
+        suffix = source_path.suffix.lower()
+        if suffix in VIDEO_EXTENSIONS:
+            return self._first_frame_as_pil(source_path)
+        return Image.open(source_path).convert("RGB")
+
+    def _is_stale(self, generation: int) -> bool:
+        """True if reset() has bumped the generation since `generation`
+        was captured -- the job must stop without writing or notifying."""
+        with self._lock:
+            return generation != self._generation
+
+    def _discard_subscribers(self, job_key: tuple[int, str]) -> None:
+        """Drop a job's subscriber list without notifying -- used when
+        the job is cancelled, fails, or finds the source missing."""
+        with self._lock:
+            self._inflight.pop(job_key, None)
 
     def _notify_ready(self, table_name: str, row_id: str) -> None:
         if self.on_thumbnail_ready is not None:

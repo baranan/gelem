@@ -6,10 +6,6 @@
 # corresponding .py file in the operators/ folder.
 
 operators:
-  thumbnail:
-    enabled: true
-    description: "Generates gallery thumbnails and previews."
-
   blendshapes:
     enabled: true
     description: "Extracts blendshape values from face images using mediapipe."

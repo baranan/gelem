@@ -10,10 +10,10 @@ one or more execution methods. The menu is built from the description.
 yet true and must be by the named item, `[MIGRATING]` has listed exceptions.
 
 `[TARGET -> P1.11]` **There is currently no good reference operator.**
-`operators/thumbnail.py` is described as one but is dead code -- its docstring
-claims `ArtifactStore.request_thumbnail()` calls it, and
-`ArtifactStore._generate_thumbnails()` reimplements the whole thing inline and
-never does. It will be deleted and a real operator promoted in its place.
+`operators/thumbnail.py` used to be described as one but was dead code -- it
+was deleted in P0.5b-2i (`ArtifactStore` generates thumbnails inline in
+`_run_job`, off a bounded worker pool). P1.11 still owes a real operator
+promoted in its place.
 
 ---
 

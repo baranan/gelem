@@ -376,7 +376,7 @@ def test_persisted_fingerprint_is_re_stated_on_next_request(tmp_path):
 #     (so __eq__ / __hash__ separate two policies) AND the stable_hash()
 #     parts tuple (so the on-disk filename separates them too). If it were
 #     dropped from stable_hash() alone, two policies would be two distinct
-#     index entries mapping to ONE filename on disk, and whichever put()
+#     index entries mapping to ONE filename on disk, and whichever write
 #     ran second would silently overwrite the other policy's picture.
 # ===========================================================================
 def test_policy_is_part_of_the_stable_hash(tmp_path):
