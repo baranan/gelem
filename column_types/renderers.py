@@ -8,11 +8,15 @@ Each render function has the signature:
         -> QPixmap | QWidget | None
 
 In 'thumbnail' mode (used by gallery tiles), the function returns a
-QPixmap scaled to fit within size x size pixels.
+QPixmap scaled to fit within size x size pixels. For media columns this
+mode is demand-driven (P0.5b-3i): it returns the cached picture on a hit
+and a grey placeholder on a miss, and NEVER opens or decodes a source
+file. The generation request is queued by the controller, not here.
 
 In 'detail' mode (used by DetailWidget), the function returns a QWidget
 suitable for full-size display — a ZoomableImageView for images, a
-QVideoWidget+QMediaPlayer for videos, a QLabel for text values.
+QVideoWidget+QMediaPlayer for videos, a QLabel for text values. Detail
+mode is the deliberate exception that still opens the source.
 
 Student A is responsible for this file. For each new operator that
 produces a new kind of output, Student A adds a render function here.
@@ -74,10 +78,13 @@ def make_media_path_renderer(artifact_store):
     on file extension. It supports two display modes:
 
         'thumbnail': Returns a QPixmap scaled to fit within size x size.
-                     For images: loads via PIL (using ArtifactStore cache).
-                     For videos: extracts first frame via OpenCV.
+                     Cache hit -> the cached picture; cache miss -> a grey
+                     placeholder, with the generation request queued by
+                     the controller. No source file is opened here, for
+                     images or videos (P0.5b-3i).
 
-        'detail':    Returns a QWidget for full-size display.
+        'detail':    Returns a QWidget for full-size display, opening the
+                     source directly.
                      For images: returns a ZoomableImageView.
                      For videos: returns a QVideoWidget with QMediaPlayer.
 
@@ -104,27 +111,35 @@ def make_media_path_renderer(artifact_store):
             # render_column_value() resolves the media cell once and drops
             # the canonical address and an absolute source path into the
             # context, so this renderer needs no project root and does no
-            # address parsing of its own. A direct caller that skipped
-            # that step falls back to treating the raw value as a path.
+            # address parsing of its own. In detail mode a direct caller
+            # that skipped that step falls back to treating the raw value
+            # as a path.
             ctx = context or {}
 
-            # Thumbnail-mode cache fast path: on a hit this returns a
-            # picture without touching the filesystem at all -- no exists()
-            # below, no decode. Only a miss falls through to the source.
+            # Thumbnail mode is demand-driven (P0.5b-3i): it is
+            # cache-or-placeholder and NEVER stats, opens or decodes a
+            # source file -- not for an image tile and not for a video
+            # tile. On a hit the cache lookup touches no filesystem; on a
+            # miss we return a placeholder immediately and the controller
+            # (render_column_value) queues the generation request. The
+            # ready notification repaints the tile, which then hits.
             if mode == "thumbnail":
                 cached = _cached_thumbnail(ctx, size, artifact_store)
                 if cached is not None:
                     return cached
+                return _placeholder_pixmap(size)
 
+            # Detail mode is the deliberate exception -- it opens the
+            # source directly for a full-size view.
             source_path = ctx.get("source_path") or str(value)
             path = Path(source_path)
             if not path.exists():
                 return None
 
             if _is_image(path):
-                return _render_image(path, size, mode, artifact_store, ctx)
+                return _render_image(path)
             elif _is_video(path):
-                return _render_video(path, size, mode)
+                return _render_video(path)
             else:
                 # Unknown extension — return None so placeholder shows.
                 print(f"[Renderer] Unsupported media extension: {path.suffix}")
@@ -138,6 +153,27 @@ def make_media_path_renderer(artifact_store):
 
 
 _PREVIEW_SIZE_THRESHOLD = 200  # pixels — tiles larger than this use 'preview'
+
+
+def _placeholder_pixmap(size: int):
+    """A neutral grey QPixmap shown in a tile while its real picture is
+    still being generated (P0.5b-3i).
+
+    The renderer never decodes a source on the paint path, so a cache
+    miss returns this immediately. It is paintable, not None, so the
+    tile shows a stable grey slot rather than a blank canvas and the
+    caller never has to special-case a missing return.
+    """
+    try:
+        from PySide6.QtGui import QPixmap, QColor
+
+        pixmap = QPixmap(size, size)
+        pixmap.fill(QColor(210, 210, 210))
+        return pixmap
+
+    except Exception as e:
+        print(f"[Renderer] placeholder pixmap error: {e}")
+        return None
 
 
 def _cached_thumbnail(context: dict | None, size: int, artifact_store):
@@ -168,161 +204,82 @@ def _cached_thumbnail(context: dict | None, size: int, artifact_store):
     return _pil_to_pixmap(img)
 
 
-def _render_image(
-    path: Path,
-    size: int,
-    mode: str,
-    artifact_store,
-    context: dict | None = None,
-):
+def _render_image(path: Path):
     """
-    Renders an image file.
+    Renders an image file for detail mode: a ZoomableImageView widget
+    with the full-resolution image loaded through Qt's QPixmap.
 
-    In thumbnail mode: checks ArtifactStore cache first for speed,
-    falls back to loading directly if not cached. The artifact type
-    is chosen by size: tiles <= 200px use 'thumbnail', larger use
-    'preview'. Requires context={'canonical_address': ...} to hit the
-    cache (render_column_value() puts it there).
-
-    In detail mode: returns a ZoomableImageView widget with the
-    full-resolution image loaded.
+    Thumbnail mode never reaches here -- render() serves it
+    cache-or-placeholder and never decodes a source (P0.5b-3i). This is
+    not a source decode by PIL or cv2; it is Qt loading a file for a
+    full-size view, the same as detail mode has always done.
 
     Args:
-        path:           Path to the image file.
-        size:           Target size in pixels (thumbnail mode only).
-        mode:           'thumbnail' or 'detail'.
-        artifact_store: ArtifactStore for thumbnail caching.
-        context:        Optional dict with row-level metadata.
+        path: Path to the image file.
 
     Returns:
-        QPixmap (thumbnail mode) or ZoomableImageView (detail mode).
+        A ZoomableImageView widget.
     """
-    if mode == "detail":
-        from PySide6.QtGui import QPixmap
-        from shared_widgets.zoomable_image_view import ZoomableImageView
+    from PySide6.QtGui import QPixmap
+    from shared_widgets.zoomable_image_view import ZoomableImageView
 
-        widget = ZoomableImageView()
-        pixmap = QPixmap(str(path))
-        if not pixmap.isNull():
-            widget.show_pixmap(pixmap)
-        return widget
-
-    else:
-        # Thumbnail mode: try the ArtifactStore cache, keyed by the
-        # picture's canonical media address (P0.5b-1). The cache lookup
-        # touches no filesystem on a hit. `render()` already tried this
-        # before calling here; the call is repeated so _render_image is
-        # still correct if invoked directly.
-        cached = _cached_thumbnail(context, size, artifact_store)
-        if cached is not None:
-            return cached
-
-        # Cache miss or no address — load directly from disk. Removing
-        # this fallback is P0.5b-3 (docs/media_architecture.md 4.6 item 3).
-        with Image.open(path) as img:
-            img = img.convert("RGB")
-            img.thumbnail((size, size), Image.LANCZOS)
-            return _pil_to_pixmap(img)
+    widget = ZoomableImageView()
+    pixmap = QPixmap(str(path))
+    if not pixmap.isNull():
+        widget.show_pixmap(pixmap)
+    return widget
 
 
-def _render_video(path: Path, size: int, mode: str):
+def _render_video(path: Path):
     """
-    Renders a video file.
+    Renders a video file for detail mode: a QWidget containing a
+    QMediaPlayer and QVideoWidget so the researcher can play the video.
 
-    In thumbnail mode: extracts the first frame using OpenCV and
-    returns it as a QPixmap.
-
-    In detail mode: returns a QWidget containing a QMediaPlayer
-    and QVideoWidget so the researcher can play the video.
+    Thumbnail mode never reaches here -- render() serves it
+    cache-or-placeholder and never runs cv2 (P0.5b-3i). The first-frame
+    extraction that used to live here is now only in
+    ArtifactStore._run_job, off the main thread.
 
     Args:
         path: Path to the video file.
-        size: Target size in pixels (thumbnail mode only).
-        mode: 'thumbnail' or 'detail'.
 
     Returns:
-        QPixmap (thumbnail mode) or QWidget with video player (detail mode).
+        A QWidget with a video player.
     """
-    if mode == "detail":
-        # Return a video player widget.
-        from PySide6.QtWidgets import QWidget, QVBoxLayout, QPushButton, QHBoxLayout
-        from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
-        from PySide6.QtMultimediaWidgets import QVideoWidget
-        from PySide6.QtCore import QUrl
+    from PySide6.QtWidgets import QWidget, QVBoxLayout, QPushButton, QHBoxLayout
+    from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+    from PySide6.QtMultimediaWidgets import QVideoWidget
+    from PySide6.QtCore import QUrl
 
-        container = QWidget()
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(0, 0, 0, 0)
+    container = QWidget()
+    layout = QVBoxLayout(container)
+    layout.setContentsMargins(0, 0, 0, 0)
 
-        # Video display widget.
-        video_widget = QVideoWidget()
-        layout.addWidget(video_widget)
+    # Video display widget.
+    video_widget = QVideoWidget()
+    layout.addWidget(video_widget)
 
-        # Playback controls.
-        controls = QHBoxLayout()
-        play_btn = QPushButton("▶ Play")
-        pause_btn = QPushButton("⏸ Pause")
-        controls.addWidget(play_btn)
-        controls.addWidget(pause_btn)
-        controls.addStretch()
-        layout.addLayout(controls)
+    # Playback controls.
+    controls = QHBoxLayout()
+    play_btn = QPushButton("▶ Play")
+    pause_btn = QPushButton("⏸ Pause")
+    controls.addWidget(play_btn)
+    controls.addWidget(pause_btn)
+    controls.addStretch()
+    layout.addLayout(controls)
 
-        # Wire up the media player.
-        # QAudioOutput is required in Qt6 to route audio.
-        player = QMediaPlayer(container)
-        audio  = QAudioOutput(container)
-        player.setAudioOutput(audio)
-        player.setVideoOutput(video_widget)
-        player.setSource(QUrl.fromLocalFile(str(path)))
+    # Wire up the media player.
+    # QAudioOutput is required in Qt6 to route audio.
+    player = QMediaPlayer(container)
+    audio  = QAudioOutput(container)
+    player.setAudioOutput(audio)
+    player.setVideoOutput(video_widget)
+    player.setSource(QUrl.fromLocalFile(str(path)))
 
-        play_btn.clicked.connect(player.play)
-        pause_btn.clicked.connect(player.pause)
+    play_btn.clicked.connect(player.play)
+    pause_btn.clicked.connect(player.pause)
 
-        return container
-
-    else:
-        # Thumbnail mode: extract first frame with OpenCV.
-        return _video_first_frame_pixmap(path, size)
-
-
-def _video_first_frame_pixmap(path: Path, size: int):
-    """
-    Extracts the first frame of a video and returns it as a QPixmap
-    scaled to fit within size x size pixels.
-
-    Uses OpenCV (cv2) for frame extraction. If OpenCV is not installed
-    or the video cannot be read, returns None.
-
-    Args:
-        path: Path to the video file.
-        size: Target size in pixels.
-
-    Returns:
-        A QPixmap, or None if extraction fails.
-    """
-    try:
-        import cv2
-        import numpy as np
-
-        cap = cv2.VideoCapture(str(path))
-        ok, frame = cap.read()
-        cap.release()
-
-        if not ok or frame is None:
-            return None
-
-        # OpenCV returns BGR — convert to RGB for PIL.
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img = Image.fromarray(frame_rgb)
-        img.thumbnail((size, size), Image.LANCZOS)
-        return _pil_to_pixmap(img)
-
-    except ImportError:
-        print("[Renderer] OpenCV (cv2) not installed — cannot render video thumbnail.")
-        return None
-    except Exception as e:
-        print(f"[Renderer] Video frame extraction error: {e}")
-        return None
+    return container
 
 
 # ---------------------------------------------------------------------------

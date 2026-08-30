@@ -500,8 +500,9 @@ def test_defect_b_no_visual_column_reports_zero_width_range_grouped(make_control
 # (row_id, artifact_type), so a row with full_path and avatar_path showed
 # the same picture in both tiles. P0.5b-1 keys derived artifacts by media
 # address instead (docs/media_architecture.md 4.5), and this test -- which
-# goes through PUBLIC controller API only (render_column_value() and the
-# thumbnail-request path reached by load_folder()) -- now passes.
+# goes through PUBLIC controller API only (render_column_value(), which
+# since P0.5b-3i also queues the demand thumbnail request on a miss) --
+# now passes.
 
 
 def _solid_png(path: Path, colour: tuple[int, int, int]) -> None:
@@ -517,11 +518,15 @@ def _solid_png(path: Path, colour: tuple[int, int, int]) -> None:
 # Setup checks still raise RuntimeError rather than AssertionError so the
 # only AssertionError the test can produce is the real colour comparison.
 #
-# NOTE (see the work-item handoff): this test passes EVEN IF the cache is
-# broken, because avatar_path has no cached artifact and _render_image
-# falls back to Image.open(blue.png). It proves the fallback, not the
-# keying. test_artifact_identity.py::test_second_media_column_gets_its_
-# own_cached_artifact is what actually guards the fix.
+# P0.5b-3i rewrite: the renderer no longer has an Image.open fallback, so
+# a cache miss now renders a grey placeholder for BOTH columns -- which
+# means this test only means something once BOTH pictures are really in
+# the cache. It now drives the demand path (render -> miss -> request
+# queued -> wait -> render -> hit) for each column in turn. That also
+# makes it a genuine end-to-end check of the address keying, where before
+# it leaned on the fallback (see the old note). The cache-level guard is
+# still test_artifact_identity.py::test_second_media_column_gets_its_own_
+# cached_artifact.
 def test_two_media_columns_on_one_row_render_different_pictures(qapp, tmp_path):
     # qapp: QPixmap (built below via render_column_value) requires a
     # live QApplication, and Qt aborts the whole process with qFatal
@@ -558,15 +563,7 @@ def test_two_media_columns_on_one_row_render_different_pictures(qapp, tmp_path):
 
     store.on_thumbnail_ready = _on_ready
 
-    # Public thumbnail-request path: load_folder() queues a thumbnail
-    # for full_path (the red image).
     controller.load_folder(folder)
-    # Setup check -> RuntimeError, not AssertionError: see the marker.
-    if not ready.wait(timeout=30):
-        raise RuntimeError(
-            "thumbnail generation for the loaded image did not finish "
-            "within 30s"
-        )
 
     # Merge a second media column, avatar_path, pointing at the blue
     # image. Its .png values make ColumnTypeRegistry infer 'media_path',
@@ -579,23 +576,39 @@ def test_two_media_columns_on_one_row_render_different_pictures(qapp, tmp_path):
     row = controller.get_row(row_id)
 
     def _render(column_name):
-        pixmap = controller.render_column_value(
+        return controller.render_column_value(
             column_name,
             row[column_name],
             150,
             "thumbnail",
             {"row_id": row_id, "column_name": column_name},
         )
-        # Setup check -> RuntimeError, not AssertionError: see the marker.
-        if pixmap is None or pixmap.isNull():
+
+    def _centre(column_name):
+        # First render: cache miss -> placeholder, demand request queued.
+        # Wait for the worker, then render again for the real picture.
+        ready.clear()
+        first = _render(column_name)
+        if first is None or first.isNull():
             raise RuntimeError(
                 f"render_column_value returned nothing for {column_name}"
+            )
+        if not ready.wait(timeout=30):
+            raise RuntimeError(
+                f"thumbnail generation for {column_name} did not finish "
+                f"within 30s"
+            )
+        pixmap = _render(column_name)
+        if pixmap is None or pixmap.isNull():
+            raise RuntimeError(
+                f"render_column_value returned nothing for {column_name} "
+                f"after its thumbnail was generated"
             )
         image = pixmap.toImage()
         return image.pixelColor(image.width() // 2, image.height() // 2)
 
-    full_path_colour = _render("full_path")
-    avatar_path_colour = _render("avatar_path")
+    full_path_colour = _centre("full_path")
+    avatar_path_colour = _centre("avatar_path")
 
     assert full_path_colour != avatar_path_colour, (
         "full_path and avatar_path rendered the same picture for one row -- "

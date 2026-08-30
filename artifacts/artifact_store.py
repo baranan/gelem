@@ -21,11 +21,10 @@ The fingerprint is part of the key, but a cache lookup on the paint path
 must not call `stat()`. So ArtifactStore keeps a memo of
 `canonical address -> (size, mtime)`. Nothing in THIS file stats a source
 on a cache lookup: the source stat happens only on a worker thread, inside
-`_run_job` (via `_stat_fingerprint`). (`AppController._request_thumbnail_
-for_cell` does an `exists()` check on the main thread before it calls
-`request_thumbnail`, which is a separate concern -- this file's lookups
-and short-circuit touch the filesystem for nothing.) An address in the
-memo is one of three states:
+`_run_job` (via `_stat_fingerprint`). The demand-driven caller
+(`AppController.render_column_value` -> `_queue_thumbnail_request`,
+P0.5b-3i) does no `exists()` check either -- a missing source is the
+worker's business. An address in the memo is one of three states:
 
   * **absent** -- a lookup misses. Nothing is served.
   * **seeded-unverified** -- put there by `load_index` from the persisted
@@ -55,10 +54,11 @@ finishes are coalesced -- one decode, every waiting (table, row) a
 subscriber. `reset()` bumps a generation counter; a job whose captured
 generation is stale commits nothing -- no index entry, no fingerprint-memo
 entry, no notification (a JPEG already encoded to disk can linger, with
-nothing pointing at it -- P0.5b-2ii). Priority and viewport cancellation
-are P0.5b-3 and have
-no producer in the repo yet. Disk-cache eviction and the memory LRU
-ceiling are P0.5b-2ii.
+nothing pointing at it -- P0.5b-2ii). Requests are issued on demand as
+tiles paint (P0.5b-3i, `AppController.render_column_value`); there is no
+eager whole-table pass. Priority ordering and viewport cancellation are
+P0.5b-3ii and have no producer in the repo yet. Disk-cache eviction and
+the memory LRU ceiling are P0.5b-2ii.
 
 This file is written centrally (not by a student).
 """
@@ -453,16 +453,20 @@ class ArtifactStore:
         project that was fully thumbnailed reopens with its cache usable
         with no paint-path decode. Those fingerprints are the freshness as
         of the last save, not a fresh stat, so none is marked verified:
-        the next request_thumbnail() for such an address always spawns a
-        worker (rather than short-circuiting), and if the source changed
-        since the save the worker's fresh fingerprint no longer matches
-        and it regenerates. Until that request happens a get_pixmap()
-        lookup serves the persisted picture. For display (not analysis) a
-        briefly-stale preview is an accepted trade against decoding every
-        visible source image on the main thread after every reload.
-        P0.5b-1 issues no such request after load_project (the eager sites
-        are load_folder, load_csv_as_primary and the operator create_table
-        result path only); P0.5b-3's demand-driven requests close that gap.
+        a request_thumbnail() for such an address always spawns a worker
+        (rather than short-circuiting), and if the source changed since the
+        save the worker's fresh fingerprint no longer matches and it
+        regenerates. A get_pixmap() lookup serves the persisted picture in
+        the meantime. For display (not analysis) a briefly-stale preview is
+        an accepted trade against decoding every visible source image on
+        the main thread after every reload.
+
+        Demand-driven display (P0.5b-3i) issues a request only for an
+        address the seeded index does NOT cover -- a painted row whose
+        picture is missing from the index. A seeded (unverified) entry is
+        served as-is on the paint path and is not re-requested on view;
+        the re-stat happens only if something else calls request_thumbnail()
+        for it (or after a reset()).
         """
         index_path = project_path / "artifact_index.json"
         if not index_path.exists():

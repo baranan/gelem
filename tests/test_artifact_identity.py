@@ -201,7 +201,12 @@ def test_changed_source_fingerprint_changes_the_key():
 
 # ===========================================================================
 # 6. Load folder A, then folder B: no row of B shows a picture from A.
-#    No sleep, no thread synchronisation, no race.
+#
+#    P0.5b-3i: load_folder no longer generates thumbnails eagerly, so this
+#    drives the demand path -- render (miss -> placeholder, request queued),
+#    wait for the worker, render again (hit). The property under test is
+#    unchanged: after load_folder(B) reset() has wiped folder A's cache, so
+#    the only picture the demand request can produce is folder B's blue one.
 # ===========================================================================
 
 def test_load_folder_a_then_b_shows_no_a_picture(qapp, tmp_path):
@@ -212,17 +217,26 @@ def test_load_folder_a_then_b_shows_no_a_picture(qapp, tmp_path):
     _solid_png(folder_a / "shot_a.png", (255, 0, 0))
     _solid_png(folder_b / "shot_b.png", (0, 0, 255))
 
-    controller, _, _ = _build_controller(tmp_path)
+    controller, _, store = _build_controller(tmp_path)
+    event = _wait_for_thumbnail(store)
 
     controller.load_folder(folder_a)
     controller.load_folder(folder_b)  # resets the store
 
     row_id = controller.get_all_row_ids()[0]
     row = controller.get_row(row_id)
-    pixmap = controller.render_column_value(
-        "full_path", row["full_path"], 150, "thumbnail",
-        {"row_id": row_id, "column_name": "full_path"},
-    )
+
+    def _render():
+        return controller.render_column_value(
+            "full_path", row["full_path"], 150, "thumbnail",
+            {"row_id": row_id, "column_name": "full_path"},
+        )
+
+    placeholder = _render()  # cache miss -> placeholder, demand request queued
+    assert placeholder is not None and not placeholder.isNull()
+    assert event.wait(timeout=30), "demand-driven thumbnail was never generated"
+
+    pixmap = _render()  # now a cache hit
     assert pixmap is not None and not pixmap.isNull()
     colour = _centre_colour(pixmap)
     assert colour.blue() > colour.red(), (
@@ -251,17 +265,6 @@ def test_load_project_a_then_b_shows_no_a_picture(qapp, tmp_path):
     controller, _, store = _build_controller(tmp_path)
     event = _wait_for_thumbnail(store)
 
-    # Fully thumbnail and save each project, so its artifact_index.json
-    # holds a real entry.
-    controller.load_folder(folder_a)
-    assert event.wait(timeout=30), "folder A thumbnail never generated"
-    controller.save_project(project_a)
-
-    event.clear()
-    controller.load_folder(folder_b)
-    assert event.wait(timeout=30), "folder B thumbnail never generated"
-    controller.save_project(project_b)
-
     def _render_first_row():
         row_id = controller.get_all_row_ids()[0]
         row = controller.get_row(row_id)
@@ -269,6 +272,20 @@ def test_load_project_a_then_b_shows_no_a_picture(qapp, tmp_path):
             "full_path", row["full_path"], 150, "thumbnail",
             {"row_id": row_id, "column_name": "full_path"},
         )
+
+    # Fully thumbnail and save each project, so its artifact_index.json
+    # holds a real entry. P0.5b-3i: the thumbnail is generated on demand
+    # when the first row renders, not eagerly by load_folder.
+    controller.load_folder(folder_a)
+    _render_first_row()  # cache miss -> queues the demand request
+    assert event.wait(timeout=30), "folder A thumbnail never generated"
+    controller.save_project(project_a)
+
+    event.clear()
+    controller.load_folder(folder_b)
+    _render_first_row()
+    assert event.wait(timeout=30), "folder B thumbnail never generated"
+    controller.save_project(project_b)
 
     # Open project A. load_index() seeds the fingerprint memo from the
     # saved index, so the cache is usable at once -- no wait needed.

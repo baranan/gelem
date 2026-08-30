@@ -518,11 +518,9 @@ class AppController(QObject):
             table_name = f"{operator_name}_result"
             try:
                 self._dataset.create_table_from_df(table_name, result_df)
-                stored_df = self._dataset.get_table(table_name)
-                for _, row in stored_df.iterrows():
-                    self._request_thumbnail_for_cell(
-                        row["row_id"], row.get("full_path", ""), table_name
-                    )
+                # No eager thumbnail pass here (P0.5b-3i): when the
+                # researcher switches to this table its tiles paint and
+                # render_column_value() queues each request on demand.
                 self.tables_updated.emit(self._dataset.list_tables())
                 self.table_created.emit(table_name)
                 self.operator_complete.emit(operator_name)
@@ -744,8 +742,10 @@ class AppController(QObject):
 
     def load_folder(self, folder_path: Path) -> None:
         """
-        Loads a folder of media files into the dataset and starts
-        thumbnail generation for all items.
+        Loads a folder of media files into the dataset.
+
+        Thumbnails are generated on demand as tiles paint (P0.5b-3i),
+        not in an eager whole-table pass here.
 
         Args:
             folder_path: Path to the folder containing media files.
@@ -762,12 +762,6 @@ class AppController(QObject):
             self._project_root   = Path(folder_path)
 
             self._dataset.load_folder(folder_path)
-            df = self._dataset.get_table("frames")
-
-            for _, row in df.iterrows():
-                self._request_thumbnail_for_cell(
-                    row["row_id"], row.get("full_path", ""), "frames"
-                )
 
             self.columns_updated.emit(self._registry.list_all_columns())
             self.tables_updated.emit(self._dataset.list_tables())
@@ -801,12 +795,8 @@ class AppController(QObject):
             self._project_root   = Path(csv_path).parent
 
             self._dataset.load_csv_as_primary(csv_path, image_column)
-            df = self._dataset.get_table("frames")
-
-            for _, row in df.iterrows():
-                self._request_thumbnail_for_cell(
-                    row["row_id"], row.get("full_path", ""), "frames"
-                )
+            # Thumbnails are generated on demand as tiles paint
+            # (P0.5b-3i), not in an eager whole-table pass here.
 
             self.columns_updated.emit(self._registry.list_all_columns())
             self.tables_updated.emit(self._dataset.list_tables())
@@ -1242,16 +1232,19 @@ class AppController(QObject):
             self._store.reset()
             # load_index() re-seeds the index AND the fingerprint memo
             # from the persisted (size, mtime) values, so a project that
-            # was fully thumbnailed reopens with its cache usable
-            # immediately -- no paint-path decode while workers catch up.
+            # was fully thumbnailed reopens showing its cached pictures
+            # with no paint-path decode.
             #
-            # This path issues no thumbnail request: the three
-            # ArtifactStore.request_thumbnail() call sites are
-            # load_folder(), load_csv_as_primary() and the operator
-            # create_table result path, and _refresh_result() below only
-            # re-runs the query. ArtifactStore.load_index()'s docstring is
-            # the authority on what that means for freshness and on which
-            # work item closes it. Do not restate it here.
+            # load_project() itself issues no thumbnail request -- it only
+            # seeds the index and re-runs the query. A row the seeded
+            # index does not cover (never thumbnailed before the save)
+            # gets a request when its tile paints: render_column_value()
+            # sees the cache miss and queues one (P0.5b-3i). A row that IS
+            # in the seeded index is served as-is, even if its source has
+            # changed since the save -- painting does not re-stat.
+            # ArtifactStore.load_index()'s docstring is the authority on
+            # what the seeded memo means for freshness; do not restate it
+            # here.
             self._store.load_index(project_path)
             self.tables_updated.emit(self._dataset.list_tables())
             self.columns_updated.emit(self._registry.list_all_columns())
@@ -1300,30 +1293,34 @@ class AppController(QObject):
         except Exception:
             return []
 
-    def _request_thumbnail_for_cell(
+    def _queue_thumbnail_request(
         self,
         row_id: str,
-        cell,
+        canonical_address: str,
+        source_path: str,
         table_name: str,
     ) -> None:
-        """Eager thumbnail request for one media cell.
+        """Queue a thumbnail/preview generation request for one already
+        resolved media cell.
 
-        The three eager sites (load_folder, load_csv_as_primary, and the
-        create_table result path) stay eager and stay reading full_path
-        in this diff -- making them demand-driven is P0.5b-3. They now
-        pass the picture's canonical address plus a resolved source path,
-        which are different things.
+        Called on demand by render_column_value() when a tile paints and
+        misses the cache (P0.5b-3i) -- there is no eager whole-table pass
+        any more. The caller has already turned the cell into a canonical
+        address (the cache key) and an absolute source path (where a
+        worker reads the pixels), so this does not re-parse it.
+
+        No exists() check: whether the source can be read is the worker's
+        business. ArtifactStore._stat_fingerprint returns None for a
+        missing or unreadable file and the job discards its subscribers
+        without notifying, exactly as a failed decode does. Keeping the
+        check off this path also keeps the paint thread from touching the
+        filesystem at all. The trade is that a genuinely broken path is
+        re-submitted as a (fast, failing) job each time its tile is
+        repainted from scratch; viewport-scoped cancellation is
+        P0.5b-3ii.
         """
-        if not isinstance(cell, str) or not cell:
-            return
-        try:
-            address, source_path = self._resolve_media_cell(cell)
-        except MediaAddressError:
-            return
-        if not Path(source_path).exists():
-            return
         self._store.request_thumbnail(
-            row_id, address, Path(source_path), table_name
+            row_id, canonical_address, Path(source_path), table_name
         )
 
     def _resolve_media_cell(self, value) -> tuple[str, str]:
@@ -1424,11 +1421,59 @@ class AppController(QObject):
                 ctx["canonical_address"] = canonical_address
                 ctx["source_path"] = source_path
             except MediaAddressError:
-                # Not a well-formed address -- let the renderer fall back
-                # to treating the raw value as a path.
+                # The cell does not parse as a media address (e.g. a file
+                # name with a literal '#'). In thumbnail mode there is
+                # nothing more to do -- the renderer shows a placeholder
+                # and no demand request can be keyed. Canonicalising such
+                # cells at import is P1.8 (docs/known_defects.md). In
+                # detail mode the renderer still treats the raw value as
+                # a path.
                 pass
 
+            # Demand-driven thumbnail generation (P0.5b-3i). In thumbnail
+            # mode the renderer is cache-or-placeholder and never decodes
+            # a source, so this is the one place that notices the miss and
+            # queues the work. The controller does it, not the renderer,
+            # because only the controller knows the row and the table.
+            # request_thumbnail() coalesces by address, so a still-pending
+            # tile repainted several times adds no extra job. Detail mode
+            # opens the source itself and needs no request.
+            if (
+                mode == "thumbnail"
+                and "canonical_address" in ctx
+                and ctx.get("row_id") is not None
+                and not self._artifact_is_cached(ctx["canonical_address"])
+            ):
+                self._queue_thumbnail_request(
+                    ctx["row_id"],
+                    ctx["canonical_address"],
+                    ctx["source_path"],
+                    self._active_table,
+                )
+
         return self._registry.render(column_name, value, size, mode, ctx)
+
+    def _artifact_is_cached(self, canonical_address: str) -> bool:
+        """True if both derived pictures for this address -- thumbnail and
+        preview -- are already in the ArtifactStore index. An index
+        lookup that opens no source file.
+
+        Used by render_column_value() to decide whether a thumbnail-mode
+        paint needs a generation request queued. Both purposes are
+        checked, not just one: a tile larger than the renderer's preview
+        threshold paints from the 'preview' artifact, and a request
+        regenerates both anyway, so "either is missing" is the right
+        trigger -- it matches ArtifactStore.request_thumbnail()'s own
+        both-present short-circuit. A seeded entry from load_index()
+        counts as cached and is served as-is on the paint path -- painting
+        does not force a re-stat (see ArtifactStore.load_index()'s
+        docstring). Only an address the seeded index does not cover gets a
+        demand request.
+        """
+        return (
+            self._store.get(canonical_address, "thumbnail") is not None
+            and self._store.get(canonical_address, "preview") is not None
+        )
 
     def get_column_type(self, column_name: str):
         """

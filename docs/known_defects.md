@@ -76,6 +76,13 @@ failing test before or as it is fixed.
   save/load. Belongs with the schema work (P1.8).
 - **A non-string media cell is silently skipped** and is not counted by
   `_is_blank_cell()`.
+- **A media cell that does not parse as an address shows a permanent grey
+  placeholder.** Since P0.5b-3i the thumbnail renderer never decodes a source,
+  and `render_column_value()` cannot key a demand request without a canonical
+  address, so a file name with a literal `#` (which `parse()` reads as a
+  fragment start) renders a placeholder and never a picture. Before P0.5b-3i
+  the renderer's `Image.open` fallback still displayed it. The real fix is
+  canonicalising cells at import (P1.8); detail mode is unaffected.
 - **Many module docstrings still assign files to Student A, B, or C.** Remove as
   those files are touched. (Done in `tests/test_renderer.py`, 24 Aug 2026.)
 
@@ -107,6 +114,13 @@ failing test before or as it is fixed.
   a public method.
 - **`export_csv()`, `run_create_table()` and `run_create_display()` deliver rows
   in the caller's `row_ids` order** rather than table order.
+- **A broken or missing media path re-queues a failing worker job on every
+  fresh repaint.** Since P0.5b-3i there is no main-thread `exists()` short-circuit
+  and no negative cache, so a job that finds the source missing writes no index
+  entry, `_artifact_is_cached()` stays False, and scrolling the tile back into
+  view re-submits it. Coalescing bounds it to one in-flight job per address and
+  the failing job is microseconds, but a proper fix (skip-list or viewport
+  cancellation) is P0.5b-3ii.
 - **No guardrail stops a future caller of `read_only_view()` from mutating the
   frame it returns.** Its docstring also leans on QueryEngine purity, but the
   test covers `apply()` only -- not `apply_grouped()` or `get_group_values()`.
@@ -114,9 +128,6 @@ failing test before or as it is fixed.
   rather than raising.
 - **`AppController.get_group_values()` ends in a bare `except Exception: return
   []`**, so a missing column silently becomes "this column has no values".
-- **Two lines above the corrected comment in `load_project()`** still say the
-  cache is usable "while workers catch up", on a path where no workers are
-  spawned. A fragment; let P0.5b-3 sweep it when it touches the method.
 - **`.claude/settings.json` has no `permissions.deny` list** for
   `Bash(git commit *)` and `Bash(git push *)`. `.claude/` now exists; this is
   still not done.
@@ -125,6 +136,16 @@ failing test before or as it is fixed.
 
 ## Fixed
 
+- **The media renderer decoded source files on the paint path, and the
+  controller requested a thumbnail for every row on load.** `_render_image`
+  fell back to `Image.open` and `_render_video` ran `cv2.VideoCapture` on the
+  main thread on a cache miss; `load_folder`, `load_csv_as_primary` and the
+  `create_table` result path each looped over the whole table queuing
+  requests. *(P0.5b-3i: thumbnail mode is cache-or-placeholder and opens no
+  source; `AppController.render_column_value` queues one request per painted
+  tile on a miss; the three eager loops are gone. Tests:
+  `tests/test_demand_driven_display.py`,
+  `tests/test_artifact_identity.py`.)*
 - **`ArtifactStore.request_thumbnail()` spawned one raw `threading.Thread` per
   call.** *(P0.5b-2i: requests run on a bounded `WorkerPool`
   (`artifacts/worker_pool.py`, default 2 workers, a keyword-only `ArtifactStore`

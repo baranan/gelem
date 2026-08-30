@@ -663,21 +663,29 @@ Demand-driven, and a bounded worker pool alone does not achieve it. Define it
 explicitly:
 
 1. A viewport change requests the visible rows plus a small prefetch margin.
-2. A cache miss returns a placeholder **immediately**.
-3. **No media is opened or decoded during a paint.** Today `_render_image` falls
-   back to `Image.open` on the main thread, and `_render_video` runs
-   `cv2.VideoCapture` on the main thread on *every* paint of *every* video tile,
-   consulting no cache at all. That is the dominant current display cost.
-4. ArtifactStore queues the request with viewport priority.
-5. Stale off-screen requests are cancelled.
+2. A cache miss returns a placeholder **immediately**. **Done, P0.5b-3i:**
+   `make_media_path_renderer`'s `render()` returns a grey placeholder pixmap on a
+   thumbnail-mode miss.
+3. **No media is opened or decoded during a paint.** **Done, P0.5b-3i:** the
+   thumbnail path is cache-or-placeholder for both image and video tiles;
+   `_render_image`'s `Image.open` fallback and `_video_first_frame_pixmap`'s
+   `cv2.VideoCapture` are gone. On a miss the controller
+   (`render_column_value`) queues one `ArtifactStore.request_thumbnail`. Detail
+   mode still opens the source, by design.
+4. ArtifactStore queues the request with viewport priority. **Still open,
+   P0.5b-3ii:** the request is queued but FIFO, not viewport-prioritised
+   (`get_displayed_ranges()` still has no caller).
+5. Stale off-screen requests are cancelled. **Still open, P0.5b-3ii.**
 6. Workers return raw image data or a persisted cache artifact -- never a
    `QPixmap`.
 7. `QPixmap` construction happens only on the main thread.
 8. The ready notification carries enough context to repaint the right table, row
    and column.
 
-The controller also currently requests a thumbnail for **every** row immediately
-after loading, which must stop.
+**Resolved, P0.5b-3i:** the controller no longer requests a thumbnail for every
+row immediately after loading. `load_folder`, `load_csv_as_primary` and the
+operator `create_table` result path queue nothing; requests are issued by
+`render_column_value` as tiles paint.
 
 ---
 

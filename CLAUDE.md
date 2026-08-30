@@ -202,8 +202,9 @@ state. This rule carries no violation list of its own -- it points at the three
   had already encoded its JPEG leaves that file on disk with nothing pointing
   at it -- reclaiming it is P0.5b-2ii (see `docs/known_defects.md`, the
   append-only disk cache). Made true by P0.5b-2i.
-  `docs/media_architecture.md` §4.4 is the authority. Priority ordering and
-  viewport cancellation are P0.5b-3. Tests: `tests/test_request_queue.py`.
+  `docs/media_architecture.md` §4.4 is the authority. Demand-driven requests
+  land P0.5b-3i; priority ordering and viewport cancellation are P0.5b-3ii.
+  Tests: `tests/test_request_queue.py`.
 
 ### UI
 
@@ -240,8 +241,10 @@ state. This rule carries no violation list of its own -- it points at the three
 
 - **`[TARGET -> P1.2]`** **Only the media resolver decodes *source* media.** No
   `cv2.VideoCapture`, `av.open`, or `Image.open` **of a user's media file**
-  anywhere else. Three places do today: `BaseOperator.load_image`,
-  `column_types/renderers.py`, and `ArtifactStore._decode_source`.
+  anywhere else. Two places do today: `BaseOperator.load_image` and
+  `ArtifactStore._decode_source`. (`column_types/renderers.py` came off this
+  list in P0.5b-3i: thumbnail mode is cache-or-placeholder and decodes
+  nothing, and detail mode loads through Qt's `QPixmap(path)`, not PIL or cv2.)
 - **`[NOW]`** **Reading and writing Gelem's own derived artifacts is a different
   operation and is not covered by that rule.** `ArtifactStore` reads back the JPEGs
   it wrote, and must keep being able to. P0.5b-1 built the narrow `ArtifactCodec`
@@ -252,20 +255,31 @@ state. This rule carries no violation list of its own -- it points at the three
   (`tests/test_artifact_identity.py::test_codec_refuses_path_outside_cache_root`).
   `[TARGET -> P1.2]` The matching half -- source decoding confined to the
   resolver, so that *nothing else opens an image at all* -- waits on the
-  resolver. Until then `column_types/renderers.py` (`_render_image` fallback) and
-  `ArtifactStore._decode_source` still decode source media directly.
+  resolver. `column_types/renderers.py` stopped decoding source media in
+  P0.5b-3i (its `_render_image` `Image.open` fallback and
+  `_video_first_frame_pixmap` `cv2` path are gone). `ArtifactStore._decode_source`
+  still decodes source media directly until the resolver lands.
 - **`[TARGET -> P1.10]`** Native playback is the explicit exception. `QMediaPlayer`
   receives a file path and a time range directly. It shares the address **parser**
   with the resolver but not the decoding path.
-- **`[TARGET -> P0.5, sub-item P0.5b-3]`** No media is opened or decoded during a
-  paint. A cache miss returns a placeholder immediately and queues a request.
-  P0.5b-1 keyed the cache, made a hit touch no filesystem, and put a
-  cache-first fast path in `make_media_path_renderer`'s `render()` ahead of the
-  image/video dispatch -- so **both** image and video tiles now consult the
-  cache and skip decoding on a hit. On a **miss** the two paths still decode on
-  the main thread: `_render_video()` runs `cv2.VideoCapture` and `_render_image`
-  falls back to a direct `Image.open`. Removing both misses -- the placeholder
-  + queued-request behaviour above -- is P0.5b-3.
+- **`[NOW]`** No media is opened or decoded during a paint. In thumbnail mode
+  `make_media_path_renderer`'s `render()` is cache-or-placeholder for **both**
+  image and video tiles: a hit returns the cached picture touching no
+  filesystem, a miss returns a grey placeholder pixmap immediately. It never
+  stats, opens or decodes a source file. On a miss
+  `AppController.render_column_value()` -- the one place that knows the row and
+  table -- queues exactly one generation request through
+  `ArtifactStore.request_thumbnail` (coalesced by canonical address, so a
+  still-pending tile repainted many times adds no second job); the ready
+  notification repaints the tile, which then hits. Detail mode is the
+  deliberate exception and still opens the source (through Qt for images,
+  `QMediaPlayer` for video). Made true by P0.5b-3i.
+  `docs/media_architecture.md` §4.6 is the authority. Tests:
+  `tests/test_demand_driven_display.py`;
+  `tests/test_artifact_identity.py::test_load_folder_a_then_b_shows_no_a_picture`
+  and `::test_load_project_a_then_b_shows_no_a_picture` exercise it end to end.
+  **Still P0.5b-3ii:** viewport priority ordering and cancellation of stale
+  off-screen requests (the request queue is FIFO today).
 - **`[NOW]`** Derived images are identified by an `ArtifactKey` -- canonical
   **media address**, source fingerprint, purpose, resolution,
   representative-frame policy, renderer cache version -- not by the row that
@@ -292,7 +306,7 @@ state. This rule carries no violation list of its own -- it points at the three
   `test_load_folder_a_then_b_shows_no_a_picture`,
   `test_load_project_a_then_b_shows_no_a_picture`),
   `tests/test_gallery_seam.py::test_two_media_columns_on_one_row_render_different_pictures`.
-  **Not yet done (P0.5b-3):** the ready notification still carries
+  **Not yet done (P0.5b-3ii):** the ready notification still carries
   `(table_name, row_id)`, not the column -- repainting a row repaints its
   columns and each looks up its own key, which is sufficient for now.
 - **`[NOW]`** `media/media_address.py` gives the address grammar exact,
