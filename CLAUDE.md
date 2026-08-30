@@ -421,13 +421,14 @@ history is in `docs/archive/rule_verification_log.md`.
 - **Prefer explicit, readable Python over terse idioms.** Y B's background is
   JavaScript and C. Comment each block before the block.
 - **Use `--` rather than em dashes** in prose and comments.
-- **Read only what the work item names, and do not explore the repository.**
-  The work-item prompt lists the files the change touches. Read those, plus any
-  file a rule above cites for the specific rule you are relying on. **Do not
-  spawn subagents to search or survey the codebase** -- Y B pays for each
-  subagent's own requests, and repository-wide exploration is the single largest
-  source of that cost. If the named files turn out not to be enough, say which
-  file you need and why, and ask.
+- **Read only what the work item names, and read only the parts you need.** Use
+  the Read tool's offset and limit on any file over about 1,000 lines --
+  `docs/media_architecture.md` is about 100KB and must never be read whole. Do
+  not survey the repository. A subagent is appropriate for two things: reading a
+  large document and reporting back a specific section, and verification passes
+  such as `/code-review`. Do not use one to search for files or to reconstruct
+  context you were not given. If the named files are not enough, stop and say
+  which file you need and why, rather than inferring.
 - **Do not front-load the whole codebase.** `gelem_codebase_for_claude.txt` is a
   point-in-time review export, not a source of truth. It goes stale immediately.
 
