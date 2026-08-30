@@ -87,7 +87,9 @@ def _capture_submits(store: ArtifactStore) -> list:
     the job. Returns the list the callables land in, so a test can count
     queued jobs without any of them decoding anything."""
     submitted: list = []
-    store._pool.submit = lambda fn: submitted.append(fn)
+    # WorkerPool.submit takes an optional opaque `key` (P0.5b-3ii-a); the
+    # recorder must accept it even though this helper ignores it.
+    store._pool.submit = lambda fn, key=None: submitted.append(fn)
     return submitted
 
 
