@@ -31,7 +31,7 @@ from PIL import Image
 from artifacts.artifact_store import ArtifactStore, THUMBNAIL_RESOLUTION
 from artifacts.artifact_codec import ArtifactCodec, ArtifactCodecError
 from media.artifact_key import ArtifactKey, SourceFingerprint
-from media.media_address import parse, canonical_key, resolve_source
+from media.media_address import POLICIES, parse, canonical_key, resolve_source
 
 from models.dataset import Dataset
 from models.query_engine import QueryEngine
@@ -364,4 +364,102 @@ def test_persisted_fingerprint_is_re_stated_on_next_request(tmp_path):
     pixel = Image.open(fresh).convert("RGB").getpixel((5, 5))
     assert pixel[2] > pixel[0], (
         f"request did not regenerate after the source changed: {pixel}"
+    )
+
+
+# ===========================================================================
+# 10. Representative-frame policy is part of stable_hash(), not merely part
+#     of dataclass equality.
+#
+#     No other test in the repo builds an ArtifactKey with a policy other
+#     than the "first" default. policy sits in BOTH the dataclass fields
+#     (so __eq__ / __hash__ separate two policies) AND the stable_hash()
+#     parts tuple (so the on-disk filename separates them too). If it were
+#     dropped from stable_hash() alone, two policies would be two distinct
+#     index entries mapping to ONE filename on disk, and whichever put()
+#     ran second would silently overwrite the other policy's picture.
+# ===========================================================================
+def test_policy_is_part_of_the_stable_hash(tmp_path):
+    # A range address, because policy only means anything for a range --
+    # "first" frame in the range versus the frame nearest its midpoint.
+    address = canonical_key(
+        parse("C:/videos/p01.mp4#t=1.000000-4.000000"), str(tmp_path)
+    )
+    fingerprint = SourceFingerprint(size=4321, mtime_ns=8765)
+
+    assert "first" in POLICIES and "midpoint" in POLICIES
+
+    first = ArtifactKey(
+        address, fingerprint, "thumbnail", THUMBNAIL_RESOLUTION, policy="first"
+    )
+    midpoint = ArtifactKey(
+        address, fingerprint, "thumbnail", THUMBNAIL_RESOLUTION, policy="midpoint"
+    )
+
+    # Every field except policy is identical between the two keys.
+    assert first.canonical_address == midpoint.canonical_address
+    assert first.fingerprint == midpoint.fingerprint
+    assert first.purpose == midpoint.purpose
+    assert first.resolution == midpoint.resolution
+    assert first.renderer_version == midpoint.renderer_version
+    assert first.policy != midpoint.policy
+
+    # Dataclass equality already tells them apart...
+    assert first != midpoint
+    # ...but the DISK FILENAME must tell them apart too, or the second
+    # policy's picture overwrites the first's under one name.
+    assert first.stable_hash() != midpoint.stable_hash(), (
+        "policy is in dataclass equality but missing from stable_hash() -- "
+        "two policies would share one JPEG on disk"
+    )
+
+
+# ===========================================================================
+# 11. The SAME row_id in two different tables, pointing at DIFFERENT media,
+#     yields two distinct cached artifacts -- each with its own pixels.
+#
+#     create_table_from_rows() deliberately keeps row ids when copying
+#     rows, so row_id "7" can exist in both "frames" and "segments" and
+#     mean two different files. docs/media_architecture.md section 4.5
+#     lists this as one of the five ways the old (row_id, artifact_type)
+#     key was wrong. test_same_file_two_tables_share_one_cache_entry above
+#     covers the opposite requirement (same file, two tables -> one entry);
+#     this covers the collision case it never touched.
+# ===========================================================================
+def test_same_row_id_two_tables_different_media_do_not_collide(tmp_path):
+    green_path = tmp_path / "green.png"
+    yellow_path = tmp_path / "yellow.png"
+    _solid_png(green_path, (0, 200, 0))
+    _solid_png(yellow_path, (220, 220, 0))
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    event = _wait_for_thumbnail(store)
+
+    green_addr, green_src = _address_of(green_path, tmp_path)
+    yellow_addr, yellow_src = _address_of(yellow_path, tmp_path)
+
+    # Same row_id "7"; two different tables; two different source files.
+    store.request_thumbnail("7", green_addr, Path(green_src), "frames")
+    assert event.wait(timeout=30), "green thumbnail was never generated"
+    event.clear()
+
+    store.request_thumbnail("7", yellow_addr, Path(yellow_src), "segments")
+    assert event.wait(timeout=30), "yellow thumbnail was never generated"
+
+    green_thumb = store.get(green_addr, "thumbnail")
+    yellow_thumb = store.get(yellow_addr, "thumbnail")
+    assert green_thumb is not None, "no cached artifact for row 7 in 'frames'"
+    assert yellow_thumb is not None, "no cached artifact for row 7 in 'segments'"
+    assert green_thumb != yellow_thumb, (
+        "row_id 7 in two tables collapsed to one cache file -- the key is "
+        "keyed by the row, not by the media address"
+    )
+
+    green_px = Image.open(green_thumb).convert("RGB").getpixel((5, 5))
+    yellow_px = Image.open(yellow_thumb).convert("RGB").getpixel((5, 5))
+    assert green_px[1] > green_px[0] and green_px[1] > green_px[2], (
+        f"row 7 / 'frames' artifact is not green: {green_px}"
+    )
+    assert yellow_px[0] > 150 and yellow_px[1] > 150 and yellow_px[2] < 100, (
+        f"row 7 / 'segments' artifact is not yellow: {yellow_px}"
     )

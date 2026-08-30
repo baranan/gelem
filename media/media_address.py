@@ -49,6 +49,7 @@ __all__ = [
     "select_frame",
     "frames_in_range",
     "region_to_pixels",
+    "POLICIES",
 ]
 
 
@@ -580,7 +581,10 @@ def resolve_source(cell: str, project_root: str) -> Tuple[str, str]:
 # real timings.
 # ---------------------------------------------------------------------------
 
-_POLICIES = ("first", "midpoint")
+# The representative-frame policies a range address may ask for. Public
+# because media/artifact_key.py needs it to validate an ArtifactKey's
+# policy field against the same list select_frame() enforces.
+POLICIES = ("first", "midpoint")
 
 # Used only when a single-frame stream gives no real gap to measure from
 # (see _estimated_stream_end_us below). Deliberately not a small, plausible
@@ -707,7 +711,7 @@ def select_frame(
       range containing no frame at all raises (decision 11) rather than
       falling back to a frame outside it or returning nothing silently.
     """
-    if policy not in _POLICIES:
+    if policy not in POLICIES:
         raise MediaAddressError(f"unknown representative-frame policy: {policy!r}")
 
     if addr.frame is not None:

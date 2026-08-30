@@ -13,7 +13,7 @@ ids. The correct key is what the picture is made of:
   + source fingerprint        (size and mtime)
   + purpose                   ('thumbnail' | 'preview')
   + requested resolution      (max side, in pixels)
-  + representative-frame policy   (media_address._POLICIES)
+  + representative-frame policy   (media_address.POLICIES)
   + renderer cache version    (bumped by hand when our output changes)
 
 The table, row and column identify the UI subscriber waiting for the
@@ -30,7 +30,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 
-from media.media_address import _POLICIES
+from media.media_address import POLICIES
 
 # Bumped BY HAND whenever a change to how Gelem renders a thumbnail or
 # preview could alter the pixels it produces (a different resize filter, a
@@ -78,9 +78,9 @@ class ArtifactKey:
             raise ValueError(
                 f"artifact purpose must be one of {PURPOSES}, got {self.purpose!r}"
             )
-        if self.policy not in _POLICIES:
+        if self.policy not in POLICIES:
             raise ValueError(
-                f"representative-frame policy must be one of {_POLICIES}, "
+                f"representative-frame policy must be one of {POLICIES}, "
                 f"got {self.policy!r}"
             )
         if self.resolution <= 0:

@@ -40,8 +40,6 @@ from typing import Any
 
 from PIL import Image
 
-from artifacts.artifact_store import THUMBNAIL_RESOLUTION, PREVIEW_RESOLUTION
-
 
 # ---------------------------------------------------------------------------
 # Known media extensions
@@ -156,10 +154,12 @@ def _cached_thumbnail(context: dict | None, size: int, artifact_store):
     address = context.get("canonical_address")
     if not address:
         return None
-    if size <= _PREVIEW_SIZE_THRESHOLD:
-        purpose, resolution = "thumbnail", THUMBNAIL_RESOLUTION
-    else:
-        purpose, resolution = "preview", PREVIEW_RESOLUTION
+    # The purpose -> resolution mapping lives only on the store instance
+    # (ArtifactStore.resolution_for), which is already injected here --
+    # this renderer no longer imports a resolution constant to recompute
+    # it.
+    purpose = "thumbnail" if size <= _PREVIEW_SIZE_THRESHOLD else "preview"
+    resolution = artifact_store.resolution_for(purpose)
     pil_image = artifact_store.get_pixmap(address, purpose, resolution)
     if pil_image is None:
         return None

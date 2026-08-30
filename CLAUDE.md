@@ -625,17 +625,17 @@ thread per call -- that bullet stays; the bounded pool is P0.5b-2.)*
   CSV import paths.
 - `_id_counter` assumes `row_id` parses as an int. No stale-file cleanup on
   re-save.
-- **The purpose -> resolution mapping is computed in two places** (P0.5b-1):
-  `ArtifactStore._resolution_for` and `column_types/renderers.py::_cached_thumbnail`,
-  the latter via a `column_types -> artifacts.artifact_store` module-constant
-  import (`THUMBNAIL_RESOLUTION` / `PREVIEW_RESOLUTION`) even though the store
-  instance is already injected into the renderer factory. Fix by making
-  `_resolution_for` public and calling it through the instance.
-- **`media/artifact_key.py` imports `_POLICIES`, a private name, from
-  `media_address`** (P0.5b-1). Make `_POLICIES` public (`POLICIES`), add it to
-  `media_address.__all__`, and update `artifact_key.py` (the only cross-module
-  importer -- `artifact_store.py` uses only its own `REPRESENTATIVE_FRAME_POLICY`
-  constant).
+- ~~**The purpose -> resolution mapping is computed in two places**~~ *(Fixed
+  P0.5b-1-followups: `ArtifactStore._resolution_for` is now the public
+  `ArtifactStore.resolution_for`, `column_types/renderers.py::_cached_thumbnail`
+  calls it on the injected store instance, and the
+  `column_types -> artifacts.artifact_store` constant import
+  (`THUMBNAIL_RESOLUTION` / `PREVIEW_RESOLUTION`) is gone. There is now exactly
+  one definition of purpose -> resolution.)*
+- ~~**`media/artifact_key.py` imports `_POLICIES`, a private name, from
+  `media_address`**~~ *(Fixed P0.5b-1-followups: `_POLICIES` is now the public
+  `POLICIES`, in `media_address.__all__`; `artifact_key.py` imports the public
+  name and no private alias remains.)*
 - Many module docstrings still assign files to Student A, B, or C. Remove as those
   files are touched. *(Done in `tests/test_renderer.py` 24 Aug 2026, the only
   file touched this session.)*
@@ -644,3 +644,9 @@ thread per call -- that bullet stays; the bounded pool is P0.5b-2.)*
 that used to be here is removed -- `operators/CLAUDE.md` no longer makes that
 claim; it already documents `self._output_dir` and notes `self.output_dir`
 "never existed". The other bullets in this section are still true as written.)*
+
+*(30 Aug 2026, P0.5b-1-followups: the purpose -> resolution and `_POLICIES`
+bullets above are fixed and struck through. The `operators/thumbnail.py` bullet
+was NOT actioned -- `main.py:57,98` still import and register `ThumbnailOperator`,
+so deleting the file needs `main.py` changed too; left for P1.11 as the review
+brief instructed. All other bullets in this section are unchanged and still true.)*

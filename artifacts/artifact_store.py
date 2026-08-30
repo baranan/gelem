@@ -129,7 +129,15 @@ class ArtifactStore:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _resolution_for(purpose: str) -> int:
+    def resolution_for(purpose: str) -> int:
+        """The requested resolution (max side, in pixels) that enters the
+        ArtifactKey for a purpose.
+
+        This is the ONE definition of the purpose -> resolution mapping in
+        the repository. The renderer factory is handed a store instance
+        and calls this on it; nothing imports THUMBNAIL_RESOLUTION /
+        PREVIEW_RESOLUTION across a module boundary to recompute it.
+        """
         return THUMBNAIL_RESOLUTION if purpose == "thumbnail" else PREVIEW_RESOLUTION
 
     def _key(
@@ -220,7 +228,7 @@ class ArtifactStore:
             policy:            Representative-frame policy.
         """
         if resolution is None:
-            resolution = self._resolution_for(purpose)
+            resolution = self.resolution_for(purpose)
         key = self._complete_key(canonical_address, purpose, resolution, policy)
         if key is None:
             return None
@@ -262,7 +270,7 @@ class ArtifactStore:
         reads the JPEG back through ArtifactCodec.
         """
         if resolution is None:
-            resolution = self._resolution_for(purpose)
+            resolution = self.resolution_for(purpose)
         key = self._complete_key(canonical_address, purpose, resolution, policy)
         if key is None:
             return None
@@ -402,8 +410,8 @@ class ArtifactStore:
         briefly-stale preview is an accepted trade against decoding every
         visible source image on the main thread after every reload.
         P0.5b-1 issues no such request after load_project (the eager sites
-        are load_folder / load_csv_as_primary only); P0.5b-3's
-        demand-driven requests close that gap.
+        are load_folder, load_csv_as_primary and the operator create_table
+        result path only); P0.5b-3's demand-driven requests close that gap.
         """
         index_path = project_path / "artifact_index.json"
         if not index_path.exists():

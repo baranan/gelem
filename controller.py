@@ -1244,9 +1244,14 @@ class AppController(QObject):
             # from the persisted (size, mtime) values, so a project that
             # was fully thumbnailed reopens with its cache usable
             # immediately -- no paint-path decode while workers catch up.
-            # A source file changed since the save is corrected on its
-            # next request, when the worker re-stats and the fingerprint
-            # no longer matches.
+            #
+            # This path issues no thumbnail request: the three
+            # ArtifactStore.request_thumbnail() call sites are
+            # load_folder(), load_csv_as_primary() and the operator
+            # create_table result path, and _refresh_result() below only
+            # re-runs the query. ArtifactStore.load_index()'s docstring is
+            # the authority on what that means for freshness and on which
+            # work item closes it. Do not restate it here.
             self._store.load_index(project_path)
             self.tables_updated.emit(self._dataset.list_tables())
             self.columns_updated.emit(self._registry.list_all_columns())
