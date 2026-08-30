@@ -406,8 +406,8 @@ class ArtifactStore:
             self._inflight[job_key] = [(table_name, row_id)]
 
         # job_key -- (generation, canonical address) -- is also the pool's
-        # opaque key, so set_wanted_addresses() can promote or drop this
-        # job by address without the pool knowing what an address is.
+        # opaque key, so set_wanted_addresses() can drop this job by
+        # address without the pool knowing what an address is.
         self._pool.submit(
             lambda: self._run_job(job_key, Path(source_path)), key=job_key
         )
@@ -429,8 +429,9 @@ class ArtifactStore:
         Among jobs that are still QUEUED (not yet running) in the current
         generation:
 
-          * jobs whose address is in `addresses` are moved to the front
-            of the worker queue, so what is on screen decodes first;
+          * jobs whose address is in `addresses` survive, keeping their
+            existing submit order among themselves -- submit order is
+            paint order, and the pool does no priority reordering;
           * every other job is dropped -- its worker job is removed and
             its `_inflight` entry deleted, so a later request_thumbnail()
             for that address starts a fresh job instead of joining one
@@ -439,9 +440,9 @@ class ArtifactStore:
 
         A job that has already started on a worker is never touched: it
         runs to completion and commits normally. This method takes
-        addresses only -- never rows, tables or viewport positions. It
-        has no consumer yet; wiring the controller to call it on scroll
-        is P0.5b-3ii-b.
+        addresses only -- never rows, tables or viewport positions. Its
+        consumer is AppController, which calls it whenever a gallery
+        reports or clears a displayed range (P0.5b-3ii-b).
         """
         wanted = {str(address) for address in addresses}
 
@@ -464,19 +465,15 @@ class ArtifactStore:
                 if job_key[0] == generation and job_key[1] in wanted
             ]
 
-            # Drop the non-wanted jobs, then promote the wanted ones.
-            # drop_pending returns only the keys it actually removed from
-            # the queue -- a job a worker popped at the same moment is not
-            # in that list, so we leave its _inflight entry alone and it
-            # commits normally. promote() after the drop only reorders the
-            # survivors; with the same key set on both calls it is
-            # currently a no-op, but the spec defines this operation as
-            # "promote wanted, drop the rest" and keeping both calls means
-            # a future wider keep set still does the right thing.
+            # Drop the non-wanted jobs. drop_pending returns only the keys
+            # it actually removed from the queue -- a job a worker popped
+            # at the same moment is not in that list, so we leave its
+            # _inflight entry alone and it commits normally. The surviving
+            # jobs keep their submit order; the pool does no priority
+            # reordering, and submit order is paint order.
             dropped = self._pool.drop_pending(keep_keys)
             for job_key in dropped:
                 self._inflight.pop(job_key, None)
-            self._pool.promote(keep_keys)
 
     def set_cache_max_bytes(self, max_bytes: int) -> None:
         """

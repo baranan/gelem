@@ -203,8 +203,12 @@ state. This rule carries no violation list of its own -- it points at the three
   at it -- reclaiming it is P0.5b-2ii (see `docs/known_defects.md`, the
   append-only disk cache). Made true by P0.5b-2i.
   `docs/media_architecture.md` §4.4 is the authority. Demand-driven requests
-  land P0.5b-3i; priority ordering and viewport cancellation are P0.5b-3ii.
-  Tests: `tests/test_request_queue.py`.
+  landed P0.5b-3i. Viewport cancellation landed P0.5b-3ii: the pool primitive
+  is `WorkerPool.drop_pending(keep)` (there is no priority reorder -- survivors
+  keep submit order, which is paint order), `ArtifactStore.set_wanted_addresses`
+  turns an address set into a keep set, and `AppController._update_wanted_addresses`
+  is its consumer, called on every gallery displayed-range report or clear.
+  Tests: `tests/test_request_queue.py`, `tests/test_demand_driven_display.py`.
 
 ### UI
 
@@ -278,8 +282,10 @@ state. This rule carries no violation list of its own -- it points at the three
   `tests/test_demand_driven_display.py`;
   `tests/test_artifact_identity.py::test_load_folder_a_then_b_shows_no_a_picture`
   and `::test_load_project_a_then_b_shows_no_a_picture` exercise it end to end.
-  **Still P0.5b-3ii:** viewport priority ordering and cancellation of stale
-  off-screen requests (the request queue is FIFO today).
+  P0.5b-3ii-b added viewport-scoped cancellation: the request queue is
+  submit-order FIFO with no priority reordering, and a queued job whose
+  address is no longer in the on-screen set is dropped -- see the
+  `WorkerPool` rule above and `docs/media_architecture.md` §4.4.
 - **`[NOW]`** Derived images are identified by an `ArtifactKey` -- canonical
   **media address**, source fingerprint, purpose, resolution,
   representative-frame policy, renderer cache version -- not by the row that
@@ -306,9 +312,9 @@ state. This rule carries no violation list of its own -- it points at the three
   `test_load_folder_a_then_b_shows_no_a_picture`,
   `test_load_project_a_then_b_shows_no_a_picture`),
   `tests/test_gallery_seam.py::test_two_media_columns_on_one_row_render_different_pictures`.
-  **Not yet done (P0.5b-3ii):** the ready notification still carries
-  `(table_name, row_id)`, not the column -- repainting a row repaints its
-  columns and each looks up its own key, which is sufficient for now.
+  The ready notification carries `(table_name, row_id)`, not the column that
+  asked -- a deliberate simplification, not yet worth changing. See
+  `docs/known_defects.md`.
 - **`[NOW]`** `media/media_address.py` gives the address grammar exact,
   guarded-by-test meaning: escaping, canonical form, frame/time-point and
   range semantics, region validation and pixel arithmetic, and which

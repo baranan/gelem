@@ -43,6 +43,7 @@ import column_types.renderers as renderers_mod
 from column_types.renderers import make_media_path_renderer
 
 from artifacts.artifact_store import ArtifactStore
+from media.media_address import MediaAddressError
 from column_types.registry import ColumnTypeRegistry
 from models.dataset import Dataset
 from models.query_engine import QueryEngine
@@ -302,3 +303,139 @@ def test_detail_mode_still_opens_the_source(qapp, tmp_path):
     assert isinstance(widget, QWidget), (
         "detail mode should still return a widget built from the source"
     )
+
+
+# ===========================================================================
+# 7. Viewport -> ArtifactStore.set_wanted_addresses (P0.5b-3ii-b).
+#
+#    AppController is the consumer of set_wanted_addresses(). It calls it
+#    whenever a gallery reports or clears a displayed range, with the
+#    canonical addresses of exactly the rows in the union of the reported
+#    ranges. The controller does no stat/open/decode to build that set.
+# ===========================================================================
+
+def _folder_of_pngs(tmp_path, count):
+    folder = tmp_path / "media"
+    folder.mkdir()
+    for i in range(count):
+        _solid_png(folder / f"{i:02d}.png", (i * 7 % 256, 20, 30))
+    return folder
+
+
+def _capture_wanted(store):
+    """Record every set_wanted_addresses() call as a set of str."""
+    calls: list = []
+    store.set_wanted_addresses = lambda addrs: calls.append({str(a) for a in addrs})
+    return calls
+
+
+def _addresses_of_positions(controller, positions):
+    """The canonical addresses of the rows at the given flat-order
+    positions, resolved the same way the controller resolves a cell."""
+    ids = controller.get_visible_row_ids()
+    wanted = set()
+    for pos in positions:
+        cell = controller.get_row(ids[pos])["full_path"]
+        address, _src = controller._resolve_media_cell(cell)
+        wanted.add(str(address))
+    return wanted
+
+
+def test_reported_range_publishes_exactly_that_range_s_addresses(qapp, tmp_path):
+    folder = _folder_of_pngs(tmp_path, 5)
+    controller, _, store = _build_controller(tmp_path)
+    controller.load_folder(folder)
+    calls = _capture_wanted(store)
+
+    layout = controller.get_result_layout()
+    controller.report_displayed_range("vp", 1, 4, layout.result_id)
+
+    assert calls, "reporting a displayed range did not call set_wanted_addresses"
+    assert calls[-1] == _addresses_of_positions(controller, [1, 2, 3])
+
+
+def test_unparseable_media_cell_is_skipped_not_raised(qapp, tmp_path):
+    folder = _folder_of_pngs(tmp_path, 3)
+    controller, _, store = _build_controller(tmp_path)
+    controller.load_folder(folder)
+    calls = _capture_wanted(store)
+
+    # Make the first row's cell look like a value that is not a media
+    # address (a literal '#' with no '=' after it). The controller must
+    # skip it, exactly as render_column_value() does, not propagate the
+    # MediaAddressError.
+    real_resolve = controller._resolve_media_cell
+    ids = controller.get_visible_row_ids()
+    bad_cell = controller.get_row(ids[0])["full_path"]
+
+    def flaky_resolve(value):
+        if value == bad_cell:
+            raise MediaAddressError("not an address")
+        return real_resolve(value)
+
+    controller._resolve_media_cell = flaky_resolve
+
+    layout = controller.get_result_layout()
+    controller.report_displayed_range("vp", 0, 3, layout.result_id)
+
+    # No raise, and the surviving two rows are still published.
+    assert calls[-1] == _addresses_of_positions(controller, [1, 2])
+
+
+def test_clearing_the_last_displayed_range_publishes_an_empty_set(qapp, tmp_path):
+    folder = _folder_of_pngs(tmp_path, 4)
+    controller, _, store = _build_controller(tmp_path)
+    controller.load_folder(folder)
+    calls = _capture_wanted(store)
+
+    layout = controller.get_result_layout()
+    controller.report_displayed_range("vp", 0, 4, layout.result_id)
+    assert calls[-1] != set(), "a non-empty range should want some addresses"
+
+    controller.clear_displayed_range("vp")
+    assert calls[-1] == set(), (
+        "clearing the last displayed range should leave nothing wanted"
+    )
+
+
+def test_two_viewports_union_their_ranges_rather_than_overwrite(qapp, tmp_path):
+    folder = _folder_of_pngs(tmp_path, 8)
+    controller, _, store = _build_controller(tmp_path)
+    controller.load_folder(folder)
+    calls = _capture_wanted(store)
+
+    layout = controller.get_result_layout()
+    controller.report_displayed_range("vp1", 0, 2, layout.result_id)
+    controller.report_displayed_range("vp2", 5, 8, layout.result_id)
+
+    # The second report does not replace the first: the published set is
+    # the union of both galleries' rows.
+    assert calls[-1] == _addresses_of_positions(controller, [0, 1, 5, 6, 7])
+
+
+def test_update_wanted_addresses_touches_no_filesystem(qapp, tmp_path, monkeypatch):
+    folder = _folder_of_pngs(tmp_path, 4)
+    controller, _, store = _build_controller(tmp_path)
+    controller.load_folder(folder)
+    calls = _capture_wanted(store)
+
+    layout = controller.get_result_layout()
+    # Compute the expectation BEFORE the filesystem is sealed off -- the
+    # assertion at the end only compares sets.
+    expected = _addresses_of_positions(controller, [0, 1, 2, 3])
+
+    # The helper's architectural claim (docs/media_architecture.md 4.4,
+    # and its own docstring) is that it resolves cells with pure path
+    # arithmetic and never stats, opens or decodes anything. Seal off the
+    # three filesystem entry points it could plausibly reach and assert
+    # the report still goes through.
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("_update_wanted_addresses touched the filesystem")
+
+    monkeypatch.setattr(Path, "stat", _boom)
+    monkeypatch.setattr(Path, "exists", _boom)
+    monkeypatch.setattr("builtins.open", _boom)
+
+    controller.report_displayed_range("vp", 0, 4, layout.result_id)
+
+    assert calls[-1] == expected

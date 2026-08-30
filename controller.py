@@ -723,10 +723,18 @@ class AppController(QObject):
         if self._result is None or result_id != self._result.result_id:
             return
         self._displayed_ranges[viewport_key] = (start, stop)
+        # A gallery scrolled or mounted a new window: tell the artifact
+        # store which addresses are on screen so it can drop queued
+        # thumbnail jobs for rows that just left it (P0.5b-3ii-b).
+        self._update_wanted_addresses()
 
     def clear_displayed_range(self, viewport_key: str) -> None:
         """Forgets the displayed range for viewport_key, if any."""
         self._displayed_ranges.pop(viewport_key, None)
+        # One fewer gallery on screen. Recompute the wanted set from the
+        # ranges that remain -- if this was the last one, the set is empty
+        # and every queued job may be dropped (P0.5b-3ii-b).
+        self._update_wanted_addresses()
 
     def get_displayed_ranges(self) -> list[tuple[int, int]]:
         """
@@ -737,6 +745,65 @@ class AppController(QObject):
         here.
         """
         return sorted(self._displayed_ranges.values(), key=lambda r: r[0])
+
+    def _update_wanted_addresses(self) -> None:
+        """Tell the ArtifactStore which canonical media addresses the
+        galleries are currently showing (P0.5b-3ii-b).
+
+        This is the consumer of ArtifactStore.set_wanted_addresses(): the
+        store uses the set to drop queued thumbnail jobs for rows that
+        scrolled off screen. It runs on every displayed-range report or
+        clear -- a gallery already de-dupes those, so this fires once per
+        mounted-window shift, not once per scrolled pixel.
+
+        It must not stat, open or decode anything -- it reads cells that
+        are already in memory and turns each into an address with pure
+        path arithmetic (media.media_address.resolve_source touches no
+        filesystem). The cost is O(visible tiles), the same order as
+        painting them.
+        """
+        # 1. The media columns are the registered columns whose type is
+        #    tagged "media_path" -- the same test render_column_value()
+        #    uses. This set does not change from row to row, so resolve it
+        #    once here rather than re-checking every column of every row.
+        media_columns = [
+            name
+            for name in self._registry.list_all_columns()
+            if getattr(self._registry.get(name), "tag", None) == "media_path"
+        ]
+        if not media_columns:
+            self._store.set_wanted_addresses(set())
+            return
+
+        # 2. Collect the row ids in every currently-displayed range. Two
+        #    galleries showing different slices union here rather than
+        #    overwrite -- get_displayed_ranges() returns one entry per
+        #    viewport, and a set folds any overlap.
+        row_ids: list[str] = []
+        for start, stop in self.get_displayed_ranges():
+            row_ids.extend(self.get_row_ids_in_range(start, stop))
+
+        # 3. For each row, turn each non-empty media cell into a canonical
+        #    artifact-cache address. A cell that does not parse as a media
+        #    address is skipped, exactly as render_column_value() skips it
+        #    (a file name with a literal '#', pending P1.8).
+        wanted: set[str] = set()
+        for row_id in row_ids:
+            row = self._dataset.get_row(row_id, self._active_table)
+            for column_name in media_columns:
+                value = row.get(column_name)
+                if not isinstance(value, str) or not value:
+                    continue
+                try:
+                    canonical_address, _source_path = self._resolve_media_cell(value)
+                except MediaAddressError:
+                    continue
+                wanted.add(canonical_address)
+
+        # 4. Hand the set to the store. An empty set (every gallery
+        #    cleared its range) says nothing on screen wants a picture, so
+        #    every queued job may be dropped.
+        self._store.set_wanted_addresses(wanted)
 
     # ── Public API ────────────────────────────────────────────────────
 
@@ -1316,8 +1383,9 @@ class AppController(QObject):
         check off this path also keeps the paint thread from touching the
         filesystem at all. The trade is that a genuinely broken path is
         re-submitted as a (fast, failing) job each time its tile is
-        repainted from scratch; viewport-scoped cancellation is
-        P0.5b-3ii.
+        repainted from scratch. A job for an address that scrolls off
+        screen before a worker reaches it is dropped by
+        _update_wanted_addresses() (P0.5b-3ii-b).
         """
         self._store.request_thumbnail(
             row_id, canonical_address, Path(source_path), table_name

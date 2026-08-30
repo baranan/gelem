@@ -85,6 +85,15 @@ failing test before or as it is fixed.
   canonicalising cells at import (P1.8); detail mode is unaffected.
 - **Many module docstrings still assign files to Student A, B, or C.** Remove as
   those files are touched. (Done in `tests/test_renderer.py`, 24 Aug 2026.)
+- **The thumbnail-ready notification is row-grained, not column-grained.**
+  `thumbnails_ready` / `ArtifactStore.on_thumbnail_ready` carry
+  `(table_name, row_id)`. Artifact identity moved to the media address in
+  P0.5b-1, but the ready signal was left as it was: a repaint of the row
+  repaints every column of that row and each re-looks-up its own `ArtifactKey`,
+  so a row with two media columns does one redundant cache hit per update. Held
+  deliberately through P0.5b-3ii as sufficient; no item assigned.
+  `CLAUDE.md`'s "Derived images are identified by an `ArtifactKey`" rule points
+  here.
 
 ## Open -- smells, no item assigned
 
@@ -114,13 +123,17 @@ failing test before or as it is fixed.
   a public method.
 - **`export_csv()`, `run_create_table()` and `run_create_display()` deliver rows
   in the caller's `row_ids` order** rather than table order.
-- **A broken or missing media path re-queues a failing worker job on every
-  fresh repaint.** Since P0.5b-3i there is no main-thread `exists()` short-circuit
-  and no negative cache, so a job that finds the source missing writes no index
-  entry, `_artifact_is_cached()` stays False, and scrolling the tile back into
-  view re-submits it. Coalescing bounds it to one in-flight job per address and
-  the failing job is microseconds, but a proper fix (skip-list or viewport
-  cancellation) is P0.5b-3ii.
+- **A broken or missing media path whose tile is on screen re-queues a failing
+  worker job on every fresh repaint.** Since P0.5b-3i there is no main-thread
+  `exists()` short-circuit and no negative cache, so a job that finds the source
+  missing writes no index entry, `_artifact_is_cached()` stays False, and
+  repainting the tile re-submits it. Coalescing bounds it to one in-flight job
+  per address and the failing job is microseconds. P0.5b-3ii's viewport
+  cancellation bounds only the off-screen case: once the tile scrolls away its
+  address leaves the wanted set and the queued job is dropped. A tile still on
+  screen is inside the wanted set, so its job is never dropped and re-queues on
+  every repaint. The remaining fix is a negative cache -- remember an address
+  that failed to decode and do not re-queue it -- and no item is assigned.
 - **No guardrail stops a future caller of `read_only_view()` from mutating the
   frame it returns.** Its docstring also leans on QueryEngine purity, but the
   test covers `apply()` only -- not `apply_grouped()` or `get_group_values()`.

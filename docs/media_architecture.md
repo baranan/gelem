@@ -592,34 +592,45 @@ handful of simultaneous players is fine; dozens are not.
 
 ### 4.4 Replace thread-per-request with a bounded pool
 
-*Partly done, P0.5b-2i (30 Aug 2026).* `ArtifactStore.request_thumbnail` no
-longer spawns a raw thread per call. It runs jobs on a bounded `WorkerPool`
-(`artifacts/worker_pool.py`), coalesces requests by canonical address (one
-decode, many `(table, row)` subscribers), and cancels via a generation counter
-that `reset()` bumps -- a stale job is guaranteed to leave no index entry, no
-fingerprint-memo entry and to send no notification (a JPEG it had already
-encoded can linger on disk with nothing pointing at it -- reclaiming it is
-P0.5b-2ii). Worker count is a keyword-only `ArtifactStore` constructor
-parameter, default 2. **Still outstanding, P0.5b-3:** priority ordering
-(`get_displayed_ranges()` has no caller yet) and viewport cancellation. Tests:
-`tests/test_request_queue.py`.
+*Done. P0.5b-2i (30 Aug 2026) built the pool; P0.5b-3ii (30 Aug 2026) added
+viewport cancellation.*
 
-`ArtifactStore.request_thumbnail` currently spawns a raw `threading.Thread` per
-call. At gallery scale that is thousands of threads. Replace with:
+`ArtifactStore.request_thumbnail` runs jobs on a bounded `WorkerPool`
+(`artifacts/worker_pool.py`), not a thread per call. It coalesces requests by
+canonical address (one decode, many `(table, row)` subscribers) and cancels
+via a generation counter that `reset()` bumps -- a stale job is guaranteed to
+leave no index entry, no fingerprint-memo entry and to send no notification (a
+JPEG it had already encoded can linger on disk with nothing pointing at it --
+reclaiming it is P0.5b-2ii). Worker count is a keyword-only `ArtifactStore`
+constructor parameter, default 2.
 
-- **a bounded pool** whose size is a setting. *Provisional default 2-4 workers.*
-- a priority queue where visible rows outrank prefetched rows
-- **cancellation** -- when the viewport moves, drop stale requests
+**There is no priority queue.** The original plan was a bounded pool *plus* a
+priority queue where visible rows outrank prefetched rows. That second
+mechanism was dropped in P0.5b-3ii-b, and `WorkerPool.promote()` with it. The
+gallery reports exactly one tier of viewport information -- one mounted window,
+with its buffer rows already folded in -- and with a single tier, cancelling
+the off-screen jobs subsumes any reordering a priority queue would have done: a
+still-wanted job simply outlives the unwanted jobs that would have run before
+it. The pool is therefore just a bound plus submit-order FIFO with
+cancellation, and submit order is paint order.
+
+Viewport cancellation runs on every scroll: a gallery reports or clears its
+mounted window, `AppController._update_wanted_addresses` turns the union of
+every gallery's window into the set of canonical addresses on screen,
+`ArtifactStore.set_wanted_addresses` turns that into a keep set of pool keys,
+and `WorkerPool.drop_pending` removes every still-queued job not in it. A job
+already running on a worker is never touched. Without this, one fast scroll
+queues thousands of renders nobody will see and the gallery runs seconds behind
+the scrollbar -- most of the difference between "instant" and "broken", and
+independent of everything else here.
 
 **The numbers here are provisional defaults, not architecture.** Worker count,
 handle count and cache ceiling are all machine-dependent, so by the rule in
 `CLAUDE.md` they are settings with low defaults. What is architectural is that the
-pool is *bounded*, prioritised and cancellable -- not any particular bound.
+pool is *bounded* and *cancellable* -- not any particular bound.
 *(Second review round caught these as constants contradicting that rule.)*
 
-Without cancellation one fast scroll queues thousands of renders nobody will see,
-and the gallery runs seconds behind the scrollbar. This is most of the difference
-between "instant" and "broken", and it is independent of everything else here.
+Tests: `tests/test_request_queue.py`, `tests/test_demand_driven_display.py`.
 
 ### 4.5 Artifact identity is the address, not the row
 

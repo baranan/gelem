@@ -430,15 +430,17 @@ def test_worker_count_is_a_keyword_only_constructor_parameter(tmp_path):
 
 
 # ===========================================================================
-# g. WorkerPool job identity -- promote() and drop_pending() (P0.5b-3ii-a).
+# g. WorkerPool job identity -- drop_pending() (P0.5b-3ii-a, P0.5b-3ii-b).
 #
-#    The pool never interprets a key; it only matches by membership. Each
-#    test parks the single worker inside a blocker job, stacks keyed jobs
-#    behind it, reorders or prunes the queue, then releases the worker and
-#    reads back the order the jobs actually ran in. Remove promote() and
-#    `test_promote_moves_matching_keys_to_the_front` fails; remove
-#    drop_pending()'s effect and `test_drop_pending_removes_unkept_jobs...`
-#    fails.
+#    The pool never interprets a key; it only matches by membership. It
+#    does NOT reorder jobs -- there is no promote(); survivors run in
+#    submit order. Each test parks the single worker inside a blocker job,
+#    stacks keyed jobs behind it, prunes the queue with drop_pending,
+#    then releases the worker and reads back the order the jobs actually
+#    ran in. Remove drop_pending()'s effect and
+#    `test_drop_pending_removes_unkept_jobs...` fails. That survivors run
+#    in submit order (no reordering) is asserted one layer up by
+#    section h's `test_set_wanted_addresses_keeps_wanted_jobs_in_queue_order`.
 # ===========================================================================
 
 def _pool_with_blocked_worker():
@@ -470,37 +472,23 @@ def _recorder(order, order_lock, tag):
     return job
 
 
-def test_promote_moves_matching_keys_to_the_front():
+def test_drop_pending_leaves_the_survivors_in_submit_order():
     pool, release, order, order_lock = _pool_with_blocked_worker()
 
     pool.submit(_recorder(order, order_lock, "a"), key="a")
     pool.submit(_recorder(order, order_lock, "b"), key="b")
     pool.submit(_recorder(order, order_lock, "c"), key="c")
 
-    pool.promote(["b", "c"])
+    # Keys handed c-before-b; the pool does no reordering, so the two
+    # survivors must still run in submit order (b then c), and the dropped
+    # "a" must not run at all.
+    dropped = pool.drop_pending(keep=["c", "b"])
+    assert dropped == ["a"]
 
     release.set()
-    _spin_until(lambda: len(order) == 3, timeout=5)
-    # b and c jump ahead of a; among themselves, and relative to a, every
-    # job keeps its original order.
-    assert order == ["b", "c", "a"]
-    pool.shutdown()
-
-
-def test_promote_uses_queue_order_not_the_order_of_the_keys_argument():
-    pool, release, order, order_lock = _pool_with_blocked_worker()
-
-    pool.submit(_recorder(order, order_lock, "a"), key="a")
-    pool.submit(_recorder(order, order_lock, "b"), key="b")
-    pool.submit(_recorder(order, order_lock, "c"), key="c")
-
-    # Keys handed in c-before-b; the queue has b before c, and the queue
-    # order is what survives.
-    pool.promote(["c", "b"])
-
-    release.set()
-    _spin_until(lambda: len(order) == 3, timeout=5)
-    assert order == ["b", "c", "a"]
+    _spin_until(lambda: len(order) == 2, timeout=5)
+    time.sleep(0.1)
+    assert order == ["b", "c"]
     pool.shutdown()
 
 
@@ -535,7 +523,7 @@ def test_drop_pending_returns_nothing_and_changes_nothing_when_all_kept():
     pool.shutdown()
 
 
-def test_promote_and_drop_pending_never_touch_a_running_job():
+def test_drop_pending_never_touches_a_running_job():
     pool = WorkerPool(worker_count=1)
     started = threading.Semaphore(0)
     release = threading.Event()
@@ -549,10 +537,10 @@ def test_promote_and_drop_pending_never_touch_a_running_job():
     pool.submit(running_job, key="running")
     assert started.acquire(timeout=5)
 
-    # "running" is neither kept by drop_pending nor named to promote, but
-    # it has already left the queue -- both calls must leave it alone.
+    # "running" is not in the survivor set, but it has already left the
+    # queue -- drop_pending only prunes jobs still waiting, so it must be
+    # left alone.
     assert pool.drop_pending(keep=[]) == []
-    pool.promote(["something-else"])
 
     release.set()
     assert finished.wait(timeout=5), "a running job was disturbed"
@@ -575,13 +563,13 @@ def test_submit_without_a_key_still_runs_and_drops_as_key_none():
 
 
 # ===========================================================================
-# h. ArtifactStore.set_wanted_addresses (P0.5b-3ii-a).
+# h. ArtifactStore.set_wanted_addresses (P0.5b-3ii-a, P0.5b-3ii-b).
 #
 #    Declares the canonical addresses the display currently wants. Among
-#    jobs still QUEUED in the current generation: wanted ones move to the
-#    front, every other one is dropped -- no callback, nothing committed,
-#    and its _inflight entry removed so a later request starts a fresh
-#    job. A job already running is untouched.
+#    jobs still QUEUED in the current generation: wanted ones survive in
+#    their existing submit order, every other one is dropped -- no
+#    callback, nothing committed, and its _inflight entry removed so a
+#    later request starts a fresh job. A job already running is untouched.
 # ===========================================================================
 
 def test_set_wanted_addresses_drops_a_queued_request_for_an_unwanted_address(tmp_path):

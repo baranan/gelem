@@ -10,19 +10,25 @@ callables and runs them, at most `worker_count` at a time, in the order
 they were submitted.
 
 P0.5b-3ii-a gave each job an optional `key` -- an opaque handle the pool
-never inspects. `promote(keys)` pulls the jobs carrying those keys to the
-front of the pending queue; `drop_pending(keep)` deletes the pending jobs
-whose keys are not in `keep` and reports what it deleted. Both act only
-on jobs still waiting; a job already running on a worker is never
-touched. The pool still does not know what a key means -- deciding which
-addresses are wanted, and turning that into a key set, is ArtifactStore's
-job one layer up.
+never inspects. `drop_pending(keep)` deletes the pending jobs whose keys
+are not in `keep` and reports what it deleted. It acts only on jobs still
+waiting; a job already running on a worker is never touched. The pool
+still does not know what a key means -- deciding which addresses are
+wanted, and turning that into a key set, is ArtifactStore's job one layer
+up.
+
+The pool provides exactly two things: a bound (at most `worker_count`
+jobs run at once) and submit-order FIFO with cancellation
+(`drop_pending`, `clear_pending`). It does NOT reorder jobs by priority
+-- surviving jobs always run in the order they were submitted. There is
+no promote(); with viewport cancellation a wanted job simply outlives the
+unwanted ones that would have run before it, so an explicit reorder is
+unnecessary (P0.5b-3ii-b).
 
 Everything address-shaped -- request coalescing by canonical address,
 generation-based cancellation tied to ArtifactStore.reset(), and the
-choice of which jobs are worth promoting or dropping -- lives one layer
-up, in ArtifactStore. This module is just the bound and the ordering
-primitive.
+choice of which jobs are worth dropping -- lives one layer up, in
+ArtifactStore. This module is just the bound and the ordering primitive.
 
 Threads are daemon threads and are started lazily on the first submit, so
 importing this module (or building a pool that is never used) starts
@@ -58,8 +64,8 @@ class WorkerPool:
         self._worker_count = worker_count
 
         # _queue holds pending jobs. Each entry is a (fn, key) tuple --
-        # `key` is the opaque handle promote()/drop_pending() match on,
-        # or None when submit() was called without one. shutdown() also
+        # `key` is the opaque handle drop_pending() matches on, or None
+        # when submit() was called without one. shutdown() also
         # appends the bare _SENTINEL object, which the loops below skip.
         # _lock guards the queue; _not_empty is how idle workers wait for
         # the next job without spinning.
@@ -84,11 +90,11 @@ class WorkerPool:
         exception it raises is caught and printed, never propagated.
 
         `key` is an opaque handle for this job. The pool never inspects
-        or compares it except by membership in the collections handed to
-        promote() and drop_pending(). Two jobs may share a key, and None
-        (the default) is a valid key like any other -- a job submitted
-        without a key is dropped by any drop_pending() call whose `keep`
-        does not contain None.
+        or compares it except by membership in the collection handed to
+        drop_pending(). Two jobs may share a key, and None (the default)
+        is a valid key like any other -- a job submitted without a key is
+        dropped by any drop_pending() call whose `keep` does not contain
+        None.
         """
         with self._not_empty:
             if self._shutdown:
@@ -97,36 +103,6 @@ class WorkerPool:
                 self._start_workers()
             self._queue.append((fn, key))
             self._not_empty.notify()
-
-    def promote(self, keys: Iterable[object]) -> None:
-        """Move every pending job whose key is in `keys` to the front of
-        the queue. The promoted jobs keep their existing order relative
-        to each other, and the jobs left behind keep theirs -- only the
-        two groups swap places. A job already running on a worker is not
-        in the queue and is unaffected. Keys that match no pending job
-        are ignored.
-        """
-        # A plain list, not a set: a key need not be hashable, and the
-        # pending queue is short enough that membership cost does not
-        # matter.
-        wanted = list(keys)
-        with self._lock:
-            promoted: list = []
-            rest: list = []
-            for entry in self._queue:
-                if entry is _SENTINEL:
-                    # Only present during shutdown(), which does not call
-                    # this method -- but keep it in place if it is.
-                    rest.append(entry)
-                    continue
-                _fn, key = entry
-                if key in wanted:
-                    promoted.append(entry)
-                else:
-                    rest.append(entry)
-            self._queue.clear()
-            self._queue.extend(promoted)
-            self._queue.extend(rest)
 
     def drop_pending(self, keep: Iterable[object]) -> list:
         """Remove every pending job whose key is NOT in `keep`, and
