@@ -40,6 +40,8 @@ from typing import Any
 
 from PIL import Image
 
+from artifacts.artifact_store import THUMBNAIL_RESOLUTION, PREVIEW_RESOLUTION
+
 
 # ---------------------------------------------------------------------------
 # Known media extensions
@@ -101,12 +103,28 @@ def make_media_path_renderer(artifact_store):
             QPixmap in thumbnail mode, QWidget in detail mode, or None.
         """
         try:
-            path = Path(str(value))
+            # render_column_value() resolves the media cell once and drops
+            # the canonical address and an absolute source path into the
+            # context, so this renderer needs no project root and does no
+            # address parsing of its own. A direct caller that skipped
+            # that step falls back to treating the raw value as a path.
+            ctx = context or {}
+
+            # Thumbnail-mode cache fast path: on a hit this returns a
+            # picture without touching the filesystem at all -- no exists()
+            # below, no decode. Only a miss falls through to the source.
+            if mode == "thumbnail":
+                cached = _cached_thumbnail(ctx, size, artifact_store)
+                if cached is not None:
+                    return cached
+
+            source_path = ctx.get("source_path") or str(value)
+            path = Path(source_path)
             if not path.exists():
                 return None
 
             if _is_image(path):
-                return _render_image(path, size, mode, artifact_store, context)
+                return _render_image(path, size, mode, artifact_store, ctx)
             elif _is_video(path):
                 return _render_video(path, size, mode)
             else:
@@ -124,6 +142,32 @@ def make_media_path_renderer(artifact_store):
 _PREVIEW_SIZE_THRESHOLD = 200  # pixels — tiles larger than this use 'preview'
 
 
+def _cached_thumbnail(context: dict | None, size: int, artifact_store):
+    """A QPixmap from the ArtifactStore cache for this context's canonical
+    media address, or None on a miss.
+
+    On a memory-cache hit this touches no filesystem -- no stat, no
+    exists, no open. `render_column_value()` puts 'canonical_address' in
+    the context; without it (a direct caller) this always misses and the
+    source path is used instead.
+    """
+    if not context or artifact_store is None:
+        return None
+    address = context.get("canonical_address")
+    if not address:
+        return None
+    if size <= _PREVIEW_SIZE_THRESHOLD:
+        purpose, resolution = "thumbnail", THUMBNAIL_RESOLUTION
+    else:
+        purpose, resolution = "preview", PREVIEW_RESOLUTION
+    pil_image = artifact_store.get_pixmap(address, purpose, resolution)
+    if pil_image is None:
+        return None
+    img = pil_image.copy()
+    img.thumbnail((size, size), Image.LANCZOS)
+    return _pil_to_pixmap(img)
+
+
 def _render_image(
     path: Path,
     size: int,
@@ -137,7 +181,8 @@ def _render_image(
     In thumbnail mode: checks ArtifactStore cache first for speed,
     falls back to loading directly if not cached. The artifact type
     is chosen by size: tiles <= 200px use 'thumbnail', larger use
-    'preview'. Requires context={'row_id': ...} to hit the cache.
+    'preview'. Requires context={'canonical_address': ...} to hit the
+    cache (render_column_value() puts it there).
 
     In detail mode: returns a ZoomableImageView widget with the
     full-resolution image loaded.
@@ -163,17 +208,17 @@ def _render_image(
         return widget
 
     else:
-        # Thumbnail mode: try ArtifactStore cache if row_id is available.
-        row_id = context.get("row_id") if context else None
-        if row_id and artifact_store is not None:
-            artifact_type = "thumbnail" if size <= _PREVIEW_SIZE_THRESHOLD else "preview"
-            pil_image = artifact_store.get_pixmap(row_id, artifact_type)
-            if pil_image is not None:
-                img = pil_image.copy()
-                img.thumbnail((size, size), Image.LANCZOS)
-                return _pil_to_pixmap(img)
+        # Thumbnail mode: try the ArtifactStore cache, keyed by the
+        # picture's canonical media address (P0.5b-1). The cache lookup
+        # touches no filesystem on a hit. `render()` already tried this
+        # before calling here; the call is repeated so _render_image is
+        # still correct if invoked directly.
+        cached = _cached_thumbnail(context, size, artifact_store)
+        if cached is not None:
+            return cached
 
-        # Cache miss or no context — load directly from disk.
+        # Cache miss or no address — load directly from disk. Removing
+        # this fallback is P0.5b-3 (docs/media_architecture.md 4.6 item 3).
         with Image.open(path) as img:
             img = img.convert("RGB")
             img.thumbnail((size, size), Image.LANCZOS)

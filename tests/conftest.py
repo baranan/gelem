@@ -39,6 +39,47 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from PySide6.QtWidgets import QApplication
 
+TEST_IMAGES  = Path(__file__).parent.parent / "test_images"
+METADATA_CSV = TEST_IMAGES / "metadata.csv"
+
+
+@pytest.fixture
+def make_controller():
+    """Factory: a real AppController over the 20-row test_images table.
+
+    Was copied verbatim into tests/test_gallery_seam.py and
+    tests/test_visible_row_order.py -- two places computing one thing.
+    Returns ``(controller, dataset, op_registry)``; pass ``merge_csv=True``
+    to also merge metadata.csv on file_name.
+    """
+    from models.dataset import Dataset
+    from models.query_engine import QueryEngine
+    from artifacts.artifact_store import ArtifactStore
+    from column_types.registry import ColumnTypeRegistry
+    from operators.operator_registry import OperatorRegistry
+    from controller import AppController
+
+    def _make(tmp_path, *, merge_csv: bool = False):
+        store    = ArtifactStore(tmp_path / "artifacts")
+        registry = ColumnTypeRegistry()
+        registry.setup_defaults(store)
+
+        dataset = Dataset()
+        dataset.set_registry(registry)
+        dataset.load_folder(TEST_IMAGES)
+        if merge_csv:
+            dataset.confirm_merge(
+                dataset.merge_csv(METADATA_CSV, join_on="file_name")
+            )
+
+        op_registry = OperatorRegistry()
+        controller  = AppController(
+            dataset, QueryEngine(), store, registry, op_registry
+        )
+        return controller, dataset, op_registry
+
+    return _make
+
 
 @pytest.fixture(scope="session")
 def qapp() -> QApplication:

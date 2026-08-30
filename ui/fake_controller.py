@@ -538,9 +538,17 @@ class FakeController(QObject):
         """
         return None
     
-    def get_artifact_pixmap(self, row_id: str, artifact_type: str):
-        if artifact_type == "thumbnail":
-            return self._thumb_cache.get(row_id, None)
+    def get_artifact_pixmap(
+        self,
+        address: str,
+        purpose: str = "thumbnail",
+        resolution: int | None = None,
+    ):
+        # Mirrors AppController's P0.5b-1 signature: artifacts are
+        # identified by media address, not by row. The fake keys its
+        # thumbnail cache by row id and has no address map, so it returns
+        # None -- exactly what the real store returns for an address with
+        # no cache entry. UI code already handles None.
         return None
 
     def render_column_value(

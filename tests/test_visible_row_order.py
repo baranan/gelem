@@ -33,38 +33,17 @@ from PySide6.QtWidgets import QApplication
 
 from models.dataset import Dataset
 from models.query_engine import QueryEngine, Filter
-from artifacts.artifact_store import ArtifactStore
-from column_types.registry import ColumnTypeRegistry
-from operators.operator_registry import OperatorRegistry
 from operators.base import BaseOperator
-from controller import AppController
 from models.query_result import ResultLayout, GroupSection
 
-TEST_IMAGES  = project_root / "test_images"
-METADATA_CSV = TEST_IMAGES / "metadata.csv"
+# The controller factory lives in tests/conftest.py (make_controller
+# fixture) -- it was duplicated here and in tests/test_gallery_seam.py.
 
 
 @pytest.fixture(scope="module", autouse=True)
 def _qapp():
     if QApplication.instance() is None:
         QApplication(sys.argv)
-
-
-def _make_controller(tmp_path, *, merge_csv=False):
-    """Builds a real controller over the 20-row test_images table."""
-    store    = ArtifactStore(tmp_path / "artifacts")
-    registry = ColumnTypeRegistry()
-    registry.setup_defaults(store)
-
-    dataset = Dataset()
-    dataset.set_registry(registry)
-    dataset.load_folder(TEST_IMAGES)
-    if merge_csv:
-        dataset.confirm_merge(dataset.merge_csv(METADATA_CSV, join_on="file_name"))
-
-    op_registry = OperatorRegistry()
-    controller  = AppController(dataset, QueryEngine(), store, registry, op_registry)
-    return controller, dataset, op_registry
 
 
 class _RecordingOperator(BaseOperator):
@@ -109,8 +88,8 @@ def _run_operator_and_wait(controller, op_registry, row_ids, monkeypatch):
 #    even with randomise on. Fails on pre-P0.4 code.
 # ---------------------------------------------------------------------------
 
-def test_randomised_order_is_the_same_everywhere(tmp_path, monkeypatch):
-    controller, dataset, op_registry = _make_controller(tmp_path)
+def test_randomised_order_is_the_same_everywhere(make_controller, tmp_path, monkeypatch):
+    controller, dataset, op_registry = make_controller(tmp_path)
     op = _RecordingOperator()
     op_registry.register(op)
 
@@ -141,8 +120,8 @@ def test_randomised_order_is_the_same_everywhere(tmp_path, monkeypatch):
 # 2. save_filtered_as_table() runs no second query and copies no table.
 # ---------------------------------------------------------------------------
 
-def test_save_filtered_set_does_not_requery_or_copy(tmp_path, monkeypatch):
-    controller, dataset, _ = _make_controller(tmp_path)
+def test_save_filtered_set_does_not_requery_or_copy(make_controller, tmp_path, monkeypatch):
+    controller, dataset, _ = make_controller(tmp_path)
     controller.set_filters([], randomise=True, seed=7)
 
     counts = {"apply": 0, "get_table": 0}
@@ -176,8 +155,8 @@ def test_save_filtered_set_does_not_requery_or_copy(tmp_path, monkeypatch):
 # 3. In grouped mode the GroupSections tile the flat order exactly.
 # ---------------------------------------------------------------------------
 
-def test_group_sections_tile_the_flat_order(tmp_path):
-    controller, dataset, _ = _make_controller(tmp_path, merge_csv=True)
+def test_group_sections_tile_the_flat_order(make_controller, tmp_path):
+    controller, dataset, _ = make_controller(tmp_path, merge_csv=True)
     controller.set_group_by("condition")
 
     layout = controller.get_result_layout()
@@ -212,8 +191,8 @@ def test_group_sections_tile_the_flat_order(tmp_path):
 #    the zero-group case. None and () are different states.
 # ---------------------------------------------------------------------------
 
-def test_groups_none_vs_tuple(tmp_path):
-    controller, _, _ = _make_controller(tmp_path, merge_csv=True)
+def test_groups_none_vs_tuple(make_controller, tmp_path):
+    controller, _, _ = make_controller(tmp_path, merge_csv=True)
 
     controller.set_group_by(None)
     assert controller.get_result_layout().groups is None
@@ -234,8 +213,8 @@ def test_groups_none_vs_tuple(tmp_path):
 # 5. Displayed-range bookkeeping: two keys, clearing one, stale id, refresh.
 # ---------------------------------------------------------------------------
 
-def test_displayed_range_tracking(tmp_path):
-    controller, _, _ = _make_controller(tmp_path)
+def test_displayed_range_tracking(make_controller, tmp_path):
+    controller, _, _ = make_controller(tmp_path)
     controller.set_filters([])
     rid = controller.get_result_layout().result_id
 
@@ -262,8 +241,8 @@ def test_displayed_range_tracking(tmp_path):
 # 6. ResultLayout exposes no row ids.
 # ---------------------------------------------------------------------------
 
-def test_result_layout_carries_no_row_ids(tmp_path):
-    controller, _, _ = _make_controller(tmp_path, merge_csv=True)
+def test_result_layout_carries_no_row_ids(make_controller, tmp_path):
+    controller, _, _ = make_controller(tmp_path, merge_csv=True)
     controller.set_group_by("condition")
     layout = controller.get_result_layout()
 
@@ -285,10 +264,10 @@ def test_result_layout_carries_no_row_ids(tmp_path):
 # 6b. A failed query does not leave the previous result standing.
 # ---------------------------------------------------------------------------
 
-def test_failed_refresh_publishes_an_empty_result_for_the_active_table(
+def test_failed_refresh_publishes_an_empty_result_for_the_active_table(make_controller, 
     tmp_path, monkeypatch
 ):
-    controller, _, _ = _make_controller(tmp_path)
+    controller, _, _ = make_controller(tmp_path)
     controller.set_filters([])
     assert controller.get_visible_row_ids(), "sanity: started with a real result"
 
@@ -315,8 +294,8 @@ def test_failed_refresh_publishes_an_empty_result_for_the_active_table(
 #    the promised guardrail test.
 # ---------------------------------------------------------------------------
 
-def test_visible_columns_none_versus_empty(tmp_path):
-    controller, _, _ = _make_controller(tmp_path)
+def test_visible_columns_none_versus_empty(make_controller, tmp_path):
+    controller, _, _ = make_controller(tmp_path)
 
     # Before any choice: no preference, and the effective list falls back
     # to the default media column.

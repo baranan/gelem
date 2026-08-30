@@ -50,29 +50,9 @@ from controller import AppController
 from ui.gallery_widget import GalleryWidget, TileWidget
 from ui.main_window import MainWindow
 
-TEST_IMAGES = project_root / "test_images"
-METADATA_CSV = TEST_IMAGES / "metadata.csv"
-
-
-# ---------------------------------------------------------------------------
-# Construction -- mirrors tests/test_visible_row_order.py::_make_controller
-# ---------------------------------------------------------------------------
-
-def _make_controller(tmp_path, *, merge_csv=False):
-    """Builds a real controller over the 20-row test_images table."""
-    store = ArtifactStore(tmp_path / "artifacts")
-    registry = ColumnTypeRegistry()
-    registry.setup_defaults(store)
-
-    dataset = Dataset()
-    dataset.set_registry(registry)
-    dataset.load_folder(TEST_IMAGES)
-    if merge_csv:
-        dataset.confirm_merge(dataset.merge_csv(METADATA_CSV, join_on="file_name"))
-
-    op_registry = OperatorRegistry()
-    controller = AppController(dataset, QueryEngine(), store, registry, op_registry)
-    return controller, dataset, op_registry
+# The controller factory is the make_controller fixture in
+# tests/conftest.py -- it used to be copied into this file and
+# tests/test_visible_row_order.py.
 
 
 def _any_group_with_offset(layout):
@@ -152,9 +132,9 @@ def _fresh_gallery(controller, reports_first=True):
 # PART 2 -- the reported range
 # ===========================================================================
 
-def test_flat_scrolled_to_top_reports_start_zero(realize_widget, tmp_path):
+def test_flat_scrolled_to_top_reports_start_zero(make_controller, realize_widget, tmp_path):
     """1. Flat mode, scrolled to top: reported start is 0."""
-    controller, _, _ = _make_controller(tmp_path)
+    controller, _, _ = make_controller(tmp_path)
     controller.set_filters([])
     layout = controller.get_result_layout()
 
@@ -166,7 +146,7 @@ def test_flat_scrolled_to_top_reports_start_zero(realize_widget, tmp_path):
     assert reports[-1][0] == 0
 
 
-def test_grouped_scrolled_to_top_reports_absolute_start(realize_widget, tmp_path):
+def test_grouped_scrolled_to_top_reports_absolute_start(make_controller, realize_widget, tmp_path):
     """
     2. Grouped mode, scrolled to top: a gallery given set_range(S, E)
     with S > 0 reports start == S, not 0.
@@ -175,7 +155,7 @@ def test_grouped_scrolled_to_top_reports_absolute_start(realize_widget, tmp_path
     group-local indices instead of absolute ones would pass every
     other test in the repo and silently feed P0.5 the wrong rows.
     """
-    controller, _, _ = _make_controller(tmp_path, merge_csv=True)
+    controller, _, _ = make_controller(tmp_path, merge_csv=True)
     controller.set_group_by("condition")
     layout = controller.get_result_layout()
     section = _any_group_with_offset(layout)
@@ -190,12 +170,12 @@ def test_grouped_scrolled_to_top_reports_absolute_start(realize_widget, tmp_path
     assert reports[-1][0] != 0
 
 
-def test_scrolled_to_bottom_reports_slice_stop(realize_widget, qapp, tmp_path):
+def test_scrolled_to_bottom_reports_slice_stop(make_controller, realize_widget, qapp, tmp_path):
     """
     3. Scrolled to the bottom: the reported stop equals the slice's
     stop E. Driven by setting the vertical scrollbar to its maximum.
     """
-    controller, _, _ = _make_controller(tmp_path)
+    controller, _, _ = make_controller(tmp_path)
     controller.set_filters([])
     layout = controller.get_result_layout()
     end = layout.total
@@ -213,11 +193,11 @@ def test_scrolled_to_bottom_reports_slice_stop(realize_widget, qapp, tmp_path):
     assert reports[-1][1] == end
 
 
-def test_report_is_always_inside_the_slice(realize_widget, qapp, tmp_path):
+def test_report_is_always_inside_the_slice(make_controller, realize_widget, qapp, tmp_path):
     """
     4. For several scroll positions, S <= start <= stop <= E.
     """
-    controller, _, _ = _make_controller(tmp_path, merge_csv=True)
+    controller, _, _ = make_controller(tmp_path, merge_csv=True)
     controller.set_group_by("condition")
     layout = controller.get_result_layout()
     section = _largest_group_with_offset(layout)
@@ -235,13 +215,13 @@ def test_report_is_always_inside_the_slice(realize_widget, qapp, tmp_path):
         assert start_s <= start <= stop <= end_e
 
 
-def test_painted_ids_match_reported_range_flat(realize_widget, qapp, tmp_path):
+def test_painted_ids_match_reported_range_flat(make_controller, realize_widget, qapp, tmp_path):
     """
     5. (flat) The row ids held by the mounted tiles equal
     controller.get_visible_row_ids()[a:b] for the reported [a, b).
     No geometry involved.
     """
-    controller, _, _ = _make_controller(tmp_path)
+    controller, _, _ = make_controller(tmp_path)
     controller.set_filters([])
     layout = controller.get_result_layout()
 
@@ -257,7 +237,7 @@ def test_painted_ids_match_reported_range_flat(realize_widget, qapp, tmp_path):
         assert _painted_ids(gallery) == controller.get_visible_row_ids()[start:stop]
 
 
-def test_painted_ids_match_reported_range_grouped(realize_widget, qapp, tmp_path):
+def test_painted_ids_match_reported_range_grouped(make_controller, realize_widget, qapp, tmp_path):
     """
     5. (grouped, non-zero slice start) Same assertion as above but for
     a group gallery whose slice starts partway through the flat order.
@@ -265,7 +245,7 @@ def test_painted_ids_match_reported_range_grouped(realize_widget, qapp, tmp_path
     in the report -- the painted ids would be
     get_visible_row_ids()[0:count] and this fails.
     """
-    controller, _, _ = _make_controller(tmp_path, merge_csv=True)
+    controller, _, _ = make_controller(tmp_path, merge_csv=True)
     controller.set_group_by("condition")
     layout = controller.get_result_layout()
     section = _largest_group_with_offset(layout)
@@ -285,7 +265,7 @@ def test_painted_ids_match_reported_range_grouped(realize_widget, qapp, tmp_path
         assert _painted_ids(gallery) == controller.get_visible_row_ids()[start:stop]
 
 
-def test_reported_window_is_a_superset_of_the_strictly_visible_tiles(
+def test_reported_window_is_a_superset_of_the_strictly_visible_tiles(make_controller, 
     realize_widget, qapp, tmp_path
 ):
     """
@@ -295,7 +275,7 @@ def test_reported_window_is_a_superset_of_the_strictly_visible_tiles(
     P0.5 does not stack its own prefetch margin on top of a margin it
     did not know was there. Asserts the relationship, not the number.
     """
-    controller, _, _ = _make_controller(tmp_path)
+    controller, _, _ = make_controller(tmp_path)
     controller.set_filters([])
     layout = controller.get_result_layout()
 
@@ -327,14 +307,14 @@ def test_reported_window_is_a_superset_of_the_strictly_visible_tiles(
     assert stop - start == len(_painted_ids(gallery))
 
 
-def test_superseded_result_id_is_not_reported_under_the_new_one(
+def test_superseded_result_id_is_not_reported_under_the_new_one(make_controller, 
     realize_widget, qapp, tmp_path
 ):
     """
     7. After set_range with a new result_id, the next report carries
     the new id -- the gallery stamps its own reports.
     """
-    controller, _, _ = _make_controller(tmp_path)
+    controller, _, _ = make_controller(tmp_path)
     controller.set_filters([])
     layout_a = controller.get_result_layout()
 
@@ -372,7 +352,7 @@ def _sole_flat_gallery(window, qapp):
     return galleries[0]
 
 
-def test_defect_a_flat_gallery_honours_empty_columns_after_ungrouping(
+def test_defect_a_flat_gallery_honours_empty_columns_after_ungrouping(make_controller, 
     realize_widget, qapp, tmp_path
 ):
     """
@@ -380,7 +360,7 @@ def test_defect_a_flat_gallery_honours_empty_columns_after_ungrouping(
     The flat gallery must show the "no visual column" placeholder --
     not fall back to its stale local choice and paint full_path tiles.
     """
-    controller, _, _ = _make_controller(tmp_path, merge_csv=True)
+    controller, _, _ = make_controller(tmp_path, merge_csv=True)
     window = MainWindow(controller)
     realize_widget(window, width=1100, height=800)
 
@@ -402,7 +382,7 @@ def test_defect_a_flat_gallery_honours_empty_columns_after_ungrouping(
     )
 
 
-def test_defect_a_no_preference_ungrouping_does_not_hand_gallery_empty_list(
+def test_defect_a_no_preference_ungrouping_does_not_hand_gallery_empty_list(make_controller, 
     realize_widget, qapp, tmp_path
 ):
     """
@@ -411,7 +391,7 @@ def test_defect_a_no_preference_ungrouping_does_not_hand_gallery_empty_list(
     would show the placeholder; instead it must fall back to full_path
     and paint tiles.
     """
-    controller, _, _ = _make_controller(tmp_path, merge_csv=True)
+    controller, _, _ = make_controller(tmp_path, merge_csv=True)
     window = MainWindow(controller)
     realize_widget(window, width=1100, height=800)
 
@@ -431,7 +411,7 @@ def test_defect_a_no_preference_ungrouping_does_not_hand_gallery_empty_list(
     )
 
 
-def test_defect_a_preference_reset_while_grouped_reaches_the_flat_gallery(
+def test_defect_a_preference_reset_while_grouped_reaches_the_flat_gallery(make_controller, 
     realize_widget, qapp, tmp_path
 ):
     """
@@ -443,7 +423,7 @@ def test_defect_a_preference_reset_while_grouped_reaches_the_flat_gallery(
     still be resynced -- back to the full_path fallback, not stuck on
     the stale empty choice.
     """
-    controller, _, _ = _make_controller(tmp_path, merge_csv=True)
+    controller, _, _ = make_controller(tmp_path, merge_csv=True)
     window = MainWindow(controller)
     realize_widget(window, width=1100, height=800)
 
@@ -466,7 +446,7 @@ def test_defect_a_preference_reset_while_grouped_reaches_the_flat_gallery(
 # PART 3, DEFECT B -- the no-visual-column relayout reports a zero-width range
 # ===========================================================================
 
-def test_defect_b_no_visual_column_reports_zero_width_range_flat(
+def test_defect_b_no_visual_column_reports_zero_width_range_flat(make_controller, 
     realize_widget, tmp_path
 ):
     """
@@ -474,7 +454,7 @@ def test_defect_b_no_visual_column_reports_zero_width_range_flat(
     reports a zero-width range at its own slice start (0 in flat mode),
     the same thing the empty case in _update_visible_tiles does.
     """
-    controller, _, _ = _make_controller(tmp_path)
+    controller, _, _ = make_controller(tmp_path)
     controller.set_filters([])
     layout = controller.get_result_layout()
 
@@ -488,14 +468,14 @@ def test_defect_b_no_visual_column_reports_zero_width_range_flat(
     assert reports[-1] == (0, 0, layout.result_id)
 
 
-def test_defect_b_no_visual_column_reports_zero_width_range_grouped(
+def test_defect_b_no_visual_column_reports_zero_width_range_grouped(make_controller, 
     realize_widget, tmp_path
 ):
     """
     Same, but for a group gallery whose slice starts at S > 0: the
     zero-width range is reported at S, not at 0.
     """
-    controller, _, _ = _make_controller(tmp_path, merge_csv=True)
+    controller, _, _ = make_controller(tmp_path, merge_csv=True)
     controller.set_group_by("condition")
     layout = controller.get_result_layout()
     section = _any_group_with_offset(layout)
@@ -512,21 +492,16 @@ def test_defect_b_no_visual_column_reports_zero_width_range_grouped(
 
 
 # ===========================================================================
-# PART 4 -- guardrail for P0.5b (ArtifactStore key collision). WRITTEN TO FAIL.
+# PART 4 -- guardrail for P0.5b-1 (ArtifactStore key collision).
 # ===========================================================================
 #
-# Known defect, listed in CLAUDE.md under "Known defects" as "Fixed by
-# P0.5": ArtifactStore keys its index, its memory cache and its
-# filenames on (row_id, artifact_type), so two media columns on one row
-# collide -- a row with full_path and avatar_path shows the same
-# picture in both tiles.
-#
-# This test defines the fix. It goes through PUBLIC controller API only
-# -- AppController.render_column_value() and the thumbnail-request path
-# reached by AppController.load_folder() -- so that when P0.5 replaces
-# ArtifactStore's API wholesale (address-based keys) the test still
-# compiles and runs unchanged, and the strict xfail turns the
-# now-passing behaviour into a failure that forces the marker's removal.
+# Was a known defect ("A row with several media columns shares one cached
+# image"): ArtifactStore keyed its index, memory cache and filenames on
+# (row_id, artifact_type), so a row with full_path and avatar_path showed
+# the same picture in both tiles. P0.5b-1 keys derived artifacts by media
+# address instead (docs/media_architecture.md 4.5), and this test -- which
+# goes through PUBLIC controller API only (render_column_value() and the
+# thumbnail-request path reached by load_folder()) -- now passes.
 
 
 def _solid_png(path: Path, colour: tuple[int, int, int]) -> None:
@@ -535,27 +510,18 @@ def _solid_png(path: Path, colour: tuple[int, int, int]) -> None:
     Image.new("RGB", (240, 240), colour).save(path)
 
 
-# raises=AssertionError narrows what counts as the expected failure to
-# exactly the final colour comparison. Without it ANY exception would be
-# accepted as the xfail: a broken setup (thumbnail never generated, a
-# renderer returning None) would then report as xfailed forever, and
-# when P0.5 keys artifacts by media address the strict marker would
-# never flip to an unexpected pass -- nobody would be told the fix
-# landed. Every setup check in the test therefore raises RuntimeError,
-# not AssertionError, so the one and only AssertionError the test can
-# produce is "the two columns rendered the same picture".
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "P0.5 keys derived artifacts by media address, not by "
-        "(row_id, artifact_type) (docs/media_architecture.md 4.5). "
-        "Until then, a row's second media column renders the first "
-        "column's thumbnail. When P0.5 lands this xfail(strict) becomes "
-        "an unexpected pass -> failure: delete the marker, do not leave "
-        "a lying test behind."
-    ),
-)
+# P0.5b-1 landed: derived artifacts are keyed by media address, not by
+# (row_id, artifact_type) (docs/media_architecture.md 4.5), so the two
+# media columns on one row no longer collide. This test was
+# xfail(strict, raises=AssertionError) until then; the marker is gone.
+# Setup checks still raise RuntimeError rather than AssertionError so the
+# only AssertionError the test can produce is the real colour comparison.
+#
+# NOTE (see the work-item handoff): this test passes EVEN IF the cache is
+# broken, because avatar_path has no cached artifact and _render_image
+# falls back to Image.open(blue.png). It proves the fallback, not the
+# keying. test_artifact_identity.py::test_second_media_column_gets_its_
+# own_cached_artifact is what actually guards the fix.
 def test_two_media_columns_on_one_row_render_different_pictures(qapp, tmp_path):
     # qapp: QPixmap (built below via render_column_value) requires a
     # live QApplication, and Qt aborts the whole process with qFatal
@@ -632,7 +598,11 @@ def test_two_media_columns_on_one_row_render_different_pictures(qapp, tmp_path):
     avatar_path_colour = _render("avatar_path")
 
     assert full_path_colour != avatar_path_colour, (
-        "full_path and avatar_path rendered the same picture for one "
-        "row: ArtifactStore keys thumbnails on (row_id, artifact_type), "
-        "so the second media column collides with the first"
+        "full_path and avatar_path rendered the same picture for one row -- "
+        "the two media columns collided. Their identities differ only by "
+        "canonical media address, so this is the end-to-end check that "
+        "render_column_value carries the right address per column. The "
+        "cache-level guard is "
+        "test_artifact_identity.py::test_second_media_column_gets_its_own_"
+        "cached_artifact."
     )

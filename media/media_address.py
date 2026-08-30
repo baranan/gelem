@@ -22,6 +22,7 @@ existing). Region fractions are held the same way, as integer millionths.
 
 import bisect
 import dataclasses
+import functools
 import pathlib
 import posixpath
 import re
@@ -44,6 +45,7 @@ __all__ = [
     "absolutise",
     "relativise",
     "canonical_key",
+    "resolve_source",
     "select_frame",
     "frames_in_range",
     "region_to_pixels",
@@ -543,6 +545,31 @@ def canonical_key(addr: MediaAddress, project_root: str) -> str:
     of "make absolute", shared with models/dataset.py's save/load path.
     """
     return format(absolutise(addr, project_root))
+
+
+@functools.lru_cache(maxsize=8192)
+def resolve_source(cell: str, project_root: str) -> Tuple[str, str]:
+    """For a stored media cell, return
+    ``(canonical_key_string, absolute_source_path)``.
+
+    Memoised: this is pure (no filesystem access -- absolutise() is
+    string arithmetic) and the display path calls it once per media tile
+    render. The cache is bounded; a project switch just leaves stale
+    entries to be evicted.
+
+    The display path (``column_types/renderers.py``) needs both: the
+    canonical key form to look an artifact up in the cache, and the
+    absolute filesystem path a decoder opens. Providing them together
+    here keeps renderers free of a project root and of any address
+    parsing of their own -- the controller calls this once per media cell
+    and drops both values into the render context.
+
+    The canonical key is exactly ``canonical_key(parse(cell),
+    project_root)``; the path is that same absolutised address's path
+    portion, so the two never disagree about which file is meant.
+    """
+    addr = absolutise(parse(cell), project_root)
+    return format(addr), addr.path
 
 
 # ---------------------------------------------------------------------------

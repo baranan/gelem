@@ -134,8 +134,9 @@ re-verified there.)*
   identifies it as `(table_name, row_id)`. Made true by P0.2b: `rows_updated`
   and `thumbnails_ready` carry a frozen payload (`models/notifications.py`)
   with `table_name` and a tuple of `row_ids`;
-  `ArtifactStore.request_thumbnail(row_id, full_path, table_name)` holds the
-  table and echoes it back as `on_thumbnail_ready(table_name, row_id)`.
+  `ArtifactStore.request_thumbnail(row_id, address, source_path, table_name)`
+  (address and source_path added by P0.5b-1) holds the table and echoes it back
+  as `on_thumbnail_ready(table_name, row_id)`.
   `MainWindow` -- not the controller, not each gallery -- is the single place
   that checks the payload's table against `AppController.get_active_table()`.
   Tests: `tests/test_result_delivery.py`
@@ -145,13 +146,15 @@ re-verified there.)*
   (`test_signal_signatures_match_between_real_and_fake_controller`).
 - **`[MIGRATING]`** The same `(table_name, row_id)` discipline for **controller
   methods** that take a bare `row_id`. Known remaining set, closed:
-  `select_row(row_id)`, `get_artifact_pixmap(row_id, artifact_type)`,
-  `get_result_index(row_id)` and `get_row(row_id, table_name=None)`. Each
-  defaults to `self._active_table`, so a caller that has switched tables since
-  it captured the id reads or selects the wrong row. P0.2b did not touch these
-  and its tests do not cover them; an earlier revision of the rule above
-  claimed "controller method" was already done, which overreached -- only the
-  signals and the artifact request were.
+  `select_row(row_id)`, `get_result_index(row_id)` and
+  `get_row(row_id, table_name=None)`. Each defaults to `self._active_table`, so
+  a caller that has switched tables since it captured the id reads or selects
+  the wrong row. P0.2b did not touch these and its tests do not cover them; an
+  earlier revision of the rule above claimed "controller method" was already
+  done, which overreached -- only the signals and the artifact request were.
+  *(P0.5b-1 removed `get_artifact_pixmap` from this set: it now takes a media
+  address, not a row id -- the row never identified the picture, only the
+  subscriber. `docs/media_architecture.md` §4.5.)*
 - **`[NOW]`** **Lineage is carried by ordinary data columns, not by surrogate
   pointers.** When an operator turns one row into many -- a video into segments, a
   segment into frames -- it carries the source's identifying columns down and adds
@@ -257,22 +260,52 @@ re-verified there.)*
   `column_types/renderers.py`, and `ArtifactStore._generate_thumbnails`.
 - **`[NOW]`** **Reading and writing Gelem's own derived artifacts is a different
   operation and is not covered by that rule.** `ArtifactStore` reads back the JPEGs
-  it wrote (`get_pixmap` calls `Image.open`), and must keep being able to. A
-  guardrail that bans `Image.open` outright would either forbid legitimate cache
-  I/O or push cache internals into the resolver. `[TARGET -> P0.5]` The two are
-  separated by a narrow `ArtifactCodec`, so the guardrail can name the boundary
-  precisely: source decoding is the resolver's, artifact encoding is
-  `ArtifactCodec`'s, and nothing else opens an image at all.
+  it wrote, and must keep being able to. A guardrail that bans `Image.open`
+  outright would either forbid legitimate cache I/O or push cache internals into
+  the resolver. **P0.5b-1 built the narrow `ArtifactCodec`
+  (`artifacts/artifact_codec.py`): it is the only place a derived JPEG is
+  encoded or read back, and it refuses any path outside the artifact cache root.
+  The boundary is checked by behaviour, not source inspection -- a test hands it
+  a source-media path and asserts the raise
+  (`tests/test_artifact_identity.py::test_codec_refuses_path_outside_cache_root`).**
+  `[TARGET -> P1.2]` The matching half -- source decoding confined to the
+  resolver, so that *nothing else opens an image at all* -- waits on the
+  resolver. Until then `column_types/renderers.py` (`_render_image` fallback) and
+  `ArtifactStore._generate_thumbnails` still decode source media directly.
 - **`[TARGET -> P1.10]`** Native playback is the explicit exception. `QMediaPlayer`
   receives a file path and a time range directly. It shares the address **parser**
   with the resolver but not the decoding path.
-- **`[TARGET -> P0.5]`** No media is opened or decoded during a paint. A cache miss
-  returns a placeholder immediately and queues a request. Today
-  `_render_video()` runs `cv2.VideoCapture` on the main thread on every paint of
-  every video tile, and consults no cache at all.
-- **`[TARGET -> P0.5]`** Derived images are identified by **media address**, not by
-  row. See `docs/media_architecture.md` §4.5. The row, table and column identify
-  the UI subscriber waiting for the picture, never the picture itself.
+- **`[TARGET -> P0.5, sub-item P0.5b-3]`** No media is opened or decoded during a
+  paint. A cache miss returns a placeholder immediately and queues a request.
+  P0.5b-1 keyed the cache, made a hit touch no filesystem, and put a
+  cache-first fast path in `make_media_path_renderer`'s `render()` ahead of the
+  image/video dispatch -- so **both** image and video tiles now consult the
+  cache and skip decoding on a hit. On a **miss** the two paths still decode on
+  the main thread: `_render_video()` runs `cv2.VideoCapture` and `_render_image`
+  falls back to a direct `Image.open`. Removing both misses -- the placeholder
+  + queued-request behaviour above -- is P0.5b-3.
+- **`[NOW]`** Derived images are identified by an `ArtifactKey` -- canonical
+  **media address**, source fingerprint, purpose, resolution,
+  representative-frame policy, renderer cache version -- not by the row that
+  asked. The row, table and column identify the UI subscriber waiting for the
+  picture, never the picture itself. Made true by P0.5b-1:
+  `media/artifact_key.py` is the key; `ArtifactStore` indexes, caches, names on
+  disk and persists by it; a fingerprint memo keeps the paint-path lookup off
+  `stat()`. The memo has three states -- absent (a lookup misses),
+  seeded-unverified from `load_index` (served, and the next `request_thumbnail`
+  re-stats it), verified from a fresh `refresh_fingerprint` (served, and a
+  duplicate request short-circuits). See `docs/media_architecture.md` §4.5.
+  Tests: `tests/test_artifact_identity.py`
+  (`test_second_media_column_gets_its_own_cached_artifact`,
+  `test_same_file_two_tables_share_one_cache_entry`,
+  `test_time_range_in_address_changes_the_key`,
+  `test_changed_source_fingerprint_changes_the_key`,
+  `test_load_folder_a_then_b_shows_no_a_picture`,
+  `test_load_project_a_then_b_shows_no_a_picture`),
+  `tests/test_gallery_seam.py::test_two_media_columns_on_one_row_render_different_pictures`.
+  **Not yet done (P0.5b-3):** the ready notification still carries
+  `(table_name, row_id)`, not the column -- repainting a row repaints its
+  columns and each looks up its own key, which is sufficient for now.
 - **`[NOW]`** `media/media_address.py` gives the address grammar exact,
   guarded-by-test meaning: escaping, canonical form, frame/time-point and
   range semantics, region validation and pixel arithmetic, and which
@@ -292,12 +325,16 @@ re-verified there.)*
   hardcoded 300-1500 ms window, a seven-emotion assumption, or a
   blendshape-specific branch inside a generic component is a leak. Before building
   a feature, name the parameter that makes it general.
-- **`[TARGET -> P0.5]`** **A number that does not generalise across machines
-  or datasets must become a setting or a runtime measurement -- never a constant in
-  the code.** Worker count and cache size are both of this kind. Measuring one on
-  Y B's machine tells you the shape of the common case, not a value to hardcode.
-  Not true today: `DEFAULT_CACHE_MAX_BYTES` is a hardcoded 500 MB, and there is no
-  worker pool to have a count. *(Keyframe interval was the third example here
+- **`[TARGET -> P0.5, sub-item P0.5b-2]`** **A number that does not generalise
+  across machines or datasets must become a setting or a runtime measurement --
+  never a constant in the code.** Worker count and cache size are both of this
+  kind. Measuring one on Y B's machine tells you the shape of the common case,
+  not a value to hardcode. Not true today: `DEFAULT_CACHE_MAX_BYTES` is a
+  hardcoded 500 MB, and there is no worker pool to have a count. `THUMBNAIL_SIZE`
+  / `PREVIEW_SIZE` / `_PREVIEW_SIZE_THRESHOLD` are the same kind of constant and
+  stay module-level for now -- P0.5b-1 makes the resolution enter the artifact
+  key **as a value** rather than be assumed by the reader, but turning these
+  into settings is P0.5b-2, with worker count. *(Keyframe interval was the third example here
   until 26 Aug 2026: it was measured per video specifically to decide whether to
   build a whole-video proxy layer, and that proxy is rejected -- see
   `docs/media_architecture.md` §10.)* This rule covers two different things --
@@ -531,12 +568,6 @@ Verified against the code on 4 Aug 2026; re-verified against `main` on 24 Aug
 
 **Wrong output, not just slow:**
 
-- A row with several media columns shares one cached image. `ArtifactStore` keys on
-  `(row_id, artifact_type)` and writes `{row_id}_{artifact_type}.jpg`, so the entry
-  collides in the index *and* on disk. `ImageTile` correctly passes `column_name`
-  in the render context and `_render_image` ignores it. **A `GridTile` showing
-  `full_path` and `avatar_path` displays the source photograph in both tiles.**
-  Fixed by P0.5.
 - `BlendshapeAvatarOperator` declares tag `avatar_path` and `PlotOperator` declares
   `plot_image`. Neither is a registered type, so `register_by_tag` raises,
   `controller.py:471-472` swallows it as a printed warning, and those columns
@@ -544,15 +575,20 @@ Verified against the code on 4 Aug 2026; re-verified against `main` on 24 Aug
 - `ColumnTypeRegistry.infer_type()` mistags any column whose values end in a media
   extension. A column of `.mp4` filenames becomes `media_path`. This fires
   immediately in the new pipeline.
-- `ArtifactStore.load_index()` replaces the disk index but leaves the in-memory
-  image cache populated, so opening a second project can show the first project's
-  pictures.
 - `Dataset.load()` does not clear `ColumnTypeRegistry`, so column types from the
   previous project persist.
 
 **Non-functional at target scale:**
 
 - `ArtifactStore.request_thumbnail()` spawns one raw `threading.Thread` per call.
+- **The on-disk artifact cache (`%TEMP%\gelem_artifacts`, from `main.py`) is
+  append-only.** P0.5b-1's content-addressed filenames (`{key.stable_hash()}.jpg`)
+  removed the accidental overwrite bound the old `{row_id}_{artifact_type}.jpg`
+  naming provided -- a changed source fingerprint, a `RENDERER_CACHE_VERSION`
+  bump, `reset()`, and `load_index()` discarding an old-format index all leave
+  their JPEGs on disk. The memory cache has a ceiling and LRU eviction; the disk
+  cache has neither. Assign to **P0.5b-2**, with cache size becoming a setting
+  and `main.py`'s TODO about moving the folder inside the project.
 
 *(Two bullets removed 27 Aug 2026, P0.2b: "`Dataset.get_row()` calls
 `get_table()` ... 530k full-table copies" and "`Dataset.update_row()` scans the
@@ -563,12 +599,23 @@ lists drained with `pop(0)`, unbounded per tick" bullet is fixed by P0.2b: the
 queues are `queue.SimpleQueue` and each drain is bounded by
 `AppController._drain_budget`.)*
 
+*(Two bullets removed 27 Aug 2026, P0.5b-1: "A row with several media columns
+shares one cached image" and "`ArtifactStore.load_index()` ... can show the first
+project's pictures" are both fixed. Artifacts are now keyed by `ArtifactKey`
+(media address + fingerprint + purpose + resolution + policy + version), so two
+media columns on one row and two projects no longer collide, and `load_project()`
+calls `_store.reset()` before `load_index()`. Tests:
+`tests/test_artifact_identity.py`. `request_thumbnail()` still spawns a raw
+thread per call -- that bullet stays; the bounded pool is P0.5b-2.)*
+
 **Dead or inconsistent:**
 
 - `operators/thumbnail.py` is dead code. Its docstring says
   `ArtifactStore.request_thumbnail()` calls it; `_generate_thumbnails()`
   reimplements the whole thing inline and never touches it. Delete it and make a
-  real operator the reference.
+  real operator the reference. *(P0.5b-1: it also now calls `ArtifactStore.put`
+  with the old `(row_id, artifact_type, image)` signature -- harmless while
+  nothing invokes it; P1.11 deletes the file.)*
 - `operators_config.yaml` claims to control which operators are enabled. `main.py`
   registers them manually and never reads the file. `StatsOperator` is registered
   in code and absent from the YAML.
@@ -578,6 +625,17 @@ queues are `queue.SimpleQueue` and each drain is bounded by
   CSV import paths.
 - `_id_counter` assumes `row_id` parses as an int. No stale-file cleanup on
   re-save.
+- **The purpose -> resolution mapping is computed in two places** (P0.5b-1):
+  `ArtifactStore._resolution_for` and `column_types/renderers.py::_cached_thumbnail`,
+  the latter via a `column_types -> artifacts.artifact_store` module-constant
+  import (`THUMBNAIL_RESOLUTION` / `PREVIEW_RESOLUTION`) even though the store
+  instance is already injected into the renderer factory. Fix by making
+  `_resolution_for` public and calling it through the instance.
+- **`media/artifact_key.py` imports `_POLICIES`, a private name, from
+  `media_address`** (P0.5b-1). Make `_POLICIES` public (`POLICIES`), add it to
+  `media_address.__all__`, and update `artifact_key.py` (the only cross-module
+  importer -- `artifact_store.py` uses only its own `REPRESENTATIVE_FRAME_POLICY`
+  constant).
 - Many module docstrings still assign files to Student A, B, or C. Remove as those
   files are touched. *(Done in `tests/test_renderer.py` 24 Aug 2026, the only
   file touched this session.)*

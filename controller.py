@@ -32,6 +32,7 @@ from PySide6.QtCore import QObject, Signal, QTimer
 
 from models.query_result import QueryResult, ResultLayout, GroupSection
 from models.notifications import RowsUpdated, ThumbnailsReady
+from media.media_address import resolve_source, MediaAddressError
 
 DEFAULT_MEDIA_COLUMN_NAME = "full_path"
 
@@ -178,6 +179,15 @@ class AppController(QObject):
         self._result:           QueryResult | None      = None
         self._result_index:     dict[str, int]          = {}
         self._displayed_ranges: dict[str, tuple[int, int]] = {}
+
+        # The directory media cells are resolved against when turning a
+        # stored cell into a canonical artifact-cache address plus an
+        # absolute source path. In a loaded project the cells are already
+        # absolute (Dataset.load absolutises them), so this only matters
+        # for a relative cell; it tracks the project folder once one
+        # exists. Kept thin: the arithmetic lives in
+        # media.media_address.resolve_source.
+        self._project_root:   Path       = Path.cwd()
 
         self._active_table:   str        = "frames"
         self._active_filters: list       = []
@@ -510,13 +520,9 @@ class AppController(QObject):
                 self._dataset.create_table_from_df(table_name, result_df)
                 stored_df = self._dataset.get_table(table_name)
                 for _, row in stored_df.iterrows():
-                    full_path = row.get("full_path", "")
-                    if full_path and Path(str(full_path)).exists():
-                        self._store.request_thumbnail(
-                            row["row_id"],
-                            Path(str(full_path)),
-                            table_name,
-                        )
+                    self._request_thumbnail_for_cell(
+                        row["row_id"], row.get("full_path", ""), table_name
+                    )
                 self.tables_updated.emit(self._dataset.list_tables())
                 self.table_created.emit(table_name)
                 self.operator_complete.emit(operator_name)
@@ -753,15 +759,14 @@ class AppController(QObject):
             self._active_filters = []
             self._group_by       = None
             self._visible_cols   = None
+            self._project_root   = Path(folder_path)
 
             self._dataset.load_folder(folder_path)
             df = self._dataset.get_table("frames")
 
             for _, row in df.iterrows():
-                self._store.request_thumbnail(
-                    row["row_id"],
-                    Path(row["full_path"]),
-                    "frames",
+                self._request_thumbnail_for_cell(
+                    row["row_id"], row.get("full_path", ""), "frames"
                 )
 
             self.columns_updated.emit(self._registry.list_all_columns())
@@ -791,18 +796,17 @@ class AppController(QObject):
             self._active_filters = []
             self._group_by       = None
             self._visible_cols   = None
+            # Relative image paths in the CSV are relative to the CSV's
+            # own folder, not the process working directory.
+            self._project_root   = Path(csv_path).parent
 
             self._dataset.load_csv_as_primary(csv_path, image_column)
             df = self._dataset.get_table("frames")
 
             for _, row in df.iterrows():
-                full_path = row.get("full_path", "")
-                if full_path and Path(full_path).exists():
-                    self._store.request_thumbnail(
-                        row["row_id"],
-                        Path(full_path),
-                        "frames",
-                    )
+                self._request_thumbnail_for_cell(
+                    row["row_id"], row.get("full_path", ""), "frames"
+                )
 
             self.columns_updated.emit(self._registry.list_all_columns())
             self.tables_updated.emit(self._dataset.list_tables())
@@ -1211,6 +1215,10 @@ class AppController(QObject):
         try:
             self._dataset.save(project_path)
             self._store.save_index(project_path)
+            # NOT: self._project_root = project_path. save() does not
+            # rewrite the in-memory cells, so the base they resolve
+            # against must not move either. load_project() sets the root
+            # because load() does absolutise the cells against it.
         except Exception as e:
             self.error_occurred.emit(f"Failed to save project: {e}")
 
@@ -1225,7 +1233,20 @@ class AppController(QObject):
             # The dataset is being replaced: drop every in-flight run so
             # a late result cannot land in the newly loaded project.
             self._live_runs.clear()
+            self._project_root = Path(project_path)
             self._dataset.load(project_path)
+            # reset() BEFORE load_index(): otherwise the new project's
+            # index lands on top of the previous project's live image
+            # cache and fingerprint memo, and an old picture can appear
+            # under a new row (docs/media_architecture.md section 4.5).
+            self._store.reset()
+            # load_index() re-seeds the index AND the fingerprint memo
+            # from the persisted (size, mtime) values, so a project that
+            # was fully thumbnailed reopens with its cache usable
+            # immediately -- no paint-path decode while workers catch up.
+            # A source file changed since the save is corrected on its
+            # next request, when the worker re-stats and the fingerprint
+            # no longer matches.
             self._store.load_index(project_path)
             self.tables_updated.emit(self._dataset.list_tables())
             self.columns_updated.emit(self._registry.list_all_columns())
@@ -1274,15 +1295,66 @@ class AppController(QObject):
         except Exception:
             return []
 
-    def get_artifact_pixmap(self, row_id: str, artifact_type: str):
+    def _request_thumbnail_for_cell(
+        self,
+        row_id: str,
+        cell,
+        table_name: str,
+    ) -> None:
+        """Eager thumbnail request for one media cell.
+
+        The three eager sites (load_folder, load_csv_as_primary, and the
+        create_table result path) stay eager and stay reading full_path
+        in this diff -- making them demand-driven is P0.5b-3. They now
+        pass the picture's canonical address plus a resolved source path,
+        which are different things.
         """
-        Returns a PIL Image for the given artifact, or None.
+        if not isinstance(cell, str) or not cell:
+            return
+        try:
+            address, source_path = self._resolve_media_cell(cell)
+        except MediaAddressError:
+            return
+        if not Path(source_path).exists():
+            return
+        self._store.request_thumbnail(
+            row_id, address, Path(source_path), table_name
+        )
+
+    def _resolve_media_cell(self, value) -> tuple[str, str]:
+        """(canonical artifact-cache address, absolute source path) for a
+        media cell, via media.media_address.resolve_source.
+
+        One guarded call so the eager thumbnail sites and render_column_
+        value share exactly one definition of "resolve this cell", and so
+        renderers need neither a project root nor an address parser.
+        Raises MediaAddressError for a value that is not an address.
+        """
+        return resolve_source(str(value), str(self._project_root))
+
+    def get_artifact_pixmap(
+        self,
+        address: str,
+        purpose: str = "thumbnail",
+        resolution: int | None = None,
+    ):
+        """
+        Returns a PIL Image for a derived artifact, or None.
+
+        Identified by the media address the picture is of (P0.5b-1), not
+        by a row -- the row, table and column name the UI subscriber, not
+        the picture (docs/media_architecture.md section 4.5).
 
         Args:
-            row_id:        The item whose artifact to retrieve.
-            artifact_type: 'thumbnail' or 'preview'.
+            address:    Canonical media address (media_address.canonical_key).
+            purpose:    'thumbnail' or 'preview'.
+            resolution: Requested max side in pixels; defaults to the
+                        standard resolution for the purpose.
+
+        The representative-frame policy is the store's default ('first');
+        a real choice arrives with 'midpoint' in P1.2.
         """
-        return self._store.get_pixmap(row_id, artifact_type)
+        return self._store.get_pixmap(address, purpose, resolution)
 
     def get_row(self, row_id: str, table_name: str | None = None) -> dict:
         """
@@ -1329,7 +1401,29 @@ class AppController(QObject):
         Returns:
             A QPixmap (thumbnail mode), QWidget (detail mode), or None.
         """
-        return self._registry.render(column_name, value, size, mode, context)
+        ctx = dict(context) if context else {}
+
+        # For a media column, resolve the cell once here and hand the
+        # renderer a canonical address (its artifact-cache key) and an
+        # absolute source path. The renderer then needs no project root
+        # and does no address parsing (docs/media_architecture.md 4.5).
+        col_type = self._registry.get(column_name)
+        if (
+            col_type is not None
+            and getattr(col_type, "tag", None) == "media_path"
+            and isinstance(value, str)
+            and value
+        ):
+            try:
+                canonical_address, source_path = self._resolve_media_cell(value)
+                ctx["canonical_address"] = canonical_address
+                ctx["source_path"] = source_path
+            except MediaAddressError:
+                # Not a well-formed address -- let the renderer fall back
+                # to treating the raw value as a path.
+                pass
+
+        return self._registry.render(column_name, value, size, mode, ctx)
 
     def get_column_type(self, column_name: str):
         """
