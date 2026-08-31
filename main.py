@@ -65,12 +65,12 @@ def create_app(fake_data: bool = False):
     from controller import AppController
 
     artifacts_dir = Path(tempfile.gettempdir()) / "gelem_artifacts"
-    # TODO: When Student B implements save() and load(), replace this
-    # temp folder with a real project folder chosen by the researcher.
-    # The artifacts folder should live inside the project folder:
-    #     artifacts_dir = project_path / "artifacts"
-    # This ensures thumbnails are preserved when a project is saved and
-    # reopened. The temp folder is only appropriate during development.
+    # This is the pre-project scratch cache -- where thumbnails land
+    # before any project has been saved or opened. The first
+    # save_project() or load_project() call binds the store to
+    # project_path / "artifacts" via ArtifactStore.set_artifacts_dir()
+    # (P0.5b-2ii-a), so a saved project keeps its thumbnails and reopens
+    # without regenerating them.
 
     project_root = Path(__file__).resolve().parent
     frames_dir = project_root / "gelem_project" / "frames"

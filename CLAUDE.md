@@ -263,6 +263,14 @@ state. This rule carries no violation list of its own -- it points at the three
   P0.5b-3i (its `_render_image` `Image.open` fallback and
   `_video_first_frame_pixmap` `cv2` path are gone). `ArtifactStore._decode_source`
   still decodes source media directly until the resolver lands.
+- **`[NOW]`** The artifact cache directory is bound to the project folder on save
+  and load. `save_project` and `load_project` call
+  `ArtifactStore.set_artifacts_dir(project_path / "artifacts")` (main-thread
+  only), which re-roots the store, rebuilds the codec's containment boundary on
+  the new directory, and -- on save, before `save_index` writes the paths --
+  copies any indexed JPEG still outside the new root into it. Before the first
+  save or load the store uses a shared pre-project scratch folder. Made true by
+  P0.5b-2ii-a. Tests: `tests/test_artifact_cache_location.py`.
 - **`[TARGET -> P1.10]`** Native playback is the explicit exception. `QMediaPlayer`
   receives a file path and a time range directly. It shares the address **parser**
   with the resolver but not the decoding path.

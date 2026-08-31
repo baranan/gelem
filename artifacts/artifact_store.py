@@ -67,6 +67,7 @@ from __future__ import annotations
 from pathlib import Path
 from collections import OrderedDict
 import json
+import shutil
 import threading
 
 import numpy as np
@@ -484,6 +485,100 @@ class ArtifactStore:
         """
         self._cache_max_bytes = max_bytes
         self._evict_if_needed()
+
+    def set_artifacts_dir(self, new_dir: Path) -> None:
+        """Re-point the cache directory at `new_dir` and migrate the index.
+
+        MAIN THREAD ONLY.
+
+        Step 1 (under `_lock`): bump the generation, clear the subscriber
+        map, drop the pending queue -- exactly what reset() does for
+        cancellation, and for the same reason. load_project() calls this
+        right after reset() (the second bump is harmless); save_project()
+        calls it with NO preceding reset(), and the bump is what stops a
+        worker that is mid-decode from committing an index entry with an
+        old-root path into the very file save_index() is about to write.
+        Once the generation is bumped, no worker will touch `_index`
+        again (its commit re-checks the generation under the lock and
+        early-returns) and no new job can be enqueued (request_thumbnail
+        is main-thread only and we are on the main thread), so the copy
+        loop below can run WITHOUT the lock. A running job may still
+        leave a stray JPEG in either root -- nothing points at it
+        (P0.5b-2ii-b reclaims orphans).
+
+        Step 2 (no lock): copy every index entry whose file lies OUTSIDE
+        the new root into the new root under the same filename, building
+        the migrated index. Copy, not move: the old root may be the
+        shared scratch folder and another project's saved index may still
+        name that file. Drop -- do not migrate -- an entry whose file no
+        longer exists. This step does the file I/O, so it is kept off the
+        lock and BEFORE the swap: if a copy raises (disk full, streaming
+        path offline) the store is left untouched -- still bound to the
+        old root with the old index -- rather than half-migrated.
+
+        Step 3 (under `_lock`): install the migrated index, re-point
+        `_dir`, and rebuild the ArtifactCodec (it resolves its root once
+        at construction, so a fresh instance is required for the boundary
+        to move).
+
+        On the load path the index is empty when this runs (reset()
+        cleared it, load_index() has not run yet), so step 2 is a no-op
+        and this call just re-roots the store and the codec. Migration
+        matters on the save path, where the index still holds this
+        session's scratch-folder entries.
+        """
+        # Create the new directory up front. mkdir touches nothing the
+        # workers read, so it needs no lock.
+        new_dir = Path(new_dir)
+        new_dir.mkdir(parents=True, exist_ok=True)
+
+        # Fully-resolved root, so the "is this file already inside?"
+        # check below compares like with like.
+        resolved_root = new_dir.resolve()
+
+        # Step 1: cancel in-flight and queued work, then snapshot the
+        # index. After the generation bump nothing but this method writes
+        # `_index`, so the snapshot cannot go stale under us.
+        with self._lock:
+            self._generation += 1
+            self._inflight.clear()
+            self._pool.clear_pending()
+            index_snapshot = dict(self._index)
+
+        # Step 2: build the migrated index off the lock.
+        migrated: dict[ArtifactKey, Path] = {}
+        for key, path in index_snapshot.items():
+            path = Path(path)
+
+            # Already inside the new root: keep the entry, unless its file
+            # has vanished, in which case drop it.
+            try:
+                path.resolve().relative_to(resolved_root)
+                if path.exists():
+                    migrated[key] = path
+                continue
+            except ValueError:
+                # Outside the new root -- falls through to migration.
+                pass
+
+            # The JPEG is gone: drop the entry rather than leave it
+            # pointing at a nonexistent path.
+            if not path.exists():
+                continue
+
+            # Copy the JPEG into the new root under the same name and
+            # repoint the entry. copy2 keeps mtime so a later
+            # directory-driven eviction sees the real age.
+            dest = new_dir / path.name
+            if not dest.exists():
+                shutil.copy2(path, dest)
+            migrated[key] = dest
+
+        # Step 3: install the results and move the boundary.
+        with self._lock:
+            self._index = migrated
+            self._dir = new_dir
+            self._codec = ArtifactCodec(new_dir)
 
     def save_index(self, project_path: Path) -> None:
         """Saves the artifact index to disk as versioned JSON."""

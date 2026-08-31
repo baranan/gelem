@@ -33,10 +33,12 @@ failing test before or as it is fixed.
 
 ## Open -- non-functional at target scale
 
-- **The on-disk artifact cache (`%TEMP%\gelem_artifacts`, from `main.py`) is
-  append-only, and nothing prunes it.** It is also **one folder shared by every
-  project**; `main.py` carries a TODO saying it should live inside the project
-  folder.
+- **The on-disk artifact cache is append-only, and nothing prunes it.** Before a
+  project is saved or opened the cache is the shared pre-project scratch folder
+  (`%TEMP%\gelem_artifacts`, from `main.py`); a save or load then binds the store
+  to `project_path / "artifacts"` and migrates the index into it (P0.5b-2ii-a,
+  `tests/test_artifact_cache_location.py`). Pruning the append-only cache is
+  still open, **assigned to P0.5b-2ii-b**.
 
   P0.5b-1's content-addressed filenames (`{key.stable_hash()}.jpg`) removed the
   accidental overwrite bound that the old `{row_id}_{artifact_type}.jpg` naming
@@ -56,8 +58,7 @@ failing test before or as it is fixed.
   generation-cancelled job that had already written its file.
 
   The memory cache has a ceiling and LRU eviction; the disk cache has neither.
-  **Assigned to P0.5b-2ii**, together with cache size becoming a setting and the
-  `main.py` TODO.
+  **Assigned to P0.5b-2ii-b**; cache size becoming a setting is P0.5b-2ii-c.
 
 ## Open -- dead or inconsistent
 
@@ -134,6 +135,28 @@ failing test before or as it is fixed.
   screen is inside the wanted set, so its job is never dropped and re-queues on
   every repaint. The remaining fix is a negative cache -- remember an address
   that failed to decode and do not re-queue it -- and no item is assigned.
+- **Saving a project cancels in-flight thumbnail jobs without repainting their
+  tiles.** `save_project` -> `ArtifactStore.set_artifacts_dir` bumps the
+  generation (P0.5b-2ii-a) so no worker commits an old-root path into the index
+  being saved. A side effect: any thumbnail still generating when the user hits
+  Save is dropped and sends no `on_thumbnail_ready`, so its tile stays a grey
+  placeholder until the next repaint re-queues it (scroll, resize, table
+  switch). Self-healing and minor; no negative cache involved. No item assigned.
+- **The first save of a project copies the whole scratch thumbnail cache on the
+  main thread.** `set_artifacts_dir`'s migration loop is a synchronous
+  `shutil.copy2` per indexed JPEG (P0.5b-2ii-a); for a large frame dataset on a
+  slow filesystem this blocks the UI during Save. The file I/O is kept off
+  `_lock` and before the directory swap, so a failure leaves the store
+  consistent, but it is still synchronous. An async or move-based migration is a
+  candidate for P0.5b-2ii-b. Also: a migration failure propagates after
+  `Dataset.save()` has already written, so `save_project` reports "Failed to
+  save project" over a folder that does hold a complete dataset.
+- **Migrated artifact paths are stored absolute**, so moving a saved project
+  folder breaks its thumbnail cache: `load_index` seeds the old absolute paths,
+  the rebuilt codec rejects them as outside the new root, `get_pixmap` misses,
+  but `_artifact_is_cached` still sees the index key and queues no regeneration,
+  leaving permanent grey tiles. The fix is relative paths in `artifact_index.json`
+  resolved against the store's current directory; not assigned.
 - **No guardrail stops a future caller of `read_only_view()` from mutating the
   frame it returns.** Its docstring also leans on QueryEngine purity, but the
   test covers `apply()` only -- not `apply_grouped()` or `get_group_values()`.

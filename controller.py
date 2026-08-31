@@ -1271,6 +1271,11 @@ class AppController(QObject):
         """
         try:
             self._dataset.save(project_path)
+            # Bind the artifact cache to this project's folder BEFORE the
+            # index is written, so migration finishes first and every path
+            # in the saved index names a file inside project_path/artifacts
+            # (P0.5b-2ii-a). Main-thread only -- see set_artifacts_dir.
+            self._store.set_artifacts_dir(project_path / "artifacts")
             self._store.save_index(project_path)
             # NOT: self._project_root = project_path. save() does not
             # rewrite the in-memory cells, so the base they resolve
@@ -1297,6 +1302,12 @@ class AppController(QObject):
             # cache and fingerprint memo, and an old picture can appear
             # under a new row (docs/media_architecture.md section 4.5).
             self._store.reset()
+            # Bind the artifact cache to this project's folder BEFORE
+            # load_index() seeds the persisted paths (P0.5b-2ii-a). The
+            # index is empty here (reset() cleared it), so this call just
+            # re-roots the store and the codec -- the migration path only
+            # does work on save.
+            self._store.set_artifacts_dir(project_path / "artifacts")
             # load_index() re-seeds the index AND the fingerprint memo
             # from the persisted (size, mtime) values, so a project that
             # was fully thumbnailed reopens showing its cached pictures
