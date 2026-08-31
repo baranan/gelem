@@ -698,6 +698,114 @@ row immediately after loading. `load_folder`, `load_csv_as_primary` and the
 operator `create_table` result path queue nothing; requests are issued by
 `render_column_value` as tiles paint.
 
+### 4.7 The artifacts directory
+
+**Single authority for where derived JPEGs live and how the directory is kept in
+bounds.** Added P0.5b-2ii-b2. Nothing else -- not `4.4`, not `4.5` -- restates
+this.
+
+**Placement.** Before the first save or load the store writes to a shared
+pre-project scratch folder (`%TEMP%\gelem_artifacts`). `save_project` and
+`load_project` call `ArtifactStore.set_artifacts_dir(project_path / "artifacts")`
+(main thread only), which re-roots the store, rebuilds the codec's containment
+boundary, and -- on save -- copies any still-external indexed JPEG into the new
+root. The saved `artifact_index.json` stores each path *relative* to the
+artifacts directory, so a project folder can move between machines (the Google
+Drive Streaming path this project lives on resolves to a different absolute
+prefix on each machine).
+
+**Filenames are one-way.** A cache file is named `<stable_hash>.jpg`, where
+`stable_hash` is a truncated sha256 of the `ArtifactKey` (32 characters of
+`[0-9a-f]`). There is no reverse lookup from a filename back to a key. A JPEG
+whose index entry is gone -- an old-format index discarded on load, an
+`INDEX_FORMAT_VERSION` or `RENDERER_CACHE_VERSION` bump, a changed source
+fingerprint, `reset()` on never-saved artifacts, process exit, a corrupted
+index, a generation-cancelled job that had already encoded its file -- is
+unreachable forever.
+
+**Eviction is directory-driven, not index-driven.** An index-only pass can never
+see an orphan, because the orphan is precisely the file the index does not name.
+`ArtifactStore.reconcile_and_evict()` (main thread only, structured like
+`set_artifacts_dir` and for the same reasons) walks the directory once with
+`os.scandir`, using each `DirEntry`'s cached stat so the walk itself costs no
+extra `stat()` per file (only an index entry whose file the walk did not see is
+`os.stat`-ed once, to confirm it is really gone before its entry is dropped),
+and:
+
+1. **Freezes the directory.** Under the store lock it bumps the generation and
+   clears the pending queue, so no worker can commit an index entry into the
+   directory being swept, and snapshots the index's paths. Both call sites
+   already bumped; it bumps again rather than trust a stated precondition.
+2. **Plans and deletes.** The pure `artifacts/cache_sweep.py::plan_sweep` decides
+   from the files found and the index's names: orphans (on disk, not in the
+   index) are deleted -- but only when the index is trustworthy (see below); then,
+   if the indexed survivors still exceed the ceiling, they are evicted oldest
+   first until under it. A per-file delete failure is logged and skipped -- a
+   sweep that cannot delete still reconciles.
+3. **Reconciles the index.** Under the lock, every key whose file was deleted is
+   removed from the index, along with every key whose file the walk did not see
+   *and* a direct `os.stat` confirms is gone -- a permission error or an offline
+   placeholder is not "gone", and dropping it would negate `load_index()`. The
+   fingerprint memo and verified flag for an address are dropped when no
+   surviving key still uses it. Each removed key is also popped from the
+   in-memory image cache (and `_cache_bytes` adjusted), so `get_pixmap()` cannot
+   keep serving a picture whose backing JPEG the sweep just deleted; the rest of
+   that cache is untouched.
+
+Only `<stable_hash>.jpg` files at the top level are sweep-owned. Subdirectories,
+`artifact_index.json` and anything else in the folder are invisible, which is
+what makes running the sweep inside a user's project folder safe.
+
+**Orphan deletion depends on `ArtifactStore._index_authoritative`.** This is
+store state, not a per-call decision, because the sweep can run one click after
+a failed load. `load_index()` sets it: `False` when `artifact_index.json` is
+missing or cannot be read or parsed (a real saved project always writes an
+index, so that means a partial sync or a transient error, not "nothing is
+cached" -- `_index` is empty only because `reset()` cleared it); `True` when the
+index loaded, or when a format-version mismatch discarded it whole (that index
+was read and deliberately rejected; its JPEGs are keyed by hashes that cannot be
+reconstructed without it, so they are genuinely unreachable and reclaiming them
+is correct). `reset()` sets it `True` -- an empty index right after reset is the
+truth, and the flag must not latch across projects.
+
+While the flag is `False`, `reconcile_and_evict()` still runs the missing-file
+reconciliation (safe in any index state) but plans **no orphan deletions**:
+reclaiming a genuine orphan is not worth deleting a real cached JPEG whose index
+entry merely failed to load, and the next `save_project` rewrites the index so
+the following sweep cleans up for real. `load_project()` additionally uses
+`load_index()`'s return value to skip the walk entirely on the load path.
+`save_project()` always *calls* the sweep (its in-memory index is normally
+authoritative), but orphan deletion there still obeys the flag, so a save
+immediately after a failed load does not wipe the cache.
+
+**The ceiling** is `DEFAULT_DISK_CACHE_MAX_BYTES` (1 GiB), a keyword-only
+`ArtifactStore` constructor parameter, measured against the sweep-owned files
+that remain after step 2's deletions (orphans, when the index is trustworthy).
+It is machine-dependent and becomes a setting in P0.5b-2ii-c. It is separate
+from the in-memory image-cache ceiling `DEFAULT_CACHE_MAX_BYTES`.
+
+**Eviction is by write order, not access order.** "Oldest" means oldest mtime.
+No per-file access time is tracked: the cache is read on the paint path and
+timestamping every read would put a write on the hot path for a signal that does
+not survive a restart anyway. A file written long ago and shown daily is evicted
+before one written yesterday and never shown. For a display cache that
+regenerates a miss in one worker pass, that trade is deliberate.
+
+Eviction is also per file, not per address: the thumbnail and the preview of one
+picture have separate mtimes and are considered independently, and
+`is_cached()` needs both, so evicting one forces a regenerate of the pair on the
+next paint. Sustained operation right at the ceiling can therefore churn. The
+ceiling is sized (1 GiB) so this is a rare edge, not the steady state; pairing
+the two files for eviction is a possible later refinement, not P0.5b-2ii-b2.
+
+**The reconcile half also fixes the grey-tile bug.** `load_index()` seeds an
+index entry from a saved path without checking the file is present. Any
+indexed-but-absent state -- a partial sync, a deleted cache file, a foreign-OS
+absolute path -- otherwise reopens with `is_cached()` reporting True, so
+demand-driven display queues no request and the tile stays a permanent grey
+placeholder until restart. Step 3 drops those entries, and the next paint queues
+a request.
+
 ---
 
 ## 5. Storage: tables stay in memory

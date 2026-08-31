@@ -66,7 +66,10 @@ This file is written centrally (not by a student).
 from __future__ import annotations
 from pathlib import Path
 from collections import OrderedDict
+from typing import NamedTuple
 import json
+import os
+import re
 import shutil
 import threading
 
@@ -74,6 +77,7 @@ import numpy as np
 from PIL import Image
 
 from artifacts.artifact_codec import ArtifactCodec, ArtifactCodecError
+from artifacts.cache_sweep import SweepFile, plan_sweep
 from artifacts.worker_pool import WorkerPool
 from media.artifact_key import ArtifactKey, SourceFingerprint
 
@@ -99,7 +103,28 @@ PREVIEW_RESOLUTION   = max(PREVIEW_SIZE)
 # different key and does not collide with these pictures.
 REPRESENTATIVE_FRAME_POLICY = "first"
 
+# The in-memory image-cache ceiling. Machine dependent, so a
+# [TARGET -> P0.5b-2ii-c] settings site alongside
+# DEFAULT_DISK_CACHE_MAX_BYTES below -- neither is a setting yet.
 DEFAULT_CACHE_MAX_BYTES = 500 * 1024 * 1024
+
+# The on-disk artifact cache ceiling, measured against the total size of
+# the sweep-owned JPEGs that survive orphan removal (see
+# cache_sweep.plan_sweep). Separate number from DEFAULT_CACHE_MAX_BYTES,
+# which is memory. 1 GiB. Machine dependent, so a
+# [TARGET -> P0.5b-2ii-c] settings site; until then it is this module
+# default and a keyword-only ArtifactStore constructor parameter, the
+# same treatment worker_count gets.
+DEFAULT_DISK_CACHE_MAX_BYTES = 1024 * 1024 * 1024
+
+# A cache file on disk is named "<stable_hash>.jpg". ArtifactKey.
+# stable_hash() is a sha256 hex digest truncated to 32 characters, so
+# the name is exactly 32 of [0-9a-f] then ".jpg". ONLY files matching
+# this at the top level of the artifacts directory are sweep-owned:
+# subdirectories, artifact_index.json and anything else are invisible to
+# the sweep. That is what makes running the sweep inside a user's
+# project folder safe.
+_ARTIFACT_FILENAME_RE = re.compile(r"\A[0-9a-f]{32}\.jpg\Z")
 
 # Bumped when the on-disk index layout changes. load_index() discards an
 # index written under a different version rather than half-reading it.
@@ -110,6 +135,18 @@ DEFAULT_CACHE_MAX_BYTES = 500 * 1024 * 1024
 INDEX_FORMAT_VERSION = 3
 
 
+class SweepResult(NamedTuple):
+    """Counts from one `reconcile_and_evict()` call, for the log line and
+    the tests."""
+
+    files_deleted: int          # orphans + ceiling evictions actually unlinked
+    index_entries_dropped: int  # keys removed from _index (deleted or missing)
+    missing_files_reconciled: int   # index paths that had no file on disk
+    delete_failures: int        # planned deletes that raised OSError
+    bytes_before: int
+    bytes_after: int
+
+
 class ArtifactStore:
     """
     Stores and retrieves derived visual files for gallery display.
@@ -118,7 +155,13 @@ class ArtifactStore:
     thumbnails are generated from the first frame.
     """
 
-    def __init__(self, artifacts_dir: Path, *, worker_count: int = 2):
+    def __init__(
+        self,
+        artifacts_dir: Path,
+        *,
+        worker_count: int = 2,
+        disk_cache_max_bytes: int = DEFAULT_DISK_CACHE_MAX_BYTES,
+    ):
         self._dir = artifacts_dir
         self._dir.mkdir(parents=True, exist_ok=True)
         self._codec = ArtifactCodec(self._dir)
@@ -127,6 +170,13 @@ class ArtifactStore:
         # the main thread, so both live under _lock.
         self._index: dict[ArtifactKey, Path] = {}
         self._fingerprints: dict[str, SourceFingerprint] = {}
+        # Whether an empty or partial _index can be trusted to mean
+        # "nothing else is cached". True at construction and after
+        # reset() (an empty index then IS the truth); set by load_index()
+        # -- False when artifact_index.json was missing or unreadable, so
+        # reconcile_and_evict() must not delete the directory's JPEGs as
+        # orphans. Main-thread only, like _cache.
+        self._index_authoritative: bool = True
         # Addresses whose memo fingerprint came from a fresh stat this
         # session (written by _run_job's commit), as opposed to being
         # seeded from a persisted index by load_index (which may be
@@ -167,6 +217,11 @@ class ArtifactStore:
         self._cache: OrderedDict[ArtifactKey, Image.Image] = OrderedDict()
         self._cache_bytes: int = 0
         self._cache_max_bytes: int = DEFAULT_CACHE_MAX_BYTES
+
+        # The on-disk ceiling the directory sweep (reconcile_and_evict)
+        # enforces. Keyword-only constructor parameter, not a hardcoded
+        # constant -- machine dependent, [TARGET -> P0.5b-2ii-c].
+        self._disk_cache_max_bytes: int = disk_cache_max_bytes
 
         self.on_thumbnail_ready = None
 
@@ -650,6 +705,242 @@ class ArtifactStore:
             self._dir = new_dir
             self._codec = ArtifactCodec(new_dir)
 
+    @staticmethod
+    def _confirmed_missing(path: Path) -> bool:
+        """True only when `path` is *definitely* not on disk (a
+        FileNotFoundError from `os.stat`). A permission error, a locked
+        file, or an offline network / Google Drive Streaming placeholder
+        returns False -- the sweep never drops an index entry it cannot
+        positively prove is gone, because that would negate load_index()
+        and force a needless regenerate on the next paint.
+
+        Called only for the handful of index paths the directory walk
+        did not see, so the common (clean) sweep does no extra stat at
+        all."""
+        try:
+            os.stat(path)
+            return False
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+
+    def reconcile_and_evict(self) -> SweepResult:
+        """Walk the artifacts directory, delete orphaned and over-ceiling
+        JPEGs, and drop index entries whose file is gone.
+
+        MAIN THREAD ONLY. Structured like `set_artifacts_dir` and for the
+        same reasons -- it bumps the generation so no worker can commit
+        into the directory being swept, then does its file I/O off the
+        lock, then reinstalls under the lock.
+
+        `docs/media_architecture.md` section 4.7 is the authority. Two
+        problems, one directory walk:
+
+          * The on-disk cache is append-only -- a JPEG whose index entry
+            is gone (an old-format index discarded on load, a
+            RENDERER_CACHE_VERSION bump, a changed fingerprint, reset()
+            on never-saved artifacts, a generation-cancelled job that had
+            already encoded its file) is unreachable forever, because the
+            on-disk name is a one-way hash. Only a directory walk can
+            find it; an index-only pass never can.
+          * load_index() seeds an index entry without checking the JPEG
+            is on disk. An indexed-but-absent entry reopens with
+            is_cached() reporting True, so demand-driven display queues
+            no request and the tile is a permanent grey placeholder.
+            Reconciling the index against the real directory fixes this.
+
+        Step 1 (under _lock): bump the generation and clear the pending
+        queue, so no worker can commit an index entry into the directory
+        being swept. Both call sites (save_project, load_project) have
+        already bumped -- but a stated precondition is not a guarantee,
+        and a worker that commits an entry naming a file this method is
+        about to delete would reintroduce the very inconsistency it
+        removes. The extra bump is harmless: the generation is a
+        monotonic cancellation counter, nothing keys off its value.
+        Snapshot the index under the same lock hold, before the walk.
+
+        Step 2 (no lock): walk the directory with os.scandir and use each
+        DirEntry's cached stat for size and mtime, so the whole ceiling
+        costs one pass, not one stat per file. Only <hash>.jpg files at
+        the top level are sweep-owned. Every `_index` value is written as
+        `self._dir / "<hash>.jpg"` and migrated to `new_dir / name` by
+        set_artifacts_dir, so it is always a direct child of the current
+        directory: the walk matches index entries to files by BASENAME,
+        with no `resolve()` syscall per path. Hand the found files and
+        the index's names to the pure `plan_sweep`, then delete the files
+        it plans. A per-file delete failure (file locked, path offline)
+        is logged and skipped, never raised -- a sweep that cannot delete
+        must still reconcile. If the directory itself is unreadable
+        (offline mount, transient Drive error) the whole sweep is a
+        no-op rather than treat every indexed file as an orphan.
+
+        Step 3 (under _lock): remove from `_index` every key whose file
+        was deleted, plus every key whose file the walk did not see AND
+        `os.stat` confirms is gone (a permission error or an offline
+        placeholder is NOT "gone" -- dropping it would negate
+        load_index()). Drop the matching entry from `_fingerprints` and
+        `_verified` when no surviving key still uses that address, and
+        drop each removed key from the in-memory image cache so
+        get_pixmap() cannot keep serving a picture whose JPEG was just
+        deleted. Only the removed keys are touched -- the rest of the
+        memory cache is left intact.
+
+        Untrustworthy index. When `self._index_authoritative` is False --
+        set by load_index() when `artifact_index.json` was missing or
+        unreadable -- an empty or partial `_index` cannot be taken to
+        mean "nothing else is cached". The sweep then plans NO orphan
+        deletions (`plan_sweep(delete_orphans=False)`): reclaiming a
+        genuine orphan is not worth the risk of deleting a real cached
+        JPEG whose index entry just failed to load, and one save later
+        `save_project` would rewrite the index and the next sweep cleans
+        up for real. The missing-file reconciliation half still runs --
+        dropping an index entry whose file is gone is safe in any index
+        state and fixes the grey tile. Ceiling eviction still applies to
+        indexed survivors, of which there are none in this state, so it
+        is inert.
+        """
+        # ---- Step 1: freeze the directory, snapshot the index ----
+        with self._lock:
+            self._generation += 1
+            self._inflight.clear()
+            self._pool.clear_pending()
+            sweep_dir = Path(self._dir)
+            index_items = list(self._index.items())
+
+        # Match index entries to files by BASENAME within this one
+        # directory -- os.path.abspath is lexical (no syscall), normcase
+        # folds Windows case. keys_by_name maps a normalised filename to
+        # the keys naming it; the list keeps step 3 total even though two
+        # distinct keys never share a stable_hash. An entry whose parent
+        # is NOT this directory (should not happen after set_artifacts_dir
+        # migrates every entry) is left entirely alone -- never deleted,
+        # never dropped.
+        sweep_dir_key = os.path.normcase(os.path.abspath(str(sweep_dir)))
+        keys_by_name: dict[str, list[ArtifactKey]] = {}
+        for key, path in index_items:
+            path = Path(path)
+            parent_key = os.path.normcase(os.path.abspath(str(path.parent)))
+            if parent_key != sweep_dir_key:
+                continue
+            keys_by_name.setdefault(
+                os.path.normcase(path.name), []
+            ).append(key)
+
+        # ---- Step 2: walk, plan, delete (no lock) ----
+        found: list[SweepFile] = []
+        try:
+            with os.scandir(sweep_dir) as scanner:
+                for dir_entry in scanner:
+                    # Sweep-owned == a top-level <hash>.jpg file. A
+                    # subdirectory, artifact_index.json, or a stray file
+                    # is invisible.
+                    if _ARTIFACT_FILENAME_RE.match(dir_entry.name) is None:
+                        continue
+                    try:
+                        if not dir_entry.is_file():
+                            continue
+                        entry_stat = dir_entry.stat()
+                    except OSError:
+                        # Cannot classify this one entry. Skip it -- the
+                        # confirmed-missing recheck below still protects
+                        # any index entry that points here.
+                        continue
+                    name_key = os.path.normcase(dir_entry.name)
+                    found.append(SweepFile(
+                        path=name_key,
+                        size_bytes=entry_stat.st_size,
+                        mtime_ns=entry_stat.st_mtime_ns,
+                    ))
+        except OSError as error:
+            # The directory itself is unreadable right now. Do nothing
+            # rather than treat every indexed file as an orphan or as
+            # missing -- the sweep runs again on the next save or load.
+            print(f"[ArtifactStore] cache sweep skipped, directory "
+                  f"unreadable: {error}")
+            return SweepResult(0, 0, 0, 0, 0, 0)
+
+        # Read the trust flag once. When the last load could not read the
+        # index, an empty _index does not mean "nothing else is cached",
+        # so plan no orphan deletions -- see the docstring.
+        delete_orphans = self._index_authoritative
+
+        plan = plan_sweep(
+            found,
+            indexed_paths=set(keys_by_name),
+            max_bytes=self._disk_cache_max_bytes,
+            delete_orphans=delete_orphans,
+        )
+
+        deleted_names: list[str] = []
+        delete_failures = 0
+        for name in plan.files_to_delete:
+            try:
+                (sweep_dir / name).unlink()
+                deleted_names.append(name)
+            except OSError as error:
+                # A file we cannot delete (locked, offline) must not stop
+                # the reconciliation half below.
+                delete_failures += 1
+                print(f"[ArtifactStore] cache sweep could not delete "
+                      f"{name}: {error}")
+
+        # An index name the walk did not see is only "missing" if a
+        # direct stat confirms it. plan.paths_missing is the candidate
+        # set; filter it down to the ones really gone.
+        confirmed_missing = [
+            name for name in plan.paths_missing
+            if self._confirmed_missing(sweep_dir / name)
+        ]
+
+        # ---- Step 3: reconcile the index (under _lock) ----
+        drop_names = set(deleted_names) | set(confirmed_missing)
+        entries_dropped = 0
+        dropped_keys: list[ArtifactKey] = []
+        with self._lock:
+            addresses_touched: set[str] = set()
+            for name in drop_names:
+                for key in keys_by_name.get(name, []):
+                    if self._index.pop(key, None) is not None:
+                        entries_dropped += 1
+                        dropped_keys.append(key)
+                        addresses_touched.add(key.canonical_address)
+
+            # Drop the fingerprint memo + verified flag for an address
+            # only when no surviving index key still uses it.
+            surviving_addresses = {
+                key.canonical_address for key in self._index
+            }
+            for address in addresses_touched:
+                if address not in surviving_addresses:
+                    self._fingerprints.pop(address, None)
+                    self._verified.discard(address)
+
+        # Evict any dropped key that is still in the in-memory image
+        # cache, so get_pixmap() cannot keep serving a picture whose
+        # backing JPEG the sweep just deleted. _cache is main-thread only
+        # (this method is too), so no lock is needed for it.
+        for key in dropped_keys:
+            image = self._cache.pop(key, None)
+            if image is not None:
+                self._cache_bytes -= image.width * image.height * 3
+
+        result = SweepResult(
+            files_deleted=len(deleted_names),
+            index_entries_dropped=entries_dropped,
+            missing_files_reconciled=len(confirmed_missing),
+            delete_failures=delete_failures,
+            bytes_before=plan.bytes_before,
+            bytes_after=plan.bytes_after,
+        )
+        # Only log when the sweep actually changed something -- it runs on
+        # every save and load, and a clean no-op should be silent.
+        if entries_dropped or result.files_deleted or delete_failures:
+            print(f"[ArtifactStore] cache sweep: {result.files_deleted} "
+                  f"deleted, {entries_dropped} index entries dropped, "
+                  f"{plan.bytes_before} -> {plan.bytes_after} bytes")
+        return result
+
     def _relative_for_index(self, path: Path) -> Path | None:
         """`path` expressed relative to the artifacts directory, or None
         if it lies outside it.
@@ -740,8 +1031,30 @@ class ArtifactStore:
         index_path = project_path / "artifact_index.json"
         index_path.write_text(json.dumps(payload, indent=2))
 
-    def load_index(self, project_path: Path) -> None:
+    def load_index(self, project_path: Path) -> bool:
         """Loads the artifact index from disk.
+
+        Sets `self._index_authoritative` AND returns the same bool -- the
+        flag is what `reconcile_and_evict()` reads (it can run on the
+        save path, one click after a failed load, with no fresh return
+        value to consult); the return value is a convenience for
+        `load_project()`, which uses it to skip the walk entirely.
+
+          * True  -- it loaded, OR a format-version mismatch discarded it
+            whole. In both cases an empty `_index` is the truth (the
+            mismatched index's JPEGs are keyed by hashes that cannot be
+            reconstructed without it, so they are genuinely unreachable),
+            and it is safe to run `reconcile_and_evict()` and reclaim the
+            directory's JPEGs.
+          * False -- `artifact_index.json` is missing, or exists but
+            could not be read or parsed. A real saved project always
+            writes an index, so a missing or unreadable one means a
+            partial sync, a half-written file, or a transient filesystem
+            error on the Google Drive Streaming path -- the index
+            contents are UNKNOWN. `_index` is empty only because the
+            preceding reset() cleared it, NOT because nothing is cached,
+            so `reconcile_and_evict()` must not delete the directory's
+            JPEGs as orphans (it still reconciles missing entries).
 
         An index whose format version does not match is discarded whole,
         not half-read. Callers must reset() first -- load_index() replaces
@@ -785,18 +1098,28 @@ class ArtifactStore:
         """
         index_path = project_path / "artifact_index.json"
         if not index_path.exists():
-            return
+            # A saved project always has an index. Missing one means a
+            # partial sync or a lost file, not "nothing is cached" -- the
+            # sweep must not delete the directory's JPEGs as orphans.
+            self._index_authoritative = False
+            return False
         try:
             payload = json.loads(index_path.read_text())
         except (ValueError, OSError):
-            return
+            # The file is there but unreadable or unparseable. We do NOT
+            # know what is cached, so the sweep must not delete orphans.
+            self._index_authoritative = False
+            return False
         if (
             not isinstance(payload, dict)
             or payload.get("format_version") != INDEX_FORMAT_VERSION
         ):
             # Written under the old (row_id, artifact_type) scheme or an
-            # unknown one. Discard rather than mixing schemes.
-            return
+            # unknown one. Discard rather than mixing schemes -- those
+            # JPEGs are genuinely unreachable now, so an empty _index IS
+            # the truth and it is correct for the sweep to reclaim them.
+            self._index_authoritative = True
+            return True
 
         new_index: dict[ArtifactKey, Path] = {}
         new_fingerprints: dict[str, SourceFingerprint] = {}
@@ -852,10 +1175,14 @@ class ArtifactStore:
             # Every seeded fingerprint is the freshness as of the last
             # save, not a fresh stat -- so none is verified.
             self._verified = set()
+        # The index loaded: it is now the authority on what is cached.
+        self._index_authoritative = True
+        return True
 
     def reset(self) -> None:
         """Clears the index, the memory cache, the fingerprint memo and
-        the in-flight subscriber map, and bumps the worker generation.
+        the in-flight subscriber map, bumps the worker generation, and
+        marks the (now empty) index authoritative.
 
         load_project() must call this BEFORE load_index(): otherwise a new
         project's index lands on top of the previous project's live image
@@ -877,6 +1204,10 @@ class ArtifactStore:
             self._fingerprints.clear()
             self._verified.clear()
             self._inflight.clear()
+            # An empty index right after reset() IS the truth -- clear
+            # any not-authoritative state a previous failed load left, so
+            # the flag does not latch across projects.
+            self._index_authoritative = True
             # Drop jobs still sitting in the pool queue. Inside the lock so
             # no request_thumbnail can slip a current-generation job onto
             # the queue between the bump and this clear and have it wiped

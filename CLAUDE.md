@@ -264,16 +264,19 @@ state. This rule carries no violation list of its own -- it points at the three
   `_video_first_frame_pixmap` `cv2` path are gone). `ArtifactStore._decode_source`
   still decodes source media directly until the resolver lands.
 - **`[NOW]`** The artifact cache directory is bound to the project folder on save
-  and load. `save_project` and `load_project` call
-  `ArtifactStore.set_artifacts_dir(project_path / "artifacts")` (main-thread
-  only), which re-roots the store, rebuilds the codec's containment boundary on
-  the new directory, and -- on save, before `save_index` writes the paths --
-  copies any indexed JPEG still outside the new root into it. Before the first
-  save or load the store uses a shared pre-project scratch folder. The saved
-  `artifact_index.json` stores each path relative to the artifacts directory
-  (P0.5b-2ii-b1), so a project folder can move between machines without losing
-  its cache. Made true by P0.5b-2ii-a and P0.5b-2ii-b1. Tests:
-  `tests/test_artifact_cache_location.py`.
+  and load, and swept to stay in bounds. `docs/media_architecture.md` §4.7 is the
+  authority for where derived JPEGs live, why their one-way filenames force
+  directory-driven eviction, and the sweep's three steps -- do not restate it
+  here. `save_project` and `load_project` call
+  `ArtifactStore.set_artifacts_dir(project_path / "artifacts")` then
+  `reconcile_and_evict()` (main-thread only; on save both run before `save_index`
+  writes the paths, or it would record files the sweep then deletes; on load the
+  sweep is skipped unless `load_index()` reports the index authoritative). The
+  sweep walks the directory, deletes orphaned and over-ceiling JPEGs, and drops
+  index entries whose file is missing -- the last is what stops a reopened
+  project showing a permanent grey tile for a cached-but-absent picture. Made
+  true by P0.5b-2ii-a, -b1 and -b2. Tests: `tests/test_artifact_cache_location.py`,
+  `tests/test_cache_sweep.py`.
 - **`[TARGET -> P1.10]`** Native playback is the explicit exception. `QMediaPlayer`
   receives a file path and a time range directly. It shares the address **parser**
   with the resolver but not the decoding path.

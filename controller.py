@@ -1276,6 +1276,12 @@ class AppController(QObject):
             # in the saved index names a file inside project_path/artifacts
             # (P0.5b-2ii-a). Main-thread only -- see set_artifacts_dir.
             self._store.set_artifacts_dir(project_path / "artifacts")
+            # Sweep the artifacts directory BEFORE save_index writes the
+            # records (P0.5b-2ii-b2). The order is load-bearing:
+            # reversed, save_index would serialize records naming files
+            # the sweep is about to delete, and the reopened project
+            # would report those pictures cached.
+            self._store.reconcile_and_evict()
             self._store.save_index(project_path)
             # NOT: self._project_root = project_path. save() does not
             # rewrite the in-memory cells, so the base they resolve
@@ -1323,7 +1329,19 @@ class AppController(QObject):
             # ArtifactStore.load_index()'s docstring is the authority on
             # what the seeded memo means for freshness; do not restate it
             # here.
-            self._store.load_index(project_path)
+            index_is_authoritative = self._store.load_index(project_path)
+            # Reconcile the freshly-seeded index against the real
+            # artifacts directory and evict orphaned / over-ceiling
+            # JPEGs (P0.5b-2ii-b2). load_index() seeds entries from the
+            # saved paths without checking the file is present; this
+            # drops any entry whose JPEG is missing, so a demand request
+            # is queued for that tile instead of it staying a permanent
+            # grey placeholder. Skip the sweep when load_index() could
+            # not read the index file: _index is empty then only because
+            # reset() cleared it, and sweeping would delete every real
+            # JPEG as an orphan over a recoverable error.
+            if index_is_authoritative:
+                self._store.reconcile_and_evict()
             self.tables_updated.emit(self._dataset.list_tables())
             self.columns_updated.emit(self._registry.list_all_columns())
             self._refresh_result()

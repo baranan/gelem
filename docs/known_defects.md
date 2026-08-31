@@ -31,46 +31,6 @@ failing test before or as it is fixed.
 - **`Dataset.load()` does not clear `ColumnTypeRegistry`**, so column types from
   the previous project persist.
 
-## Open -- non-functional at target scale
-
-- **The on-disk artifact cache is append-only, and nothing prunes it.** Before a
-  project is saved or opened the cache is the shared pre-project scratch folder
-  (`%TEMP%\gelem_artifacts`, from `main.py`); a save or load then binds the store
-  to `project_path / "artifacts"` and migrates the index into it (P0.5b-2ii-a,
-  `tests/test_artifact_cache_location.py`). Pruning the append-only cache is
-  still open, **assigned to P0.5b-2ii-b**.
-
-  P0.5b-2ii-b1 made the saved index store paths relative to the artifacts
-  directory, so a moved project folder keeps its cache. The reverse case is
-  still open: `load_index()` seeds an index entry without checking the JPEG is
-  actually on disk. So any "indexed but file absent" state -- an `artifacts/`
-  subfolder moved without its files, a partial sync, a deleted cache, a
-  hand-corrupted path that rebuilds to a non-existent file -- reopens with
-  `is_cached()` reporting True and no demand request ever queued: a permanent
-  grey tile until the app restarts. The directory walk P0.5b-2ii-b2 adds for
-  eviction is where the index and the real directory get reconciled; the
-  missing-file check belongs there.
-
-  P0.5b-1's content-addressed filenames (`{key.stable_hash()}.jpg`) removed the
-  accidental overwrite bound that the old `{row_id}_{artifact_type}.jpg` naming
-  provided. A changed source fingerprint, a `RENDERER_CACHE_VERSION` bump,
-  `reset()`, `load_index()` discarding an old-format index, and (P0.5b-2i) a job
-  cancelled by `reset()` after it had already encoded its JPEG all leave their
-  JPEGs on disk. The last case is routine now: every project switch cancels
-  in-flight thumbnail jobs.
-
-  **Eviction must be directory-driven, not index-driven.** `ArtifactStore` never
-  walks the artifacts directory -- it only reads its index -- so a JPEG with no
-  index entry is invisible to Gelem forever and an index pass can never reclaim
-  it. Events after which a JPEG becomes unreachable, as a checklist for the
-  eviction design: an old-format index discarded, a future
-  `INDEX_FORMAT_VERSION` bump, a `RENDERER_CACHE_VERSION` bump, `reset()` on
-  never-saved artifacts, process exit, the index overwritten or corrupted, and a
-  generation-cancelled job that had already written its file.
-
-  The memory cache has a ceiling and LRU eviction; the disk cache has neither.
-  **Assigned to P0.5b-2ii-b**; cache size becoming a setting is P0.5b-2ii-c.
-
 ## Open -- dead or inconsistent
 
 - **`operators_config.yaml` claims to control which operators are enabled.**
@@ -177,6 +137,28 @@ failing test before or as it is fixed.
 
 ## Fixed
 
+- **The on-disk artifact cache was append-only, and `load_index()` seeded index
+  entries without checking the JPEG was present.** Nothing walked the artifacts
+  directory, so a JPEG whose index entry was gone -- from a discarded old-format
+  index, an `INDEX_FORMAT_VERSION` or `RENDERER_CACHE_VERSION` bump, a changed
+  source fingerprint, `reset()` on never-saved artifacts, process exit, a
+  corrupted index, or a generation-cancelled job that had already encoded its
+  file -- was unreachable forever, because the on-disk name is a one-way hash.
+  The reverse case: an indexed-but-absent entry (a partial sync, a deleted cache
+  file, a foreign-OS absolute path) reopened with `is_cached()` reporting True,
+  so demand-driven display queued no request and the tile stayed a permanent
+  grey placeholder until the app restarted. *(P0.5b-2ii-b2:
+  `ArtifactStore.reconcile_and_evict()` walks the directory on every save and
+  load -- via the pure `artifacts/cache_sweep.py::plan_sweep` -- deletes
+  orphaned and over-ceiling JPEGs, and drops index entries whose file is gone.
+  On load the sweep runs only when `load_index()` reports the index as
+  authoritative, so a transient failure reading `artifact_index.json` cannot
+  turn into a full cache wipe. Disk ceiling `DEFAULT_DISK_CACHE_MAX_BYTES`
+  (1 GiB), evicted oldest-mtime first; becoming a setting is P0.5b-2ii-c. The sweep runs only at save and
+  load, so the pre-project scratch folder (`%TEMP%\gelem_artifacts`, used by a
+  session that never saves a project) is deliberately out of scope and still
+  grows unbounded until the OS clears `%TEMP%`. `docs/media_architecture.md`
+  §4.7 is the authority. Tests: `tests/test_cache_sweep.py`.)*
 - **The media renderer decoded source files on the paint path, and the
   controller requested a thumbnail for every row on load.** `_render_image`
   fell back to `Image.open` and `_render_video` ran `cv2.VideoCapture` on the
