@@ -1521,7 +1521,7 @@ class AppController(QObject):
                 mode == "thumbnail"
                 and "canonical_address" in ctx
                 and ctx.get("row_id") is not None
-                and not self._artifact_is_cached(ctx["canonical_address"])
+                and not self._store.is_cached(ctx["canonical_address"])
             ):
                 self._queue_thumbnail_request(
                     ctx["row_id"],
@@ -1531,28 +1531,6 @@ class AppController(QObject):
                 )
 
         return self._registry.render(column_name, value, size, mode, ctx)
-
-    def _artifact_is_cached(self, canonical_address: str) -> bool:
-        """True if both derived pictures for this address -- thumbnail and
-        preview -- are already in the ArtifactStore index. An index
-        lookup that opens no source file.
-
-        Used by render_column_value() to decide whether a thumbnail-mode
-        paint needs a generation request queued. Both purposes are
-        checked, not just one: a tile larger than the renderer's preview
-        threshold paints from the 'preview' artifact, and a request
-        regenerates both anyway, so "either is missing" is the right
-        trigger -- it matches ArtifactStore.request_thumbnail()'s own
-        both-present short-circuit. A seeded entry from load_index()
-        counts as cached and is served as-is on the paint path -- painting
-        does not force a re-stat (see ArtifactStore.load_index()'s
-        docstring). Only an address the seeded index does not cover gets a
-        demand request.
-        """
-        return (
-            self._store.get(canonical_address, "thumbnail") is not None
-            and self._store.get(canonical_address, "preview") is not None
-        )
 
     def get_column_type(self, column_name: str):
         """

@@ -12,6 +12,12 @@ dropped. `AppController.save_project` / `load_project` call it with
 `project_path / "artifacts"` so a saved project keeps its thumbnails and
 reopens without regenerating them.
 
+P0.5b-2ii-b1 -- the saved `artifact_index.json` stores each path RELATIVE
+to the artifacts directory, so a project folder can move between machines
+(e.g. a Google Drive Streaming path) without the cache being lost. Same
+item folds `AppController._artifact_is_cached` and
+`ArtifactStore._both_present` into one public `ArtifactStore.is_cached`.
+
 Written from the work-item spec, not from the implementation. New file on
 purpose: tests/test_dataset.py runs everything in it twice.
 
@@ -22,6 +28,7 @@ Run with:
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import threading
 from pathlib import Path
@@ -32,8 +39,13 @@ sys.path.insert(0, str(project_root))
 import pytest
 from PIL import Image
 
-from artifacts.artifact_store import ArtifactStore
+from artifacts.artifact_store import (
+    ArtifactStore,
+    THUMBNAIL_RESOLUTION,
+    PREVIEW_RESOLUTION,
+)
 from artifacts.artifact_codec import ArtifactCodecError
+from media.artifact_key import ArtifactKey, SourceFingerprint
 from media.media_address import resolve_source
 
 from models.dataset import Dataset
@@ -230,11 +242,17 @@ def test_saved_index_paths_are_all_inside_the_project_folder(qapp, tmp_path):
     records = payload["artifacts"]
     assert records, "the saved index has no entries to check"
 
+    # P0.5b-2ii-b1: paths are stored relative to the artifacts directory.
+    # Each must resolve, under that directory, to a real file inside it.
     artifacts_root = (project / "artifacts").resolve()
     for record in records:
-        entry = Path(record["path"]).resolve()
+        stored = Path(record["path"])
+        assert not stored.is_absolute(), (
+            f"saved index entry is absolute: {stored}"
+        )
+        entry = (artifacts_root / stored).resolve()
         assert entry.parent == artifacts_root, (
-            f"saved index entry is outside the project folder: {entry}"
+            f"saved index entry resolves outside the project folder: {entry}"
         )
         assert entry.exists(), f"saved index entry does not exist: {entry}"
 
@@ -415,3 +433,359 @@ def test_running_job_commits_nothing_across_a_rebind(tmp_path):
     assert store._fingerprints == {}
     assert store._verified == set()
     assert notified == [], "a job that raced the rebind sent a notification"
+
+
+# ===========================================================================
+# P0.5b-2ii-b1 -- relative index paths
+# ===========================================================================
+
+# ===========================================================================
+# 9. Round trip across a MOVED project folder: save, move the whole folder
+#    to a path it has never seen, load from there. Both is_cached() and
+#    get_pixmap() must serve the cached picture. This is the defect the
+#    item exists to fix, so it is the first test.
+# ===========================================================================
+
+def test_thumbnail_cache_survives_moving_the_project_folder(qapp, tmp_path):
+    media = tmp_path / "media"
+    media.mkdir()
+    shot = media / "shot.png"
+    _solid_png(shot, (210, 40, 40))
+
+    controller, _, store = _build_controller(tmp_path)
+    event = _wait_for_thumbnail(store)
+    controller.load_folder(media)
+    _render_first_row(controller)  # cache miss -> queues the demand request
+    assert event.wait(timeout=30), "thumbnail never generated"
+
+    original = tmp_path / "proj"
+    controller.save_project(original)
+
+    # Move the entire project folder somewhere it has never lived.
+    moved = tmp_path / "relocated" / "proj"
+    moved.parent.mkdir()
+    shutil.move(str(original), str(moved))
+
+    controller.load_project(moved)
+
+    addr, _src = resolve_source(str(shot), str(moved))
+    assert store.is_cached(addr), (
+        "a project loaded from a moved folder reports its cache as missing"
+    )
+    image = store.get_pixmap(addr, "thumbnail")
+    assert image is not None, (
+        "get_pixmap served nothing for a moved project's cached thumbnail"
+    )
+
+
+# ===========================================================================
+# 10. save_index writes no absolute path.
+# ===========================================================================
+
+def test_saved_index_paths_are_relative(qapp, tmp_path):
+    media = tmp_path / "media"
+    media.mkdir()
+    _solid_png(media / "shot.png", (40, 210, 40))
+
+    controller, _, store = _build_controller(tmp_path)
+    event = _wait_for_thumbnail(store)
+    controller.load_folder(media)
+    _render_first_row(controller)
+    assert event.wait(timeout=30), "thumbnail never generated"
+
+    project = tmp_path / "proj"
+    controller.save_project(project)
+
+    payload = json.loads((project / "artifact_index.json").read_text())
+    records = payload["artifacts"]
+    assert records, "nothing in the saved index to check"
+    for record in records:
+        assert not Path(record["path"]).is_absolute(), (
+            f"saved index stored an absolute path: {record['path']!r}"
+        )
+
+
+# ===========================================================================
+# 11. A record whose stored "path" is absolute is skipped by load_index --
+#     per record, not a whole-file discard: its relative sibling loads.
+# ===========================================================================
+
+def test_load_index_skips_a_record_with_an_absolute_path(tmp_path):
+    source = tmp_path / "s.png"
+    _solid_png(source, (0, 0, 210))
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    event = _wait_for_thumbnail(store)
+    addr, src = _address_of(source, tmp_path)
+    store.request_thumbnail("r", addr, Path(src), "frames")
+    assert event.wait(timeout=30)
+    store.save_index(tmp_path)
+
+    index_path = tmp_path / "artifact_index.json"
+    payload = json.loads(index_path.read_text())
+    # Rewrite ONLY the thumbnail record's path to an absolute string;
+    # leave the preview record relative.
+    made_absolute = None
+    for record in payload["artifacts"]:
+        if record["purpose"] == "thumbnail":
+            record["path"] = str(
+                (tmp_path / "artifacts" / record["path"]).resolve()
+            )
+            made_absolute = record["path"]
+    assert made_absolute is not None and Path(made_absolute).is_absolute()
+    index_path.write_text(json.dumps(payload))
+
+    store2 = ArtifactStore(tmp_path / "artifacts")
+    store2.load_index(tmp_path)
+
+    assert store2.get(addr, "thumbnail") is None, (
+        "load_index kept a record whose path was absolute"
+    )
+    assert store2.get(addr, "preview") is not None, (
+        "load_index discarded the relative sibling record too"
+    )
+
+
+# ===========================================================================
+# 12. An index file written with format_version 2 is discarded whole.
+# ===========================================================================
+
+def test_version_2_index_is_discarded_whole(tmp_path):
+    source = tmp_path / "s.png"
+    _solid_png(source, (0, 210, 0))
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    event = _wait_for_thumbnail(store)
+    addr, src = _address_of(source, tmp_path)
+    store.request_thumbnail("r", addr, Path(src), "frames")
+    assert event.wait(timeout=30)
+    store.save_index(tmp_path)
+
+    index_path = tmp_path / "artifact_index.json"
+    payload = json.loads(index_path.read_text())
+    assert payload["format_version"] == 3
+    payload["format_version"] = 2
+    index_path.write_text(json.dumps(payload))
+
+    store2 = ArtifactStore(tmp_path / "artifacts")
+    store2.load_index(tmp_path)
+
+    assert store2._index == {}, "a version-2 index was not discarded whole"
+    assert store2.get(addr, "thumbnail") is None
+    assert store2.get(addr, "preview") is None
+
+
+# ===========================================================================
+# 13. is_cached is False when only the thumbnail key is in the index and
+#     the preview key is not -- "either missing" is the trigger.
+# ===========================================================================
+
+def test_is_cached_needs_both_thumbnail_and_preview(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    address = "C:/x/y.png"
+    fingerprint = SourceFingerprint(size=10, mtime_ns=20)
+
+    # Seed the memo and ONLY the thumbnail key.
+    thumb_key = ArtifactKey(address, fingerprint, "thumbnail", THUMBNAIL_RESOLUTION)
+    store._fingerprints[address] = fingerprint
+    store._index[thumb_key] = tmp_path / "artifacts" / "a.jpg"
+
+    assert store.is_cached(address) is False, (
+        "is_cached returned True with the preview key absent"
+    )
+
+    # Adding the preview key flips it to True.
+    preview_key = ArtifactKey(address, fingerprint, "preview", PREVIEW_RESOLUTION)
+    store._index[preview_key] = tmp_path / "artifacts" / "b.jpg"
+    assert store.is_cached(address) is True
+
+
+# ===========================================================================
+# 14. is_cached is False for an address with no fingerprint-memo entry.
+# ===========================================================================
+
+def test_is_cached_false_without_a_fingerprint_memo(tmp_path):
+    store = ArtifactStore(tmp_path / "artifacts")
+    assert store.is_cached("C:/never/seen.png") is False
+
+
+# ===========================================================================
+# 15. The verified/unverified distinction survives: an address seeded by
+#     load_index (unverified) still queues a worker on request_thumbnail
+#     rather than short-circuiting, even though is_cached() is True for it.
+# ===========================================================================
+
+def test_seeded_address_still_queues_a_worker(tmp_path):
+    source = tmp_path / "s.png"
+    _solid_png(source, (210, 0, 0))
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    event = _wait_for_thumbnail(store)
+    addr, src = _address_of(source, tmp_path)
+    store.request_thumbnail("r", addr, Path(src), "frames")
+    assert event.wait(timeout=30)
+    store.save_index(tmp_path)
+
+    # Reopen: the address is seeded (unverified) from the saved index.
+    store2 = ArtifactStore(tmp_path / "artifacts")
+    store2.load_index(tmp_path)
+    assert store2.is_cached(addr) is True, "seeded entry should serve on paint"
+
+    # Count pool submissions across the next request.
+    submitted: list = []
+    real_submit = store2._pool.submit
+
+    def _counting_submit(fn, key=None):
+        submitted.append(key)
+        return real_submit(fn, key=key)
+
+    store2._pool.submit = _counting_submit
+
+    event2 = _wait_for_thumbnail(store2)
+    store2.request_thumbnail("r", addr, Path(src), "frames")
+    assert event2.wait(timeout=30), "seeded address never delivered a callback"
+    assert submitted, (
+        "request_thumbnail short-circuited on an unverified (seeded) fingerprint"
+    )
+
+
+# ===========================================================================
+# 16. load_index skips a relative record whose '..'-laden path escapes the
+#     artifacts directory -- the same outside-root rule save_index applies,
+#     so is_cached() cannot report an unreadable tile as cached.
+# ===========================================================================
+
+def test_load_index_skips_a_relative_path_that_escapes_the_cache_root(tmp_path):
+    source = tmp_path / "s.png"
+    _solid_png(source, (0, 130, 130))
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    event = _wait_for_thumbnail(store)
+    addr, src = _address_of(source, tmp_path)
+    store.request_thumbnail("r", addr, Path(src), "frames")
+    assert event.wait(timeout=30)
+    store.save_index(tmp_path)
+
+    index_path = tmp_path / "artifact_index.json"
+    payload = json.loads(index_path.read_text())
+    # Point the thumbnail record at a path that climbs out of the cache
+    # dir; leave the preview record alone.
+    for record in payload["artifacts"]:
+        if record["purpose"] == "thumbnail":
+            record["path"] = "../../elsewhere/x.jpg"
+    index_path.write_text(json.dumps(payload))
+
+    store2 = ArtifactStore(tmp_path / "artifacts")
+    store2.load_index(tmp_path)
+
+    assert store2.get(addr, "thumbnail") is None, (
+        "load_index kept a record whose relative path escapes the cache root"
+    )
+    assert store2.get(addr, "preview") is not None, (
+        "load_index discarded the in-root sibling record too"
+    )
+    assert store2.is_cached(addr) is False, (
+        "is_cached reports True when one artifact escaped the cache root"
+    )
+
+
+# ===========================================================================
+# 17. load_index skips a degenerate empty/"." path -- it would rebuild to
+#     the artifacts directory itself, which get_pixmap cannot read but
+#     is_cached would otherwise count as present.
+# ===========================================================================
+
+def test_load_index_skips_a_degenerate_empty_path(tmp_path):
+    source = tmp_path / "s.png"
+    _solid_png(source, (90, 90, 90))
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    event = _wait_for_thumbnail(store)
+    addr, src = _address_of(source, tmp_path)
+    store.request_thumbnail("r", addr, Path(src), "frames")
+    assert event.wait(timeout=30)
+    store.save_index(tmp_path)
+
+    index_path = tmp_path / "artifact_index.json"
+    payload = json.loads(index_path.read_text())
+    for record in payload["artifacts"]:
+        if record["purpose"] == "thumbnail":
+            record["path"] = ""
+    index_path.write_text(json.dumps(payload))
+
+    store2 = ArtifactStore(tmp_path / "artifacts")
+    store2.load_index(tmp_path)
+
+    assert store2.get(addr, "thumbnail") is None
+    assert store2.get(addr, "preview") is not None
+    assert store2.is_cached(addr) is False
+
+
+# ===========================================================================
+# 18. One malformed record (no "path" key, or a non-string path) is
+#     skipped, not fatal: the rest of the index still loads.
+# ===========================================================================
+
+def test_load_index_skips_a_record_with_no_usable_path(tmp_path):
+    source = tmp_path / "s.png"
+    _solid_png(source, (120, 60, 30))
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    event = _wait_for_thumbnail(store)
+    addr, src = _address_of(source, tmp_path)
+    store.request_thumbnail("r", addr, Path(src), "frames")
+    assert event.wait(timeout=30)
+    store.save_index(tmp_path)
+
+    index_path = tmp_path / "artifact_index.json"
+    payload = json.loads(index_path.read_text())
+    for record in payload["artifacts"]:
+        if record["purpose"] == "thumbnail":
+            del record["path"]          # missing key
+        else:
+            record["path"] = None       # non-string
+    index_path.write_text(json.dumps(payload))
+
+    store2 = ArtifactStore(tmp_path / "artifacts")
+    store2.load_index(tmp_path)  # must not raise
+
+    # Both records were unusable, so nothing loaded -- but the call
+    # returned normally rather than aborting load_project.
+    assert store2._index == {}
+    assert store2.get(addr, "thumbnail") is None
+
+
+# ===========================================================================
+# 19. The producer (_run_job) and the consumer (is_cached / _both_present_
+#     locked) must agree on the resolution that enters the key. Both now
+#     route through resolution_for(); this pins that the key _run_job
+#     actually writes carries resolution_for(purpose), so a future change
+#     to resolution_for cannot silently desynchronise them.
+# ===========================================================================
+
+def test_run_job_key_resolution_matches_resolution_for(tmp_path):
+    source = tmp_path / "s.png"
+    _solid_png(source, (70, 140, 210))
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    event = _wait_for_thumbnail(store)
+    addr, src = _address_of(source, tmp_path)
+    store.request_thumbnail("r", addr, Path(src), "frames")
+    assert event.wait(timeout=30), "thumbnail was never generated"
+
+    # _run_job committed one key per purpose into the index. Each key's
+    # resolution must be exactly what resolution_for() returns for its
+    # purpose -- the same call is_cached() makes to look them up.
+    by_purpose = {key.purpose: key for key in store._index}
+    assert set(by_purpose) == {"thumbnail", "preview"}, (
+        f"expected a thumbnail and a preview key, got {sorted(by_purpose)}"
+    )
+    for purpose, key in by_purpose.items():
+        assert key.resolution == store.resolution_for(purpose), (
+            f"_run_job wrote a {purpose} key at resolution {key.resolution}, "
+            f"but resolution_for({purpose!r}) is {store.resolution_for(purpose)} "
+            f"-- producer and is_cached() are desynchronised"
+        )
+
+    # And the round trip through is_cached() agrees.
+    assert store.is_cached(addr) is True

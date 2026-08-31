@@ -40,6 +40,17 @@ failing test before or as it is fixed.
   `tests/test_artifact_cache_location.py`). Pruning the append-only cache is
   still open, **assigned to P0.5b-2ii-b**.
 
+  P0.5b-2ii-b1 made the saved index store paths relative to the artifacts
+  directory, so a moved project folder keeps its cache. The reverse case is
+  still open: `load_index()` seeds an index entry without checking the JPEG is
+  actually on disk. So any "indexed but file absent" state -- an `artifacts/`
+  subfolder moved without its files, a partial sync, a deleted cache, a
+  hand-corrupted path that rebuilds to a non-existent file -- reopens with
+  `is_cached()` reporting True and no demand request ever queued: a permanent
+  grey tile until the app restarts. The directory walk P0.5b-2ii-b2 adds for
+  eviction is where the index and the real directory get reconciled; the
+  missing-file check belongs there.
+
   P0.5b-1's content-addressed filenames (`{key.stable_hash()}.jpg`) removed the
   accidental overwrite bound that the old `{row_id}_{artifact_type}.jpg` naming
   provided. A changed source fingerprint, a `RENDERER_CACHE_VERSION` bump,
@@ -127,7 +138,7 @@ failing test before or as it is fixed.
 - **A broken or missing media path whose tile is on screen re-queues a failing
   worker job on every fresh repaint.** Since P0.5b-3i there is no main-thread
   `exists()` short-circuit and no negative cache, so a job that finds the source
-  missing writes no index entry, `_artifact_is_cached()` stays False, and
+  missing writes no index entry, `ArtifactStore.is_cached()` stays False, and
   repainting the tile re-submits it. Coalescing bounds it to one in-flight job
   per address and the failing job is microseconds. P0.5b-3ii's viewport
   cancellation bounds only the off-screen case: once the tile scrolls away its
@@ -151,12 +162,6 @@ failing test before or as it is fixed.
   candidate for P0.5b-2ii-b. Also: a migration failure propagates after
   `Dataset.save()` has already written, so `save_project` reports "Failed to
   save project" over a folder that does hold a complete dataset.
-- **Migrated artifact paths are stored absolute**, so moving a saved project
-  folder breaks its thumbnail cache: `load_index` seeds the old absolute paths,
-  the rebuilt codec rejects them as outside the new root, `get_pixmap` misses,
-  but `_artifact_is_cached` still sees the index key and queues no regeneration,
-  leaving permanent grey tiles. The fix is relative paths in `artifact_index.json`
-  resolved against the store's current directory; not assigned.
 - **No guardrail stops a future caller of `read_only_view()` from mutating the
   frame it returns.** Its docstring also leans on QueryEngine purity, but the
   test covers `apply()` only -- not `apply_grouped()` or `get_group_values()`.

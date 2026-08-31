@@ -103,7 +103,11 @@ DEFAULT_CACHE_MAX_BYTES = 500 * 1024 * 1024
 
 # Bumped when the on-disk index layout changes. load_index() discards an
 # index written under a different version rather than half-reading it.
-INDEX_FORMAT_VERSION = 2
+# 2 -> 3 (P0.5b-2ii-b1): record "path" is now RELATIVE to the artifacts
+# directory, not absolute. A version-2 index is discarded whole -- its
+# absolute paths cannot be trusted once the project folder has moved, and
+# a project reopened after this change regenerates its pictures on demand.
+INDEX_FORMAT_VERSION = 3
 
 
 class ArtifactStore:
@@ -381,13 +385,21 @@ class ArtifactStore:
         """
         address = str(address)
 
+        # Short-circuit check in ONE lock hold: generation, fingerprint,
+        # verified and both-present are read together, so a worker
+        # committing a picture cannot land between the reads and leave the
+        # decision half-based on stale state. _notify_ready is called
+        # AFTER the lock is released -- it calls into a UI callback.
         with self._lock:
             generation = self._generation
             fingerprint = self._fingerprints.get(address)
             verified = address in self._verified
-        if verified and fingerprint is not None and self._both_present(
-            address, fingerprint
-        ):
+            short_circuit = (
+                verified
+                and fingerprint is not None
+                and self._both_present_locked(address, fingerprint)
+            )
+        if short_circuit:
             self._notify_ready(table_name, row_id)
             return
 
@@ -413,15 +425,73 @@ class ArtifactStore:
             lambda: self._run_job(job_key, Path(source_path)), key=job_key
         )
 
-    def _both_present(self, address: str, fingerprint: SourceFingerprint) -> bool:
+    def is_cached(
+        self,
+        canonical_address: str,
+        policy: str = REPRESENTATIVE_FRAME_POLICY,
+    ) -> bool:
+        """True if BOTH derived pictures for this address -- thumbnail and
+        preview, at the standard resolutions -- are already in the index.
+        An index-only lookup: opens no source file and stats nothing.
+
+        This is the ONE definition of "is this address already cached".
+        `render_column_value()` calls it once per painted media tile to
+        decide whether to queue a demand request; `request_thumbnail()`
+        shares its both-present helper for its own synchronous
+        short-circuit.
+
+        Both purposes are checked, not just one. A tile larger than the
+        renderer's preview threshold paints from the 'preview' artifact, a
+        request regenerates both anyway, and this matches
+        `request_thumbnail()`'s both-present short-circuit -- so "either
+        one missing" is the right trigger for a demand request.
+
+        A `load_index()`-seeded entry counts as cached here and is served
+        as-is. Whether painting re-stats it, and how `request_thumbnail()`
+        treats an unverified fingerprint differently, is `load_index()`'s
+        docstring to state -- not this one.
+
+        Single lock hold. The two `get()` calls this replaced cost four
+        `_lock` acquisitions per tile.
+        """
+        with self._lock:
+            fingerprint = self._fingerprints.get(canonical_address)
+            if fingerprint is None:
+                return False
+            try:
+                return self._both_present_locked(
+                    canonical_address, fingerprint, policy
+                )
+            except ValueError:
+                # A bad policy is a caller error, but a lookup returns
+                # False for every "not available" case, so it does here
+                # too rather than raising out of a paint.
+                return False
+
+    def _both_present_locked(
+        self,
+        address: str,
+        fingerprint: SourceFingerprint,
+        policy: str = REPRESENTATIVE_FRAME_POLICY,
+    ) -> bool:
+        """True if this address's thumbnail AND preview keys (standard
+        resolutions) are both in `_index`.
+
+        CALLER MUST HOLD `_lock`. Shared by `is_cached()` and
+        `request_thumbnail()` so neither nests a second lock acquisition
+        the way the old `_both_present()` did -- it re-took `_lock` after
+        the caller had already released it, making the short-circuit
+        non-atomic.
+        """
         thumb_key = self._key(
-            address, fingerprint, "thumbnail", THUMBNAIL_RESOLUTION
+            address, fingerprint, "thumbnail",
+            self.resolution_for("thumbnail"), policy,
         )
         preview_key = self._key(
-            address, fingerprint, "preview", PREVIEW_RESOLUTION
+            address, fingerprint, "preview",
+            self.resolution_for("preview"), policy,
         )
-        with self._lock:
-            return thumb_key in self._index and preview_key in self._index
+        return thumb_key in self._index and preview_key in self._index
 
     def set_wanted_addresses(self, addresses) -> None:
         """Declare the set of canonical media addresses the display
@@ -580,22 +650,92 @@ class ArtifactStore:
             self._dir = new_dir
             self._codec = ArtifactCodec(new_dir)
 
+    def _relative_for_index(self, path: Path) -> Path | None:
+        """`path` expressed relative to the artifacts directory, or None
+        if it lies outside it.
+
+        Tries a plain `relative_to` first -- no filesystem I/O, and the
+        common case, since `_run_job` writes `self._dir / "<hash>.jpg"`
+        and `set_artifacts_dir` migrates every entry to `self._dir /
+        name`. Falls back to comparing both sides `.resolve()`d for a
+        path that is inside the directory but not lexically (a symlinked
+        or '..'-laden `_dir`). Returns None when the entry names a file
+        outside the cache root: `save_index` SKIPS such a record rather
+        than writing an absolute path, and nothing is lost because
+        `ArtifactCodec` would refuse to read that path back anyway.
+
+        Reads `self._dir` only. Both callers -- `save_index` (over a
+        snapshot) and `load_index` -- run it OUTSIDE `_lock`, so the
+        `.resolve()` in the fallback branch is never filesystem I/O under
+        the lock.
+
+        The lexical branch does no I/O and covers the common case: every
+        `_index` entry is `self._dir / "<hash>.jpg"`. A lexical result is
+        rejected if it starts with `..` -- `a/b/../../x` is lexically
+        "under" `a` but escapes it -- and only then does the resolved
+        fallback run. `resolve()` also raises `OSError` on a symlink
+        loop; that is "not safely inside" too, so it returns None.
+
+        Same resolve()+relative_to() containment idea as
+        `ArtifactCodec._require_inside`; the codec's copy cannot be
+        shared (separate object, private root), so if the semantics ever
+        change (Windows case folding, UNC) the two move together.
+        """
+        path = Path(path)
+        try:
+            rel = path.relative_to(self._dir)
+            if ".." not in rel.parts:
+                return rel
+        except ValueError:
+            pass
+        try:
+            return path.resolve().relative_to(Path(self._dir).resolve())
+        except (ValueError, OSError):
+            return None
+
     def save_index(self, project_path: Path) -> None:
-        """Saves the artifact index to disk as versioned JSON."""
+        """Saves the artifact index to disk as versioned JSON.
+
+        Each record's "path" is stored RELATIVE to the artifacts
+        directory (`self._dir`), not absolute, so a project folder can be
+        moved between machines -- e.g. the Google Drive Streaming path
+        this project lives on resolves to a different absolute prefix on
+        each machine -- and still find its cached JPEGs. `load_index()`
+        rebuilds each path as `self._dir / <relative>`.
+
+        A record whose file lies outside the cache root is skipped (see
+        `_relative_for_index`); `ArtifactCodec` would refuse to read such
+        a path back anyway, so skipping loses nothing.
+
+        The in-memory `_index` keeps ABSOLUTE paths -- only this JSON
+        boundary is relative.
+
+        The `_index` is snapshotted under `_lock` and the relative-path
+        conversion runs outside it: `_relative_for_index`'s fallback
+        branch can do a `.resolve()` syscall, and that must not block a
+        worker commit or a paint-path `is_cached()` call.
+        """
         with self._lock:
-            records = [
-                {
-                    "address":          key.canonical_address,
-                    "size":             key.fingerprint.size,
-                    "mtime_ns":         key.fingerprint.mtime_ns,
-                    "purpose":          key.purpose,
-                    "resolution":       key.resolution,
-                    "policy":           key.policy,
-                    "renderer_version": key.renderer_version,
-                    "path":             str(path),
-                }
-                for key, path in self._index.items()
-            ]
+            entries = list(self._index.items())
+
+        records = []
+        for key, path in entries:
+            relative = self._relative_for_index(path)
+            if relative is None:
+                # Outside the cache root -- unreadable through the codec
+                # anyway. Skip rather than persist an absolute path that
+                # load_index() would have to reject.
+                continue
+            records.append({
+                "address":          key.canonical_address,
+                "size":             key.fingerprint.size,
+                "mtime_ns":         key.fingerprint.mtime_ns,
+                "purpose":          key.purpose,
+                "resolution":       key.resolution,
+                "policy":           key.policy,
+                "renderer_version": key.renderer_version,
+                "path":             str(relative),
+            })
         payload = {"format_version": INDEX_FORMAT_VERSION, "artifacts": records}
         index_path = project_path / "artifact_index.json"
         index_path.write_text(json.dumps(payload, indent=2))
@@ -626,6 +766,22 @@ class ArtifactStore:
         served as-is on the paint path and is not re-requested on view;
         the re-stat happens only if something else calls request_thumbnail()
         for it (or after a reset()).
+
+        Paths in the JSON are RELATIVE to the artifacts directory
+        (P0.5b-2ii-b1). This method rebuilds each as `self._dir /
+        record["path"]`, so its precondition is that `self._dir` is
+        already the project's artifacts directory when it runs.
+        `AppController.load_project()` satisfies this: it calls
+        `set_artifacts_dir(project_path / "artifacts")` immediately
+        before `load_index(project_path)`. The precondition is documented
+        here, not asserted in code. A record whose stored path is
+        absolute is skipped -- a version-3 index should never contain
+        one, and `self._dir / <absolute>` would silently discard
+        `self._dir` and reintroduce exactly the moved-folder bug this
+        format removes. A relative path that escapes the artifacts
+        directory (a `..`-laden path in a corrupt or hand-edited index)
+        is skipped for the same reason save_index skips an outside-root
+        entry: the codec cannot read it.
         """
         index_path = project_path / "artifact_index.json"
         if not index_path.exists():
@@ -657,9 +813,35 @@ class ArtifactStore:
                     policy=record.get("policy", REPRESENTATIVE_FRAME_POLICY),
                     renderer_version=record["renderer_version"],
                 )
+                # Inside the try: a record with no "path", or a non-string
+                # path (null, a number), is one bad record to skip -- not
+                # a reason to abort the whole load.
+                record_path = Path(record["path"])
             except (KeyError, TypeError, ValueError):
                 continue
-            new_index[key] = Path(record["path"])
+
+            if not record_path.parts:
+                # "" or "." -- a degenerate path that would rebuild to
+                # the artifacts directory itself. Skip.
+                continue
+            if record_path.is_absolute():
+                # A version-3 index carries relative paths. pathlib's `/`
+                # with an absolute right-hand operand DISCARDS the left
+                # side, so `self._dir / record_path` would silently be
+                # `record_path` itself -- the moved-folder bug this
+                # format removes. Skip the record.
+                continue
+            rebuilt = self._dir / record_path
+            if self._relative_for_index(rebuilt) is None:
+                # A '..'-laden relative path (corrupt or hand-edited
+                # index) that escapes the artifacts directory. Same
+                # reasoning as save_index skipping an outside-root entry:
+                # ArtifactCodec would refuse to read it, and keeping it
+                # would only make is_cached() report a permanent grey
+                # tile as cached. Cheap: _relative_for_index does no I/O
+                # unless the path actually contains '..'.
+                continue
+            new_index[key] = rebuilt
             # Last writer wins; every record for one address carries the
             # same fingerprint (they were saved together).
             new_fingerprints[record["address"]] = fingerprint
@@ -755,10 +937,12 @@ class ArtifactStore:
                 return
 
             thumb_key = self._key(
-                address, fingerprint, "thumbnail", THUMBNAIL_RESOLUTION
+                address, fingerprint, "thumbnail",
+                self.resolution_for("thumbnail"),
             )
             preview_key = self._key(
-                address, fingerprint, "preview", PREVIEW_RESOLUTION
+                address, fingerprint, "preview",
+                self.resolution_for("preview"),
             )
 
             # A concurrent job for the same address (same generation) may

@@ -269,8 +269,11 @@ state. This rule carries no violation list of its own -- it points at the three
   only), which re-roots the store, rebuilds the codec's containment boundary on
   the new directory, and -- on save, before `save_index` writes the paths --
   copies any indexed JPEG still outside the new root into it. Before the first
-  save or load the store uses a shared pre-project scratch folder. Made true by
-  P0.5b-2ii-a. Tests: `tests/test_artifact_cache_location.py`.
+  save or load the store uses a shared pre-project scratch folder. The saved
+  `artifact_index.json` stores each path relative to the artifacts directory
+  (P0.5b-2ii-b1), so a project folder can move between machines without losing
+  its cache. Made true by P0.5b-2ii-a and P0.5b-2ii-b1. Tests:
+  `tests/test_artifact_cache_location.py`.
 - **`[TARGET -> P1.10]`** Native playback is the explicit exception. `QMediaPlayer`
   receives a file path and a time range directly. It shares the address **parser**
   with the resolver but not the decoding path.
