@@ -29,6 +29,7 @@ Run with:
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
 from pathlib import Path
@@ -426,15 +427,25 @@ def test_update_wanted_addresses_touches_no_filesystem(qapp, tmp_path, monkeypat
 
     # The helper's architectural claim (docs/media_architecture.md 4.4,
     # and its own docstring) is that it resolves cells with pure path
-    # arithmetic and never stats, opens or decodes anything. Seal off the
-    # three filesystem entry points it could plausibly reach and assert
-    # the report still goes through.
+    # arithmetic and never stats, opens or decodes anything. Seal off
+    # every filesystem entry point it could plausibly reach and assert the
+    # report still goes through. Path.stat / Path.exists / builtins.open
+    # are only the pathlib-and-open surface; os.stat, os.path.exists,
+    # Path.is_file and Path.resolve are separate C-level entry points that
+    # hit the filesystem without routing through those three (os.path.exists
+    # calls os.stat directly, Path.is_file calls os.stat via the accessor,
+    # and Path.resolve calls os.path.realpath), so a leak through any of
+    # them would slip past the original seal.
     def _boom(*_args, **_kwargs):
         raise AssertionError("_update_wanted_addresses touched the filesystem")
 
     monkeypatch.setattr(Path, "stat", _boom)
     monkeypatch.setattr(Path, "exists", _boom)
     monkeypatch.setattr("builtins.open", _boom)
+    monkeypatch.setattr(os, "stat", _boom)
+    monkeypatch.setattr("os.path.exists", _boom)
+    monkeypatch.setattr(Path, "is_file", _boom)
+    monkeypatch.setattr(Path, "resolve", _boom)
 
     controller.report_displayed_range("vp", 0, 4, layout.result_id)
 
