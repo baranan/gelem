@@ -58,7 +58,9 @@ nothing pointing at it -- P0.5b-2ii). Requests are issued on demand as
 tiles paint (P0.5b-3i, `AppController.render_column_value`); there is no
 eager whole-table pass. Priority ordering and viewport cancellation are
 P0.5b-3ii and have no producer in the repo yet. Disk-cache eviction and
-the memory LRU ceiling are P0.5b-2ii.
+the memory LRU ceiling landed in P0.5b-2ii; the ceilings, the worker
+count and the thumbnail/preview sizes are constructor parameters supplied
+from settings/ by main.py (P0.5b-2ii-c1, docs/architecture.md section 9).
 
 This file is written centrally (not by a student).
 """
@@ -85,16 +87,16 @@ from media.artifact_key import ArtifactKey, SourceFingerprint
 # We only need to know which extensions are videos here.
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 
-THUMBNAIL_SIZE = (150, 150)
-PREVIEW_SIZE   = (600, 600)
-
-# The resolution (max side, in pixels) that enters the ArtifactKey for
-# each purpose. Derived from the size tuples above rather than restated,
-# so the key and the resize stay in step. THUMBNAIL_SIZE / PREVIEW_SIZE
-# remain plain module constants in this diff -- turning them into
-# machine-independent settings is P0.5b-2, together with worker count.
-THUMBNAIL_RESOLUTION = max(THUMBNAIL_SIZE)
-PREVIEW_RESOLUTION   = max(PREVIEW_SIZE)
+# Fallback thumbnail / preview target sizes, (width, height) in pixels.
+# DEFAULTS ONLY: the real values come from settings/ via main.py and are
+# passed to the ArtifactStore constructor (P0.5b-2ii-c1,
+# docs/architecture.md section 9). The instance derives its
+# _thumbnail_resolution / _preview_resolution (max side) from whatever it
+# is given; there is no module-level RESOLUTION constant any more, because
+# the resolution is now instance state, not an assumption a reader can
+# import.
+DEFAULT_THUMBNAIL_SIZE = (150, 150)
+DEFAULT_PREVIEW_SIZE   = (600, 600)
 
 # For now the store always records the first frame of a video (or the
 # whole image) and ignores any frame or time specifier in the address.
@@ -103,18 +105,17 @@ PREVIEW_RESOLUTION   = max(PREVIEW_SIZE)
 # different key and does not collide with these pictures.
 REPRESENTATIVE_FRAME_POLICY = "first"
 
-# The in-memory image-cache ceiling. Machine dependent, so a
-# [TARGET -> P0.5b-2ii-c] settings site alongside
-# DEFAULT_DISK_CACHE_MAX_BYTES below -- neither is a setting yet.
+# The in-memory image-cache ceiling. DEFAULT ONLY -- the real value comes
+# from settings/ via main.py and is passed to the constructor as
+# memory_cache_max_bytes (P0.5b-2ii-c1, docs/architecture.md section 9).
 DEFAULT_CACHE_MAX_BYTES = 500 * 1024 * 1024
 
 # The on-disk artifact cache ceiling, measured against the total size of
 # the sweep-owned JPEGs that survive orphan removal (see
 # cache_sweep.plan_sweep). Separate number from DEFAULT_CACHE_MAX_BYTES,
-# which is memory. 1 GiB. Machine dependent, so a
-# [TARGET -> P0.5b-2ii-c] settings site; until then it is this module
-# default and a keyword-only ArtifactStore constructor parameter, the
-# same treatment worker_count gets.
+# which is memory. 1 GiB. DEFAULT ONLY -- the real value comes from
+# settings/ via main.py and is passed to the constructor as
+# disk_cache_max_bytes (P0.5b-2ii-c1, docs/architecture.md section 9).
 DEFAULT_DISK_CACHE_MAX_BYTES = 1024 * 1024 * 1024
 
 # A cache file on disk is named "<stable_hash>.jpg". ArtifactKey.
@@ -161,7 +162,16 @@ class ArtifactStore:
         *,
         worker_count: int = 2,
         disk_cache_max_bytes: int = DEFAULT_DISK_CACHE_MAX_BYTES,
+        memory_cache_max_bytes: int = DEFAULT_CACHE_MAX_BYTES,
+        thumbnail_size: tuple[int, int] = DEFAULT_THUMBNAIL_SIZE,
+        preview_size: tuple[int, int] = DEFAULT_PREVIEW_SIZE,
     ):
+        # Every keyword parameter defaults to the module DEFAULT_ constant,
+        # so the positional ArtifactStore(dir) construction used by older
+        # tests keeps working. main.py passes all five from settings/
+        # (P0.5b-2ii-c1, docs/architecture.md section 9). None of these
+        # five is machine-independent, so none is a bare constant in the
+        # code -- CLAUDE.md's generality rule.
         self._dir = artifacts_dir
         self._dir.mkdir(parents=True, exist_ok=True)
         self._codec = ArtifactCodec(self._dir)
@@ -190,10 +200,10 @@ class ArtifactStore:
         # the main thread, replacing the old raw thread-per-request. The
         # worker count is a constructor parameter with a low default, not
         # a module constant -- it is machine dependent (CLAUDE.md's
-        # no-machine-dependent-constant rule, [TARGET -> P0.5b-2]). Same
-        # precedent as AppController's drain_budget. Keyword-only so the
-        # positional ArtifactStore(dir) construction in main.py and the
-        # tests keeps working unchanged.
+        # no-machine-dependent-constant rule). main.py passes it from
+        # settings/ (P0.5b-2ii-c1). Same precedent as AppController's
+        # drain_budget. Keyword-only so the positional ArtifactStore(dir)
+        # construction in the tests keeps working unchanged.
         self._pool = WorkerPool(worker_count=worker_count)
 
         # Request coalescing and cancellation state, all guarded by
@@ -216,11 +226,26 @@ class ArtifactStore:
         # reads the JPEG back through the codec and fills this cache.
         self._cache: OrderedDict[ArtifactKey, Image.Image] = OrderedDict()
         self._cache_bytes: int = 0
-        self._cache_max_bytes: int = DEFAULT_CACHE_MAX_BYTES
+        self._cache_max_bytes: int = memory_cache_max_bytes
+
+        # Thumbnail / preview target sizes and the derived resolutions
+        # (max side, in pixels) that enter every ArtifactKey. All four are
+        # written ONCE here and never mutated again. That "never mutated
+        # after __init__" property is load-bearing: it is the only reason
+        # a worker thread may read _thumbnail_size / _preview_size in
+        # _run_job without holding _lock. Making them runtime-changeable
+        # would break that -- a setter would have to stop the workers, or
+        # move the read under the lock. Changing the thumbnail or preview
+        # size therefore needs a restart (docs/architecture.md section 9).
+        self._thumbnail_size: tuple[int, int] = tuple(thumbnail_size)
+        self._preview_size: tuple[int, int] = tuple(preview_size)
+        self._thumbnail_resolution: int = max(self._thumbnail_size)
+        self._preview_resolution: int = max(self._preview_size)
 
         # The on-disk ceiling the directory sweep (reconcile_and_evict)
         # enforces. Keyword-only constructor parameter, not a hardcoded
-        # constant -- machine dependent, [TARGET -> P0.5b-2ii-c].
+        # constant -- machine dependent; main.py passes it from settings/
+        # (P0.5b-2ii-c1, docs/architecture.md section 9).
         self._disk_cache_max_bytes: int = disk_cache_max_bytes
 
         self.on_thumbnail_ready = None
@@ -229,17 +254,35 @@ class ArtifactStore:
     # Key construction
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def resolution_for(purpose: str) -> int:
+    def resolution_for(self, purpose: str) -> int:
         """The requested resolution (max side, in pixels) that enters the
         ArtifactKey for a purpose.
 
-        This is the ONE definition of the purpose -> resolution mapping in
-        the repository. The renderer factory is handed a store instance
-        and calls this on it; nothing imports THUMBNAIL_RESOLUTION /
-        PREVIEW_RESOLUTION across a module boundary to recompute it.
+        Reads this instance's _thumbnail_resolution / _preview_resolution,
+        which were fixed from the injected sizes in __init__. This is the
+        ONE definition of the purpose -> resolution mapping in the
+        repository; the renderer factory is handed a store instance and
+        calls this on it. It is an instance method (no longer a
+        staticmethod) precisely because the mapping is now per-store
+        configuration, not a module constant.
         """
-        return THUMBNAIL_RESOLUTION if purpose == "thumbnail" else PREVIEW_RESOLUTION
+        if purpose == "thumbnail":
+            return self._thumbnail_resolution
+        return self._preview_resolution
+
+    def purpose_for_tile_size(self, size: int) -> str:
+        """The purpose a gallery tile of `size` pixels should request:
+        'thumbnail' when the tile is at or below this store's thumbnail
+        resolution, 'preview' for anything larger.
+
+        This is the one place the tile-size -> purpose decision lives.
+        column_types/renderers.py calls this rather than comparing `size`
+        against a module constant, so the boundary moves with the
+        configured thumbnail size.
+        """
+        if size <= self._thumbnail_resolution:
+            return "thumbnail"
+        return "preview"
 
     def _key(
         self,
@@ -601,15 +644,35 @@ class ArtifactStore:
             for job_key in dropped:
                 self._inflight.pop(job_key, None)
 
-    def set_cache_max_bytes(self, max_bytes: int) -> None:
-        """
-        Sets the maximum memory the cache may use, in bytes.
+    def set_memory_cache_max_bytes(self, n: int) -> None:
+        """Set the in-memory image-cache ceiling to `n` bytes AND evict the
+        oldest entries now until the cache is under it.
 
-        Args:
-            max_bytes: Maximum cache size in bytes.
+        MAIN THREAD ONLY (touches _cache, like _evict_if_needed).
+
+        The eviction is done here, not left to the caller: the
+        P0.5b-2ii-b2 defect was exactly a guard that only held if the call
+        site remembered to follow up. `n` must be at least 1.
         """
-        self._cache_max_bytes = max_bytes
+        if n < 1:
+            raise ValueError("memory cache ceiling must be at least 1 byte")
+        self._cache_max_bytes = n
         self._evict_if_needed()
+
+    def set_disk_cache_max_bytes(self, n: int) -> SweepResult:
+        """Set the on-disk artifact-cache ceiling to `n` bytes AND run the
+        directory sweep now, bringing the cache under the new ceiling.
+        Returns the SweepResult from that reconcile_and_evict() call.
+
+        MAIN THREAD ONLY (reconcile_and_evict is main-thread only).
+
+        The sweep is run here, not left to the caller -- same reasoning as
+        set_memory_cache_max_bytes. `n` must be at least 1.
+        """
+        if n < 1:
+            raise ValueError("disk cache ceiling must be at least 1 byte")
+        self._disk_cache_max_bytes = n
+        return self.reconcile_and_evict()
 
     def set_artifacts_dir(self, new_dir: Path) -> None:
         """Re-point the cache directory at `new_dir` and migrate the index.
@@ -1298,14 +1361,22 @@ class ArtifactStore:
                     self._discard_subscribers(job_key)
                     return
 
+                # This runs on a WORKER thread. It reads self._thumbnail_size
+                # and self._preview_size without holding _lock. That is safe
+                # for ONE reason only: both are written once in __init__ and
+                # never mutated afterwards (see the __init__ comment). If the
+                # thumbnail or preview size ever became runtime-changeable,
+                # this unlocked read would be a data race -- a size change
+                # would then require a restart, or these reads would have to
+                # move under the lock.
                 thumb = image.copy()
-                thumb.thumbnail(THUMBNAIL_SIZE, Image.LANCZOS)
+                thumb.thumbnail(self._thumbnail_size, Image.LANCZOS)
                 thumb_dest = self._dir / f"{thumb_key.stable_hash()}.jpg"
                 self._codec.write_jpeg(thumb_dest, np.array(thumb, dtype=np.uint8))
                 pending_index[thumb_key] = thumb_dest
 
                 preview = image.copy()
-                preview.thumbnail(PREVIEW_SIZE, Image.LANCZOS)
+                preview.thumbnail(self._preview_size, Image.LANCZOS)
                 preview_dest = self._dir / f"{preview_key.stable_hash()}.jpg"
                 self._codec.write_jpeg(
                     preview_dest, np.array(preview, dtype=np.uint8)

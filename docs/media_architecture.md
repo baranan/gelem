@@ -778,11 +778,15 @@ the following sweep cleans up for real. `load_project()` additionally uses
 authoritative), but orphan deletion there still obeys the flag, so a save
 immediately after a failed load does not wipe the cache.
 
-**The ceiling** is `DEFAULT_DISK_CACHE_MAX_BYTES` (1 GiB), a keyword-only
-`ArtifactStore` constructor parameter, measured against the sweep-owned files
-that remain after step 2's deletions (orphans, when the index is trustworthy).
-It is machine-dependent and becomes a setting in P0.5b-2ii-c. It is separate
-from the in-memory image-cache ceiling `DEFAULT_CACHE_MAX_BYTES`.
+**The ceiling** is a keyword-only `ArtifactStore` constructor parameter
+(`disk_cache_max_bytes`, default `DEFAULT_DISK_CACHE_MAX_BYTES` = 1 GiB),
+measured against the sweep-owned files that remain after step 2's deletions
+(orphans, when the index is trustworthy). It is machine-dependent, so `main.py`
+passes it from `settings/` (P0.5b-2ii-c1; `docs/architecture.md` §9 is the
+authority for the settings, and only the editing dialog, c2, is still missing).
+`ArtifactStore.set_disk_cache_max_bytes(n)` lowers it and runs this sweep itself.
+It is separate from the in-memory image-cache ceiling
+(`memory_cache_max_bytes`, default `DEFAULT_CACHE_MAX_BYTES`).
 
 **Eviction is by write order, not access order.** "Oldest" means oldest mtime.
 No per-file access time is tracked: the cache is read on the paint path and

@@ -63,6 +63,19 @@ def create_app(fake_data: bool = False):
     from operators.stats_operator import StatsOperator
     from operators.video_frames import VideoFramesOperator
     from controller import AppController
+    from settings.qsettings_backend import QSettingsBackend
+    from settings.settings_store import SettingsStore
+
+    # Load the machine-tunable settings. The store never raises: a corrupt
+    # or out-of-range saved value is clamped or defaulted, and each such
+    # correction comes back as a plain-English message we print here.
+    # Components receive the resulting plain values as constructor
+    # arguments -- never the store or the GelemSettings object itself
+    # (docs/architecture.md section 9).
+    settings_store = SettingsStore(QSettingsBackend())
+    gelem_settings, settings_problems = settings_store.load()
+    for problem in settings_problems:
+        print(f"[settings] {problem}")
 
     artifacts_dir = Path(tempfile.gettempdir()) / "gelem_artifacts"
     # This is the pre-project scratch cache -- where thumbnails land
@@ -88,7 +101,14 @@ def create_app(fake_data: bool = False):
 
     dataset           = Dataset()
     query_engine      = QueryEngine()
-    artifact_store    = ArtifactStore(artifacts_dir)
+    artifact_store    = ArtifactStore(
+        artifacts_dir,
+        worker_count=gelem_settings.worker_count,
+        disk_cache_max_bytes=gelem_settings.picture_disk_max_bytes,
+        memory_cache_max_bytes=gelem_settings.picture_memory_max_bytes,
+        thumbnail_size=gelem_settings.thumbnail_size,
+        preview_size=gelem_settings.preview_size,
+    )
     registry          = ColumnTypeRegistry()
     operator_registry = OperatorRegistry()
 

@@ -348,18 +348,18 @@ state. This rule carries no violation list of its own -- it points at the three
   hardcoded 300-1500 ms window, a seven-emotion assumption, or a
   blendshape-specific branch inside a generic component is a leak. Before building
   a feature, name the parameter that makes it general.
-- **`[TARGET -> P0.5, sub-item P0.5b-2ii]`** **A number that does not generalise
-  across machines or datasets must become a setting or a runtime measurement --
-  never a constant in the code.** The rule covers two different mechanisms: a
-  number that varies **by machine** needs a setting; a number that varies **by
-  file or dataset** needs a runtime measurement.
-  Not true today. Open sites: `DEFAULT_CACHE_MAX_BYTES` is a hardcoded 500 MB;
-  worker count became an `ArtifactStore` constructor parameter (default 2) in
-  P0.5b-2i but is not yet wired to a setting or a measurement; `THUMBNAIL_SIZE`,
-  `PREVIEW_SIZE` and `_PREVIEW_SIZE_THRESHOLD` stay module-level for now
-  (P0.5b-1 makes the resolution enter the artifact key **as a value** rather
-  than be assumed by the reader, which is a different fix). All of these close
-  in P0.5b-2ii, and this tag does not flip until then.
+- **`[TARGET -> P0.5, sub-item P0.5b-2ii-c2]`** **A number that does not
+  generalise across machines or datasets must become a setting or a runtime
+  measurement -- never a constant in the code.** The rule covers two different
+  mechanisms: a number that varies **by machine** needs a setting; a number that
+  varies **by file or dataset** needs a runtime measurement.
+  The five machine-dependent numbers -- the in-memory cache ceiling, the disk
+  cache ceiling, the worker count, the thumbnail size and the preview size --
+  now come from `settings/` and are passed into the `ArtifactStore` constructor
+  by `main.py` (P0.5b-2ii-c1). `docs/architecture.md` §9 is the single authority
+  for them; do not restate the list. The module-level `DEFAULT_` constants that
+  remain are fallbacks only. This tag does **not** flip yet: no researcher can
+  change a value until the settings dialog exists, which is P0.5b-2ii-c2.
 - **`[TARGET -> P1.2]`** The first real per-file measurement case: resolving
   `#f=N` against a variable-frame-rate file (decision 8,
   `docs/media_architecture.md` §3.6) needs a per-file index of frame

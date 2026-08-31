@@ -153,8 +153,11 @@ failing test before or as it is fixed.
   orphaned and over-ceiling JPEGs, and drops index entries whose file is gone.
   On load the sweep runs only when `load_index()` reports the index as
   authoritative, so a transient failure reading `artifact_index.json` cannot
-  turn into a full cache wipe. Disk ceiling `DEFAULT_DISK_CACHE_MAX_BYTES`
-  (1 GiB), evicted oldest-mtime first; becoming a setting is P0.5b-2ii-c. The sweep runs only at save and
+  turn into a full cache wipe. Disk ceiling defaults to
+  `DEFAULT_DISK_CACHE_MAX_BYTES` (1 GiB), evicted oldest-mtime first; `main.py`
+  now passes it (and the memory ceiling, worker count and thumbnail/preview
+  sizes) from `settings/` (P0.5b-2ii-c1, `docs/architecture.md` §9), with only
+  the editing dialog (c2) still missing. The sweep runs only at save and
   load, so the pre-project scratch folder (`%TEMP%\gelem_artifacts`, used by a
   session that never saves a project) is deliberately out of scope and still
   grows unbounded until the OS clears `%TEMP%`. `docs/media_architecture.md`

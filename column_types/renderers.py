@@ -152,9 +152,6 @@ def make_media_path_renderer(artifact_store):
     return render
 
 
-_PREVIEW_SIZE_THRESHOLD = 200  # pixels — tiles larger than this use 'preview'
-
-
 def _placeholder_pixmap(size: int):
     """A neutral grey QPixmap shown in a tile while its real picture is
     still being generated (P0.5b-3i).
@@ -190,11 +187,12 @@ def _cached_thumbnail(context: dict | None, size: int, artifact_store):
     address = context.get("canonical_address")
     if not address:
         return None
-    # The purpose -> resolution mapping lives only on the store instance
-    # (ArtifactStore.resolution_for), which is already injected here --
-    # this renderer no longer imports a resolution constant to recompute
-    # it.
-    purpose = "thumbnail" if size <= _PREVIEW_SIZE_THRESHOLD else "preview"
+    # Both the tile-size -> purpose decision and the purpose -> resolution
+    # mapping live only on the store instance, which is already injected
+    # here -- this renderer no longer holds a size threshold constant or a
+    # resolution constant of its own. purpose_for_tile_size() draws the
+    # line at the store's configured thumbnail resolution.
+    purpose = artifact_store.purpose_for_tile_size(size)
     resolution = artifact_store.resolution_for(purpose)
     pil_image = artifact_store.get_pixmap(address, purpose, resolution)
     if pil_image is None:

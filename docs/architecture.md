@@ -444,3 +444,52 @@ the two lists already disagree.
 - **Avatar rendering.** Turning blendshape values into a deformed 3D face. Blocked
   on a usable VRM source. Will attach through a column contract defined once that
   is solved.
+
+---
+
+## 9. Settings
+
+**Single authority for the machine-tunable values.** Nothing else -- not
+`media_architecture.md` §4.7, not `CLAUDE.md` -- restates this list. Added
+P0.5b-2ii-c1. The editing dialog is P0.5b-2ii-c2; until it exists a researcher
+cannot change any of these without editing the platform settings store by hand.
+
+### The five values
+
+| Value | Default | Meaning | Takes effect |
+|---|---|---|---|
+| `picture_memory_max_bytes` | 500 MiB | Ceiling on the RAM the ArtifactStore's in-memory decoded-image cache may hold. Over it, the least recently used images are dropped; they regenerate from disk on next view. | **Immediately** |
+| `picture_disk_max_bytes` | 1 GiB | Ceiling on the total size of the derived-JPEG files in a project's `artifacts/` folder. Over it, the oldest (by write time) are deleted and regenerate on demand. | **Immediately** |
+| `worker_count` | 2 | How many background threads decode and resize source media for thumbnails and previews. Higher uses more CPU and RAM for faster gallery fill. | **On restart** |
+| `thumbnail_size` | 150x150 | Target pixel size of a gallery thumbnail. Its larger side is the "thumbnail resolution" that enters the artifact key and decides, per tile, whether a tile asks for a thumbnail or a preview. | **On restart** |
+| `preview_size` | 600x600 | Target pixel size of the larger preview image used for bigger tiles and quick previews. | **On restart** |
+
+Bounds and the exact defaults live in `settings/settings.py` as module-level
+constants; a saved value outside its bounds is clamped, an unparseable one falls
+back to the default, and either way the app still starts. One cross-field rule:
+if the preview's larger side is smaller than the thumbnail's, the preview size is
+set equal to the thumbnail size.
+
+### Why some need a restart
+
+The memory and disk ceilings are read every time the cache is checked or swept,
+so a setter can lower them and immediately evict down to the new bound
+(`ArtifactStore.set_memory_cache_max_bytes`, `set_disk_cache_max_bytes` -- each
+does the eviction itself, it is not left to the caller).
+
+Worker count is fixed when the `WorkerPool` builds its threads. Thumbnail and
+preview sizes are read by worker threads without a lock, which is only safe
+because they are written once in `ArtifactStore.__init__` and never mutated --
+see the comment there. Changing any of the three therefore needs a fresh
+process.
+
+### How a value reaches a component
+
+`main.py` builds a `QSettingsBackend`, wraps it in a `SettingsStore`, calls
+`load()`, prints any correction messages, and passes the **plain values** into
+the `ArtifactStore` constructor -- exactly as `worker_count` and
+`disk_cache_max_bytes` were already passed. **A component never receives the
+settings store or the `GelemSettings` object, and never imports `settings/`.**
+Only `main.py` and the `settings/` package may import `settings/` or `QSettings`
+(guarded by `tests/test_settings.py`). `settings/` is Qt-free except
+`settings/qsettings_backend.py`, the one file that touches PySide6.
