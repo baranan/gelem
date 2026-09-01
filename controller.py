@@ -1631,22 +1631,31 @@ class AppController(QObject):
     def apply_settings(self, values: dict) -> list[str]:
         """
         Validates and persists *values* through the settings gateway,
-        then pushes the two immediate-effect ceilings into the artifact
-        store so they take effect without a restart.
+        then pushes an immediate-effect ceiling into the artifact store
+        ONLY when that ceiling's stored value actually changed.
 
-        The values pushed into the store are read back from the gateway
-        AFTER saving, so a value the gateway corrected (clamped, or
-        lifted by the cross-field rule) is never contradicted by what the
-        store is told.
+        "Actually changed" is measured against the gateway, not the
+        caller's mapping: the value the gateway reports before the save
+        is compared with the value it reports after. A caller can submit
+        a number the gateway corrects straight back to what was already
+        stored -- that pushes nothing, because pushing a ceiling is not
+        free (the memory ceiling evicts, the disk ceiling runs a full
+        artifacts-directory sweep, both on the main thread).
+
+        When the disk ceiling was pushed and the resulting sweep deleted
+        cached picture files, one plain-English sentence naming the count
+        is appended to the returned list.
 
         Args:
             values: field name -> raw value mapping from the settings
                     dialog.
 
         Returns:
-            The list of plain-English problem messages describing every
-            correction the gateway made (empty when all values were
-            accepted as given).
+            A list of plain-English messages for the researcher: every
+            correction message the gateway produced, plus at most one
+            sentence reporting cached picture files the disk-ceiling
+            sweep deleted. Empty when nothing was corrected and nothing
+            swept.
 
         Raises:
             RuntimeError: if no settings gateway was wired in.
@@ -1657,19 +1666,57 @@ class AppController(QObject):
                 "without settings_gateway=, so settings cannot be applied."
             )
 
-        problems = self._settings_gateway.save_values(values)
-
-        # Read the saved values back, so a corrected number -- not the
-        # raw one the dialog passed -- is what the store is told.
-        saved = {
+        # Read the ceilings the gateway reports BEFORE the save, so we can
+        # tell a real change from a no-op the gateway corrected back.
+        before = {
             field.name: field.current_value
             for field in self._settings_gateway.describe_fields()
         }
-        self._store.set_memory_cache_max_bytes(
-            saved["picture_memory_max_bytes"]
-        )
-        self._store.set_disk_cache_max_bytes(
-            saved["picture_disk_max_bytes"]
-        )
 
-        return problems
+        problems = self._settings_gateway.save_values(values)
+
+        # Read them again AFTER the save. Any push uses this number -- the
+        # corrected one, never the raw request.
+        after = {
+            field.name: field.current_value
+            for field in self._settings_gateway.describe_fields()
+        }
+
+        messages = list(problems)
+
+        # Push the memory ceiling only if its stored value moved.
+        if (
+            before["picture_memory_max_bytes"]
+            != after["picture_memory_max_bytes"]
+        ):
+            self._store.set_memory_cache_max_bytes(
+                after["picture_memory_max_bytes"]
+            )
+
+        # Push the disk ceiling only if its stored value moved. When the
+        # resulting sweep deleted files, report the count to the researcher.
+        if (
+            before["picture_disk_max_bytes"]
+            != after["picture_disk_max_bytes"]
+        ):
+            sweep = self._store.set_disk_cache_max_bytes(
+                after["picture_disk_max_bytes"]
+            )
+            # The sweep runs on any disk-ceiling change, not only a cut, and
+            # its count folds in orphan cleanup as well as ceiling eviction --
+            # so the sentence states plainly that files went, without claiming
+            # a direction.
+            if sweep.files_deleted > 0:
+                # Singular/plural: this is researcher-facing text and
+                # files_deleted is often 1.
+                noun = (
+                    "cached picture file"
+                    if sweep.files_deleted == 1
+                    else "cached picture files"
+                )
+                messages.append(
+                    f"Applying the new disk cache limit deleted "
+                    f"{sweep.files_deleted} {noun}."
+                )
+
+        return messages

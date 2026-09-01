@@ -517,7 +517,16 @@ list of correction messages.
 
 `main.py` builds the gateway over the same `SettingsStore` and passes it to
 `AppController` as `settings_gateway=`. `AppController.get_settings_fields()` and
-`apply_settings(values)` forward to it; `apply_settings` additionally pushes the
-two immediate-effect ceilings into the `ArtifactStore` (reading them back from
-the gateway after saving, so a corrected value is what the store is told). The
-dialog that drives this is P0.5b-2ii-c2b2.
+`apply_settings(values)` forward to it; `apply_settings` additionally pushes an
+immediate-effect ceiling into the `ArtifactStore` only when that ceiling's value
+actually changed -- the value the gateway reports before the save is compared
+with the value it reports after, so a number the gateway corrected straight back
+to what was already stored pushes nothing (the memory push evicts and the disk
+push runs a full sweep, both on the main thread). A change to the disk ceiling in
+either direction runs a sweep -- the cache can sit over its ceiling between
+sweeps, so even raising the limit can evict genuinely cached pictures -- and when
+that sweep deletes cached picture files `apply_settings` appends one
+plain-English sentence naming the count to the messages it returns; the count
+includes orphan cleanup as well as ceiling eviction, so it is not an exact
+measure of what the researcher lost. The dialog that drives this is
+P0.5b-2ii-c2b2.

@@ -56,18 +56,25 @@ class _StubDataset:
 
 
 class _StubStore:
-    """Records exactly what the controller pushes into the artifact store."""
+    """Records exactly what the controller pushes into the artifact store.
+
+    `set_disk_cache_max_bytes` returns a SweepResult-shaped object whose
+    `files_deleted` count the test controls via `disk_files_deleted`
+    (default 0, i.e. the sweep removed nothing).
+    """
 
     def __init__(self):
         self.on_thumbnail_ready = None
         self.memory_calls: list[int] = []
         self.disk_calls: list[int] = []
+        self.disk_files_deleted: int = 0
 
     def set_memory_cache_max_bytes(self, nbytes: int) -> None:
         self.memory_calls.append(nbytes)
 
-    def set_disk_cache_max_bytes(self, nbytes: int) -> None:
+    def set_disk_cache_max_bytes(self, nbytes: int):
         self.disk_calls.append(nbytes)
+        return SimpleNamespace(files_deleted=self.disk_files_deleted)
 
 
 class _StubGateway:
@@ -352,3 +359,159 @@ def test_raising_thumbnail_alone_lifts_the_stored_preview():
     assert any("preview" in message.lower() for message in problems)
     assert backend.data["artifacts/thumbnail_max_side"] == "800"
     assert backend.data["artifacts/preview_max_side"] == "800"
+
+
+# ===========================================================================
+# P0.5b-2ii-c2b2a -- apply_settings pushes a ceiling ONLY when that ceiling's
+# stored value actually changed (gateway value before the save vs after),
+# and reports a disk-ceiling sweep that deleted cached picture files.
+#
+# Every test below seeds all five fields with distinct, non-default,
+# in-range values (defaults are 500 MiB / 1 GiB / 2 / 150 / 600), so a
+# wrong push is visible.
+# ===========================================================================
+
+# 256 MiB / 512 MiB / 5 / 200 / 700 -- none of them a default, all in range,
+# and preview (700) >= thumbnail (200).
+_FIVE_DISTINCT_SEED = {
+    "picture_memory_max_bytes": 256 * 1024 * 1024,
+    "picture_disk_max_bytes": 512 * 1024 * 1024,
+    "worker_count": 5,
+    "thumbnail_max_side": 200,
+    "preview_max_side": 700,
+}
+
+
+class _RevertingMemoryGateway:
+    """A SettingsGateway stand-in that accepts a memory-ceiling change in
+    its mapping but persists the value that was ALREADY stored -- it
+    corrects the submission straight back. describe_fields() therefore
+    reports the same memory number before and after the save, even though
+    the caller's mapping named that field.
+    """
+
+    def __init__(self, start: dict[str, int]):
+        self._values = dict(start)
+        self.saved_mapping: dict | None = None
+
+    def save_values(self, mapping) -> list[str]:
+        self.saved_mapping = dict(mapping)
+        stored_memory = self._values["picture_memory_max_bytes"]
+        self._values.update({k: int(v) for k, v in mapping.items()})
+        # The correction: the memory ceiling is put straight back to what
+        # was already stored, so nothing actually changed.
+        self._values["picture_memory_max_bytes"] = stored_memory
+        return ["the memory ceiling could not be changed and was kept"]
+
+    def describe_fields(self) -> list:
+        return [
+            SimpleNamespace(name=name, current_value=value)
+            for name, value in self._values.items()
+        ]
+
+
+def test_t1_changing_only_thumbnail_pushes_neither_ceiling():
+    gateway = _StubGateway(_FIVE_DISTINCT_SEED)
+    store = _StubStore()
+    controller = _make_controller(gateway, store)
+
+    # A field that is neither ceiling.
+    problems = controller.apply_settings({"thumbnail_max_side": 300})
+
+    assert problems == []
+    assert store.memory_calls == []
+    assert store.disk_calls == []
+
+
+def test_t2_changing_only_the_memory_ceiling_pushes_only_it():
+    gateway = _StubGateway(_FIVE_DISTINCT_SEED)
+    store = _StubStore()
+    controller = _make_controller(gateway, store)
+
+    new_memory = 333 * 1024 * 1024   # in range, distinct from the 256 MiB seed
+    problems = controller.apply_settings(
+        {"picture_memory_max_bytes": new_memory}
+    )
+
+    assert problems == []
+    # The memory ceiling was pushed with exactly the saved number.
+    assert store.memory_calls == [new_memory]
+    # The disk ceiling did not move, so its sweep never ran.
+    assert store.disk_calls == []
+
+
+def test_t3_a_value_corrected_back_to_the_stored_one_pushes_nothing():
+    # The caller submits a DIFFERENT memory ceiling; the gateway corrects
+    # it straight back to the value already stored. Nothing changed, so
+    # nothing must be pushed.
+    #
+    # An implementation that keyed off the caller's mapping KEYS -- "the
+    # mapping named picture_memory_max_bytes, therefore push it" -- would
+    # call set_memory_cache_max_bytes here and fail this test. The correct
+    # implementation compares the gateway's before/after values, sees no
+    # change, and pushes nothing.
+    gateway = _RevertingMemoryGateway(_FIVE_DISTINCT_SEED)
+    store = _StubStore()
+    controller = _make_controller(gateway, store)
+
+    problems = controller.apply_settings(
+        {"picture_memory_max_bytes": 999 * 1024 * 1024}
+    )
+
+    assert problems == ["the memory ceiling could not be changed and was kept"]
+    assert store.memory_calls == []
+    assert store.disk_calls == []
+
+
+def test_t4_a_disk_ceiling_cut_that_deletes_files_reports_the_count():
+    gateway = _StubGateway(_FIVE_DISTINCT_SEED)
+    store = _StubStore()
+    store.disk_files_deleted = 12
+    controller = _make_controller(gateway, store)
+
+    # Genuinely lower the disk ceiling (512 MiB seed -> 100 MiB, in range).
+    new_disk = 100 * 1024 * 1024
+    problems = controller.apply_settings({"picture_disk_max_bytes": new_disk})
+
+    assert store.disk_calls == [new_disk]
+    # One message names the 12 deleted files.
+    assert any("12" in message for message in problems)
+
+
+def test_t4b_the_sweep_note_is_singular_when_exactly_one_file_went():
+    # Researcher-facing text: "deleted 1 cached picture file", not "files".
+    gateway = _StubGateway(_FIVE_DISTINCT_SEED)
+    store = _StubStore()
+    store.disk_files_deleted = 1
+    controller = _make_controller(gateway, store)
+
+    new_disk = 100 * 1024 * 1024   # 512 MiB seed -> 100 MiB, in range
+    problems = controller.apply_settings({"picture_disk_max_bytes": new_disk})
+
+    assert store.disk_calls == [new_disk]
+    # The singular noun phrase, with no trailing "s" on "file".
+    assert any("deleted 1 cached picture file." in message for message in problems)
+    assert not any("1 cached picture files" in message for message in problems)
+
+
+def test_t5_a_disk_ceiling_change_that_deletes_nothing_adds_no_message():
+    # This gateway returns one correction message and leaves files_deleted
+    # at 0 on the store. The returned list must be exactly that one
+    # correction message -- no sweep note tacked on.
+    #
+    # T5 is also the only test in this file that fails an implementation
+    # which skips BOTH ceiling pushes whenever the gateway's correction
+    # list is non-empty: here the correction list is non-empty AND the
+    # disk ceiling genuinely changed, so the disk push (and its sweep)
+    # must still happen -- assert store.disk_calls below pins that.
+    gateway = _CorrectingStubGateway(_FIVE_DISTINCT_SEED)
+    store = _StubStore()   # disk_files_deleted stays 0
+    controller = _make_controller(gateway, store)
+
+    # A real disk-ceiling change (512 MiB seed -> 100 MiB).
+    problems = controller.apply_settings(
+        {"picture_disk_max_bytes": 100 * 1024 * 1024}
+    )
+
+    assert store.disk_calls == [100 * 1024 * 1024]
+    assert problems == ["the memory ceiling was corrected"]
