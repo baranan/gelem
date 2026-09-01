@@ -65,6 +65,7 @@ def create_app(fake_data: bool = False):
     from controller import AppController
     from settings.qsettings_backend import QSettingsBackend
     from settings.settings_store import SettingsStore
+    from settings.settings_gateway import SettingsGateway
 
     # Load the machine-tunable settings. The store never raises: a corrupt
     # or out-of-range saved value is clamped or defaulted, and each such
@@ -76,6 +77,12 @@ def create_app(fake_data: bool = False):
     gelem_settings, settings_problems = settings_store.load()
     for problem in settings_problems:
         print(f"[settings] {problem}")
+
+    # The plain-data editing face over the same store. AppController gets
+    # this -- never the store or the GelemSettings object -- and only
+    # passes calls through to it (docs/architecture.md section 9). The
+    # dialog that drives it is P0.5b-2ii-c2b2.
+    settings_gateway = SettingsGateway(settings_store)
 
     artifacts_dir = Path(tempfile.gettempdir()) / "gelem_artifacts"
     # This is the pre-project scratch cache -- where thumbnails land
@@ -129,6 +136,7 @@ def create_app(fake_data: bool = False):
         artifact_store=artifact_store,
         registry=registry,
         operator_registry=operator_registry,
+        settings_gateway=settings_gateway,
     )
 
     window = MainWindow(controller)

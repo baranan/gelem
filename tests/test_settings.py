@@ -670,3 +670,65 @@ def test_main_forwards_all_five_settings_values_into_artifact_store():
         f"  missing keyword arguments: {missing or 'none'}\n"
         f"  present but not read from {settings_name}.*: {hardcoded or 'none'}"
     )
+
+
+# ===========================================================================
+# 12. Guardrail (P0.5b-2ii-c2b1): main.py's create_app builds a
+#     SettingsGateway and passes it into AppController(...) as
+#     settings_gateway=. Without this the controller has no gateway and its
+#     get_settings_fields / apply_settings raise -- and every other test
+#     stays green because they construct AppController without a gateway on
+#     purpose.
+# ===========================================================================
+
+def _single_call_by_func_name(scope: ast.AST, func_name: str) -> ast.Call:
+    calls = [
+        node
+        for node in ast.walk(scope)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == func_name
+    ]
+    assert len(calls) == 1, (
+        f"expected exactly one {func_name}(...) call in create_app, "
+        f"found {len(calls)}"
+    )
+    return calls[0]
+
+
+def test_main_passes_a_settings_gateway_into_app_controller():
+    main_path = PROJECT_ROOT / "main.py"
+    main_tree = ast.parse(main_path.read_text(encoding="utf-8"))
+    create_app = _create_app_function(main_tree)
+
+    controller_call = _single_call_by_func_name(create_app, "AppController")
+    keywords = {
+        kw.arg: kw.value for kw in controller_call.keywords if kw.arg is not None
+    }
+
+    assert "settings_gateway" in keywords, (
+        "main.py's AppController(...) call has no settings_gateway keyword"
+    )
+    value = keywords["settings_gateway"]
+    assert isinstance(value, ast.Name), (
+        "settings_gateway= should be a plain name bound earlier in create_app, "
+        f"not {ast.dump(value)}"
+    )
+    bound_name = value.id
+
+    # That name must be bound in create_app to a SettingsGateway(...) call.
+    gateway_bindings = [
+        node
+        for node in ast.walk(create_app)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == bound_name
+            for target in node.targets
+        )
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+        and node.value.func.id == "SettingsGateway"
+    ]
+    assert gateway_bindings, (
+        f"create_app does not bind {bound_name!r} to a SettingsGateway(...) call"
+    )

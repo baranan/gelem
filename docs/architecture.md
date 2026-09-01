@@ -451,7 +451,7 @@ the two lists already disagree.
 
 **Single authority for the machine-tunable values.** Nothing else -- not
 `media_architecture.md` §4.7, not `CLAUDE.md` -- restates this list. Added
-P0.5b-2ii-c1. The editing dialog is P0.5b-2ii-c2; until it exists a researcher
+P0.5b-2ii-c1. The editing dialog is P0.5b-2ii-c2b2; until it exists a researcher
 cannot change any of these without editing the platform settings store by hand.
 
 ### The five values
@@ -493,8 +493,31 @@ process.
 `main.py` builds a `QSettingsBackend`, wraps it in a `SettingsStore`, calls
 `load()`, prints any correction messages, and passes the **plain values** into
 the `ArtifactStore` constructor -- exactly as `worker_count` and
-`disk_cache_max_bytes` were already passed. **A component never receives the
-settings store or the `GelemSettings` object, and never imports `settings/`.**
-Only `main.py` and the `settings/` package may import `settings/` or `QSettings`
-(guarded by `tests/test_settings.py`). `settings/` is Qt-free except
-`settings/qsettings_backend.py`, the one file that touches PySide6.
+`disk_cache_max_bytes` were already passed. **No component receives the
+`SettingsStore` or a `GelemSettings` object. `AppController` receives a
+`SettingsGateway` and only passes calls through to it. No component imports
+`settings/`.** Only `main.py` and the `settings/` package may import `settings/`
+or `QSettings` (guarded by `tests/test_settings.py`). `settings/` is Qt-free
+except `settings/qsettings_backend.py`, the one file that touches PySide6.
+
+### The editing face
+
+`SettingsGateway` (`settings/settings_gateway.py`, added P0.5b-2ii-c2b1) is the
+plain-data face a settings dialog edits through. It is Qt-free and holds no
+knowledge that a dialog exists. Two methods: `describe_fields()` returns one
+`SettingField` per value -- name, label, help text, bounds (read from the
+`*_RANGE` constants, never retyped), unit, restart-required flag, current value
+-- and `save_values(mapping)` takes a **partial** update: it overlays the
+caller's mapping onto the values currently in the store (a field the mapping
+does not name keeps its current persisted value), runs the overlaid full mapping
+through `GelemSettings.from_values` (so an out-of-range or unparseable value is
+corrected and the preview-not-smaller-than-thumbnail rule is applied before
+anything is written), persists the result through the store, and returns the
+list of correction messages.
+
+`main.py` builds the gateway over the same `SettingsStore` and passes it to
+`AppController` as `settings_gateway=`. `AppController.get_settings_fields()` and
+`apply_settings(values)` forward to it; `apply_settings` additionally pushes the
+two immediate-effect ceilings into the `ArtifactStore` (reading them back from
+the gateway after saving, so a corrected value is what the store is told). The
+dialog that drives this is P0.5b-2ii-c2b2.

@@ -90,6 +90,8 @@ class AppController(QObject):
         registry,
         operator_registry,
         drain_budget: int = 200,
+        *,
+        settings_gateway=None,
     ):
         super().__init__()
 
@@ -98,6 +100,14 @@ class AppController(QObject):
         self._store            = artifact_store
         self._registry         = registry
         self._op_registry      = operator_registry
+
+        # The plain-data editing face of the machine-tunable settings
+        # (settings/settings_gateway.py). Default None so existing test
+        # construction sites need no edit; main.py builds a real one and
+        # passes it in. The two settings pass-through methods below raise
+        # if it is absent. The controller only forwards calls -- it never
+        # imports settings/ and holds no GelemSettings or SettingsStore.
+        self._settings_gateway = settings_gateway
 
         self._dataset.set_registry(registry)
         self._store.on_thumbnail_ready = self._on_thumbnail_ready
@@ -1595,3 +1605,71 @@ class AppController(QObject):
             The operator object, or None if not found.
         """
         return self._op_registry.get(operator_name)
+
+    # ── Settings pass-throughs ───────────────────────────────────────
+    #
+    # The controller does not own settings and does not import settings/.
+    # It holds a SettingsGateway (a plain-data face over the store) and
+    # forwards these two calls to it. The dialog that will call these is
+    # P0.5b-2ii-c2b2; there is no UI here yet.
+
+    def get_settings_fields(self):
+        """
+        Returns the editable settings as a list of plain-data
+        SettingField objects (see settings/settings_gateway.py).
+
+        Raises:
+            RuntimeError: if no settings gateway was wired in.
+        """
+        if self._settings_gateway is None:
+            raise RuntimeError(
+                "AppController has no settings gateway -- it was constructed "
+                "without settings_gateway=, so settings cannot be read."
+            )
+        return self._settings_gateway.describe_fields()
+
+    def apply_settings(self, values: dict) -> list[str]:
+        """
+        Validates and persists *values* through the settings gateway,
+        then pushes the two immediate-effect ceilings into the artifact
+        store so they take effect without a restart.
+
+        The values pushed into the store are read back from the gateway
+        AFTER saving, so a value the gateway corrected (clamped, or
+        lifted by the cross-field rule) is never contradicted by what the
+        store is told.
+
+        Args:
+            values: field name -> raw value mapping from the settings
+                    dialog.
+
+        Returns:
+            The list of plain-English problem messages describing every
+            correction the gateway made (empty when all values were
+            accepted as given).
+
+        Raises:
+            RuntimeError: if no settings gateway was wired in.
+        """
+        if self._settings_gateway is None:
+            raise RuntimeError(
+                "AppController has no settings gateway -- it was constructed "
+                "without settings_gateway=, so settings cannot be applied."
+            )
+
+        problems = self._settings_gateway.save_values(values)
+
+        # Read the saved values back, so a corrected number -- not the
+        # raw one the dialog passed -- is what the store is told.
+        saved = {
+            field.name: field.current_value
+            for field in self._settings_gateway.describe_fields()
+        }
+        self._store.set_memory_cache_max_bytes(
+            saved["picture_memory_max_bytes"]
+        )
+        self._store.set_disk_cache_max_bytes(
+            saved["picture_disk_max_bytes"]
+        )
+
+        return problems

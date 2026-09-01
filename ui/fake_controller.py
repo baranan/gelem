@@ -478,6 +478,16 @@ class FakeController(QObject):
     def get_operator(self, operator_name: str):
         return self._op_registry.get(operator_name)
 
+    # Settings pass-throughs -- mirror AppController.get_settings_fields
+    # and apply_settings so --fake-data does not crash when settings UI
+    # calls them. There is no settings store in fake mode, so both are
+    # inert: no fields to edit, no corrections to report.
+    def get_settings_fields(self) -> list:
+        return []
+
+    def apply_settings(self, values: dict) -> list[str]:
+        return []
+
     def get_group_values(self, column: str) -> list:
         fake_values = {
             "condition":  ["positive", "negative", "neutral"],
