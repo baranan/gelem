@@ -450,3 +450,155 @@ def test_update_wanted_addresses_touches_no_filesystem(qapp, tmp_path, monkeypat
     controller.report_displayed_range("vp", 0, 4, layout.result_id)
 
     assert calls[-1] == expected
+
+
+# ===========================================================================
+# 8. The thumbnail-ready notification names the tile's OWN table.
+#
+#    render_column_value() queues the demand request under the table the
+#    calling tile names in its context dict, falling back to the
+#    controller's active table only when the caller supplies none. The
+#    attribution is the caller's to make, not read back off controller
+#    state.
+# ===========================================================================
+
+def _run_the_one_submitted_job(submitted: list) -> None:
+    """Run the single job _capture_submits recorded, on the calling
+    thread. _run_job does a real decode + encode and then notifies every
+    subscriber through store.on_thumbnail_ready."""
+    assert len(submitted) == 1, (
+        f"expected exactly one queued job, got {len(submitted)}"
+    )
+    submitted[0]()
+
+
+def _queued_subscribers(store: ArtifactStore) -> list:
+    """Every (table_name, row_id) pair sitting in the store's in-flight
+    map -- read before the job runs and pops its own entry."""
+    return [pair for subs in store._inflight.values() for pair in subs]
+
+
+def test_ready_notification_names_the_context_table_not_the_active_table(
+    qapp, tmp_path
+):
+    folder = tmp_path / "media"
+    folder.mkdir()
+    _solid_png(folder / "a.png", (10, 20, 200))
+
+    controller, _, store = _build_controller(tmp_path)
+    controller.load_folder(folder)
+
+    active = controller.get_active_table()
+    assert active != "other", (
+        "test needs the tile's table to differ from the active table"
+    )
+
+    row_id = controller.get_all_row_ids()[0]
+    row = controller.get_row(row_id)
+
+    submitted = _capture_submits(store)
+    controller.render_column_value(
+        "full_path", row["full_path"], 150, "thumbnail",
+        {"row_id": row_id, "column_name": "full_path", "table_name": "other"},
+    )
+
+    # The request is queued under "other" -- the table the tile is
+    # showing -- not under the controller's active table.
+    assert _queued_subscribers(store) == [("other", row_id)], (
+        f"request queued under {_queued_subscribers(store)}, expected "
+        f"[('other', {row_id!r})]"
+    )
+
+    # And the ThumbnailsReady the finished job produces names "other".
+    ready: list = []
+    controller.thumbnails_ready.connect(ready.append)
+    _run_the_one_submitted_job(submitted)
+    controller._drain_thumbnails()
+
+    assert [payload.table_name for payload in ready] == ["other"], (
+        f"ThumbnailsReady named {[p.table_name for p in ready]}, "
+        f"expected ['other']"
+    )
+    assert ready[0].row_ids == (row_id,)
+
+
+def test_ready_notification_falls_back_to_active_table_without_context(
+    qapp, tmp_path
+):
+    folder = tmp_path / "media"
+    folder.mkdir()
+    _solid_png(folder / "a.png", (0, 90, 30))
+
+    controller, _, store = _build_controller(tmp_path)
+    controller.load_folder(folder)
+    active = controller.get_active_table()
+
+    row_id = controller.get_all_row_ids()[0]
+    row = controller.get_row(row_id)
+
+    submitted = _capture_submits(store)
+    # No "table_name" key in the context: the fallback must still route
+    # the request to the active table.
+    controller.render_column_value(
+        "full_path", row["full_path"], 150, "thumbnail",
+        {"row_id": row_id, "column_name": "full_path"},
+    )
+
+    assert _queued_subscribers(store) == [(active, row_id)], (
+        f"with no table_name in the context the request should queue "
+        f"under the active table {active!r}, got "
+        f"{_queued_subscribers(store)}"
+    )
+
+    ready: list = []
+    controller.thumbnails_ready.connect(ready.append)
+    _run_the_one_submitted_job(submitted)
+    controller._drain_thumbnails()
+    assert [payload.table_name for payload in ready] == [active]
+
+
+# ===========================================================================
+# 9. Wiring: a real UI tile puts table_name in the context it builds.
+#
+#    This uses a LIVE widget, not an AST check. Constructing ImageTile and
+#    calling its real render() exercises the exact context dict the tile
+#    hands the controller; an AST check would only prove the string
+#    "table_name" appears somewhere in the file. The stub controller
+#    records the context it is handed. A test that built the real
+#    AppController would prove nothing about the UI -- the controller's
+#    fallback would fill the table name in either case.
+# ===========================================================================
+
+def test_image_tile_passes_its_table_name_in_the_render_context(qapp):
+    from ui.tiles.image_tile import ImageTile
+
+    class _RecordingController:
+        """Minimal stand-in: ImageTile.render() calls exactly these
+        three methods."""
+
+        def __init__(self):
+            self.seen_context = None
+
+        def get_active_table(self):
+            return "faces"
+
+        def get_row(self, row_id, table_name=None):
+            return {"full_path": "C:/proj/x.png"}
+
+        def render_column_value(
+            self, column_name, value, size, mode="thumbnail", context=None
+        ):
+            self.seen_context = context
+            return None
+
+    controller = _RecordingController()
+    tile = ImageTile("r1", "full_path", controller)
+    tile.render(120, 120)
+
+    assert controller.seen_context is not None, (
+        "ImageTile.render() did not call render_column_value with a context"
+    )
+    assert controller.seen_context.get("table_name") == "faces", (
+        "ImageTile did not pass its active table name in the render context"
+    )
+    assert controller.seen_context.get("row_id") == "r1"

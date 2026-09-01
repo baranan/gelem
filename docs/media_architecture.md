@@ -634,9 +634,14 @@ Tests: `tests/test_request_queue.py`, `tests/test_demand_driven_display.py`.
 
 ### 4.5 Artifact identity is the address, not the row
 
-**New, and this is a live bug, not only a scaling concern.**
+**Fixed in P0.5b-1: the row-keyed index and cache are gone, replaced by the
+`ArtifactKey` described at the end of this section. Everything between here and
+there is the reasoning that led to that key, kept deliberately -- it is the
+record of why the key has the shape it has.**
 
-`ArtifactStore` currently keys both its index and its memory cache on
+**When this was written it was a live bug, not only a scaling concern.**
+
+`ArtifactStore` then keyed both its index and its memory cache on
 `(row_id, artifact_type)`, and writes files named `{row_id}_{artifact_type}.jpg`.
 That is wrong on at least five counts:
 
@@ -683,15 +688,31 @@ explicitly:
    `cv2.VideoCapture` are gone. On a miss the controller
    (`render_column_value`) queues one `ArtifactStore.request_thumbnail`. Detail
    mode still opens the source, by design.
-4. ArtifactStore queues the request with viewport priority. **Still open,
-   P0.5b-3ii:** the request is queued but FIFO, not viewport-prioritised
-   (`get_displayed_ranges()` still has no caller).
-5. Stale off-screen requests are cancelled. **Still open, P0.5b-3ii.**
+4. ArtifactStore queues the request. **Done, P0.5b-3ii:** there is no priority
+   queue -- §4.4 records why one was dropped, and how cancelling the off-screen
+   jobs subsumes the reordering a priority queue would have done. The queue is
+   submit-order FIFO, and submit order is paint order.
+5. Stale off-screen requests are cancelled. **Done, P0.5b-3ii-b:** on every
+   scroll a gallery reports its mounted window, and
+   `ArtifactStore.set_wanted_addresses` drops every still-queued job whose
+   address is no longer on screen (§4.4).
 6. Workers return raw image data or a persisted cache artifact -- never a
    `QPixmap`.
 7. `QPixmap` construction happens only on the main thread.
 8. The ready notification carries enough context to repaint the right table, row
-   and column.
+   and column. **Half done, the close-tile-table-attribution item.** What the
+   code now does: `render_column_value` attributes a demand request to the table
+   its caller names in the render context, falling back to the controller's
+   active table only when the caller names none -- so attribution is the
+   caller's to state rather than something read back off controller state. The
+   ready notification carries `(table_name, row_id)`; the row is a superset of
+   the column, so no column name is needed. What the code does not do: no
+   gallery or tile carries a table identity of its own. `ImageTile` passes
+   `get_active_table()`, which is the same value the fallback would have used,
+   so a tile still cannot name any table other than the active one. The clause
+   is therefore only half true today; the remaining half needs galleries to
+   carry a table identity injected at construction and pass it down to their
+   tiles.
 
 **Resolved, P0.5b-3i:** the controller no longer requests a thumbnail for every
 row immediately after loading. `load_folder`, `load_csv_as_primary` and the
@@ -1144,7 +1165,8 @@ randomised on-screen order is saved as shown. Tests:
 
 **P0.5 ArtifactStore identity and demand-driven display.** *(was P0.3)*
 Implement §4.5 and §4.6. Address-based keys, `ArtifactCodec` separated from source
-decoding (§7), bounded worker pool with priority and cancellation, no decoding in a
+decoding (§7), bounded worker pool with cancellation (no priority queue -- §4.4
+records why), no decoding in a
 paint path, clear the memory cache on project load, cache size becomes a setting.
 This fixes the avatar-tile bug and is the foundation segment thumbnails and
 every tile attach to. **The thumbnail path used to carry the project-reload

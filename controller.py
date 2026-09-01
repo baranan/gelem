@@ -1505,7 +1505,12 @@ class AppController(QObject):
             size:        Target size in pixels.
             mode:        'thumbnail' (default) or 'detail'.
             context:     Optional dict with row-level metadata, e.g.
-                         {'row_id': ..., 'column_name': ...}.
+                         {'row_id': ..., 'column_name': ...,
+                         'table_name': ...}. When 'table_name' is given
+                         it names the table the calling tile is showing,
+                         and a demand thumbnail request is queued under
+                         it rather than under the controller's active
+                         table.
 
         Returns:
             A QPixmap (thumbnail mode), QWidget (detail mode), or None.
@@ -1551,11 +1556,18 @@ class AppController(QObject):
                 and ctx.get("row_id") is not None
                 and not self._store.is_cached(ctx["canonical_address"])
             ):
+                # The caller (a tile) names the table it is showing. Use
+                # that, so the request and its ready notification are
+                # attributed to the caller's table rather than to
+                # whatever this controller's active table is now. Fall
+                # back to the active table only when the caller did not
+                # supply one.
+                request_table = ctx.get("table_name") or self._active_table
                 self._queue_thumbnail_request(
                     ctx["row_id"],
                     ctx["canonical_address"],
                     ctx["source_path"],
-                    self._active_table,
+                    request_table,
                 )
 
         return self._registry.render(column_name, value, size, mode, ctx)

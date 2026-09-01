@@ -111,9 +111,20 @@ class ImageTile(BaseTile):
         # Ask the controller to render it. The renderer decides how —
         # thumbnail from ArtifactStore for media, formatted text for
         # numeric/text columns, etc.
+        # Name the table this tile is showing, so the demand thumbnail
+        # request -- and the ready notification it triggers -- is
+        # attributed to that table rather than read back off controller
+        # state. The gallery always displays the controller's active
+        # table (MainWindow re-lays the gallery out on every table
+        # switch), so get_active_table() is that table; the tile has no
+        # independent table identity to pass instead.
         pixmap = self._controller.render_column_value(
             self.column_name, value, size, mode="thumbnail",
-            context={"row_id": self.row_id, "column_name": self.column_name},
+            context={
+                "row_id": self.row_id,
+                "column_name": self.column_name,
+                "table_name": self._controller.get_active_table(),
+            },
         )
 
         # Fit the rendered pixmap into a (width, height) canvas with
