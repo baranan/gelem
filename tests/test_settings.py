@@ -13,7 +13,6 @@ from __future__ import annotations
 import ast
 import os
 import sys
-import warnings
 from pathlib import Path
 
 import pytest
@@ -376,12 +375,7 @@ def test_qsettings_backend_contract(tmp_path):
 # ===========================================================================
 
 def _imported_modules(path: Path) -> list[str]:
-    # Some unrelated source files in the tree carry latent SyntaxWarnings
-    # (a stray backslash escape in a string); this scan is not the place
-    # to surface them.
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", SyntaxWarning)
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+    tree = ast.parse(path.read_text(encoding="utf-8"))
     names: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -394,18 +388,67 @@ def _imported_modules(path: Path) -> list[str]:
     return names
 
 
+# The component directories this guardrail walks. These are the seven
+# components and the packages they are split across:
+#   artifacts/      -- ArtifactStore
+#   column_types/   -- ColumnTypeRegistry
+#   media/          -- media address grammar (and the future resolver)
+#   models/         -- Dataset, QueryEngine, provenance
+#   operators/      -- OperatorRegistry and the operators
+#   settings/       -- the settings mechanism
+#   shared_widgets/ -- shared display components
+#   ui/             -- UI widgets
+# Deliberately NOT walked: archive/ (superseded code, kept only for history
+# and allowed to rot), manual_testing/ (throwaway by-hand scripts), and the
+# root-level one-off scripts. A stale archived file that no longer parses
+# must not be able to fail this guardrail.
+_COMPONENT_DIRS = (
+    "artifacts",
+    "column_types",
+    "media",
+    "models",
+    "operators",
+    "settings",
+    "shared_widgets",
+    "ui",
+)
+
+# Root-level modules that are shipped parts of the app, not scripts:
+# controller.py is the AppController; main.py is the entry point (and is
+# itself allowed to import settings, so callers skip it explicitly).
+_ROOT_MODULES = ("controller.py", "main.py")
+
+
 def _production_py_files() -> list[Path]:
-    """Every .py file that ships in the app: excludes tests/ and the
-    scratch/venv trees."""
-    skip_top = {"tests", "docs", ".git", "gelem_project", "test_images"}
-    result = []
-    for path in PROJECT_ROOT.rglob("*.py"):
-        parts = path.relative_to(PROJECT_ROOT).parts
-        if parts[0] in skip_top:
-            continue
-        if any(part.startswith(".") or part == "__pycache__" for part in parts):
-            continue
-        result.append(path)
+    """Every .py file that ships in the app, restricted to the component
+    directories plus the two root-level app modules.
+
+    The list is built from an allow-list, so a typo in _COMPONENT_DIRS or a
+    renamed directory would otherwise return a short or empty list and every
+    guardrail test built on this would pass while checking nothing. Guard
+    against that: a name that does not resolve to an existing directory or
+    file is a hard failure, not a silent skip.
+    """
+    result: list[Path] = []
+    for dir_name in _COMPONENT_DIRS:
+        component_dir = PROJECT_ROOT / dir_name
+        assert component_dir.is_dir(), (
+            f"_COMPONENT_DIRS names {dir_name!r}, which is not a directory "
+            f"under {PROJECT_ROOT}. The allow-list needs updating "
+            f"(a directory was renamed or the name is a typo)."
+        )
+        for path in component_dir.rglob("*.py"):
+            if any(part == "__pycache__" for part in path.parts):
+                continue
+            result.append(path)
+    for module_name in _ROOT_MODULES:
+        module_path = PROJECT_ROOT / module_name
+        assert module_path.is_file(), (
+            f"_ROOT_MODULES names {module_name!r}, which is not a file "
+            f"under {PROJECT_ROOT}. The allow-list needs updating "
+            f"(a module was renamed or the name is a typo)."
+        )
+        result.append(module_path)
     return result
 
 
@@ -434,6 +477,23 @@ def test_only_qsettings_backend_imports_pyside_in_settings_package():
         if touches_qt and path.name != "qsettings_backend.py":
             offenders.append(path.name)
     assert not offenders, f"settings/ files importing PySide6: {offenders}"
+
+
+def test_production_file_walk_is_not_vacuous():
+    # If _production_py_files() ever returns a short or empty list, every
+    # guardrail built on it passes while checking nothing. Assert it really
+    # reaches the two root modules and at least one file in every allow-listed
+    # directory.
+    files = _production_py_files()
+    posix_paths = {path.relative_to(PROJECT_ROOT).as_posix() for path in files}
+
+    assert "main.py" in posix_paths
+    assert "controller.py" in posix_paths
+
+    for dir_name in _COMPONENT_DIRS:
+        assert any(
+            path.relative_to(PROJECT_ROOT).parts[0] == dir_name for path in files
+        ), f"_production_py_files() returned no file from {dir_name!r}"
 
 
 # ===========================================================================
