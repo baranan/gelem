@@ -254,15 +254,14 @@ def test_no_way_to_express_an_asymmetric_size(tmp_path):
     assert store.resolution_for("thumbnail") == 173
     assert store.resolution_for("preview") == 421
 
-    # Static: no max( on the size -> resolution path. resolution_for is
-    # the single definition of that mapping (see its docstring).
-    import inspect
-    from artifacts import artifact_store as artifact_store_module
-
-    resolution_for_src = inspect.getsource(
-        artifact_store_module.ArtifactStore.resolution_for
-    )
-    assert "max(" not in resolution_for_src
+    # The two equality assertions just above are the real check: they show
+    # the injected setting reaches ArtifactStore's resolution unchanged --
+    # no width/height pair, no max() of a pair, no rounding. A source-text
+    # assertion ("max(" not in inspect.getsource(resolution_for)) used to
+    # sit here; it was removed deliberately. It asserted on implementation
+    # text rather than behaviour, proved strictly less than the equalities
+    # above, and would have mis-fired on an innocent local named max_side.
+    # Do not re-add it.
 
 
 # ===========================================================================
@@ -731,4 +730,46 @@ def test_main_passes_a_settings_gateway_into_app_controller():
     ]
     assert gateway_bindings, (
         f"create_app does not bind {bound_name!r} to a SettingsGateway(...) call"
+    )
+
+    # Strengthening (P0.5b filler): binding the name to *a* SettingsGateway
+    # call is not enough. main.py could build the gateway over a second,
+    # independent SettingsStore/backend while loading its settings from a
+    # first one -- the two stores would drift and the dialog would edit a
+    # store nobody reads. Pin it down: the gateway's first positional
+    # argument must be a plain name, and THAT name must be bound in
+    # create_app to a SettingsStore(...) call. It is left to the reader to
+    # confirm by eye that this is the same store `.load()` was called on --
+    # `_settings_object_name` already located that assignment, and there is
+    # only one SettingsStore(...) call in create_app.
+    gateway_call = gateway_bindings[0].value
+    assert gateway_call.args, (
+        "SettingsGateway(...) is called with no positional argument; it must "
+        "receive the SettingsStore as its first positional argument"
+    )
+    store_arg = gateway_call.args[0]
+    assert isinstance(store_arg, ast.Name), (
+        "SettingsGateway(...)'s first positional argument should be a plain "
+        "name bound earlier in create_app to a SettingsStore(...) call, not "
+        f"{ast.dump(store_arg)}"
+    )
+    store_name = store_arg.id
+
+    store_bindings = [
+        node
+        for node in ast.walk(create_app)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == store_name
+            for target in node.targets
+        )
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+        and node.value.func.id == "SettingsStore"
+    ]
+    assert store_bindings, (
+        f"create_app passes {store_name!r} to SettingsGateway(...) but never "
+        f"binds {store_name!r} to a SettingsStore(...) call -- the gateway is "
+        "being built over something other than a SettingsStore the app loads "
+        "its settings from"
     )
