@@ -281,9 +281,25 @@ def test_settings_store_round_trip_through_dict_backend():
     store = SettingsStore(backend)
 
     store.save(original)
-    # Everything persisted as a string of plain decimal digits.
-    assert all(isinstance(value, str) for value in backend.data.values())
-    assert "120" in backend.data.values()
+
+    # The exact layout the backend must hold after save(). The key names are
+    # pinned here on purpose: they are a contract with the values already
+    # sitting in a researcher's registry, not an implementation detail. A
+    # deliberate rename is a migration event and must fail this test loudly
+    # -- exactly as P0.5b-2ii-c2a did when it renamed the two "_max_side"
+    # keys so an old "WxH" pair value could never be read as the new single
+    # integer. Comparing the whole dict with == also catches a value written
+    # under the wrong key and, in particular, a symmetric swap of the two
+    # size keys that would round-trip cleanly through load() and slip past a
+    # mere "120 is somewhere in the values" check.
+    expected_persisted = {
+        "artifacts/picture_memory_max_bytes": "268435456",
+        "artifacts/picture_disk_max_bytes": "734003200",
+        "artifacts/worker_count": "6",
+        "artifacts/thumbnail_max_side": "120",
+        "artifacts/preview_max_side": "800",
+    }
+    assert backend.data == expected_persisted
 
     reloaded, problems = store.load()
     assert problems == []
