@@ -28,13 +28,13 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from artifacts.artifact_store import ArtifactStore, DEFAULT_THUMBNAIL_SIZE
+from artifacts.artifact_store import ArtifactStore, DEFAULT_THUMBNAIL_MAX_SIDE
 
 # The thumbnail resolution (max side) is now instance state on an
 # ArtifactStore, derived from its configured thumbnail size. A store built
 # with defaults uses this; these key-identity tests build ArtifactKeys by
 # hand, so they need the same number as a value.
-THUMBNAIL_RESOLUTION = max(DEFAULT_THUMBNAIL_SIZE)
+THUMBNAIL_RESOLUTION = DEFAULT_THUMBNAIL_MAX_SIDE
 from artifacts.artifact_codec import ArtifactCodec, ArtifactCodecError
 from media.artifact_key import ArtifactKey, SourceFingerprint
 from media.media_address import POLICIES, parse, canonical_key, resolve_source

@@ -41,15 +41,15 @@ from PIL import Image
 
 from artifacts.artifact_store import (
     ArtifactStore,
-    DEFAULT_THUMBNAIL_SIZE,
-    DEFAULT_PREVIEW_SIZE,
+    DEFAULT_THUMBNAIL_MAX_SIDE,
+    DEFAULT_PREVIEW_MAX_SIDE,
 )
 
 # Thumbnail / preview resolutions are now instance state, derived from a
 # store's configured sizes. A default-constructed store uses these; the
 # by-hand ArtifactKeys below must match store.resolution_for(...).
-THUMBNAIL_RESOLUTION = max(DEFAULT_THUMBNAIL_SIZE)
-PREVIEW_RESOLUTION = max(DEFAULT_PREVIEW_SIZE)
+THUMBNAIL_RESOLUTION = DEFAULT_THUMBNAIL_MAX_SIDE
+PREVIEW_RESOLUTION = DEFAULT_PREVIEW_MAX_SIDE
 from artifacts.artifact_codec import ArtifactCodecError
 from media.artifact_key import ArtifactKey, SourceFingerprint
 from media.media_address import resolve_source

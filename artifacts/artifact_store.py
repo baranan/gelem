@@ -87,16 +87,17 @@ from media.artifact_key import ArtifactKey, SourceFingerprint
 # We only need to know which extensions are videos here.
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 
-# Fallback thumbnail / preview target sizes, (width, height) in pixels.
+# Fallback thumbnail / preview target sizes: the largest side, in pixels.
 # DEFAULTS ONLY: the real values come from settings/ via main.py and are
 # passed to the ArtifactStore constructor (P0.5b-2ii-c1,
-# docs/architecture.md section 9). The instance derives its
-# _thumbnail_resolution / _preview_resolution (max side) from whatever it
-# is given; there is no module-level RESOLUTION constant any more, because
+# docs/architecture.md section 9). These are a single number each, not a
+# (width, height) pair -- only the larger side ever entered the artifact
+# key, so a pair could describe a picture the key misdescribed
+# (P0.5b-2ii-c2a). There is no module-level RESOLUTION constant, because
 # the resolution is now instance state, not an assumption a reader can
 # import.
-DEFAULT_THUMBNAIL_SIZE = (150, 150)
-DEFAULT_PREVIEW_SIZE   = (600, 600)
+DEFAULT_THUMBNAIL_MAX_SIDE = 150
+DEFAULT_PREVIEW_MAX_SIDE   = 600
 
 # For now the store always records the first frame of a video (or the
 # whole image) and ignores any frame or time specifier in the address.
@@ -163,8 +164,8 @@ class ArtifactStore:
         worker_count: int = 2,
         disk_cache_max_bytes: int = DEFAULT_DISK_CACHE_MAX_BYTES,
         memory_cache_max_bytes: int = DEFAULT_CACHE_MAX_BYTES,
-        thumbnail_size: tuple[int, int] = DEFAULT_THUMBNAIL_SIZE,
-        preview_size: tuple[int, int] = DEFAULT_PREVIEW_SIZE,
+        thumbnail_max_side: int = DEFAULT_THUMBNAIL_MAX_SIDE,
+        preview_max_side: int = DEFAULT_PREVIEW_MAX_SIDE,
     ):
         # Every keyword parameter defaults to the module DEFAULT_ constant,
         # so the positional ArtifactStore(dir) construction used by older
@@ -228,19 +229,19 @@ class ArtifactStore:
         self._cache_bytes: int = 0
         self._cache_max_bytes: int = memory_cache_max_bytes
 
-        # Thumbnail / preview target sizes and the derived resolutions
-        # (max side, in pixels) that enter every ArtifactKey. All four are
-        # written ONCE here and never mutated again. That "never mutated
-        # after __init__" property is load-bearing: it is the only reason
-        # a worker thread may read _thumbnail_size / _preview_size in
-        # _run_job without holding _lock. Making them runtime-changeable
-        # would break that -- a setter would have to stop the workers, or
-        # move the read under the lock. Changing the thumbnail or preview
-        # size therefore needs a restart (docs/architecture.md section 9).
-        self._thumbnail_size: tuple[int, int] = tuple(thumbnail_size)
-        self._preview_size: tuple[int, int] = tuple(preview_size)
-        self._thumbnail_resolution: int = max(self._thumbnail_size)
-        self._preview_resolution: int = max(self._preview_size)
+        # Thumbnail / preview target sizes: the largest side, in pixels.
+        # This IS the resolution that enters every ArtifactKey -- there is
+        # no separate "size" and "resolution" any more, because only the
+        # larger side was ever used (P0.5b-2ii-c2a). Both are written ONCE
+        # here and never mutated again. That "never mutated after __init__"
+        # property is load-bearing: it is the only reason a worker thread
+        # may read _thumbnail_max_side / _preview_max_side in _run_job
+        # without holding _lock. Making them runtime-changeable would break
+        # that -- a setter would have to stop the workers, or move the read
+        # under the lock. Changing the thumbnail or preview size therefore
+        # needs a restart (docs/architecture.md section 9).
+        self._thumbnail_max_side: int = thumbnail_max_side
+        self._preview_max_side: int = preview_max_side
 
         # The on-disk ceiling the directory sweep (reconcile_and_evict)
         # enforces. Keyword-only constructor parameter, not a hardcoded
@@ -258,7 +259,7 @@ class ArtifactStore:
         """The requested resolution (max side, in pixels) that enters the
         ArtifactKey for a purpose.
 
-        Reads this instance's _thumbnail_resolution / _preview_resolution,
+        Reads this instance's _thumbnail_max_side / _preview_max_side,
         which were fixed from the injected sizes in __init__. This is the
         ONE definition of the purpose -> resolution mapping in the
         repository; the renderer factory is handed a store instance and
@@ -267,8 +268,8 @@ class ArtifactStore:
         configuration, not a module constant.
         """
         if purpose == "thumbnail":
-            return self._thumbnail_resolution
-        return self._preview_resolution
+            return self._thumbnail_max_side
+        return self._preview_max_side
 
     def purpose_for_tile_size(self, size: int) -> str:
         """The purpose a gallery tile of `size` pixels should request:
@@ -280,7 +281,7 @@ class ArtifactStore:
         against a module constant, so the boundary moves with the
         configured thumbnail size.
         """
-        if size <= self._thumbnail_resolution:
+        if size <= self._thumbnail_max_side:
             return "thumbnail"
         return "preview"
 
@@ -1361,22 +1362,32 @@ class ArtifactStore:
                     self._discard_subscribers(job_key)
                     return
 
-                # This runs on a WORKER thread. It reads self._thumbnail_size
-                # and self._preview_size without holding _lock. That is safe
-                # for ONE reason only: both are written once in __init__ and
-                # never mutated afterwards (see the __init__ comment). If the
-                # thumbnail or preview size ever became runtime-changeable,
-                # this unlocked read would be a data race -- a size change
-                # would then require a restart, or these reads would have to
-                # move under the lock.
+                # This runs on a WORKER thread. It reads
+                # self._thumbnail_max_side and self._preview_max_side
+                # without holding _lock. That is safe for ONE reason only:
+                # both are written once in __init__ and never mutated
+                # afterwards (see the __init__ comment). If the thumbnail or
+                # preview size ever became runtime-changeable, this unlocked
+                # read would be a data race -- a size change would then
+                # require a restart, or these reads would have to move under
+                # the lock. The PIL box is built here from the single
+                # largest-side number; a square box is behaviour-identical
+                # to the old square defaults, and PIL.Image.thumbnail
+                # preserves aspect ratio within it.
                 thumb = image.copy()
-                thumb.thumbnail(self._thumbnail_size, Image.LANCZOS)
+                thumb.thumbnail(
+                    (self._thumbnail_max_side, self._thumbnail_max_side),
+                    Image.LANCZOS,
+                )
                 thumb_dest = self._dir / f"{thumb_key.stable_hash()}.jpg"
                 self._codec.write_jpeg(thumb_dest, np.array(thumb, dtype=np.uint8))
                 pending_index[thumb_key] = thumb_dest
 
                 preview = image.copy()
-                preview.thumbnail(self._preview_size, Image.LANCZOS)
+                preview.thumbnail(
+                    (self._preview_max_side, self._preview_max_side),
+                    Image.LANCZOS,
+                )
                 preview_dest = self._dir / f"{preview_key.stable_hash()}.jpg"
                 self._codec.write_jpeg(
                     preview_dest, np.array(preview, dtype=np.uint8)

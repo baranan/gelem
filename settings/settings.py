@@ -42,13 +42,18 @@ PICTURE_DISK_MAX_BYTES_RANGE = (64 * 1024 * 1024, 1024 * 1024 * 1024 * 1024)
 DEFAULT_WORKER_COUNT = 2
 WORKER_COUNT_RANGE = (1, 32)
 
-# Thumbnail target size, (width, height) in pixels. Each side 32 to 1024.
-DEFAULT_THUMBNAIL_SIZE = (150, 150)
-THUMBNAIL_SIDE_RANGE = (32, 1024)
+# Thumbnail target size: the largest side, in pixels. 32 to 1024. Only the
+# larger side is ever used downstream -- ArtifactStore turns it straight
+# into the resolution that enters the artifact key -- so it is a single
+# number, not a (width, height) pair. A pair could describe a picture whose
+# real short side was nowhere near the resolution the key claimed.
+DEFAULT_THUMBNAIL_MAX_SIDE = 150
+THUMBNAIL_MAX_SIDE_RANGE = (32, 1024)
 
-# Preview target size, (width, height) in pixels. Each side 64 to 4096.
-DEFAULT_PREVIEW_SIZE = (600, 600)
-PREVIEW_SIDE_RANGE = (64, 4096)
+# Preview target size: the largest side, in pixels. 64 to 4096. Single
+# number for the same reason as the thumbnail.
+DEFAULT_PREVIEW_MAX_SIDE = 600
+PREVIEW_MAX_SIDE_RANGE = (64, 4096)
 
 
 # ---------------------------------------------------------------------------
@@ -102,62 +107,6 @@ def _parse_int_field(
     return value
 
 
-def _parse_size_field(
-    raw,
-    default: tuple[int, int],
-    side_bounds: tuple[int, int],
-    label: str,
-    problems: list[str],
-) -> tuple[int, int]:
-    """Parse `raw` as a (width, height) pixel size and clamp each side
-    into `side_bounds`.
-
-    `raw` may be the persisted "WxH" string, or an already-parsed
-    (w, h) sequence. Absent (None) means "use the default", with no
-    message. Anything unparseable falls back to the default with one
-    problem. If either side is clamped, one problem is recorded.
-    """
-    low, high = side_bounds
-
-    if raw is None:
-        return default
-
-    # Accept either "150x150" or a 2-element sequence.
-    width_raw = None
-    height_raw = None
-    if isinstance(raw, str):
-        parts = raw.lower().split("x")
-        if len(parts) == 2:
-            width_raw, height_raw = parts[0].strip(), parts[1].strip()
-    else:
-        try:
-            width_raw, height_raw = raw
-        except (TypeError, ValueError):
-            width_raw = height_raw = None
-
-    try:
-        if width_raw is None or height_raw is None:
-            raise ValueError
-        width = int(width_raw)
-        height = int(height_raw)
-    except (TypeError, ValueError):
-        problems.append(
-            f"Could not read the {label} setting (saved value {raw!r}); "
-            f"using the default of {default[0]}x{default[1]}."
-        )
-        return default
-
-    # Clamp each side independently.
-    clamped_width = min(max(width, low), high)
-    clamped_height = min(max(height, low), high)
-    if (clamped_width, clamped_height) != (width, height):
-        problems.append(
-            f"The {label} setting ({width}x{height}) has a side outside "
-            f"{low}..{high}; using {clamped_width}x{clamped_height}."
-        )
-    return (clamped_width, clamped_height)
-
-
 # ---------------------------------------------------------------------------
 # The settings object
 # ---------------------------------------------------------------------------
@@ -170,8 +119,8 @@ class GelemSettings:
     picture_memory_max_bytes: int = DEFAULT_PICTURE_MEMORY_MAX_BYTES
     picture_disk_max_bytes: int = DEFAULT_PICTURE_DISK_MAX_BYTES
     worker_count: int = DEFAULT_WORKER_COUNT
-    thumbnail_size: tuple[int, int] = DEFAULT_THUMBNAIL_SIZE
-    preview_size: tuple[int, int] = DEFAULT_PREVIEW_SIZE
+    thumbnail_max_side: int = DEFAULT_THUMBNAIL_MAX_SIDE
+    preview_max_side: int = DEFAULT_PREVIEW_MAX_SIDE
 
     @classmethod
     def from_values(
@@ -185,9 +134,9 @@ class GelemSettings:
         message to the returned list. A corrupt saved value must never
         stop the app starting.
 
-        One cross-field rule: if the preview's larger side is smaller than
-        the thumbnail's larger side, the preview size is set to the
-        thumbnail size and that is reported.
+        One cross-field rule: if the preview size is smaller than the
+        thumbnail size, the preview size is set to the thumbnail size and
+        that is reported.
         """
         problems: list[str] = []
 
@@ -212,40 +161,38 @@ class GelemSettings:
             "worker count",
             problems,
         )
-        thumbnail_size = _parse_size_field(
-            mapping.get("thumbnail_size"),
-            DEFAULT_THUMBNAIL_SIZE,
-            THUMBNAIL_SIDE_RANGE,
+        thumbnail_max_side = _parse_int_field(
+            mapping.get("thumbnail_max_side"),
+            DEFAULT_THUMBNAIL_MAX_SIDE,
+            THUMBNAIL_MAX_SIDE_RANGE,
             "thumbnail size",
             problems,
         )
-        preview_size = _parse_size_field(
-            mapping.get("preview_size"),
-            DEFAULT_PREVIEW_SIZE,
-            PREVIEW_SIDE_RANGE,
+        preview_max_side = _parse_int_field(
+            mapping.get("preview_max_side"),
+            DEFAULT_PREVIEW_MAX_SIDE,
+            PREVIEW_MAX_SIDE_RANGE,
             "preview size",
             problems,
         )
 
         # Cross-field rule: a preview must not be smaller than a thumbnail.
-        # Compare on the larger side of each, since that is what enters the
-        # artifact key as the resolution.
-        if max(preview_size) < max(thumbnail_size):
+        # Both are now the largest side directly, so this is a plain compare.
+        if preview_max_side < thumbnail_max_side:
             problems.append(
-                f"The preview size ({preview_size[0]}x{preview_size[1]}) is "
-                f"smaller than the thumbnail size "
-                f"({thumbnail_size[0]}x{thumbnail_size[1]}); using the "
-                f"thumbnail size for the preview as well."
+                f"The preview size ({preview_max_side}) is smaller than the "
+                f"thumbnail size ({thumbnail_max_side}); using the thumbnail "
+                f"size for the preview as well."
             )
-            preview_size = thumbnail_size
+            preview_max_side = thumbnail_max_side
 
         return (
             cls(
                 picture_memory_max_bytes=picture_memory_max_bytes,
                 picture_disk_max_bytes=picture_disk_max_bytes,
                 worker_count=worker_count,
-                thumbnail_size=thumbnail_size,
-                preview_size=preview_size,
+                thumbnail_max_side=thumbnail_max_side,
+                preview_max_side=preview_max_side,
             ),
             problems,
         )

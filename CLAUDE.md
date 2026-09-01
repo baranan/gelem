@@ -192,8 +192,9 @@ state. This rule carries no violation list of its own -- it points at the three
   `WorkerPool` (`artifacts/worker_pool.py`), not a thread per call. Worker
   count is a keyword-only `ArtifactStore` constructor parameter with a low
   default (2) -- no longer a module constant, though wiring it to a real
-  setting is still P0.5b-2ii (see the Generality `[TARGET -> P0.5b-2]` rule,
-  which does not flip here). Requests naming the same canonical address are
+  setting is still P0.5b-2ii (see the Generality
+  `[TARGET -> P0.5, sub-item P0.5b-2ii-c2]` rule, which does not flip
+  here). Requests naming the same canonical address are
   coalesced to one job with many subscribers; `reset()` bumps a generation
   counter. A job made stale by that bump is **guaranteed** to leave no index
   entry, no fingerprint-memo entry and to send no notification -- the job
@@ -354,7 +355,8 @@ state. This rule carries no violation list of its own -- it points at the three
   mechanisms: a number that varies **by machine** needs a setting; a number that
   varies **by file or dataset** needs a runtime measurement.
   The five machine-dependent numbers -- the in-memory cache ceiling, the disk
-  cache ceiling, the worker count, the thumbnail size and the preview size --
+  cache ceiling, the worker count, the thumbnail largest side and the preview
+  largest side --
   now come from `settings/` and are passed into the `ArtifactStore` constructor
   by `main.py` (P0.5b-2ii-c1). `docs/architecture.md` §9 is the single authority
   for them; do not restate the list. The module-level `DEFAULT_` constants that

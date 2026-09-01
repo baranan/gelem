@@ -26,11 +26,11 @@ from settings.settings import (
     DEFAULT_PICTURE_MEMORY_MAX_BYTES,
     DEFAULT_PICTURE_DISK_MAX_BYTES,
     DEFAULT_WORKER_COUNT,
-    DEFAULT_THUMBNAIL_SIZE,
-    DEFAULT_PREVIEW_SIZE,
+    DEFAULT_THUMBNAIL_MAX_SIDE,
+    DEFAULT_PREVIEW_MAX_SIDE,
     PICTURE_MEMORY_MAX_BYTES_RANGE,
     WORKER_COUNT_RANGE,
-    THUMBNAIL_SIDE_RANGE,
+    THUMBNAIL_MAX_SIDE_RANGE,
 )
 from settings.settings_store import SettingsStore
 
@@ -83,8 +83,8 @@ def test_empty_mapping_gives_documented_defaults_and_no_problems():
     assert settings.picture_memory_max_bytes == DEFAULT_PICTURE_MEMORY_MAX_BYTES
     assert settings.picture_disk_max_bytes == DEFAULT_PICTURE_DISK_MAX_BYTES
     assert settings.worker_count == DEFAULT_WORKER_COUNT
-    assert settings.thumbnail_size == DEFAULT_THUMBNAIL_SIZE
-    assert settings.preview_size == DEFAULT_PREVIEW_SIZE
+    assert settings.thumbnail_max_side == DEFAULT_THUMBNAIL_MAX_SIDE
+    assert settings.preview_max_side == DEFAULT_PREVIEW_MAX_SIDE
 
 
 def test_default_construction_matches_from_values_defaults():
@@ -100,19 +100,19 @@ def test_default_construction_matches_from_values_defaults():
 def test_out_of_range_values_are_clamped_with_one_message_each():
     low_mem, _high_mem = PICTURE_MEMORY_MAX_BYTES_RANGE
     low_workers, high_workers = WORKER_COUNT_RANGE
-    low_side, _high_side = THUMBNAIL_SIDE_RANGE
+    low_side, _high_side = THUMBNAIL_MAX_SIDE_RANGE
 
     # thumbnail kept small (below its min) so the clamped value stays under
-    # the preview's larger side and the cross-field rule does NOT also fire.
+    # the preview default and the cross-field rule does NOT also fire.
     settings, problems = GelemSettings.from_values({
         "picture_memory_max_bytes": str(low_mem - 1),   # below min
         "worker_count": str(high_workers + 50),          # above max
-        "thumbnail_size": "5x5",                          # both sides below min
+        "thumbnail_max_side": "5",                        # below min
     })
 
     assert settings.picture_memory_max_bytes == low_mem
     assert settings.worker_count == high_workers
-    assert settings.thumbnail_size == (low_side, low_side)
+    assert settings.thumbnail_max_side == low_side
 
     # One message for each of the three corrections, nothing else.
     assert len(problems) == 3
@@ -120,13 +120,13 @@ def test_out_of_range_values_are_clamped_with_one_message_each():
 
 
 def test_high_side_clamp_is_reported():
-    _low_side, high_side = THUMBNAIL_SIDE_RANGE
+    _low_side, high_side = THUMBNAIL_MAX_SIDE_RANGE
     settings, problems = GelemSettings.from_values({
-        "thumbnail_size": f"{high_side + 500}x{high_side + 500}",
+        "thumbnail_max_side": str(high_side + 500),
         # preview large enough that only the thumbnail clamp is reported.
-        "preview_size": f"{high_side + 1000}x{high_side + 1000}",
+        "preview_max_side": str(high_side + 1000),
     })
-    assert settings.thumbnail_size == (high_side, high_side)
+    assert settings.thumbnail_max_side == high_side
     assert len(problems) >= 1
 
 
@@ -135,16 +135,16 @@ def test_in_range_values_pass_through_untouched():
         "picture_memory_max_bytes": "268435456",   # 256 MiB, in range
         "picture_disk_max_bytes": "536870912",      # 512 MiB, in range
         "worker_count": "4",
-        "thumbnail_size": "128x128",
-        "preview_size": "512x512",
+        "thumbnail_max_side": "128",
+        "preview_max_side": "512",
     })
 
     assert problems == []
     assert settings.picture_memory_max_bytes == 268435456
     assert settings.picture_disk_max_bytes == 536870912
     assert settings.worker_count == 4
-    assert settings.thumbnail_size == (128, 128)
-    assert settings.preview_size == (512, 512)
+    assert settings.thumbnail_max_side == 128
+    assert settings.preview_max_side == 512
 
 
 # ===========================================================================
@@ -156,14 +156,14 @@ def test_unparseable_values_fall_back_to_defaults_without_raising():
     settings, problems = GelemSettings.from_values({
         "worker_count": "not-a-number",
         "picture_disk_max_bytes": "",
-        "thumbnail_size": "totally bogus",
-        "preview_size": "600xNaN",
+        "thumbnail_max_side": "totally bogus",
+        "preview_max_side": "600xNaN",
     })
 
     assert settings.worker_count == DEFAULT_WORKER_COUNT
     assert settings.picture_disk_max_bytes == DEFAULT_PICTURE_DISK_MAX_BYTES
-    assert settings.thumbnail_size == DEFAULT_THUMBNAIL_SIZE
-    assert settings.preview_size == DEFAULT_PREVIEW_SIZE
+    assert settings.thumbnail_max_side == DEFAULT_THUMBNAIL_MAX_SIDE
+    assert settings.preview_max_side == DEFAULT_PREVIEW_MAX_SIDE
 
     # One message per unreadable value.
     assert len(problems) == 4
@@ -175,12 +175,13 @@ def test_from_values_never_raises_on_junk():
         "picture_memory_max_bytes": object(),
         "picture_disk_max_bytes": None,
         "worker_count": "3.5",
-        "thumbnail_size": ["a", "b", "c"],
-        "preview_size": 12345,
+        "thumbnail_max_side": ["a", "b", "c"],
+        "preview_max_side": 12345,
     }
     settings, problems = GelemSettings.from_values(junk)   # must not raise
     assert isinstance(settings, GelemSettings)
-    # None (picture_disk) is "absent", not a problem; the other four are.
+    # None (picture_disk) is "absent", not a problem; the other four are
+    # (preview_max_side 12345 is over its maximum and gets clamped).
     assert len(problems) == 4
 
 
@@ -191,22 +192,77 @@ def test_from_values_never_raises_on_junk():
 
 def test_preview_smaller_than_thumbnail_is_corrected():
     settings, problems = GelemSettings.from_values({
-        "thumbnail_size": "800x800",
-        "preview_size": "300x300",
+        "thumbnail_max_side": "800",
+        "preview_max_side": "300",
     })
 
-    assert settings.thumbnail_size == (800, 800)
-    assert settings.preview_size == (800, 800)
+    assert settings.thumbnail_max_side == 800
+    assert settings.preview_max_side == 800
     assert any("preview" in message.lower() for message in problems)
 
 
 def test_preview_equal_to_thumbnail_is_not_corrected():
     settings, problems = GelemSettings.from_values({
-        "thumbnail_size": "400x400",
-        "preview_size": "400x400",
+        "thumbnail_max_side": "400",
+        "preview_max_side": "400",
     })
-    assert settings.preview_size == (400, 400)
+    assert settings.preview_max_side == 400
     assert problems == []
+
+
+def test_old_wxh_value_under_new_key_falls_back_with_one_message():
+    # P0.5b-2ii-c2a: the persisted key was renamed when the value went
+    # from a "WxH" pair to a single largest-side integer, precisely so an
+    # old "150x150" pair value can never be read as the new single number.
+    # If such a value somehow reaches from_values under the new key, it
+    # must be unparseable as an integer: it falls back to the default,
+    # records exactly ONE plain-English message naming the bad value, and
+    # does not raise. (preview is left at its default, well above the
+    # thumbnail default, so the cross-field rule adds nothing.)
+    settings, problems = GelemSettings.from_values({
+        "thumbnail_max_side": "150x150",
+    })
+
+    assert settings.thumbnail_max_side == DEFAULT_THUMBNAIL_MAX_SIDE
+    assert len(problems) == 1
+    assert isinstance(problems[0], str) and problems[0]
+    assert "150x150" in problems[0]
+
+
+def test_no_way_to_express_an_asymmetric_size(tmp_path):
+    # P0.5b-2ii-c2a: there is exactly one integer per purpose, and
+    # ArtifactStore's resolution equals that integer EXACTLY -- there is
+    # no width/height pair and no max() of a pair anywhere between the
+    # setting and the artifact key.
+    settings, problems = GelemSettings.from_values({
+        "thumbnail_max_side": "173",
+        "preview_max_side": "421",
+    })
+    assert problems == []
+    assert isinstance(settings.thumbnail_max_side, int)
+    assert isinstance(settings.preview_max_side, int)
+    assert settings.thumbnail_max_side == 173
+    assert settings.preview_max_side == 421
+
+    store = ArtifactStore(
+        tmp_path / "artifacts",
+        thumbnail_max_side=settings.thumbnail_max_side,
+        preview_max_side=settings.preview_max_side,
+    )
+    # Equality, not "max side of", not "at least" -- the setting IS the
+    # resolution.
+    assert store.resolution_for("thumbnail") == 173
+    assert store.resolution_for("preview") == 421
+
+    # Static: no max( on the size -> resolution path. resolution_for is
+    # the single definition of that mapping (see its docstring).
+    import inspect
+    from artifacts import artifact_store as artifact_store_module
+
+    resolution_for_src = inspect.getsource(
+        artifact_store_module.ArtifactStore.resolution_for
+    )
+    assert "max(" not in resolution_for_src
 
 
 # ===========================================================================
@@ -218,16 +274,16 @@ def test_settings_store_round_trip_through_dict_backend():
         picture_memory_max_bytes=256 * 1024 * 1024,
         picture_disk_max_bytes=700 * 1024 * 1024,
         worker_count=6,
-        thumbnail_size=(120, 90),
-        preview_size=(800, 640),
+        thumbnail_max_side=120,
+        preview_max_side=800,
     )
     backend = DictBackend()
     store = SettingsStore(backend)
 
     store.save(original)
-    # Everything persisted as a string, sizes as "WxH".
+    # Everything persisted as a string of plain decimal digits.
     assert all(isinstance(value, str) for value in backend.data.values())
-    assert "120x90" in backend.data.values()
+    assert "120" in backend.data.values()
 
     reloaded, problems = store.load()
     assert problems == []
@@ -257,8 +313,8 @@ def test_settings_store_key_names_do_not_leak_field_names():
 def test_artifact_store_uses_injected_sizes(tmp_path):
     store = ArtifactStore(
         tmp_path / "artifacts",
-        thumbnail_size=(64, 64),
-        preview_size=(256, 256),
+        thumbnail_max_side=64,
+        preview_max_side=256,
     )
 
     assert store.resolution_for("thumbnail") == 64
@@ -272,8 +328,8 @@ def test_artifact_store_uses_injected_sizes(tmp_path):
 
 def test_artifact_store_defaults_match_settings_defaults(tmp_path):
     store = ArtifactStore(tmp_path / "artifacts")
-    assert store.resolution_for("thumbnail") == max(DEFAULT_THUMBNAIL_SIZE)
-    assert store.resolution_for("preview") == max(DEFAULT_PREVIEW_SIZE)
+    assert store.resolution_for("thumbnail") == DEFAULT_THUMBNAIL_MAX_SIDE
+    assert store.resolution_for("preview") == DEFAULT_PREVIEW_MAX_SIDE
 
 
 # ===========================================================================
@@ -358,8 +414,8 @@ def test_qsettings_backend_contract(tmp_path):
     )
 
     assert backend.get("artifacts/missing") is None
-    backend.set("artifacts/thumbnail_size", "150x150")
-    assert backend.get("artifacts/thumbnail_size") == "150x150"
+    backend.set("artifacts/thumbnail_max_side", "150")
+    assert backend.get("artifacts/thumbnail_max_side") == "150"
 
     # A full store round trip works on it too.
     settings_store = SettingsStore(backend)
@@ -511,8 +567,8 @@ _REQUIRED_ARTIFACT_STORE_KWARGS = {
     "worker_count",
     "disk_cache_max_bytes",
     "memory_cache_max_bytes",
-    "thumbnail_size",
-    "preview_size",
+    "thumbnail_max_side",
+    "preview_max_side",
 }
 
 

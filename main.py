@@ -106,8 +106,8 @@ def create_app(fake_data: bool = False):
         worker_count=gelem_settings.worker_count,
         disk_cache_max_bytes=gelem_settings.picture_disk_max_bytes,
         memory_cache_max_bytes=gelem_settings.picture_memory_max_bytes,
-        thumbnail_size=gelem_settings.thumbnail_size,
-        preview_size=gelem_settings.preview_size,
+        thumbnail_max_side=gelem_settings.thumbnail_max_side,
+        preview_max_side=gelem_settings.preview_max_side,
     )
     registry          = ColumnTypeRegistry()
     operator_registry = OperatorRegistry()

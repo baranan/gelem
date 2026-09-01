@@ -461,13 +461,18 @@ cannot change any of these without editing the platform settings store by hand.
 | `picture_memory_max_bytes` | 500 MiB | Ceiling on the RAM the ArtifactStore's in-memory decoded-image cache may hold. Over it, the least recently used images are dropped; they regenerate from disk on next view. | **Immediately** |
 | `picture_disk_max_bytes` | 1 GiB | Ceiling on the total size of the derived-JPEG files in a project's `artifacts/` folder. Over it, the oldest (by write time) are deleted and regenerate on demand. | **Immediately** |
 | `worker_count` | 2 | How many background threads decode and resize source media for thumbnails and previews. Higher uses more CPU and RAM for faster gallery fill. | **On restart** |
-| `thumbnail_size` | 150x150 | Target pixel size of a gallery thumbnail. Its larger side is the "thumbnail resolution" that enters the artifact key and decides, per tile, whether a tile asks for a thumbnail or a preview. | **On restart** |
-| `preview_size` | 600x600 | Target pixel size of the larger preview image used for bigger tiles and quick previews. | **On restart** |
+| `thumbnail_max_side` | 150 | Largest side, in pixels, of a gallery thumbnail. This number is the "thumbnail resolution" that enters the artifact key and decides, per tile, whether a tile asks for a thumbnail or a preview. | **On restart** |
+| `preview_max_side` | 600 | Largest side, in pixels, of the larger preview image used for bigger tiles and quick previews. | **On restart** |
+
+Each size is a single number, not a width-and-height pair: only the larger side
+ever entered the artifact key, so a pair such as `700x100` could pass validation
+while describing a picture whose real short side was nowhere near the resolution
+the key claimed.
 
 Bounds and the exact defaults live in `settings/settings.py` as module-level
 constants; a saved value outside its bounds is clamped, an unparseable one falls
 back to the default, and either way the app still starts. One cross-field rule:
-if the preview's larger side is smaller than the thumbnail's, the preview size is
+if `preview_max_side` is smaller than `thumbnail_max_side`, the preview size is
 set equal to the thumbnail size.
 
 ### Why some need a restart

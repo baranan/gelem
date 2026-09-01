@@ -9,9 +9,9 @@ The backend protocol is two methods:
     get(key: str) -> str | None
     set(key: str, value: str) -> None
 
-Everything is persisted as a string (sizes as "WxH", byte counts as
-decimal digits), so a backend never has to know a value's type. The store
-owns the persisted key names; they appear nowhere else in the codebase.
+Everything is persisted as plain decimal digits, so a backend never has to
+know a value's type. The store owns the persisted key names; they appear
+nowhere else in the codebase.
 """
 
 from __future__ import annotations
@@ -29,12 +29,6 @@ class SettingsBackend(Protocol):
     def set(self, key: str, value: str) -> None: ...
 
 
-def _size_to_str(size: tuple[int, int]) -> str:
-    """(150, 150) -> '150x150'."""
-    width, height = size
-    return f"{int(width)}x{int(height)}"
-
-
 class SettingsStore:
     """Reads and writes a GelemSettings via a string key/value backend."""
 
@@ -43,8 +37,14 @@ class SettingsStore:
     _KEY_PICTURE_MEMORY = "artifacts/picture_memory_max_bytes"
     _KEY_PICTURE_DISK = "artifacts/picture_disk_max_bytes"
     _KEY_WORKER_COUNT = "artifacts/worker_count"
-    _KEY_THUMBNAIL_SIZE = "artifacts/thumbnail_size"
-    _KEY_PREVIEW_SIZE = "artifacts/preview_size"
+    # The key names carry the "_max_side" suffix deliberately. When the
+    # values went from a "WxH" pair to a single largest-side integer
+    # (P0.5b-2ii-c2a) the persisted keys were renamed too, so that an old
+    # pair value such as "150x150" can never be read back as the new
+    # single number -- it lands under a key nothing looks at. Nothing in
+    # the app ever wrote the old keys, so there is nothing to migrate.
+    _KEY_THUMBNAIL_MAX_SIDE = "artifacts/thumbnail_max_side"
+    _KEY_PREVIEW_MAX_SIDE = "artifacts/preview_max_side"
 
     def __init__(self, backend: SettingsBackend):
         self._backend = backend
@@ -62,8 +62,12 @@ class SettingsStore:
                 self._KEY_PICTURE_DISK
             ),
             "worker_count": self._backend.get(self._KEY_WORKER_COUNT),
-            "thumbnail_size": self._backend.get(self._KEY_THUMBNAIL_SIZE),
-            "preview_size": self._backend.get(self._KEY_PREVIEW_SIZE),
+            "thumbnail_max_side": self._backend.get(
+                self._KEY_THUMBNAIL_MAX_SIDE
+            ),
+            "preview_max_side": self._backend.get(
+                self._KEY_PREVIEW_MAX_SIDE
+            ),
         }
         return GelemSettings.from_values(raw)
 
@@ -79,8 +83,8 @@ class SettingsStore:
             self._KEY_WORKER_COUNT, str(settings.worker_count)
         )
         self._backend.set(
-            self._KEY_THUMBNAIL_SIZE, _size_to_str(settings.thumbnail_size)
+            self._KEY_THUMBNAIL_MAX_SIDE, str(settings.thumbnail_max_side)
         )
         self._backend.set(
-            self._KEY_PREVIEW_SIZE, _size_to_str(settings.preview_size)
+            self._KEY_PREVIEW_MAX_SIDE, str(settings.preview_max_side)
         )
