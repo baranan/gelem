@@ -486,3 +486,51 @@ def test_same_row_id_two_tables_different_media_do_not_collide(tmp_path):
     assert yellow_px[0] > 150 and yellow_px[1] > 150 and yellow_px[2] < 100, (
         f"row 7 / 'segments' artifact is not yellow: {yellow_px}"
     )
+
+
+# ===========================================================================
+# 12. The constructor coerces its five settings values with int().
+#
+#     GelemSettings persists every value as a string, and the settings
+#     dialog (P0.5b-2ii-c2b2) is a second path to these numbers beyond
+#     main.py. A store built with the sizes as strings ("150", "600") must
+#     behave identically to one built with the integers 150 and 600: the
+#     two sizes enter every ArtifactKey, so a string there would change
+#     every hash and silently regenerate the whole cache with no error.
+# ===========================================================================
+def test_constructor_coerces_settings_values_to_int(tmp_path):
+    root = str(tmp_path)
+
+    int_store = ArtifactStore(
+        tmp_path / "artifacts",
+        thumbnail_max_side=150,
+        preview_max_side=600,
+    )
+    str_store = ArtifactStore(
+        tmp_path / "artifacts",
+        thumbnail_max_side="150",
+        preview_max_side="600",
+    )
+
+    # resolution_for returns real integers from both, equal to each other.
+    for purpose, expected in (("thumbnail", 150), ("preview", 600)):
+        int_res = int_store.resolution_for(purpose)
+        str_res = str_store.resolution_for(purpose)
+        assert int_res == str_res == expected
+        assert type(int_res) is int
+        assert type(str_res) is int, (
+            f"{purpose} resolution from the string-built store is "
+            f"{type(str_res).__name__}, not int -- __init__ did not coerce it"
+        )
+
+    # The same source address produces the same ArtifactKey from both
+    # stores, so no cache would be regenerated after switching paths.
+    addr = canonical_key(parse("C:/videos/p01.mp4"), root)
+    fp = SourceFingerprint(size=1234, mtime_ns=5678)
+    int_key = ArtifactKey(addr, fp, "thumbnail", int_store.resolution_for("thumbnail"))
+    str_key = ArtifactKey(addr, fp, "thumbnail", str_store.resolution_for("thumbnail"))
+    assert int_key == str_key
+    assert int_key.stable_hash() == str_key.stable_hash(), (
+        "a string thumbnail size produced a different artifact key -- the "
+        "whole cache would silently regenerate"
+    )

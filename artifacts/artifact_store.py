@@ -173,6 +173,21 @@ class ArtifactStore:
         # (P0.5b-2ii-c1, docs/architecture.md section 9). None of these
         # five is machine-independent, so none is a bare constant in the
         # code -- CLAUDE.md's generality rule.
+        #
+        # Coerce all five with int() as they are stored. These five come
+        # from a settings store (GelemSettings) that persists everything
+        # as a string, and the settings dialog (P0.5b-2ii-c2b2) is a
+        # second path to these same numbers beyond main.py. The two sizes
+        # in particular enter every ArtifactKey, so a caller passing "150"
+        # instead of 150 would change every hash and silently regenerate
+        # the whole cache with no error raised. Coerce all five, not only
+        # the sizes, so no one later has to ask why some and not others.
+        worker_count = int(worker_count)
+        disk_cache_max_bytes = int(disk_cache_max_bytes)
+        memory_cache_max_bytes = int(memory_cache_max_bytes)
+        thumbnail_max_side = int(thumbnail_max_side)
+        preview_max_side = int(preview_max_side)
+
         self._dir = artifacts_dir
         self._dir.mkdir(parents=True, exist_ok=True)
         self._codec = ArtifactCodec(self._dir)
