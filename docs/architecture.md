@@ -451,8 +451,10 @@ the two lists already disagree.
 
 **Single authority for the machine-tunable values.** Nothing else -- not
 `media_architecture.md` §4.7, not `CLAUDE.md` -- restates this list. Added
-P0.5b-2ii-c1. The editing dialog is P0.5b-2ii-c2b2; until it exists a researcher
-cannot change any of these without editing the platform settings store by hand.
+P0.5b-2ii-c1. The editing dialog landed P0.5b-2ii-c2b2
+(`ui/settings_dialog.py`, reached from **File -> Settings...**); a researcher
+changes any of these values there. The two byte values are shown and edited in
+MiB, and the dialog submits only the fields that actually changed.
 
 ### The five values
 
@@ -528,5 +530,16 @@ sweeps, so even raising the limit can evict genuinely cached pictures -- and whe
 that sweep deletes cached picture files `apply_settings` appends one
 plain-English sentence naming the count to the messages it returns; the count
 includes orphan cleanup as well as ceiling eviction, so it is not an exact
-measure of what the researcher lost. The dialog that drives this is
-P0.5b-2ii-c2b2.
+measure of what the researcher lost. The dialog that drives this,
+`ui/settings_dialog.py` (P0.5b-2ii-c2b2), builds a spin box per field from
+`get_settings_fields()` -- byte fields in MiB, the rest in their native unit --
+records each starting value, and on OK passes `apply_settings()` only the
+entries whose spin box moved. When any changed field is restart-only (the
+worker count or either size) it first shows a three-button confirmation --
+"Save and quit Gelem", "Save and keep working", "Cancel" -- and, when a size
+changed, that confirmation also warns that every existing thumbnail and preview
+becomes unreachable and regenerates from source. After the save it re-reads the
+fields and shows any messages `apply_settings()` returned, including the
+sentence about swept picture files, before quitting if quit was chosen.
+`--fake-data` mode returns no fields and the dialog shows a single
+"Settings are not available in this mode." line.

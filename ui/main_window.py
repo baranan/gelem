@@ -31,6 +31,7 @@ from ui.run_operator_dialog import RunOperatorDialog
 from ui.save_table_dialog import SaveTableDialog
 from ui.csv_image_column_dialog import CsvImageColumnDialog
 from ui.merge_report_dialog import MergeReportDialog
+from ui.settings_dialog import SettingsDialog
 
 
 class MainWindow(QMainWindow):
@@ -136,6 +137,14 @@ class MainWindow(QMainWindow):
         )
         save_filtered_action.triggered.connect(self._on_save_filtered_set)
         file_menu.addAction(save_filtered_action)
+
+        file_menu.addSeparator()
+
+        # Settings editor for the machine-tunable values (docs/architecture.md
+        # section 9). Last entry in the File menu.
+        settings_action = QAction("Settings...", self)
+        settings_action.triggered.connect(self._on_open_settings)
+        file_menu.addAction(settings_action)
 
         # Operators menu — rebuilt every time it is opened so it always
         # reflects the currently registered operators.
@@ -968,3 +977,8 @@ class MainWindow(QMainWindow):
             return
 
         self._controller.save_filtered_as_table(dialog.table_name)
+
+    def _on_open_settings(self) -> None:
+        """Opens the settings editor for the machine-tunable values."""
+        dialog = SettingsDialog(self._controller, self)
+        dialog.exec()

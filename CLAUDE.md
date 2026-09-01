@@ -191,10 +191,10 @@ state. This rule carries no violation list of its own -- it points at the three
 - **`[NOW]`** `ArtifactStore` serves thumbnail requests on a **bounded**
   `WorkerPool` (`artifacts/worker_pool.py`), not a thread per call. Worker
   count is a keyword-only `ArtifactStore` constructor parameter with a low
-  default (2) -- no longer a module constant, though wiring it to a real
-  setting is still P0.5b-2ii (see the Generality
-  `[TARGET -> P0.5, sub-item P0.5b-2ii-c2]` rule, which does not flip
-  here). Requests naming the same canonical address are
+  default (2) -- no longer a module constant. It is wired to a real setting:
+  `main.py` passes the persisted `worker_count` in, and P0.5b-2ii-c2b2 gave the
+  researcher a dialog to change it (see the Generality `[NOW]` rule on
+  machine-dependent numbers). Requests naming the same canonical address are
   coalesced to one job with many subscribers; `reset()` bumps a generation
   counter. A job made stale by that bump is **guaranteed** to leave no index
   entry, no fingerprint-memo entry and to send no notification -- the job
@@ -349,7 +349,7 @@ state. This rule carries no violation list of its own -- it points at the three
   hardcoded 300-1500 ms window, a seven-emotion assumption, or a
   blendshape-specific branch inside a generic component is a leak. Before building
   a feature, name the parameter that makes it general.
-- **`[TARGET -> P0.5, sub-item P0.5b-2ii-c2]`** **A number that does not
+- **`[NOW]`** **A number that does not
   generalise across machines or datasets must become a setting or a runtime
   measurement -- never a constant in the code.** The rule covers two different
   mechanisms: a number that varies **by machine** needs a setting; a number that
@@ -360,8 +360,14 @@ state. This rule carries no violation list of its own -- it points at the three
   now come from `settings/` and are passed into the `ArtifactStore` constructor
   by `main.py` (P0.5b-2ii-c1). `docs/architecture.md` §9 is the single authority
   for them; do not restate the list. The module-level `DEFAULT_` constants that
-  remain are fallbacks only. This tag does **not** flip yet: no researcher can
-  change a value until the settings dialog exists, which is P0.5b-2ii-c2.
+  remain are fallbacks only. This tag flipped at P0.5b-2ii-c2b2: a researcher
+  can now change every one of the five from **File -> Settings...**
+  (`ui/settings_dialog.py`), which edits through
+  `AppController.get_settings_fields()` / `apply_settings()` and submits only
+  the fields that moved. Guarded by `tests/test_settings_dialog.py` (Layer A
+  arithmetic and wording, plus an AST guardrail that the File menu wires a
+  QAction to a handler constructing `SettingsDialog`) and, below the UI, by
+  `tests/test_settings.py`.
 - **`[TARGET -> P1.2]`** The first real per-file measurement case: resolving
   `#f=N` against a variable-frame-rate file (decision 8,
   `docs/media_architecture.md` §3.6) needs a per-file index of frame
