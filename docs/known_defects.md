@@ -10,8 +10,13 @@ bottom, with the item that fixed them, and are never deleted: knowing that a
 defect existed and how it was closed is worth keeping.
 
 Verified against the code on 4 Aug 2026; re-verified against `main` on 24 Aug
-2026 (P0.1) and updated by each item since. Each open defect should become a
-failing test before or as it is fixed.
+2026 (P0.1) and updated by each item since. On 2 Sep 2026 (the
+`docs-known-defects-sync` item) sixteen tracked defects were checked against the
+code named for each; all sixteen were real and none was already listed under
+other wording, so all sixteen were added below. That sync verified each new
+claim by reading the named code -- it did not re-verify the pre-existing
+entries, the "Fixed" section, or any line number already in the file. Each open
+defect should become a failing test before or as it is fixed.
 
 ---
 
@@ -66,6 +71,25 @@ failing test before or as it is fixed.
   deliberately through P0.5b-3ii as sufficient; no item assigned.
   `CLAUDE.md`'s "Derived images are identified by an `ArtifactKey`" rule points
   here.
+- **No gallery or tile carries a table identity of its own.** `ImageTile.render()`
+  passes `controller.get_active_table()` into the render context, which is
+  exactly the value `AppController.render_column_value()` would fall back to on
+  its own, so the "caller states the table" half of the display contract carries
+  no information yet. `ImageTile.render()` also calls `get_row(self.row_id)` with
+  no table argument. `docs/media_architecture.md` §4.6 item 8 is marked "Half
+  done" and is the authority; the remaining half needs a table identity injected
+  at gallery construction and passed down to the tiles, and it only pays off once
+  more than one table can be displayed at a time.
+- **`SettingsDialog._refresh_from_controller()` is all but dead code.** `_on_ok()`
+  calls it to reset the spin boxes to what the store actually kept, then
+  immediately shows the "adjusted" message box (if any) and calls `self.accept()`,
+  so the researcher only glimpses the refreshed numbers behind that box and never
+  on an open dialog. Either keep the dialog open when `apply_settings()` returned
+  messages, or drop the refresh.
+- **`CLAUDE.md` tells Claude Code to activate the environment with `.\setup.ps1`,
+  but `setup.ps1` is gitignored.** It is line 28 of `.gitignore` and is not
+  tracked, so a fresh clone cannot follow its own setup instruction. No item
+  assigned, and `CLAUDE.md` is not the file to change first.
 
 ## Open -- smells, no item assigned
 
@@ -132,6 +156,83 @@ failing test before or as it is fixed.
 - **`.claude/settings.json` has no `permissions.deny` list** for
   `Bash(git commit *)` and `Bash(git push *)`. `.claude/` now exists; this is
   still not done.
+- **`SweepResult.files_deleted` folds orphan cleanup in with ceiling eviction.**
+  `reconcile_and_evict()` counts orphans (unreachable files the index never
+  named) and ceiling evictions in one number, and `AppController.apply_settings()`
+  reports that number to the researcher as "deleted N cached picture files" -- so
+  it can over-state how many *cached* pictures were actually lost when a
+  disk-ceiling change also swept orphans. Over-reporting was accepted as the
+  safer error; the clean fix is a separate count on `SweepResult`.
+- **`AppController.apply_settings()` assumes the `ArtifactStore`'s ceilings equal
+  the persisted settings.** It compares `SettingsGateway.describe_fields()` before
+  and after `save_values()` and pushes a ceiling into the store only when the
+  persisted value moved, which is correct only while the store's ceiling and the
+  persisted setting cannot diverge. That holds today -- `apply_settings()` is the
+  only production caller of `set_memory_cache_max_bytes()` and
+  `set_disk_cache_max_bytes()` -- but the invariant is load-bearing and
+  unguarded, so anything that later sets a ceiling directly breaks it silently.
+- **`SettingsDialog._join_with_and()` raises `IndexError` on an empty list.**
+  `labels[-1]` is evaluated whenever `len(labels) != 1`. It is safe only because
+  its single call site in `confirmation_text()` is guarded by `if restart_labels:`.
+  One line to fix.
+- **A `SettingsDialog` built over an `AppController` with no settings gateway
+  raises `RuntimeError` out of a menu click.** `__init__` calls
+  `controller.get_settings_fields()`, which raises when `_settings_gateway is
+  None`, and the dialog does not catch it. No shipped path hits this -- `main.py`
+  always wires the gateway and the `None` default exists only for test
+  construction -- but nothing defends the menu action.
+- **In `--fake-data` mode `SettingsDialog` never assigns `_fields`, `_spin_boxes`
+  or `_initial_native`.** `__init__` returns after `_build_empty()` when there are
+  no fields, so any later call into `_current_native()` or `_on_ok()` would be an
+  `AttributeError`. `_on_ok` is unreachable in that mode today (only a Close
+  button is wired), so this is robustness only.
+- **The settings wiring guardrail does not pin that the gateway's store is the
+  one `.load()` was called on.**
+  `tests/test_settings.py::test_main_passes_a_settings_gateway_into_app_controller`
+  checks only that the gateway's first positional argument is a name bound to *a*
+  `SettingsStore(...)` call, so `main.py` binding two stores and loading settings
+  from one while building the gateway over the other would still pass. The test
+  comment says as much and leaves it "to the reader to confirm by eye". Three more
+  lines whenever something next touches that test.
+- **The negative assertions in `tests/test_request_queue.py` rest on
+  `time.sleep(0.1)` to `0.3`.** Tests such as
+  `test_drop_pending_removes_unkept_jobs_and_returns_their_keys` spin until the
+  kept jobs finish, then sleep and assert a dropped job did *not* run -- a slow
+  machine could let the dropped job slip in first. `tests/test_artifact_cache_location.py`
+  uses only `threading.Event` for the same kind of check and is the pattern to
+  copy.
+- **`AppController._update_wanted_addresses()` is O(visible tiles) on the UI
+  thread, once per mounted-window shift.** It runs on every displayed-range report
+  or clear, resolving every visible media cell to a canonical address with pure
+  path arithmetic (no I/O). A zero-millisecond single-shot `QTimer` would coalesce
+  a burst of scroll reports into one pass, but the cost should be measured before
+  that is built.
+- **`ui/main_window.py::_clear_grouped_galleries()` calls `clear_displayed_range()`
+  once per group key.** Each call runs `AppController._update_wanted_addresses()`
+  in full, so tearing down a group-by view triggers one complete wanted-address
+  recompute per group rather than one for the whole teardown.
+- **`test_unparseable_media_cell_is_skipped_not_raised` monkeypatches
+  `_resolve_media_cell` to raise.** In `tests/test_demand_driven_display.py`, the
+  test replaces `controller._resolve_media_cell` with a stub that raises
+  `MediaAddressError` for one cell, so it proves the `try/except` in
+  `_update_wanted_addresses()` but not that a real cell containing a literal `#`
+  actually reaches and trips it.
+- **`load_folder()` inherits the previous project's artifacts directory.** It
+  calls `ArtifactStore.reset()` but not `set_artifacts_dir()`; only
+  `save_project` / `load_project` re-point the store. So after a project has been
+  open in the session, loading a bare folder writes its thumbnails into that saved
+  project's `artifacts/` directory (as orphans, since `reset()` cleared the
+  index). Self-healing -- the saved project's next sweep deletes them -- but it is
+  undocumented and makes manual cache testing treacherous.
+- **A hard-killed encode leaves `<hash>.jpg.<pid>.<tid>.tmp` files that nothing
+  reclaims.** `ArtifactCodec.write_jpeg()` writes to that temp name and
+  `os.replace`s it into place, cleaning up only when the encode itself fails; a
+  process killed mid-write leaves the temp file behind. The cache sweep owns only
+  top-level `<hash>.jpg` files by design (`docs/media_architecture.md` §4.7), so
+  these are never swept. A deliberate gap, not an accident; no item assigned.
+- **`manual_testing/` is gitignored** (line 26 of `.gitignore`), so fixes or
+  checks made there are never committed and vanish on a fresh clone. Whether the
+  directory should be tracked has not been decided.
 
 ---
 
