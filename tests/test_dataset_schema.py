@@ -277,6 +277,21 @@ def test_check_frame_runs_once_per_accept(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# P1.8b-2 -- the whole pytest suite runs with strict_schema on
+# ---------------------------------------------------------------------------
+
+def test_suite_runs_with_strict_schema_on():
+    # NEGATIVE CHECK. tests/conftest.py flips Dataset._DEFAULT_STRICT_SCHEMA to
+    # True at import time so every Dataset built in a test is strict. Without
+    # this test, deleting that one conftest line would leave the whole suite
+    # green while every test silently dropped back to the lenient path -- an
+    # "unexpected" dtype adjustment would be applied and recorded instead of
+    # refused, and nothing would notice.
+    assert Dataset._DEFAULT_STRICT_SCHEMA is True
+    assert Dataset().strict_schema is True
+
+
+# ---------------------------------------------------------------------------
 # check 6 -- strict mode, positive and negative
 # ---------------------------------------------------------------------------
 
@@ -527,6 +542,7 @@ def _frames_for_updates(tmp_path):
 
 def test_apply_row_updates_degrades_a_schema_rejection_when_strict_off(tmp_path):
     ds = _frames_for_updates(tmp_path)
+    ds.strict_schema = False  # this test proves the lenient "all unplaceable" degrade, not the strict re-raise
     rid = ds.get_table("frames")["row_id"].iloc[0]
     before = ds.read_only_view("frames").copy()
 
@@ -566,6 +582,7 @@ def test_apply_row_updates_degrades_a_wrong_type_for_an_existing_column(tmp_path
     # setter raise TypeError, from inside the write loop -- which is now inside
     # the try. Strict off: whole batch unplaceable, stored frame unchanged.
     ds = _frames_for_updates(tmp_path)
+    ds.strict_schema = False  # first half proves the lenient degrade; the second half flips strict on itself
     rid = ds.get_table("frames")["row_id"].iloc[0]
     before = ds.read_only_view("frames").copy()
 

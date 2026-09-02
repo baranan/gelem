@@ -302,6 +302,13 @@ class Dataset:
     # Required columns that Gelem creates internally for the frames table.
     FRAMES_REQUIRED_COLUMNS = ["row_id", "full_path", "file_name"]
 
+    # Class-level default for the per-instance strict_schema flag. The
+    # production default is OFF: an "unexpected" dtype adjustment is applied
+    # and recorded, not refused. The pytest suite flips this class default to
+    # True for the whole run (tests/conftest.py), so every Dataset built in a
+    # test -- including the one this constructor builds below -- is strict.
+    _DEFAULT_STRICT_SCHEMA: bool = False
+
     def __init__(self):
         self.provenance = ProvenanceLog()
         self._id_counter: int = 0
@@ -324,9 +331,12 @@ class Dataset:
         # public methods.
         self._schema_messages: list[str] = []
         # When True, _accept_table also refuses a frame whose only problem is
-        # an "unexpected" dtype adjustment (step 4). Off by default; enabling it
-        # project-wide is a separate item.
-        self.strict_schema: bool = False
+        # an "unexpected" dtype adjustment (the frame declared a width the
+        # schema did not expect), and apply_row_updates re-raises instead of
+        # degrading. Read from the class default here, BEFORE the first
+        # _accept_table call below, so the constructor's own accept is strict
+        # too when the suite has flipped the class default.
+        self.strict_schema: bool = type(self)._DEFAULT_STRICT_SCHEMA
 
         self._tables: dict[str, pd.DataFrame] = {}
         self._accept_table(

@@ -1,8 +1,8 @@
 """
 tests/conftest.py
 
-Two jobs, both of which have to happen before any test module is
-imported:
+Three jobs, all of which have to happen before any test module is
+imported, so they run in the early block below rather than in fixtures:
 
   1. Force Qt's "offscreen" platform plugin. pytest imports every
      conftest.py before it collects the test modules beside it, so
@@ -15,6 +15,20 @@ imported:
      do this for when they are run one at a time; doing it here as well
      is harmless and keeps a bare `pytest` run working from any
      directory.
+
+  3. Flip Dataset._DEFAULT_STRICT_SCHEMA to True for the whole run
+     (P1.8b-2). It must be a class-level flip done at import time, not a
+     fixture: test modules build Dataset() directly, Dataset.__init__
+     runs its own _accept_table("frames", ...) before any fixture could
+     reach the instance, and tests/test_dataset.py runs 64 assertions
+     through module-level run_test(...) calls at import -- a fixture, set
+     up only at the first test's setup, would miss all of that. Because
+     conftest.py is imported before its sibling test modules are
+     collected, this genuinely runs first. No restore: the process exits
+     when pytest is done, exactly as for the os.environ and sys.path
+     mutations above. A test that needs the lenient path sets
+     `ds.strict_schema = False` on its own instance, which wins over the
+     class default.
 
 It also provides the shared Qt fixtures used by the widget-level tests
 (currently tests/test_gallery_seam.py). tests/test_visible_row_order.py
@@ -36,6 +50,14 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# MUST run before any test module is imported -- see job 3 above. The import
+# sits here, in the ordering-sensitive block, rather than with the imports at
+# the top of the file, so it is obvious it belongs to job 3; models.dataset
+# only pulls in pandas/numpy, already dependencies of the suite.
+from models.dataset import Dataset as _Dataset
+
+_Dataset._DEFAULT_STRICT_SCHEMA = True
 
 from PySide6.QtWidgets import QApplication
 
