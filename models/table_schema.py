@@ -352,7 +352,12 @@ def check_frame(df: pd.DataFrame, schema: TableSchema) -> SchemaCheck:
     )
 
 
-def normalise_frame(df: pd.DataFrame, schema: TableSchema) -> pd.DataFrame:
+def normalise_frame(
+    df: pd.DataFrame,
+    schema: TableSchema,
+    *,
+    check: SchemaCheck | None = None,
+) -> pd.DataFrame:
     """
     Applies the recorded adjustments and returns a NEW frame. Does not mutate the
     frame it was given.
@@ -360,8 +365,14 @@ def normalise_frame(df: pd.DataFrame, schema: TableSchema) -> pd.DataFrame:
     The caller checks first: check_frame is the gate, and normalise_frame must
     never be handed a frame that check_frame rejects. If it is, it raises rather
     than half-applying.
+
+    `check` lets a caller that has already run check_frame(df, schema) hand the
+    result back so it is not recomputed -- the round trip is not cheap on a
+    large frame. When omitted the behaviour is exactly as before: check_frame
+    runs here.
     """
-    check = check_frame(df, schema)
+    if check is None:
+        check = check_frame(df, schema)
     if check.rejections:
         raise ValueError(
             "normalise_frame was called on a frame with rejections: "
@@ -398,17 +409,13 @@ def infer_schema(
     both are true, for different callers, which is why inference lives in its own
     function.
 
-    Defaults (§4.2, §4.3): every column is a measurement unless a hint says
-    otherwise -- §4.2 does not license inferring an `index` from the data, so a
-    column becomes `index` only because the caller said so. A float column stores
-    float32, a boolean column stores bool, a repeated-string column becomes a
-    category, and carry_to_children is true for every column.
-
-    An unhinted integer column infers as a measurement with dtype int64, not the
-    float32 that §4.3 makes the general measurement default, because the same §4.3
-    paragraph carves out counters and frame ordinals as a 64-bit exception and
-    Gelem cannot tell an unhinted integer column from one of those. A caller that
-    wants the narrower storage passes ColumnHint(dtype="int32").
+    The rule, one sentence for every kind: inference keeps the dtype the column
+    arrived in (int64, float64, bool, the object/string text dtype, or an
+    already-categorical dtype), makes every column a `measurement` with
+    `carry_to_children` true, and never narrows -- §4.3's narrow defaults
+    (float32, int32, category) govern the dtypes an operator DECLARES when it
+    creates a table, not what Gelem infers, and a caller that wants one of them
+    passes ColumnHint(dtype=...).
 
     A dtype outside the supported set (see _is_supported_dtype) -- datetime64, a
     timezone-aware datetime, a pandas nullable extension dtype -- raises rather
@@ -445,34 +452,25 @@ def infer_schema(
                 f"not support yet"
             )
 
-        is_text = getattr(dt, "kind", None) == "O"
-        # "Repeated" means at least one value actually recurs among the values
-        # that are present -- compared against the non-null count, not the row
-        # count, so a high-cardinality column with a few blank cells is not
-        # mistaken for a low-cardinality one.
-        non_null = int(series.count())
-        repeated_text = is_text and series.nunique(dropna=True) < non_null
-
-        # Inferred default: measurement, with the storage dtype §4.3 gives for
-        # this kind of data. After the guard above, dt is a plain numpy
-        # integer/float/bool dtype, an object-kind text dtype, or a pandas
-        # categorical.
+        # Inference keeps the dtype the column arrived in and never narrows.
+        # After the guard above, dt is a plain numpy integer/float/bool dtype,
+        # an object-kind text dtype, or a pandas categorical.
         if isinstance(dt, pd.CategoricalDtype):
+            # Already categorical on arrival: that IS its dtype, so keep it.
             role, dtype, tag = ColumnRole.measurement, "category", "text"
         elif dt.kind == "b":
             role, dtype, tag = ColumnRole.measurement, "bool", "boolean_flag"
         elif dt.kind in ("i", "u"):
-            # §4.3's 64-bit exception is exactly the integer-arriving columns;
-            # keep them wide and let a hint narrow them.
             role, dtype, tag = ColumnRole.measurement, "int64", "numeric"
         elif dt.kind == "f":
-            role, dtype, tag = ColumnRole.measurement, "float32", "numeric"
-        elif repeated_text:
-            role, dtype, tag = ColumnRole.measurement, "category", "text"
+            role, dtype, tag = ColumnRole.measurement, "float64", "numeric"
         else:
-            # A unique-per-row text column keeps whatever text dtype it arrived
-            # in (numpy "object" or the pandas string dtype), so the inferred
-            # schema does not reject its own frame.
+            # Every text column -- whether its values repeat or not -- keeps the
+            # dtype it arrived in (numpy "object" or the pandas string dtype).
+            # A repeated-value column is left open, not turned into a category,
+            # because Gelem cannot tell a closed vocabulary from a column a
+            # researcher will keep adding labels to, and a closed dtype refuses
+            # a new label at write time.
             role, dtype, tag = ColumnRole.measurement, actual, "text"
         carry = True
 

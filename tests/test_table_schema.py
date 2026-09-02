@@ -279,7 +279,9 @@ def test_t9_infer_schema_roles_and_carry_default():
     assert pid.carry_to_children is True
     assert rt.role is ColumnRole.measurement
     assert rt.carry_to_children is True
-    assert rt.dtype == "float32"
+    # An unhinted float column keeps float64 (see change 1): inference does not
+    # narrow numeric width behind the caller's back.
+    assert rt.dtype == "float64"
 
 
 # Second correction: an integer column is a measurement by default, never an
@@ -309,20 +311,76 @@ def test_infer_schema_integer_is_measurement_not_index():
     assert fi.dtype == "int32"
 
 
+# Change 1: an unhinted float64 column infers as float64, not float32.
+def test_infer_schema_float_column_keeps_float64():
+    df = pd.DataFrame(
+        {"latency_s": pd.Series([13.351833333333333, 7.9021446], dtype="float64")}
+    )
+
+    schema = infer_schema(df)
+
+    assert schema.spec_for("latency_s").dtype == "float64"
+
+
+# A ColumnHint(dtype="float32") narrows that column in the inferred schema.
+def test_infer_schema_float_hint_narrows_to_float32():
+    df = pd.DataFrame(
+        {"latency_s": pd.Series([13.351833333333333, 7.9021446], dtype="float64")}
+    )
+
+    schema = infer_schema(
+        df, hints={"latency_s": ColumnHint(dtype="float32")}
+    )
+
+    assert schema.spec_for("latency_s").dtype == "float32"
+
+
+# The hint is a request, not an override: asking for float32 storage on a
+# column whose values do not survive float32 is deliberately REFUSED by
+# check_frame rather than silently losing precision.
+def test_float32_hint_still_rejects_a_value_that_will_not_survive():
+    df = pd.DataFrame(
+        {"latency_s": pd.Series([13.351833333333333, 7.9021446], dtype="float64")}
+    )
+    schema = infer_schema(
+        df, hints={"latency_s": ColumnHint(dtype="float32")}
+    )
+
+    check = check_frame(df, schema)
+
+    assert check.adjustments == ()
+    assert len(check.rejections) == 1
+    assert "latency_s" in check.rejections[0]
+    assert "13.351833333333333" in check.rejections[0]
+
+
 # The self-consistency property: a schema inferred from a frame must never
 # reject that same frame. This is the guardrail that catches a bad inference
-# default -- float32-for-all-numerics fails it because the large int64 value
-# cannot survive the narrowing.
+# default. Every supported kind here carries at least one value that would NOT
+# survive the narrow storage dtype §4.3 names for that kind -- a float not exact
+# in float32, an integer outside the int32 range -- so the test fails the moment
+# inference narrows any kind behind the caller's back.
 def test_inferred_schema_never_rejects_the_frame_it_was_inferred_from():
     df = pd.DataFrame(
         {
-            "big_count": pd.Series([1, 2, 3_000_000_000], dtype="int64"),
-            "score": pd.Series([0.5, 0.25, 0.75], dtype="float64"),
-            # No explicit dtype: this is what pd.read_csv actually hands the
-            # import path -- numpy object on pandas 2, a string dtype on pandas 3.
-            "condition": pd.Series(["a", "a", "b"]),
-            "note": pd.Series(["n1", "n2", "n3"]),
-            "passed": pd.Series([True, False, True], dtype="bool"),
+            # 13.351833333333333 is not exact in float32.
+            "latency_s": pd.Series(
+                [13.351833333333333, 7.9021446, 22.447181], dtype="float64"
+            ),
+            # 3_000_000_000 is outside the int32 range.
+            "sample_offset": pd.Series(
+                [3_000_000_000, 812_004_117, 41], dtype="int64"
+            ),
+            # unique-per-row text
+            "clip_id": pd.Series(["kx83aq", "qm07zt", "vt59rb"]),
+            # repeated-value text
+            "condition": pd.Series(["approach", "approach", "withdraw"]),
+            # bool
+            "responded": pd.Series([True, False, True], dtype="bool"),
+            # pandas categorical
+            "block": pd.Series(["b2", "b1", "b2"], dtype="category"),
+            # text with missing values
+            "annotation": pd.Series(["squint onset", None, "brow raise"]),
         }
     )
 
@@ -330,6 +388,11 @@ def test_inferred_schema_never_rejects_the_frame_it_was_inferred_from():
     check = check_frame(df, schema)
 
     assert check.rejections == ()
+    # A column that ARRIVES as pandas categorical still infers as category --
+    # that is the dtype it arrived in, and inference keeps arrival dtypes.
+    assert schema.spec_for("block").dtype == "category"
+    # A repeated-value text column that arrived as plain text stays open.
+    assert schema.spec_for("condition").dtype != "category"
 
 
 # A dtype this module has not reasoned about is refused, in both check_frame and
@@ -376,23 +439,39 @@ def test_infer_schema_hint_for_absent_column_is_error():
         infer_schema(df, hints={"b": ColumnHint(role=ColumnRole.index)})
 
 
-# A high-cardinality text column with a few blank cells is not a "repeated
-# string" -- a missing value must not tip it into a category.
-def test_infer_schema_unique_text_with_blanks_is_not_a_category():
+# A text column keeps whatever text dtype it arrived in, whether its values
+# repeat or not -- inference never narrows.
+def test_infer_schema_unique_text_keeps_its_arrival_dtype():
     df = pd.DataFrame(
         {"notes": pd.Series(["free text one", "free text two", None, "free text four"])}
     )
 
     schema = infer_schema(df)
 
-    assert schema.spec_for("notes").dtype != "category"
+    assert schema.spec_for("notes").dtype == str(df["notes"].dtype)
 
 
-# A genuinely repeated text column still becomes a category.
-def test_infer_schema_repeated_text_is_a_category():
+# A repeated-value text column is NOT closed to a category by inference (the
+# opposite of what it used to do): Gelem cannot tell a fixed vocabulary from a
+# column a researcher keeps adding labels to, and a category refuses a new
+# label at write time. It keeps the text dtype it arrived in.
+def test_infer_schema_repeated_text_is_left_open_not_a_category():
     df = pd.DataFrame({"condition": pd.Series(["hit", "hit", "miss", "hit"])})
 
     schema = infer_schema(df)
+
+    assert schema.spec_for("condition").dtype != "category"
+    assert schema.spec_for("condition").dtype == str(df["condition"].dtype)
+
+
+# The capability is un-defaulted, not lost: a ColumnHint still narrows a
+# repeated text column to category on request.
+def test_infer_schema_category_hint_still_narrows_repeated_text():
+    df = pd.DataFrame({"condition": pd.Series(["hit", "hit", "miss", "hit"])})
+
+    schema = infer_schema(
+        df, hints={"condition": ColumnHint(type_tag="text", dtype="category")}
+    )
 
     assert schema.spec_for("condition").dtype == "category"
 

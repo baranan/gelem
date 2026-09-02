@@ -27,6 +27,13 @@ from media.media_address import (
 )
 from media.media_address import parse as parse_address
 from media.media_address import format as format_address
+from models.table_schema import (
+    ColumnHint,
+    TableSchema,
+    check_frame,
+    infer_schema,
+    normalise_frame,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +258,31 @@ def _rewrite_media_column(values, project_root: Path, to_stored: bool):
 
 
 # ---------------------------------------------------------------------------
+# Schema acceptance
+# ---------------------------------------------------------------------------
+
+# row_id is exempt from every TableSchema. docs/architecture.md §4.1 makes it an
+# opaque handle that carries no meaning and is unique only within its table; none
+# of the three roles in §4.2 (identifier / index / measurement) fits it, and
+# adding a fourth role for one bookkeeping column would leak Dataset's internals
+# into the vocabulary operators use. The exemption lives here, in Dataset --
+# models/table_schema.py stays ignorant of row_id and takes no exemption
+# argument.
+_SCHEMA_EXEMPT_COLUMNS = frozenset({"row_id"})
+
+
+def _non_exempt_columns(df: pd.DataFrame) -> list[str]:
+    """The frame's columns that a TableSchema describes -- every column except
+    the schema-exempt bookkeeping ones, in the frame's own order."""
+    return [c for c in df.columns if c not in _SCHEMA_EXEMPT_COLUMNS]
+
+
+class SchemaRejection(ValueError):
+    """Raised by Dataset._accept_table when a frame does not conform to its
+    table's schema. The frame is not stored, wholly or partly."""
+
+
+# ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
 
@@ -271,9 +303,6 @@ class Dataset:
     FRAMES_REQUIRED_COLUMNS = ["row_id", "full_path", "file_name"]
 
     def __init__(self):
-        self._tables: dict[str, pd.DataFrame] = {
-            "frames": pd.DataFrame(columns=self.FRAMES_REQUIRED_COLUMNS)
-        }
         self.provenance = ProvenanceLog()
         self._id_counter: int = 0
         self._registry = None
@@ -284,6 +313,27 @@ class Dataset:
         # table_name -> (row count, weakref to the DataFrame) the index
         # above was built from. See _row_index_for() for how this is used.
         self._row_index_stamp: dict[str, tuple[int, weakref.ReferenceType]] = {}
+
+        # One TableSchema per stored table (docs/architecture.md §4.3), decided
+        # only in _accept_table. A table assigned straight into _tables by a
+        # test has no schema -- schema_for() returns None for it.
+        self._schemas: dict[str, TableSchema] = {}
+        # Plain-English notes about every lossless dtype adjustment made on
+        # accept, drained by take_schema_messages(). A third reporting
+        # destination, added instead of widening the return type of nine
+        # public methods.
+        self._schema_messages: list[str] = []
+        # When True, _accept_table also refuses a frame whose only problem is
+        # an "unexpected" dtype adjustment (step 4). Off by default; enabling it
+        # project-wide is a separate item.
+        self.strict_schema: bool = False
+
+        self._tables: dict[str, pd.DataFrame] = {}
+        self._accept_table(
+            "frames",
+            pd.DataFrame(columns=self.FRAMES_REQUIRED_COLUMNS),
+            source="__init__",
+        )
 
     def set_registry(self, registry) -> None:
         """
@@ -339,17 +389,17 @@ class Dataset:
     # would.
     #
     # This also means writers do not need to invalidate anything by hand.
-    # An in-place mutation that changes column values without touching
-    # row_id or row count (apply_row_updates, add_computed_column,
-    # add_column) leaves the stamp unchanged, which is correct -- row
-    # positions did not move, so the cached index is still exactly
-    # right. A write that replaces the table with a different DataFrame
-    # object (aggregate, create_table_from_df, confirm_merge, a test's
-    # direct ds._tables[...] = ... assignment) changes the stamp, so the
-    # very next lookup rebuilds rather than trusting stale positions.
-    # _set_table() and _reset_tables() below exist so every write goes
-    # through one obvious place, not because they need to do anything
-    # extra to keep the index correct.
+    # apply_row_updates mutates the stored frame in place (new columns and
+    # specific cells, never row_id or row count) and, on the common path where
+    # the schema accept makes no dtype adjustment, re-stores that same object --
+    # so the (row count, weakref) stamp still matches and the cached index is
+    # not rebuilt. Every other write path -- add_column, add_computed_column,
+    # aggregate, create_table_from_rows, create_table_from_df, confirm_merge,
+    # load, a schema accept that did adjust a dtype, and a test's direct
+    # ds._tables[...] = ... assignment -- stores a different DataFrame object,
+    # so the stamp no longer matches and the very next lookup rebuilds from the
+    # live frame rather than trusting stale positions. _set_table() and
+    # _reset_tables() below exist so every write goes through one obvious place.
 
     def _get_stored_table(self, table_name: str) -> pd.DataFrame:
         """Returns the live, stored DataFrame for table_name (no copy).
@@ -360,20 +410,190 @@ class Dataset:
         return self._tables[table_name]
 
     def _set_table(self, table_name: str, df: pd.DataFrame) -> None:
-        """The single place one stored table is written or replaced."""
+        """The single place one stored table is written or replaced. Called
+        only by _accept_table -- every other write path goes through the schema
+        accept path, not here (guarded by tests/test_dataset_schema.py)."""
         self._tables[table_name] = df
 
     def _reset_tables(self, tables: dict[str, pd.DataFrame]) -> None:
         """The single place the whole _tables dict is replaced, e.g. by a
         fresh load_folder(), load_csv_as_primary(), or load(). Clears the
-        index caches too -- not required for correctness (the stamp check
-        in _row_index_for would catch every one of these tables being a
-        new object anyway), but a table dropped by the reset (e.g. one
-        that existed only in the previous project) would otherwise leave
-        a dead entry sitting in these dicts forever."""
+        schema map and the index caches too -- not required for correctness
+        (the stamp check in _row_index_for would catch every one of these
+        tables being a new object anyway), but a table dropped by the reset
+        (e.g. one that existed only in the previous project) would otherwise
+        leave a dead entry sitting in these dicts forever."""
         self._tables = tables
+        self._schemas.clear()
         self._row_index.clear()
         self._row_index_stamp.clear()
+
+    # ------------------------------------------------------------------
+    # Schema accept path
+    # ------------------------------------------------------------------
+
+    def _media_column_hints(self, df: pd.DataFrame) -> dict[str, ColumnHint]:
+        """The only hints P1.8b-1 gives infer_schema: a media type tag for
+        'full_path' always, plus any column ColumnTypeRegistry already tags
+        'media_path'. No role hints -- that decision has not been taken."""
+        media_cols = {"full_path"}
+        if self._registry is not None:
+            for col in self._registry.list_all_columns():
+                ct = self._registry.get(col)
+                if ct is not None and ct.tag == "media_path":
+                    media_cols.add(col)
+        return {
+            col: ColumnHint(type_tag="media_path")
+            for col in df.columns
+            if col in media_cols and col not in _SCHEMA_EXEMPT_COLUMNS
+        }
+
+    def _accept_table(
+        self,
+        table_name: str,
+        df: pd.DataFrame,
+        *,
+        hints: dict[str, ColumnHint] | None = None,
+        source: str = "",
+    ) -> None:
+        """The one place a stored table's schema is decided. Every site that
+        creates or replaces a stored table calls this, never _set_table
+        directly. See docs/architecture.md §4.3.
+
+        a. row_id (and any other _SCHEMA_EXEMPT_COLUMNS member) is not part of
+           any schema.
+        b. Build the schema to check against from the FRAME's non-exempt
+           columns, in the frame's own order: a column the stored schema
+           already names keeps its stored ColumnSpec unchanged; a column the
+           stored schema does not name gets a spec inferred from the frame; a
+           column the stored schema names but the frame no longer has is simply
+           dropped (not a rejection).
+        c./d. check_frame; a non-empty rejection list means the frame is not
+           stored -- raise SchemaRejection naming the table, the source and
+           every rejection.
+        e. Otherwise apply the adjustments and write them back onto a copy of
+           the FULL frame, so row_id and the original column order survive.
+        f. Record every adjustment: one sentence per adjustment to
+           _schema_messages, and (if there were any) one provenance entry.
+        """
+        schema_columns = _non_exempt_columns(df)
+
+        # A frame with a duplicate column name cannot be described by a
+        # TableSchema (or read column-wise). Make it one more refused-frame
+        # case with the one exception type, naming table and source.
+        if len(schema_columns) != len(set(schema_columns)):
+            dupes = sorted(
+                {c for c in schema_columns if schema_columns.count(c) > 1}
+            )
+            raise SchemaRejection(
+                f"Dataset refused table {table_name!r} from {source!r}: "
+                f"duplicate column name(s) {dupes}"
+            )
+
+        frame_for_schema = df[schema_columns]
+
+        stored = self._schemas.get(table_name)
+        stored_names = (
+            set(stored.column_names()) if stored is not None else set()
+        )
+        new_columns = [c for c in schema_columns if c not in stored_names]
+
+        inferred_by_name: dict[str, object] = {}
+        if new_columns:
+            effective_hints = dict(self._media_column_hints(df))
+            if hints:
+                effective_hints.update(hints)
+            sub_hints = {
+                name: h
+                for name, h in effective_hints.items()
+                if name in new_columns
+            }
+            # infer_schema raises ValueError on a dtype it does not support
+            # (datetime64, a nullable extension dtype). Surface that as a
+            # SchemaRejection, so every "cannot accept this frame" outcome has
+            # the one type and names the table and source.
+            try:
+                inferred = infer_schema(df[new_columns], hints=sub_hints)
+            except ValueError as exc:
+                raise SchemaRejection(
+                    f"Dataset refused table {table_name!r} from {source!r}: "
+                    f"{exc}"
+                ) from exc
+            inferred_by_name = {s.name: s for s in inferred.columns}
+
+        specs = []
+        for name in schema_columns:
+            if name in stored_names:
+                specs.append(stored.spec_for(name))
+            else:
+                specs.append(inferred_by_name[name])
+        schema = TableSchema(columns=tuple(specs))
+
+        check = check_frame(frame_for_schema, schema)
+
+        if check.rejections:
+            raise SchemaRejection(
+                f"Dataset refused table {table_name!r} from {source!r}: "
+                + "; ".join(check.rejections)
+            )
+
+        # Step 4: strict mode also refuses an "unexpected" adjustment -- a
+        # width the frame declared that the schema did not expect. A
+        # "storage_policy" adjustment never triggers this.
+        if self.strict_schema:
+            unexpected = [
+                a for a in check.adjustments if a.kind == "unexpected"
+            ]
+            if unexpected:
+                raise SchemaRejection(
+                    f"Dataset refused table {table_name!r} from {source!r} "
+                    f"(strict_schema): unexpected dtype adjustment(s): "
+                    + "; ".join(
+                        f"{a.column} {a.arrived_as}->{a.stored_as}"
+                        for a in unexpected
+                    )
+                )
+
+        if check.adjustments:
+            # An adjustment rewrites a column's dtype, so build a fresh frame
+            # and leave the caller's untouched.
+            out = df.copy()
+            normalised = normalise_frame(
+                frame_for_schema, schema, check=check
+            )
+            for adjustment in check.adjustments:
+                out[adjustment.column] = normalised[adjustment.column]
+        else:
+            # Nothing to rewrite. Every call site already hands _accept_table a
+            # frame it just built or copied (a fresh DataFrame, a .copy(), or --
+            # for apply_row_updates -- the live stored frame it is re-storing
+            # unchanged), so store it as-is. Re-storing the same object here is
+            # what keeps apply_row_updates' row-id index stamp valid.
+            out = df
+        self._set_table(table_name, out)
+        self._schemas[table_name] = schema
+
+        for adjustment in check.adjustments:
+            self._schema_messages.append(
+                f"Table {table_name!r}: column {adjustment.column!r} arrived as "
+                f"{adjustment.arrived_as} and is stored as "
+                f"{adjustment.stored_as}."
+            )
+        if check.adjustments:
+            self.provenance.record("schema_adjustments", {
+                "table": table_name,
+                "source": source,
+                "adjustments": [
+                    {
+                        "column": a.column,
+                        "arrived_as": a.arrived_as,
+                        "stored_as": a.stored_as,
+                        "reason": a.reason,
+                        "kind": a.kind,
+                    }
+                    for a in check.adjustments
+                ],
+            })
 
     def _row_index_for(self, table_name: str) -> dict[str, int]:
         """Returns the row_id -> positional-index mapping for one table,
@@ -443,9 +663,13 @@ class Dataset:
 
         # If no media files found, create placeholder empty table with one row so the UI has something to show.
         if rows:
-            self._set_table("frames", pd.DataFrame(rows))
+            self._accept_table("frames", pd.DataFrame(rows), source="load_folder")
         else:
-            self._set_table("frames", pd.DataFrame(columns=self.FRAMES_REQUIRED_COLUMNS))
+            self._accept_table(
+                "frames",
+                pd.DataFrame(columns=self.FRAMES_REQUIRED_COLUMNS),
+                source="load_folder",
+            )
 
         
         # Register full_path as media_path — works for images and videos.
@@ -504,7 +728,9 @@ class Dataset:
 
             rows.append(row)
 
-        self._set_table("frames", pd.DataFrame(rows))
+        self._accept_table(
+            "frames", pd.DataFrame(rows), source="load_csv_as_primary"
+        )
 
         if image_column and image_column in csv_df.columns:
             self._register_column("full_path", "media_path")
@@ -655,7 +881,9 @@ class Dataset:
             report: The MergeReport returned by merge_csv().
         """
         if report._pending_df is not None:
-            self._set_table("frames", report._pending_df.copy())
+            self._accept_table(
+                "frames", report._pending_df.copy(), source="confirm_merge"
+            )
 
         for col in report._new_columns:
             if self._registry is not None:
@@ -689,9 +917,11 @@ class Dataset:
             col_type:   Column type tag. Defaults to 'numeric'.
             table_name: Which table to add the column to.
         """
-        df = self._get_stored_table(table_name)
+        # Work on a copy: _accept_table may reject the frame, and a rejection
+        # must leave the stored table untouched (SchemaRejection's contract).
+        df = self._get_stored_table(table_name).copy()
         df[name] = df.eval(expression)
-        self._set_table(table_name, df)
+        self._accept_table(table_name, df, source="add_computed_column")
 
         self._register_column(name, col_type)
         self.provenance.record("add_computed_column", {
@@ -717,9 +947,10 @@ class Dataset:
             col_type:   Column type tag.
             table_name: Table to add the column to.
         """
-        df = self._get_stored_table(table_name)
+        # Work on a copy so a schema rejection leaves the stored table intact.
+        df = self._get_stored_table(table_name).copy()
         df[name] = df["row_id"].map(values)
-        self._set_table(table_name, df)
+        self._accept_table(table_name, df, source="add_column")
         self._register_column(name, col_type)
 
     def update_row(
@@ -773,29 +1004,85 @@ class Dataset:
             (AppController) now accumulates these per operation_id and
             tells the user how many results a run could not place.
         """
+        # Mutate the stored frame in place -- no whole-table copy. This is the
+        # primary write path (once per table per timer tick), and a copy here
+        # would replace the DataFrame object every tick and force the row-id
+        # index to rebuild. For rollback safety on a schema rejection we
+        # snapshot only the columns this call touches: the ones it overwrites
+        # (a Series copy each) and the ones it creates (dropped on rollback).
         df    = self._get_stored_table(table_name)
         index = self._row_index_for(table_name)
 
-        # Create every new column up front so the per-row loop below is
-        # pure positional writes, not repeated column creation.
         touched_columns: set[str] = set()
         for col_updates in updates.values():
             touched_columns.update(col_updates.keys())
-        for col in touched_columns:
-            if col not in df.columns:
-                df[col] = None
-        col_locs = {col: df.columns.get_loc(col) for col in touched_columns}
+        column_snapshot: dict[str, pd.Series] = {
+            col: df[col].copy() for col in touched_columns if col in df.columns
+        }
 
         unplaceable: list[str] = []
-        for row_id, col_updates in updates.items():
-            pos = index.get(row_id)
-            if pos is None:
-                unplaceable.append(row_id)
-                continue
-            for col, val in col_updates.items():
-                df.iat[pos, col_locs[col]] = val
+        created_columns: list[str] = []
+        try:
+            # Column creation, the cell-write loop, infer_objects and the accept
+            # are all inside one try: pandas' own setters raise (a Categorical
+            # rejects a new label with TypeError, a numeric column rejects a
+            # string), and that must degrade exactly like a schema rejection
+            # rather than abort the QTimer drain.
+            for col in touched_columns:
+                if col not in df.columns:
+                    df[col] = None
+                    created_columns.append(col)
+            col_locs = {
+                col: df.columns.get_loc(col) for col in touched_columns
+            }
 
-        self._set_table(table_name, df)
+            for row_id, col_updates in updates.items():
+                pos = index.get(row_id)
+                if pos is None:
+                    unplaceable.append(row_id)
+                    continue
+                for col, val in col_updates.items():
+                    df.iat[pos, col_locs[col]] = val
+
+            # A column this call created was seeded with None and written cell
+            # by cell, so infer_objects is what gives it its real kind (and so
+            # a numeric column carries the "numeric" type tag, not "text").
+            # infer_schema then keeps that dtype -- text stays open, bool stays
+            # bool -- so the only pin still needed is: a whole-number first
+            # batch must not lock a still-being-filled column to an integer
+            # width, because a later drain may carry a decimal. Widen it to
+            # float64.
+            for col in created_columns:
+                series = df[col].infer_objects()
+                if getattr(series.dtype, "kind", None) in ("i", "u"):
+                    df[col] = series.astype("float64")
+                else:
+                    df[col] = series
+
+            self._accept_table(
+                table_name, df, source="apply_row_updates"
+            )
+        except (SchemaRejection, TypeError, ValueError) as exc:
+            # Roll back every in-place edit, including a partial one from a
+            # write loop that failed midway. This stays correct at any point:
+            # a created column is dropped whole no matter how many of its
+            # cells were written, and a snapshot is the column exactly as it
+            # was before this call touched a single cell of it.
+            for col, original in column_snapshot.items():
+                df[col] = original
+            still_created = [c for c in created_columns if c in df.columns]
+            if still_created:
+                df.drop(columns=still_created, inplace=True)
+            # A bad value in an operator's per-row results must not abort the
+            # app: controller.py drains these on a QTimer with no try/except.
+            # Downgrade to "none of this batch could be placed" -- the channel
+            # AppController already uses to report dropped results -- and
+            # record why. Under strict_schema we re-raise, so an operator's own
+            # test still fails loudly: that is the whole point of the flag.
+            if self.strict_schema:
+                raise
+            self._schema_messages.append(str(exc))
+            return list(updates.keys())
         return unplaceable
 
     # ------------------------------------------------------------------
@@ -828,7 +1115,7 @@ class Dataset:
         agg_df["row_id"] = [self._next_id() for _ in range(len(agg_df))]
 
         # Step 3: Store the new table.
-        self._set_table(name, agg_df)
+        self._accept_table(name, agg_df, source="aggregate")
 
         # Step 4: Register the column types for the new table.
         for col in agg_df.columns:
@@ -873,7 +1160,7 @@ class Dataset:
         by_id = source_df.set_index("row_id", drop=False)
         present = [rid for rid in row_ids if rid in by_id.index]
         subset = by_id.loc[present].reset_index(drop=True)
-        self._set_table(name, subset)
+        self._accept_table(name, subset, source="create_table_from_rows")
         self.provenance.record("create_table_from_rows", {
             "name":         name,
             "source_table": source_table,
@@ -901,7 +1188,7 @@ class Dataset:
             "row_id",
             [self._next_id() for _ in range(len(result))],
         )
-        self._set_table(name, result)
+        self._accept_table(name, result, source="create_table_from_df")
 
         if self._registry is not None:
             for col in result.columns:
@@ -919,6 +1206,20 @@ class Dataset:
     # ------------------------------------------------------------------
     # Table access
     # ------------------------------------------------------------------
+
+    def schema_for(self, table_name: str) -> TableSchema | None:
+        """Returns the TableSchema for a stored table, or None if the table
+        was never accepted through _accept_table (e.g. a test assigned it
+        straight into _tables)."""
+        return self._schemas.get(table_name)
+
+    def take_schema_messages(self) -> list[str]:
+        """Returns the accumulated plain-English schema-adjustment notes and
+        clears the list. The third reporting destination for accept-time
+        dtype adjustments, alongside _schema_messages' provenance entry."""
+        messages = self._schema_messages
+        self._schema_messages = []
+        return messages
 
     def get_table(self, name: str = "frames") -> pd.DataFrame:
         """
@@ -1150,7 +1451,21 @@ class Dataset:
         media_cols = {col for col, tag in column_types.items() if tag == "media_path"}
         media_cols.add("full_path")  # fallback if no sidecar (saved without registry)
 
-        new_tables: dict[str, pd.DataFrame] = {}
+        # Clear every table and schema, then accept each parquet table through
+        # the schema path -- the sidecar's media columns become type-tag hints
+        # so a media column is tagged before the registry is repopulated below.
+        self._reset_tables({})
+
+        # Restore the saved provenance log BEFORE the accept loop, so any
+        # "schema_adjustments" entry _accept_table records while loading is
+        # appended to the restored log rather than wiped by a later replace().
+        prov = project_path / "provenance.json"
+        if prov.exists():
+            self.provenance.replace(json.loads(prov.read_text()))
+
+        load_hints = {
+            col: ColumnHint(type_tag="media_path") for col in media_cols
+        }
         unparseable_media_cells = 0
         for path in parquet_files:
             df = pd.read_parquet(path)
@@ -1164,8 +1479,9 @@ class Dataset:
                     )
                     df[col] = new_values
                     unparseable_media_cells += bad
-            new_tables[path.stem] = df
-        self._reset_tables(new_tables)
+            self._accept_table(
+                path.stem, df, source="load", hints=load_hints
+            )
 
         # Restore _id_counter (assumes int-parseable row_id from _next_id()).
         max_id = 0
@@ -1173,10 +1489,6 @@ class Dataset:
             if "row_id" in df.columns and not df.empty:
                 max_id = max(max_id, int(df["row_id"].astype(int).max()))
         self._id_counter = max_id
-
-        prov = project_path / "provenance.json"
-        if prov.exists():
-            self.provenance.replace(json.loads(prov.read_text()))
 
         if self._registry is not None:
             if column_types:
