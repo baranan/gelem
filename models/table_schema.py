@@ -40,6 +40,14 @@ extra check: object is the only text name that can physically hold a non-text
 value, so a column arriving as object against a different text spec is a match
 only if every non-null value in it is actually a Python str.
 
+Serialisation (P1.8c-2a): TableSchema.to_dict() and the module-level
+schema_from_dict() round-trip a schema through plain JSON types so a project
+can save its declared schemas and a later load() can restore them without
+re-inferring. ColumnRole survives by NAME, not by numeric value, so reordering
+the enum later cannot silently change a saved project's meaning. A malformed
+payload -- a missing field, an unknown role name, an unsupported dtype name --
+raises SchemaSerialisationError rather than defaulting silently.
+
 Qt-free. pandas and numpy are permitted here (this is the data layer). This
 module imports nothing from models/dataset.py, controller.py, column_types/ or
 ui/.
@@ -53,6 +61,22 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+
+
+class SchemaSerialisationError(ValueError):
+    """Raised by schema_from_dict() on a malformed serialised schema: a missing
+    ColumnSpec field, a ColumnRole name that no member matches, or a dtype name
+    outside the set this module supports. A subclass of ValueError so a caller
+    that already guards a bad-input path with `except ValueError` still catches
+    it, while a caller that wants the precise case can name this type."""
+
+
+# The five ColumnSpec fields every serialised column entry must carry. A payload
+# missing any of them is malformed -- schema_from_dict raises rather than
+# defaulting the absent field.
+_REQUIRED_SPEC_FIELDS = frozenset(
+    {"name", "type_tag", "dtype", "role", "carry_to_children"}
+)
 
 
 class ColumnRole(enum.Enum):
@@ -120,6 +144,26 @@ class TableSchema:
 
     def columns_with_tag(self, tag: str) -> tuple[ColumnSpec, ...]:
         return tuple(s for s in self.columns if s.type_tag == tag)
+
+    def to_dict(self) -> dict:
+        """Serialise to plain JSON types: a dict with one key, "columns",
+        holding a list of per-column objects in schema order. Every ColumnSpec
+        field is written. ColumnRole is written by NAME ("identifier"), never
+        by value, so that reordering the enum later does not change what a
+        saved project means. schema_from_dict() rebuilds an equal TableSchema
+        from this output."""
+        return {
+            "columns": [
+                {
+                    "name": spec.name,
+                    "type_tag": spec.type_tag,
+                    "dtype": spec.dtype,
+                    "role": spec.role.name,
+                    "carry_to_children": bool(spec.carry_to_children),
+                }
+                for spec in self.columns
+            ]
+        }
 
 
 @dataclass(frozen=True)
@@ -197,6 +241,24 @@ def _is_supported_dtype(dtype) -> bool:
     # Anything else must be a plain numpy dtype of a numeric or bool kind -- a
     # nullable extension dtype (Int64, ...) is not a numpy dtype and is refused.
     return isinstance(dtype, np.dtype) and kind in ("i", "u", "f", "b")
+
+
+def _is_supported_dtype_name(name: str) -> bool:
+    """True when `name` is a dtype string schema_from_dict is willing to
+    rebuild. The three text dtype names are one storage kind (see
+    _TEXT_DTYPE_NAMES) and are accepted directly, because pandas cannot always
+    parse "str" into a dtype object. Every other name is parsed to a dtype and
+    then checked by the same _is_supported_dtype gate the accept path uses, so
+    the serialised set and the accepted set stay identical."""
+    if not isinstance(name, str):
+        return False
+    if name in _TEXT_DTYPE_NAMES:
+        return True
+    try:
+        dt = pd.api.types.pandas_dtype(name)
+    except TypeError:
+        return False
+    return _is_supported_dtype(dt)
 
 
 def _kind_of(dtype_name: str) -> str:
@@ -563,3 +625,88 @@ def infer_schema(
         )
 
     return TableSchema(columns=tuple(specs))
+
+
+def schema_from_dict(data) -> TableSchema:
+    """Rebuild a TableSchema from the plain-dict form TableSchema.to_dict()
+    produces. The inverse of to_dict: column order is preserved and every
+    ColumnSpec field is restored, ColumnRole by name.
+
+    A malformed payload raises SchemaSerialisationError rather than silently
+    filling in a default. Three cases are checked explicitly, one message each:
+      * a column entry missing any of the five ColumnSpec fields;
+      * a role string that names no ColumnRole member;
+      * a dtype string outside the set this module supports
+        (see _is_supported_dtype_name).
+    """
+    # The top-level shape: a mapping carrying a "columns" list.
+    if not isinstance(data, Mapping) or "columns" not in data:
+        raise SchemaSerialisationError(
+            "serialised schema is missing the 'columns' key"
+        )
+    raw_columns = data["columns"]
+    if not isinstance(raw_columns, (list, tuple)):
+        raise SchemaSerialisationError(
+            "serialised schema's 'columns' must be a list"
+        )
+
+    specs: list[ColumnSpec] = []
+    for position, entry in enumerate(raw_columns):
+        if not isinstance(entry, Mapping):
+            raise SchemaSerialisationError(
+                f"column entry at position {position} is not an object"
+            )
+
+        # Every field must be present -- a missing one is malformed, never a
+        # default.
+        missing = _REQUIRED_SPEC_FIELDS - set(entry)
+        if missing:
+            raise SchemaSerialisationError(
+                f"column entry at position {position} is missing field(s) "
+                f"{sorted(missing)}"
+            )
+
+        # name and type_tag must be strings. schemas.json is a file a person
+        # can hand-edit, so a number or null where a name belongs is a
+        # malformed payload, not something to coerce with str().
+        for field_name in ("name", "type_tag"):
+            if not isinstance(entry[field_name], str):
+                raise SchemaSerialisationError(
+                    f"column entry at position {position} has a non-string "
+                    f"{field_name}: {entry[field_name]!r}"
+                )
+
+        # ColumnRole is restored by name. An unknown name is refused, not
+        # coerced to a default role.
+        role_name = entry["role"]
+        if role_name not in ColumnRole.__members__:
+            raise SchemaSerialisationError(
+                f"column entry at position {position} has unknown ColumnRole "
+                f"name {role_name!r}"
+            )
+
+        # The dtype name must be one the module can actually store and check.
+        dtype_name = entry["dtype"]
+        if not _is_supported_dtype_name(dtype_name):
+            raise SchemaSerialisationError(
+                f"column entry at position {position} has unsupported dtype "
+                f"name {dtype_name!r}"
+            )
+
+        specs.append(
+            ColumnSpec(
+                name=entry["name"],
+                type_tag=entry["type_tag"],
+                dtype=dtype_name,
+                role=ColumnRole[role_name],
+                carry_to_children=bool(entry["carry_to_children"]),
+            )
+        )
+
+    # TableSchema construction rejects a duplicate column name with a plain
+    # ValueError; a corrupted payload is still a malformed payload, so re-raise
+    # it under the one named type this function promises.
+    try:
+        return TableSchema(columns=tuple(specs))
+    except ValueError as exc:
+        raise SchemaSerialisationError(str(exc)) from exc

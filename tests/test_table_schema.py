@@ -6,6 +6,8 @@ controller. Written from docs/architecture.md §4.2 / §4.3 and the P1.8a spec
 (as corrected), not from the implementation.
 """
 
+import json
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -15,10 +17,12 @@ from models.table_schema import (
     ColumnHint,
     ColumnRole,
     ColumnSpec,
+    SchemaSerialisationError,
     TableSchema,
     check_frame,
     infer_schema,
     normalise_frame,
+    schema_from_dict,
 )
 
 
@@ -671,3 +675,110 @@ def test_schema_queries():
     assert {s.name for s in schema.columns_with_tag("media_address")} == {"frame_address"}
     with pytest.raises(KeyError):
         schema.spec_for("nope")
+
+
+# --- serialisation (P1.8c-2a) ------------------------------------------------
+
+
+def _every_kind_schema() -> TableSchema:
+    """One schema exercising every supported dtype kind, a non-default
+    ColumnRole, and carry_to_children both True and False."""
+    return TableSchema(
+        columns=(
+            # identifier role, carry irrelevant (identifiers are always carried)
+            ColumnSpec("participant_id", "text", "object", ColumnRole.identifier, False),
+            # index role
+            ColumnSpec("frame_index", "numeric", "int64", ColumnRole.index, True),
+            # narrow integer storage, measurement carried
+            ColumnSpec("count8", "numeric", "int32", ColumnRole.measurement, True),
+            # float storage, measurement NOT carried
+            ColumnSpec("score", "numeric", "float32", ColumnRole.measurement, False),
+            # bool
+            ColumnSpec("is_ok", "boolean_flag", "bool", ColumnRole.measurement, True),
+            # categorical text
+            ColumnSpec("condition", "text", "category", ColumnRole.measurement, False),
+            # the pandas >= 3 default text dtype name
+            ColumnSpec("notes", "text", "str", ColumnRole.measurement, True),
+            # a media address, stored as object text
+            ColumnSpec("clip", "media_address", "object", ColumnRole.measurement, True),
+        )
+    )
+
+
+# Round trip: to_dict then schema_from_dict rebuilds an equal TableSchema, for
+# every supported dtype kind, a non-default role, and carry_to_children both
+# ways.
+def test_to_dict_round_trips_through_schema_from_dict():
+    original = _every_kind_schema()
+
+    rebuilt = schema_from_dict(original.to_dict())
+
+    assert rebuilt == original
+    # spell out the two fields the spec calls out, so an == that somehow
+    # passed on identity would still not hide a role or carry regression
+    assert rebuilt.spec_for("participant_id").role is ColumnRole.identifier
+    assert rebuilt.spec_for("frame_index").role is ColumnRole.index
+    assert rebuilt.spec_for("score").carry_to_children is False
+    assert rebuilt.spec_for("notes").carry_to_children is True
+    # column order is preserved
+    assert rebuilt.column_names() == original.column_names()
+
+
+# The output is genuinely JSON-serialisable -- asserted directly so a tuple, an
+# enum object or a numpy scalar cannot slip through unnoticed.
+def test_to_dict_output_is_json_serialisable():
+    data = _every_kind_schema().to_dict()
+
+    # Must not raise. round-tripping the JSON text back must also rebuild an
+    # equal schema, proving nothing was lost to str().
+    text = json.dumps(data)
+    assert schema_from_dict(json.loads(text)) == _every_kind_schema()
+
+
+# ColumnRole survives by NAME, not by numeric value: a payload written with the
+# name rebuilds correctly even though the enum has no stable numeric value.
+def test_role_survives_by_name():
+    data = _every_kind_schema().to_dict()
+    assert data["columns"][0]["role"] == "identifier"
+    assert all(isinstance(c["role"], str) for c in data["columns"])
+
+
+# schema_from_dict raises the named error on a missing field.
+def test_schema_from_dict_raises_on_missing_field():
+    data = _every_kind_schema().to_dict()
+    del data["columns"][1]["carry_to_children"]
+    with pytest.raises(SchemaSerialisationError):
+        schema_from_dict(data)
+
+
+# schema_from_dict raises the named error on an unknown role name.
+def test_schema_from_dict_raises_on_unknown_role_name():
+    data = _every_kind_schema().to_dict()
+    data["columns"][0]["role"] = "supervisor"
+    with pytest.raises(SchemaSerialisationError):
+        schema_from_dict(data)
+
+
+# schema_from_dict raises the named error on an unsupported dtype name.
+def test_schema_from_dict_raises_on_unsupported_dtype_name():
+    data = _every_kind_schema().to_dict()
+    data["columns"][1]["dtype"] = "datetime64[ns]"
+    with pytest.raises(SchemaSerialisationError):
+        schema_from_dict(data)
+
+
+# schema_from_dict raises the named error on a non-string column name -- a
+# hand-edited schemas.json is not trusted to str() its way out.
+def test_schema_from_dict_raises_on_non_string_name():
+    data = _every_kind_schema().to_dict()
+    data["columns"][0]["name"] = 123
+    with pytest.raises(SchemaSerialisationError):
+        schema_from_dict(data)
+
+
+# schema_from_dict raises the named error on a non-string type_tag.
+def test_schema_from_dict_raises_on_non_string_type_tag():
+    data = _every_kind_schema().to_dict()
+    data["columns"][0]["type_tag"] = None
+    with pytest.raises(SchemaSerialisationError):
+        schema_from_dict(data)

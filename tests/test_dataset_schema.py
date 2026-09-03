@@ -7,13 +7,20 @@ Dataset and pandas -- no Qt, no controller.
 """
 
 import ast
+import json
 import pathlib
 
 import pandas as pd
 import pytest
 
 from models.dataset import Dataset, SchemaRejection, _SCHEMA_EXEMPT_COLUMNS
-from models.table_schema import ColumnHint
+from models.table_schema import (
+    ColumnHint,
+    ColumnRole,
+    ColumnSpec,
+    TableSchema,
+    schema_from_dict,
+)
 
 REPO = pathlib.Path(__file__).parent.parent
 TEST_IMAGES = REPO / "test_images"
@@ -721,3 +728,78 @@ def test_a_column_the_frame_no_longer_has_is_dropped_not_rejected():
         source="second",
     )
     assert ds.schema_for("t").column_names() == ("a",)
+
+
+# ---------------------------------------------------------------------------
+# P1.8c-2a -- save() writes schemas.json; _accept_table accepts a declared schema
+# ---------------------------------------------------------------------------
+
+def test_save_writes_schemas_json_that_rebuilds_each_stored_schema(tmp_path):
+    # A Dataset holding more than one stored table, each with a real schema.
+    ds = _ds_with_frames(tmp_path)
+    ds.aggregate("agg", "frames", "subject", {"score": "mean"})
+    ds.create_table_from_df("built", pd.DataFrame({"z": [1, 2, 3]}))
+
+    proj = tmp_path / "proj"
+    ds.save(proj)
+
+    # schemas.json exists and round-trips: it carries its own integer format
+    # version, and rebuilding each table's serialised schema out of the
+    # "schemas" mapping yields exactly the schema Dataset still holds in memory.
+    on_disk = json.loads((proj / "schemas.json").read_text())
+    assert on_disk["format_version"] == 1
+    assert set(on_disk["schemas"]) == {"frames", "agg", "built"}
+    for table in ("frames", "agg", "built"):
+        rebuilt = schema_from_dict(on_disk["schemas"][table])
+        assert rebuilt == ds.schema_for(table), table
+
+    # The parquet files are still there -- schemas.json is an addition, not a
+    # replacement.
+    assert {p.stem for p in proj.glob("*.parquet")} == {"frames", "agg", "built"}
+
+
+def test_accept_table_with_declared_schema_beats_inference_and_drops_missing(tmp_path):
+    ds = Dataset()
+
+    # The declared schema names 'k' (as an identifier, NOT the measurement
+    # inference would pick) and 'gone' (which the frame will not carry).
+    declared = TableSchema(
+        columns=(
+            ColumnSpec("k", "numeric", "int64", ColumnRole.identifier, False),
+            ColumnSpec("gone", "numeric", "int64", ColumnRole.measurement, True),
+        )
+    )
+    df = pd.DataFrame(
+        {
+            "row_id": ["1", "2"],
+            "k": pd.Series([10, 20], dtype="int64"),
+            "extra": pd.Series([1.5, 2.5], dtype="float64"),
+        }
+    )
+
+    ds._accept_table("t", df, schema=declared, source="test")
+    got = ds.schema_for("t")
+
+    # 'k' keeps the declared spec, not an inferred one.
+    assert got.spec_for("k").role is ColumnRole.identifier
+    assert got.spec_for("k").carry_to_children is False
+    # 'extra' is in the frame but not named by the declared schema -> inferred.
+    assert got.spec_for("extra").role is ColumnRole.measurement
+    assert got.spec_for("extra").carry_to_children is True
+    # 'gone' is named by the declared schema but absent from the frame ->
+    # dropped, not a rejection.
+    assert "gone" not in got.column_names()
+    assert got.column_names() == ("k", "extra")
+
+
+def test_accept_table_without_declared_schema_is_unchanged(tmp_path):
+    # schema=None must be byte-for-byte the old behaviour. The whole rest of
+    # this file already exercises that path (no test passes schema=), and
+    # test_named_column_keeps_its_stored_spec_across_accepts in particular
+    # asserts spec resolution through _accept_table with no schema= argument.
+    # This case just pins that the default really is None.
+    import inspect
+
+    sig = inspect.signature(Dataset._accept_table)
+    assert sig.parameters["schema"].default is None
+    assert sig.parameters["schema"].kind is inspect.Parameter.KEYWORD_ONLY

@@ -464,6 +464,7 @@ class Dataset:
         df: pd.DataFrame,
         *,
         hints: dict[str, ColumnHint] | None = None,
+        schema: TableSchema | None = None,
         source: str = "",
     ) -> None:
         """The one place a stored table's schema is decided. Every site that
@@ -473,11 +474,15 @@ class Dataset:
         a. row_id (and any other _SCHEMA_EXEMPT_COLUMNS member) is not part of
            any schema.
         b. Build the schema to check against from the FRAME's non-exempt
-           columns, in the frame's own order: a column the stored schema
-           already names keeps its stored ColumnSpec unchanged; a column the
-           stored schema does not name gets a spec inferred from the frame; a
-           column the stored schema names but the frame no longer has is simply
-           dropped (not a rejection).
+           columns, in the frame's own order. The ColumnSpec for a column is
+           resolved against the AUTHORITATIVE schema -- the `schema` argument
+           when one is given (load() passes the schema it read off disk), else
+           the schema already stored for this table. A column the
+           authoritative schema names keeps that ColumnSpec unchanged; a
+           column it does not name gets a spec inferred from the frame; a
+           column it names but the frame no longer carries is simply dropped
+           (not a rejection). When `schema` is None the authoritative schema
+           is exactly the stored one, so behaviour is unchanged.
         c./d. check_frame; a non-empty rejection list means the frame is not
            stored -- raise SchemaRejection naming the table, the source and
            every rejection.
@@ -502,9 +507,13 @@ class Dataset:
 
         frame_for_schema = df[schema_columns]
 
-        stored = self._schemas.get(table_name)
+        # The authoritative source of already-decided ColumnSpecs: an explicit
+        # declared schema (load() will pass this next item) wins over anything
+        # previously stored; with no declared schema this is the stored schema
+        # and the path is byte-for-byte what it was before.
+        authoritative = schema if schema is not None else self._schemas.get(table_name)
         stored_names = (
-            set(stored.column_names()) if stored is not None else set()
+            set(authoritative.column_names()) if authoritative is not None else set()
         )
         new_columns = [c for c in schema_columns if c not in stored_names]
 
@@ -534,12 +543,15 @@ class Dataset:
         specs = []
         for name in schema_columns:
             if name in stored_names:
-                specs.append(stored.spec_for(name))
+                specs.append(authoritative.spec_for(name))
             else:
                 specs.append(inferred_by_name[name])
-        schema = TableSchema(columns=tuple(specs))
+        # Named to keep it distinct from the `schema` PARAMETER above: this is
+        # the schema built for THIS frame, which becomes the table's stored
+        # schema below.
+        built_schema = TableSchema(columns=tuple(specs))
 
-        check = check_frame(frame_for_schema, schema)
+        check = check_frame(frame_for_schema, built_schema)
 
         if check.rejections:
             raise SchemaRejection(
@@ -569,7 +581,7 @@ class Dataset:
             # and leave the caller's untouched.
             out = df.copy()
             normalised = normalise_frame(
-                frame_for_schema, schema, check=check
+                frame_for_schema, built_schema, check=check
             )
             for adjustment in check.adjustments:
                 out[adjustment.column] = normalised[adjustment.column]
@@ -581,7 +593,7 @@ class Dataset:
             # what keeps apply_row_updates' row-id index stamp valid.
             out = df
         self._set_table(table_name, out)
-        self._schemas[table_name] = schema
+        self._schemas[table_name] = built_schema
 
         for adjustment in check.adjustments:
             self._schema_messages.append(
@@ -1402,6 +1414,33 @@ class Dataset:
                     df_out[col] = new_values
                     unparseable_media_cells += bad
             df_out.to_parquet(project_path / f"{name}.parquet")
+
+        # Store each stored table's declared TableSchema (roles,
+        # carry_to_children, dtypes, column order) so a future load() can
+        # restore it exactly instead of re-inferring. A table assigned
+        # straight into _tables by a test has no schema (schema_for() returns
+        # None) and is simply left out.
+        # P1.8c-2a writes this file; making load() read it is the next item.
+        table_schemas = {}
+        for name in self._tables:
+            schema = self.schema_for(name)
+            if schema is not None:
+                table_schemas[name] = schema.to_dict()
+        if table_schemas:
+            # The file carries an integer format version of its own, next to
+            # the per-table schemas. It belongs to the FILE, not to
+            # TableSchema.to_dict() -- that is a value object and must not know
+            # it is being written to disk. The version exists so that if a
+            # later Gelem changes the schema encoding, load() can detect an
+            # older file by its version and re-infer that project rather than
+            # refuse to open it.
+            schemas_file = {
+                "format_version": 1,
+                "schemas": table_schemas,
+            }
+            (project_path / "schemas.json").write_text(
+                json.dumps(schemas_file, indent=2)
+            )
 
         # Store the column -> tag map so load() restores types exactly.
         if self._registry is not None:
