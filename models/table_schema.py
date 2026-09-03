@@ -31,6 +31,15 @@ timezone-aware datetime, or a pandas nullable extension dtype (Int64, string,
 ...) is refused with a named rejection -- an honest "not supported yet" beats a
 silent fall-through into a path nobody has checked. See _is_supported_dtype.
 
+For a text column the dtype name is informational: the three pandas text dtype
+names (numpy object, the StringDtype "string", and the pandas >= 3 default
+"str") are one storage kind, so comparison is by kind -- check_frame treats a
+text column arriving under one name against a schema declaring another as an
+exact match and never records a conversion between two text names. The one
+extra check: object is the only text name that can physically hold a non-text
+value, so a column arriving as object against a different text spec is a match
+only if every non-null value in it is actually a Python str.
+
 Qt-free. pandas and numpy are permitted here (this is the data layer). This
 module imports nothing from models/dataset.py, controller.py, column_types/ or
 ui/.
@@ -148,13 +157,22 @@ class SchemaCheck:
         return not self.rejections
 
 
+# The three names pandas 3 uses for a text column: numpy object, the StringDtype
+# ("string"), and the pandas >= 3 default for a bare text column ("str"). They
+# are ONE storage kind for schema purposes -- none is narrower than another and
+# no value is lost moving between them -- so a text column arriving under one
+# name against a schema that declares another is an exact match, not a
+# conversion. This is the module's single list of text dtype names: everything
+# else that needs to know them (_PANDAS_DEFAULT_DTYPES below, _kind_of, and
+# check_frame's exact-match short-circuit) reads this constant.
+_TEXT_DTYPE_NAMES = frozenset({"object", "string", "str"})
+
 # pandas' default dtype per kind, and the narrow storage dtypes §4.3 declares.
 # A conversion from the first set to the second is "storage_policy"; every other
-# exact conversion is "unexpected". "str"/"string" are here because pandas >= 3
-# gives a bare text column a string dtype, not numpy object, by default.
-_PANDAS_DEFAULT_DTYPES = frozenset(
-    {"int64", "float64", "object", "bool", "str", "string"}
-)
+# exact conversion is "unexpected". The text names are folded in from
+# _TEXT_DTYPE_NAMES because pandas >= 3 gives a bare text column a string dtype,
+# not numpy object, by default.
+_PANDAS_DEFAULT_DTYPES = frozenset({"int64", "float64", "bool"}) | _TEXT_DTYPE_NAMES
 _NARROW_STORAGE_DTYPES = frozenset({"int32", "int16", "int8", "float32", "category"})
 
 
@@ -183,13 +201,22 @@ def _is_supported_dtype(dtype) -> bool:
 
 def _kind_of(dtype_name: str) -> str:
     """Coarse kind of a dtype: "bool", "number" or "text". Crossing kinds is
-    always a rejection, whatever the values."""
+    always a rejection, whatever the values. The three pandas text dtype names
+    (_TEXT_DTYPE_NAMES -- the module's one list of them) are kind "text"."""
+    # Read the single list of text dtype names rather than re-deriving "text"
+    # only as a fall-through: the three names are one kind by the rule stated
+    # on _TEXT_DTYPE_NAMES.
+    if dtype_name in _TEXT_DTYPE_NAMES:
+        return "text"
     dt = pd.api.types.pandas_dtype(dtype_name)
     # bool is numeric to pandas, so it must be tested first.
     if pd.api.types.is_bool_dtype(dt):
         return "bool"
     if pd.api.types.is_numeric_dtype(dt):
         return "number"
+    # Categorical (and any other non-bool, non-numeric dtype that reaches here)
+    # groups as "text" too: it converts from text without loss, so it must not
+    # trip the crossing-kind gate. Categorical behaviour is unchanged by P1.8c-1.
     return "text"
 
 
@@ -233,6 +260,19 @@ def _round_trip_survivors(original: pd.Series, target_dtype: str):
         return True, None, None, None
     pos = int(bad[0])
     return False, pos, original.iloc[pos], back.iloc[pos]
+
+
+def _object_column_is_all_text(series: pd.Series) -> bool:
+    """True when every non-null value in an object-dtype Series is a Python str.
+
+    Nulls are skipped -- a text column with missing values is still text -- and
+    an empty column or an all-null column is text by default. This is one
+    C-level pass through pandas' infer_dtype, not a Python loop over cells:
+    infer_dtype(..., skipna=True) returns "string" only when every non-null
+    value is a str, and "empty" when there is nothing non-null to judge.
+    """
+    contents = pd.api.types.infer_dtype(series, skipna=True)
+    return contents in ("string", "empty")
 
 
 def check_frame(df: pd.DataFrame, schema: TableSchema) -> SchemaCheck:
@@ -301,6 +341,32 @@ def check_frame(df: pd.DataFrame, schema: TableSchema) -> SchemaCheck:
 
         arrived = str(frame_dtype)
         if arrived == stored:
+            continue
+
+        # Two DIFFERENT pandas text dtype names are still an exact match: the
+        # names in _TEXT_DTYPE_NAMES are one storage kind (see the rule stated
+        # there), so a text column arriving as e.g. "str" against a schema that
+        # declares "object" has lost nothing. No Adjustment, and
+        # _round_trip_survivors is never called for this column.
+        if arrived in _TEXT_DTYPE_NAMES and stored in _TEXT_DTYPE_NAMES:
+            # object is the ONLY one of the three text names that can hold
+            # values which are not text -- numpy object stores arbitrary
+            # Python objects. So when a column arrives as object against a
+            # DIFFERENT text spec, confirm its contents really are text before
+            # accepting the name difference as free; if any non-null value is
+            # not a Python str the column is declared as text but does not hold
+            # text, and that is a rejection.
+            #
+            # The scan is skipped in the two cases it could only waste work:
+            #   - arrived == stored: handled by the line above, nothing differs;
+            #   - arrived is "str" or "string": those dtypes cannot store a
+            #     non-str value, so the scan would always pass.
+            if arrived == "object" and not _object_column_is_all_text(df[name]):
+                rejections.append(
+                    f"column {name!r}: arrived as object and is declared as "
+                    f"text (schema dtype {stored!r}), but holds values that "
+                    f"are not text"
+                )
             continue
 
         # Step 1: crossing kinds is always a rejection; values are never

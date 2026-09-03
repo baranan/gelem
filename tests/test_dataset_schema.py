@@ -642,6 +642,67 @@ def test_apply_row_updates_does_not_rebuild_the_row_id_index(monkeypatch, tmp_pa
 
 
 # ---------------------------------------------------------------------------
+# P1.8c-1 -- a text column re-typed between pandas' text dtype names is an
+#            exact match, even under strict_schema
+# ---------------------------------------------------------------------------
+
+def test_text_column_retyped_between_pandas_text_names_is_not_an_adjustment():
+    # The P1.8c gate case, at the Dataset seam: a stored schema names a text
+    # column "object"; the same column later arrives as pandas "str" (which is
+    # what a parquet round trip produces on pandas 3). Under strict_schema --
+    # the whole suite -- this must be an exact match: no SchemaRejection and no
+    # recorded schema message, because the three pandas text dtype names are one
+    # storage kind. Without the P1.8c-1 clause this raised SchemaRejection
+    # (str->object classifies "unexpected", which strict mode refuses).
+    ds = Dataset()
+    ds.strict_schema = True
+
+    df1 = pd.DataFrame(
+        {"row_id": ["1", "2"], "note": pd.Series(["a", "b"], dtype="object")}
+    )
+    ds._accept_table("t", df1, source="first")
+    assert ds.schema_for("t").spec_for("note").dtype == "object"
+    ds.take_schema_messages()  # drain anything from the first accept
+
+    df2 = pd.DataFrame(
+        {"row_id": ["1", "2"], "note": pd.Series(["a", "b"], dtype="str")}
+    )
+    ds._accept_table("t", df2, source="second")  # must not raise
+
+    assert ds.take_schema_messages() == []
+    assert ds.schema_for("t").spec_for("note").dtype == "object"
+    assert list(ds.read_only_view("t")["note"]) == ["a", "b"]
+
+
+def test_object_column_of_non_strings_against_a_str_spec_raises(tmp_path):
+    # Amended rule: on pandas 3 every imported text column carries a "str"
+    # spec, so the guard has to bite there. A column that later arrives as
+    # object holding integers is declared as text but does not hold text --
+    # _accept_table must raise SchemaRejection (strict on or off) and leave the
+    # stored table untouched.
+    ds = Dataset()
+    ds.strict_schema = True
+
+    df1 = pd.DataFrame(
+        {"row_id": ["1", "2", "3"],
+         "note": pd.Series(["a", "b", "c"], dtype="str")}
+    )
+    ds._accept_table("t", df1, source="first")
+    assert ds.schema_for("t").spec_for("note").dtype == "str"
+    before = ds.read_only_view("t").copy()
+
+    df2 = pd.DataFrame(
+        {"row_id": ["1", "2", "3"],
+         "note": pd.Series([1, 2, 3], dtype="object")}
+    )
+    with pytest.raises(SchemaRejection) as exc:
+        ds._accept_table("t", df2, source="second")
+    assert "note" in str(exc.value)
+
+    pd.testing.assert_frame_equal(ds.read_only_view("t"), before)
+
+
+# ---------------------------------------------------------------------------
 # a dropped column is not a rejection
 # ---------------------------------------------------------------------------
 

@@ -200,6 +200,169 @@ def test_object_to_category_is_storage_policy():
     assert check.adjustments[0].kind == "storage_policy"
 
 
+# --- P1.8c-1: the three pandas text dtype names are one storage kind --------
+
+
+# The three names pandas 3 uses for a text column. Built here from real Series
+# so the test is exercising what this machine's pandas actually produces, not a
+# guess: object (numpy), string (StringDtype), str (the pandas >= 3 default).
+_TEXT_NAME_SERIES = {
+    "object": pd.Series(["a", "b", "a", "c"], dtype="object"),
+    "string": pd.Series(["a", "b", "a", "c"], dtype="string"),
+    "str": pd.Series(["a", "b", "a", "c"], dtype="str"),
+}
+_TEXT_NAMES = tuple(_TEXT_NAME_SERIES)
+
+
+@pytest.mark.parametrize("arrived_name", _TEXT_NAMES)
+@pytest.mark.parametrize("stored_name", _TEXT_NAMES)
+def test_all_nine_text_name_pairs_are_an_exact_match(arrived_name, stored_name):
+    # A frame column arriving under one pandas text dtype name, checked against
+    # a schema spec that declares another, is an exact match: no rejection and
+    # no Adjustment of any kind. This covers all nine ordered pairs, the three
+    # same-name ones included (those are caught by the plain `arrived == stored`
+    # line; the six cross-name ones are what the P1.8c-1 clause added).
+    df = pd.DataFrame({"col": _TEXT_NAME_SERIES[arrived_name].copy()})
+    schema = _schema_for_col(stored_name)
+
+    check = check_frame(df, schema)
+
+    assert check.rejections == (), (
+        f"{arrived_name} against {stored_name} rejected: {check.rejections}"
+    )
+    assert check.adjustments == (), (
+        f"{arrived_name} against {stored_name} recorded an adjustment: "
+        f"{check.adjustments}"
+    )
+
+
+@pytest.mark.parametrize("arrived_name", _TEXT_NAMES)
+@pytest.mark.parametrize("stored_name", _TEXT_NAMES)
+def test_normalise_frame_leaves_a_text_name_mismatch_untouched(
+    arrived_name, stored_name
+):
+    # normalise_frame returns the column with BOTH its dtype name and its values
+    # exactly as they arrived, for every text-name pair. This passes because
+    # check_frame records NO Adjustment for a text-name mismatch (the P1.8c-1
+    # clause), so normalise_frame's adjustment loop has nothing to apply -- NOT
+    # because normalise_frame special-cases text. There is deliberately no
+    # text guard in normalise_frame; a guard there would be unreachable code.
+    original = _TEXT_NAME_SERIES[arrived_name].copy()
+    df = pd.DataFrame({"col": original})
+    schema = _schema_for_col(stored_name)
+
+    out = normalise_frame(df, schema)
+
+    assert out is not df
+    assert str(out["col"].dtype) == arrived_name
+    assert list(out["col"]) == list(original)
+
+
+# Categorical is NOT a text dtype for this purpose: a text column against a
+# schema that declares "category" is still a real conversion, classified
+# storage_policy, exactly as before P1.8c-1. This guards that the text-name
+# clause did not move categorical.
+def test_category_hint_still_produces_a_storage_policy_adjustment():
+    df = pd.DataFrame({"col": pd.Series(["x", "x", "y"])})
+    schema = infer_schema(df, hints={"col": ColumnHint(dtype="category")})
+
+    check = check_frame(df, schema)
+
+    assert check.rejections == ()
+    assert len(check.adjustments) == 1
+    assert check.adjustments[0].kind == "storage_policy"
+    assert check.adjustments[0].stored_as == "category"
+
+
+# --- P1.8c-1 amended rule: an object column against a different text spec ---
+#     is a match only if its contents are actually text ----------------------
+
+
+@pytest.mark.parametrize("spec_name", ["str", "string"])
+def test_object_column_of_non_strings_is_rejected_against_a_text_spec(spec_name):
+    # object is the only text dtype name that can physically hold a non-str
+    # value. A column that arrives as object but carries [1, True, 2], checked
+    # against a schema that declares a DIFFERENT text name, is declared as text
+    # and does not hold text -- a rejection, no Adjustment, message names the
+    # column.
+    df = pd.DataFrame({"col": pd.Series([1, True, 2], dtype="object")})
+    check = check_frame(df, _schema_for_col(spec_name))
+
+    assert check.adjustments == ()
+    assert len(check.rejections) == 1
+    assert "col" in check.rejections[0]
+    assert "not text" in check.rejections[0]
+
+
+def test_object_column_of_strings_with_missing_values_is_a_match():
+    # Nulls are skipped: a text column with missing values is still text.
+    df = pd.DataFrame({"col": pd.Series(["a", None, "c"], dtype="object")})
+    check = check_frame(df, _schema_for_col("str"))
+
+    assert check.rejections == ()
+    assert check.adjustments == ()
+
+
+def test_object_column_all_null_or_empty_is_a_match():
+    # Nothing non-null to judge -> text by default, for both an all-null column
+    # and an empty one.
+    all_null = pd.DataFrame({"col": pd.Series([None, None], dtype="object")})
+    empty = pd.DataFrame({"col": pd.Series([], dtype="object")})
+
+    for df in (all_null, empty):
+        check = check_frame(df, _schema_for_col("string"))
+        assert check.rejections == (), check.rejections
+        assert check.adjustments == ()
+
+
+def test_str_and_string_dtype_columns_skip_the_contents_scan(monkeypatch):
+    # A str-dtype or string-dtype column cannot hold a non-str value, so the
+    # contents scan must not run for it. Proven with a spy on
+    # _object_column_is_all_text: it is looked up as a module global inside
+    # check_frame, so a monkeypatched replacement is observed.
+    import models.table_schema as tsmod
+
+    calls: list = []
+    real = tsmod._object_column_is_all_text
+
+    def spy(series):
+        calls.append(series)
+        return real(series)
+
+    monkeypatch.setattr(tsmod, "_object_column_is_all_text", spy)
+
+    df_str = pd.DataFrame({"col": pd.Series(["a", "b", "c"], dtype="str")})
+    check_str = check_frame(df_str, _schema_for_col("object"))
+    df_string = pd.DataFrame({"col": pd.Series(["a", "b", "c"], dtype="string")})
+    check_string = check_frame(df_string, _schema_for_col("str"))
+
+    assert calls == [], "the contents scan ran for a str/string-dtype column"
+    assert check_str.rejections == () and check_str.adjustments == ()
+    assert check_string.rejections == () and check_string.adjustments == ()
+
+
+def test_object_spec_matching_object_frame_does_not_scan(monkeypatch):
+    # arrived == stored == "object": the plain equality line short-circuits
+    # before the text clause, so the contents scan never runs -- unchanged
+    # pre-existing behaviour, an object column against an "object" spec was
+    # never value-inspected.
+    import models.table_schema as tsmod
+
+    calls: list = []
+    monkeypatch.setattr(
+        tsmod,
+        "_object_column_is_all_text",
+        lambda series: calls.append(series) or True,
+    )
+
+    df = pd.DataFrame({"col": pd.Series([1, 2, 3], dtype="object")})
+    check = check_frame(df, _schema_for_col("object"))
+
+    assert calls == []
+    assert check.rejections == ()
+    assert check.adjustments == ()
+
+
 # --- structural checks -----------------------------------------------------
 
 
