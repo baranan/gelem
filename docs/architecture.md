@@ -151,8 +151,11 @@ in an R data frame:
 The identifying columns of the source are carried down; the operator adds its own
 index. Analyses group and join on those columns.
 
-**What gets carried down** `[TARGET -> P1.8]` -- this must be answered before P1.6,
-or every splitting operator will guess differently.
+**What gets carried down** `[TARGET -> P1.6]` -- this must be answered before the
+segment and frame operators, or every splitting operator will guess differently.
+P1.8 built the `TableSchema` container -- the `role` and `carry_to_children`
+fields exist on it -- but did not decide these semantics, and nothing in the code
+sets or reads either field yet.
 
 **Two independent properties.** An earlier revision derived carry-down from the
 role and got it badly wrong; see the correction note below.
@@ -214,7 +217,9 @@ dataset with no metadata at all retains the link to its source file.
 
 ### 4.3 Schemas
 
-`[TARGET -> P1.8]` Each table has a **`TableSchema`** owned by Dataset:
+`[NOW]` for the accept path, project save and load; `[TARGET -> P1.12]` for an
+operator that declares its own output schema. Each table has a **`TableSchema`**
+owned by Dataset:
 
 - column name
 - type tag (`media_address`, `numeric`, `text`, `boolean_flag`, ...)
@@ -223,6 +228,11 @@ dataset with no metadata at all retains the link to its source file.
 - **`carry_to_children`** -- whether a splitting operator copies this column onto
   derived rows. Separate from `role`, because a trial-level measurement such as
   reaction time is both a measurement and essential on every frame row (§4.2).
+
+The `role` and `carry_to_children` fields exist on the `TableSchema` value
+object, but nothing in the code sets or reads either one yet: every column is a
+`measurement` by default, §4.2 is the authority for what carrying down should
+mean, and those semantics are still an open decision -- not settled here.
 
 `ColumnTypeRegistry` maps a **type tag** to its renderer, filter control, and
 display rules. It does not store what type a named column is.
@@ -240,11 +250,44 @@ repeated strings. Explicit exceptions: presentation timestamps, sample positions
 frame ordinals and counters need int64 or float64, and truncating them to 32 bits
 would corrupt time.
 
+`[NOW]` **Inference never narrows.** On an import path -- CSV import, folder
+load, merge -- nothing is declared, so `infer_schema` keeps the dtype each
+column arrived in: `int64` stays `int64`, `float64` stays `float64`, `bool`
+stays `bool`, a text column keeps its arrival text dtype, and a column that
+arrived categorical keeps `category`. The narrow defaults just above (float32, int32,
+categorical) are guidance for whoever *declares* a schema -- an operator that
+creates a table -- and do not license inference to narrow; a caller that wants a
+narrower storage dtype passes `ColumnHint(dtype=...)`. Tests:
+`tests/test_dataset_schema.py`.
+
+`[NOW]` **The three pandas text dtype names -- `object`, `string`, `str` -- are
+one storage kind.** The schema compares text columns by kind, not by name, so a
+text column arriving under one name against a schema declaring another is an
+exact match: no adjustment, no conversion. One exception: `object` is the only
+name that can physically hold a non-text value, so a column arriving as `object`
+against a *different* text spec matches only if every non-null value is a Python
+`str` (nulls are skipped; an empty or all-null column counts as text).
+
+`[NOW]` `Dataset.strict_schema` is off in production and on for the whole pytest
+suite -- a module-level assignment in `tests/conftest.py`, guarded by
+`tests/test_dataset_schema.py::test_suite_runs_with_strict_schema_on`. With it
+on, an "unexpected" dtype adjustment -- a width the frame declared that the
+schema did not expect -- is refused instead of applied and recorded.
+
 ### 4.4 Storage
 
 Tables live in memory as pandas DataFrames and are saved as Parquet. See
 `docs/media_architecture.md` §5 for why they stay in memory and what would change
 that.
+
+`[NOW]` A saved project folder holds one Parquet file per table plus three JSON
+sidecars: `provenance.json` (the provenance log), `column_types.json` (the
+column-name -> type-tag map) and `schemas.json` (each stored table's serialised
+`TableSchema`, written since P1.8c-2a). `schemas.json` carries `format_version`
+1; an unknown version or a corrupt file is ignored -- the project still opens,
+with every table's schema re-inferred and a message recorded -- and a table the
+file does not name is re-inferred the same way. `models/table_schema.py`'s
+`to_dict` / `schema_from_dict` are the authority on the per-table encoding.
 
 ---
 

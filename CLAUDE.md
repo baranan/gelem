@@ -86,6 +86,20 @@ state. This rule carries no violation list of its own -- it points at the three
 - **`[NOW]`** Only `Dataset` may modify a **stored** table. A worker may freely
   build and mutate a DataFrame it created itself; that is not a stored table until
   `Dataset` accepts it.
+- **`[NOW]`** Every **stored** table has a `TableSchema`. `_commit_prepared` is
+  the only caller of `_set_table` and is only ever handed a `_PreparedTable`
+  from `_prepare_table`, so every table that reaches storage was validated; a
+  non-conforming frame is refused with `SchemaRejection` and not stored, in
+  whole or in part. (A test that assigns straight into `Dataset._tables`
+  bypasses this; `schema_for()` then returns `None`.) `docs/architecture.md`
+  §4.3 is the authority for the schema and its dtype policy. Guarded by an AST
+  check and behaviour tests in `tests/test_dataset_schema.py`.
+- **`[NOW]`** `Dataset.load()` is atomic: every parquet is read and validated
+  before any in-memory state is replaced, so a failed load leaves the open
+  project untouched -- tables, schemas, provenance log and id counter.
+  `AppController.load_project()` calls `Dataset.load()` before it mutates any
+  controller field, so a failed load never moves `_project_root` or drops live
+  runs. Tests: `tests/test_project_load.py`.
 - **`[NOW]`** `get_table()` returns a copy. Modifying it does not modify the stored
   table.
 - **`[NOW]`** Reading one row must not copy the whole table. `get_row()` reads
@@ -120,6 +134,10 @@ state. This rule carries no violation list of its own -- it points at the three
   *(Re-verified 26 Aug 2026.)*
 - **`[NOW]`** `row_id` is unique **within a table**. It is not unique across
   tables: `create_table_from_rows()` deliberately keeps ids when copying rows.
+- **`[NOW]`** `row_id` is exempt from every `TableSchema`: none of the three
+  roles fits an opaque handle. `models/table_schema.py` never sees it -- the
+  exemption is in one place, `Dataset._SCHEMA_EXEMPT_COLUMNS`. Tests:
+  `tests/test_dataset_schema.py`.
 - **`[NOW]`** Row ids **are preserved by project save and load** -- `save()` writes
   them to Parquet and `load()` reads them straight back, so a saved project reopens
   with the same ids and a saved reference stays valid. They are **not** guaranteed
@@ -157,7 +175,7 @@ state. This rule carries no violation list of its own -- it points at the three
 - **`[TARGET -> P1.6, P1.7]`** Segment and frame operators must emit the columns
   that make this work: a segment index, a frame index, `time_within_segment`, and
   everything carried down from the source.
-- **`[TARGET -> P1.8]`** What gets carried down is defined by two schema
+- **`[TARGET -> P1.6]`** What gets carried down is defined by two schema
   properties, `role` and `carry_to_children` -- **not by role alone**. Identifiers
   and indices are always carried; everything else defaults to carried, because a
   trial-level covariate such as `reaction_time` is a measurement *and* is required

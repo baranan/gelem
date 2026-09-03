@@ -18,6 +18,26 @@ claim by reading the named code -- it did not re-verify the pre-existing
 entries, the "Fixed" section, or any line number already in the file. Each open
 defect should become a failing test before or as it is fixed.
 
+On 3 Sep 2026 (the `docs-p18-foldin` item) the P1.8a..P1.8c-2b rules were
+written into `CLAUDE.md` and `docs/architecture.md`, and nine further defects
+were checked against the code named for each and added below: two dtype/schema
+gaps (an `object`-vs-`object` spec skips the contents scan; `take_schema_messages()`
+has no consumer), two provenance-sidecar inconsistencies exposed by comparison
+with the new `schemas.json` fallback, two test smells, a full-table copy on two
+column-add paths, an unpinned `requirements.txt`, and a stray committed CSV. A
+tenth entry -- that a project saved before P1.8b-1 holding an unsupported-dtype
+column can no longer be opened -- was added **unverified**: it follows by reading
+from the new reject-on-unsupported-dtype path, but no such project was produced
+or opened to confirm it. That pass verified the nine checked claims by reading
+the named code; it did not verify the tenth, and did not re-verify the
+pre-existing entries, the "Fixed" section, or any line number already in the
+file. One claim checked -- that `Dataset.confirm_merge` can raise
+`SchemaRejection` with no handler -- was **not** added: `AppController.confirm_merge`
+wraps the call in `try/except Exception` and `_accept_table` is atomic, so
+nothing is left half-written. In the same pass three entries previously pointing
+at the closed umbrella item P1.8 were reassigned: the `infer_type()` address half
+to P1.8d, and the two OS-native / non-parsing media-cell entries to P1.8e.
+
 ---
 
 ## Open -- wrong output, not just slow
@@ -32,7 +52,8 @@ defect should become a failing test before or as it is fixed.
   decides by `value.lower().endswith(ext)`, so it also **fails to recognise a
   media address**, which ends in a fragment such as `#f=1234`. This matters more
   since P0.5b-1, which keys the artifact cache on those address strings. Fixing
-  the address half belongs with the schema work (P1.8).
+  the address half belongs with P1.8d, which demotes `ColumnTypeRegistry` to a
+  tag-to-renderer map and routes column-type lookup through the schema instead.
 - **`Dataset.load()` does not clear `ColumnTypeRegistry`**, so column types from
   the previous project persist.
 
@@ -50,7 +71,7 @@ defect should become a failing test before or as it is fixed.
   "Row identity and lineage" in `CLAUDE.md`.)
 - **`load_folder()` and `load_csv_as_primary()` write `str(path)`, OS-native**, so
   a fresh unsaved project's media cells are non-canonical until the first
-  save/load. Belongs with the schema work (P1.8).
+  save/load. Belongs with P1.8e, which canonicalises media cells at accept time.
 - **A non-string media cell is silently skipped** and is not counted by
   `_is_blank_cell()`.
 - **A media cell that does not parse as an address shows a permanent grey
@@ -59,7 +80,7 @@ defect should become a failing test before or as it is fixed.
   address, so a file name with a literal `#` (which `parse()` reads as a
   fragment start) renders a placeholder and never a picture. Before P0.5b-3i
   the renderer's `Image.open` fallback still displayed it. The real fix is
-  canonicalising cells at import (P1.8); detail mode is unaffected.
+  canonicalising cells at accept (P1.8e); detail mode is unaffected.
 - **Many module docstrings still assign files to Student A, B, or C.** Remove as
   those files are touched. (Done in `tests/test_renderer.py`, 24 Aug 2026.)
 - **The thumbnail-ready notification is row-grained, not column-grained.**
@@ -90,6 +111,29 @@ defect should become a failing test before or as it is fixed.
   but `setup.ps1` is gitignored.** It is line 28 of `.gitignore` and is not
   tracked, so a fresh clone cannot follow its own setup instruction. No item
   assigned, and `CLAUDE.md` is not the file to change first.
+- **`Dataset.take_schema_messages()` has no consumer.** Accept-time dtype
+  adjustments are recorded to provenance and also accumulated as plain-English
+  sentences for the researcher, but nothing in the app or the controller drains
+  `take_schema_messages()`, so those sentences are never shown. Only tests call
+  it. Added P1.8b-1.
+- **A corrupt `provenance.json` still makes a project unopenable.**
+  `Dataset.load()` does `json.loads(prov.read_text())` with no guard, so a
+  malformed provenance sidecar raises and the project will not open -- which now
+  contradicts the rule for `schemas.json`, where a corrupt sidecar is ignored
+  with a message and the project opens by inference. Pre-existing; make the two
+  consistent when something next touches `load()`.
+- **A project with no `provenance.json` inherits the previously open project's
+  log.** `Dataset.load()` calls `self.provenance.replace(...)` only when the
+  file exists, so opening a bare project (parquet only) after another project
+  leaves the first project's provenance log in place. Pre-existing.
+- **A project saved before P1.8b-1 that holds a column of an unsupported dtype
+  can no longer be opened.** *Unverified.* Since P1.8b-1 the accept path rejects
+  a datetime64, timezone-aware datetime or nullable-extension dtype with
+  `SchemaRejection`, and `load()` runs every parquet through that path, so such
+  a project would now fail to open where it opened before -- a datetime column
+  is the realistic case. Probably no such project exists: no current import path
+  parses dates, so nothing writes a datetime column. Nobody has produced or
+  opened one to check.
 
 ## Open -- smells, no item assigned
 
@@ -233,6 +277,32 @@ defect should become a failing test before or as it is fixed.
 - **`manual_testing/` is gitignored** (line 26 of `.gitignore`), so fixes or
   checks made there are never committed and vanish on a fresh clone. Whether the
   directory should be tracked has not been decided.
+- **An `object` column checked against an `object` schema spec is accepted with
+  no contents check.** `check_frame`'s `arrived == stored` short-circuit runs
+  before the text-contents scan, so a column declared `object` that actually
+  holds non-`str` values is stored; the scan only fires when an `object` column
+  meets a *different* text spec. Added P1.8c-1.
+- **`add_column` and `add_computed_column` copy the whole table for rollback
+  safety.** Both do `_get_stored_table(...).copy()` so a `SchemaRejection`
+  leaves the stored frame intact, where `apply_row_updates`'
+  in-place-plus-targeted-rollback pattern would avoid the full copy.
+- **`_assert_schema_matches_frame` in `tests/test_dataset_schema.py` cannot fail
+  its column-order assertion.** It compares `schema_for(table)` against the
+  columns of the frame the accept path itself stored, and `_prepare_table`
+  builds the schema from exactly those columns in that order -- so only the
+  "row_id absent" half of the helper can actually fail.
+- **`tests/test_dataset.py` runs its checks twice, in two shapes.** 28 collected
+  `test_` functions, plus 64 module-level `run_test(...)` calls that fire at
+  import. `CLAUDE.md` already flags the double run; the count is recorded here.
+- **`test_images2/othercolnames.csv` is committed and no prompt asked for it.**
+  It landed in the P1.8c-2b commit and is referenced only by `create_test_csv.py`,
+  not by any test. Harmless test data; delete it if a later item works in that
+  area.
+- **`requirements.txt` pins nothing -- eleven bare package names.** The
+  supported-dtype set, the text-dtype rule and the empty-parquet cast were
+  designed against pandas 3.0.2, numpy 2.4.4, pyarrow 23.0.1, Python 3.13.2. On
+  pandas 2 a bare text column is `object`, not `str`, so a fresh clone can
+  behave differently.
 
 ---
 
