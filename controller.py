@@ -1308,11 +1308,20 @@ class AppController(QObject):
             project_path: Path to an existing project folder.
         """
         try:
-            # The dataset is being replaced: drop every in-flight run so
-            # a late result cannot land in the newly loaded project.
+            # Load the dataset FIRST. Dataset.load() is atomic: on a bad
+            # project it raises and leaves the currently open project
+            # untouched. Nothing in the controller may move until it has
+            # returned successfully -- otherwise a failed load would leave
+            # _project_root pointing at the new folder while the dataset
+            # still holds the old project, and media would resolve against
+            # the wrong root. No controller step needs to run before it:
+            # Dataset.load() takes project_path as an argument and reads no
+            # controller state.
+            self._dataset.load(project_path)
+            # The dataset is now the new project: drop every in-flight run so
+            # a late result cannot land in it, and re-root media resolution.
             self._live_runs.clear()
             self._project_root = Path(project_path)
-            self._dataset.load(project_path)
             # reset() BEFORE load_index(): otherwise the new project's
             # index lands on top of the previous project's live image
             # cache and fingerprint memo, and an old picture can appear

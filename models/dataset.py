@@ -29,10 +29,12 @@ from media.media_address import parse as parse_address
 from media.media_address import format as format_address
 from models.table_schema import (
     ColumnHint,
+    SchemaSerialisationError,
     TableSchema,
     check_frame,
     infer_schema,
     normalise_frame,
+    schema_from_dict,
 )
 
 
@@ -277,9 +279,57 @@ def _non_exempt_columns(df: pd.DataFrame) -> list[str]:
     return [c for c in df.columns if c not in _SCHEMA_EXEMPT_COLUMNS]
 
 
+def _cast_empty_frame_to_schema(
+    df: pd.DataFrame, schema: TableSchema
+) -> pd.DataFrame:
+    """Return a copy of a ZERO-ROW frame with every column the schema names cast
+    to the dtype the schema declares for it.
+
+    Only meaningful for an empty frame, and only used by load(): pyarrow does
+    not preserve an empty column's dtype through a parquet round trip, so a
+    reloaded empty text column arrives as float64 and would fail check_frame's
+    "crossing text/number/bool" gate -- which rejects on kind before it ever
+    looks at values. An empty column casts to any dtype without data loss, so
+    doing the cast BEFORE the check restores the saved schema exactly.
+
+    Columns the schema does not name (row_id) are left untouched. Raises
+    TypeError or ValueError if a cast is genuinely impossible; the caller then
+    falls back to inference for that one table.
+    """
+    out = df.copy()
+    for name in schema.column_names():
+        if name in out.columns:
+            out[name] = out[name].astype(schema.spec_for(name).dtype)
+    return out
+
+
 class SchemaRejection(ValueError):
     """Raised by Dataset._accept_table when a frame does not conform to its
     table's schema. The frame is not stored, wholly or partly."""
+
+
+@dataclass
+class _PreparedTable:
+    """Everything needed to store one table, computed by Dataset._prepare_table
+    without mutating any Dataset state. Dataset._commit_prepared is the only
+    consumer -- it performs the actual writes. Kept as a plain value object so a
+    caller (load()) can build several of these, decide the whole batch is good,
+    and only then commit them one after another -- an all-or-nothing load.
+    """
+    # The table's name.
+    table_name: str
+    # The frame to store: already a fresh object (a copy when an adjustment was
+    # applied, otherwise the frame handed in, which every caller already built
+    # or copied itself).
+    frame: pd.DataFrame
+    # The TableSchema to store for this table.
+    schema: TableSchema
+    # One plain-English sentence per lossless dtype adjustment, to append to
+    # Dataset._schema_messages on commit.
+    messages: list[str]
+    # A ready-to-record "schema_adjustments" provenance params dict, or None
+    # when the frame needed no adjustment.
+    provenance_params: dict | None
 
 
 # ---------------------------------------------------------------------------
@@ -458,38 +508,58 @@ class Dataset:
             if col in media_cols and col not in _SCHEMA_EXEMPT_COLUMNS
         }
 
-    def _accept_table(
+    def _prepare_table(
         self,
         table_name: str,
         df: pd.DataFrame,
         *,
         hints: dict[str, ColumnHint] | None = None,
         schema: TableSchema | None = None,
+        consult_stored_schema: bool = True,
+        consult_registry_hints: bool = True,
         source: str = "",
-    ) -> None:
-        """The one place a stored table's schema is decided. Every site that
-        creates or replaces a stored table calls this, never _set_table
-        directly. See docs/architecture.md §4.3.
+    ) -> _PreparedTable:
+        """All of _accept_table's work up to and including validation and
+        normalisation, with NO mutation of Dataset state. Returns a
+        _PreparedTable that _commit_prepared then stores. See
+        docs/architecture.md §4.3.
 
         a. row_id (and any other _SCHEMA_EXEMPT_COLUMNS member) is not part of
            any schema.
         b. Build the schema to check against from the FRAME's non-exempt
            columns, in the frame's own order. The ColumnSpec for a column is
-           resolved against the AUTHORITATIVE schema -- the `schema` argument
-           when one is given (load() passes the schema it read off disk), else
-           the schema already stored for this table. A column the
-           authoritative schema names keeps that ColumnSpec unchanged; a
-           column it does not name gets a spec inferred from the frame; a
-           column it names but the frame no longer carries is simply dropped
-           (not a rejection). When `schema` is None the authoritative schema
-           is exactly the stored one, so behaviour is unchanged.
+           resolved against the AUTHORITATIVE schema -- see below. A column the
+           authoritative schema names keeps that ColumnSpec unchanged; a column
+           it does not name gets a spec inferred from the frame; a column it
+           names but the frame no longer carries is simply dropped (not a
+           rejection).
         c./d. check_frame; a non-empty rejection list means the frame is not
            stored -- raise SchemaRejection naming the table, the source and
            every rejection.
         e. Otherwise apply the adjustments and write them back onto a copy of
            the FULL frame, so row_id and the original column order survive.
-        f. Record every adjustment: one sentence per adjustment to
-           _schema_messages, and (if there were any) one provenance entry.
+        f. Return the adjustment sentences and the provenance params so
+           _commit_prepared can record them; this method records nothing.
+
+        The AUTHORITATIVE schema is resolved like this:
+          * an explicit `schema` argument always wins (load() passes the schema
+            it restored from schemas.json);
+          * otherwise, only when `consult_stored_schema` is True, the schema
+            already stored for this table -- which is the default and is
+            byte-for-byte the old behaviour;
+          * otherwise None: every column is inferred from the frame alone.
+        load() passes `consult_stored_schema=False` because the stored schema,
+        if any, belongs to the project being replaced and must never shape the
+        project being loaded -- not for a table schemas.json names, and not for
+        one it does not.
+
+        `consult_registry_hints` is the same idea for the OTHER piece of prior
+        in-memory state: _media_column_hints() reads the ColumnTypeRegistry,
+        which during a load still holds the outgoing project's column tags, so
+        an incoming column could inherit a `media_path` tag from the project
+        being replaced. load() passes False here too; it has already read the
+        incoming project's own media columns from column_types.json and passes
+        them in `hints`, so nothing is lost.
         """
         schema_columns = _non_exempt_columns(df)
 
@@ -507,11 +577,15 @@ class Dataset:
 
         frame_for_schema = df[schema_columns]
 
-        # The authoritative source of already-decided ColumnSpecs: an explicit
-        # declared schema (load() will pass this next item) wins over anything
-        # previously stored; with no declared schema this is the stored schema
-        # and the path is byte-for-byte what it was before.
-        authoritative = schema if schema is not None else self._schemas.get(table_name)
+        # The authoritative source of already-decided ColumnSpecs -- see the
+        # docstring. An explicit `schema` wins; else the stored schema only if
+        # the caller allows it; else nothing.
+        if schema is not None:
+            authoritative = schema
+        elif consult_stored_schema:
+            authoritative = self._schemas.get(table_name)
+        else:
+            authoritative = None
         stored_names = (
             set(authoritative.column_names()) if authoritative is not None else set()
         )
@@ -519,7 +593,13 @@ class Dataset:
 
         inferred_by_name: dict[str, object] = {}
         if new_columns:
-            effective_hints = dict(self._media_column_hints(df))
+            # _media_column_hints reads the registry; a load must not consult it
+            # (see consult_registry_hints in the docstring) and relies on the
+            # `hints` the caller passes instead.
+            if consult_registry_hints:
+                effective_hints = dict(self._media_column_hints(df))
+            else:
+                effective_hints = {}
             if hints:
                 effective_hints.update(hints)
             sub_hints = {
@@ -548,7 +628,7 @@ class Dataset:
                 specs.append(inferred_by_name[name])
         # Named to keep it distinct from the `schema` PARAMETER above: this is
         # the schema built for THIS frame, which becomes the table's stored
-        # schema below.
+        # schema on commit.
         built_schema = TableSchema(columns=tuple(specs))
 
         check = check_frame(frame_for_schema, built_schema)
@@ -586,23 +666,21 @@ class Dataset:
             for adjustment in check.adjustments:
                 out[adjustment.column] = normalised[adjustment.column]
         else:
-            # Nothing to rewrite. Every call site already hands _accept_table a
+            # Nothing to rewrite. Every call site already hands _prepare_table a
             # frame it just built or copied (a fresh DataFrame, a .copy(), or --
             # for apply_row_updates -- the live stored frame it is re-storing
-            # unchanged), so store it as-is. Re-storing the same object here is
-            # what keeps apply_row_updates' row-id index stamp valid.
+            # unchanged), so store it as-is. Re-storing the same object on commit
+            # is what keeps apply_row_updates' row-id index stamp valid.
             out = df
-        self._set_table(table_name, out)
-        self._schemas[table_name] = built_schema
 
-        for adjustment in check.adjustments:
-            self._schema_messages.append(
-                f"Table {table_name!r}: column {adjustment.column!r} arrived as "
-                f"{adjustment.arrived_as} and is stored as "
-                f"{adjustment.stored_as}."
-            )
+        messages = [
+            f"Table {table_name!r}: column {adjustment.column!r} arrived as "
+            f"{adjustment.arrived_as} and is stored as {adjustment.stored_as}."
+            for adjustment in check.adjustments
+        ]
+        provenance_params = None
         if check.adjustments:
-            self.provenance.record("schema_adjustments", {
+            provenance_params = {
                 "table": table_name,
                 "source": source,
                 "adjustments": [
@@ -615,7 +693,52 @@ class Dataset:
                     }
                     for a in check.adjustments
                 ],
-            })
+            }
+
+        return _PreparedTable(
+            table_name=table_name,
+            frame=out,
+            schema=built_schema,
+            messages=messages,
+            provenance_params=provenance_params,
+        )
+
+    def _commit_prepared(self, prepared: _PreparedTable) -> None:
+        """Store what _prepare_table computed. The ONLY caller of _set_table.
+        Mutates: the stored table, its schema, _schema_messages, and -- when the
+        frame needed adjustment -- the provenance log. Only ever handed a
+        _PreparedTable, which only _prepare_table builds, so every stored table
+        is still schema-validated."""
+        self._set_table(prepared.table_name, prepared.frame)
+        self._schemas[prepared.table_name] = prepared.schema
+        self._schema_messages.extend(prepared.messages)
+        if prepared.provenance_params is not None:
+            self.provenance.record(
+                "schema_adjustments", prepared.provenance_params
+            )
+
+    def _accept_table(
+        self,
+        table_name: str,
+        df: pd.DataFrame,
+        *,
+        hints: dict[str, ColumnHint] | None = None,
+        schema: TableSchema | None = None,
+        source: str = "",
+    ) -> None:
+        """Prepare one table and immediately store it. Every non-load write
+        path calls this, never _set_table directly. load() instead calls
+        _prepare_table for every table first and _commit_prepared for each only
+        once it knows the whole project parses -- an atomic load (P1.8c-2b).
+
+        See _prepare_table for the schema-resolution rules (points a-f). With no
+        `schema` argument the stored schema for this table is consulted, exactly
+        as before.
+        """
+        prepared = self._prepare_table(
+            table_name, df, hints=hints, schema=schema, source=source
+        )
+        self._commit_prepared(prepared)
 
     def _row_index_for(self, table_name: str) -> dict[str, int]:
         """Returns the row_id -> positional-index mapping for one table,
@@ -1467,21 +1590,97 @@ class Dataset:
             "unparseable_media_cells": unparseable_media_cells,
         })
 
+    def _read_saved_schemas(
+        self, project_path: Path
+    ) -> tuple[dict[str, TableSchema], str | None]:
+        """Read schemas.json (written by save() since P1.8c-2a) if it is
+        present. Mutates nothing.
+
+        Returns (schemas, ignored_message):
+          * ({table_name: TableSchema, ...}, None) -- format_version 1, parsed
+            cleanly. The dict may be empty if the file listed no schemas.
+          * ({}, "<one sentence>") -- the file is there but this build will not
+            use it: an unrecognised format_version, JSON that will not parse, or
+            a schema entry schema_from_dict rejects. The caller loads every
+            table by inference and surfaces the sentence -- a corrupt or
+            unknown-version sidecar must never make a project unopenable,
+            because the parquet files still hold the data.
+          * ({}, None) -- no schemas.json at all. Every table is inferred,
+            silently: this is every project saved before P1.8c-2a.
+        """
+        path = project_path / "schemas.json"
+        if not path.exists():
+            return {}, None
+
+        # json.loads raises JSONDecodeError (a ValueError subclass) on bad JSON;
+        # read_text can raise OSError. Either way the sidecar is unusable.
+        try:
+            raw = json.loads(path.read_text())
+        except (OSError, ValueError) as exc:
+            return {}, (
+                f"schemas.json could not be read ({exc}); every table was "
+                f"loaded by inference instead."
+            )
+
+        version = raw.get("format_version") if isinstance(raw, dict) else None
+        if version != 1:
+            return {}, (
+                f"schemas.json has format_version {version!r}, which this build "
+                f"of Gelem does not know; every table was loaded by inference "
+                f"instead."
+            )
+
+        serialised = raw.get("schemas", {})
+        if not isinstance(serialised, dict):
+            return {}, (
+                "schemas.json is malformed (its 'schemas' is not an object); "
+                "every table was loaded by inference instead."
+            )
+
+        schemas: dict[str, TableSchema] = {}
+        try:
+            for table_name, payload in serialised.items():
+                schemas[table_name] = schema_from_dict(payload)
+        except SchemaSerialisationError as exc:
+            # schema_from_dict's contract is that every malformed payload raises
+            # SchemaSerialisationError, so this one catch is enough.
+            return {}, (
+                f"schemas.json is malformed ({exc}); every table was loaded by "
+                f"inference instead."
+            )
+        return schemas, None
+
     def load(self, project_path: Path) -> None:
         """
-        Loads a previously saved project from disk. Replaces all in-memory
-        tables and the provenance log with the saved ones (same "open
-        project" pattern as load_folder / load_csv_as_primary). Relative
-        `full_path` values are resolved back to absolute against
+        Loads a previously saved project from disk, atomically. Every parquet is
+        read and validated against its saved schema BEFORE any in-memory state
+        is touched, so a project with a bad table leaves the currently open
+        project exactly as it was -- same tables, schemas, provenance log and id
+        counter. On success this replaces all tables, the provenance log, the id
+        counter and (via the registry) the column-type map with the saved
+        project's. Relative media paths are resolved back to absolute against
         project_path.
+
+        schemas.json (written by save() since P1.8c-2a) is honoured when its
+        format_version is one this build knows; an unknown version or a corrupt
+        file is ignored with a message and every table is loaded by inference.
+        A table with no entry in schemas.json is inferred. No schema from the
+        previously open project is ever consulted -- see _prepare_table's
+        consult_stored_schema argument.
 
         Args:
             project_path: Path to an existing project folder.
 
         Raises:
-            FileNotFoundError: If project_path doesn't exist or has no
-                parquet files.
+            FileNotFoundError: If project_path doesn't exist or has no parquet
+                files.
+            SchemaRejection: If a parquet file does not conform to its schema.
+                The previously open project is left completely untouched.
         """
+        # -----------------------------------------------------------------
+        # Before the point of no return: read and validate everything.
+        # Nothing in this half mutates a single field of self.
+        # -----------------------------------------------------------------
         if not project_path.exists():
             raise FileNotFoundError(
                 f"Project folder '{project_path}' does not exist."
@@ -1500,22 +1699,30 @@ class Dataset:
         media_cols = {col for col, tag in column_types.items() if tag == "media_path"}
         media_cols.add("full_path")  # fallback if no sidecar (saved without registry)
 
-        # Clear every table and schema, then accept each parquet table through
-        # the schema path -- the sidecar's media columns become type-tag hints
-        # so a media column is tagged before the registry is repopulated below.
-        self._reset_tables({})
+        # Saved schemas, if any and if this build understands them.
+        restored_schemas, ignored_schemas_message = self._read_saved_schemas(
+            project_path
+        )
 
-        # Restore the saved provenance log BEFORE the accept loop, so any
-        # "schema_adjustments" entry _accept_table records while loading is
-        # appended to the restored log rather than wiped by a later replace().
+        # Saved provenance log -- read now, install only after the point of no
+        # return, so a load that fails below does not replace the log.
+        saved_provenance = None
         prov = project_path / "provenance.json"
         if prov.exists():
-            self.provenance.replace(json.loads(prov.read_text()))
+            saved_provenance = json.loads(prov.read_text())
 
         load_hints = {
             col: ColumnHint(type_tag="media_path") for col in media_cols
         }
         unparseable_media_cells = 0
+        # Per-table notes for an empty table whose saved schema could not be
+        # cast onto it -- appended to _schema_messages after the point of no
+        # return, like ignored_schemas_message.
+        cast_fallback_messages: list[str] = []
+
+        # Parse and validate every parquet into a staged _PreparedTable. A
+        # SchemaRejection raised here propagates out with self untouched.
+        prepared_tables: list[_PreparedTable] = []
         for path in parquet_files:
             df = pd.read_parquet(path)
             for col in df.columns:
@@ -1528,9 +1735,59 @@ class Dataset:
                     )
                     df[col] = new_values
                     unparseable_media_cells += bad
-            self._accept_table(
-                path.stem, df, source="load", hints=load_hints
+            # The saved schema for this table when schemas.json named it, else
+            # None. Either way consult_stored_schema is False: the previous
+            # project's schema for a same-named table must not leak in.
+            declared = restored_schemas.get(path.stem)
+            if declared is not None and len(df) == 0:
+                # A zero-row parquet does not carry trustworthy column dtypes
+                # (pyarrow returns an empty text column as float64). Cast the
+                # empty frame to the saved schema's dtypes BEFORE validating --
+                # an empty frame casts losslessly, and check_frame rejects on
+                # kind before it inspects values, so the cast must precede the
+                # check. If a cast is impossible, fall back to inference for
+                # this one table.
+                try:
+                    df = _cast_empty_frame_to_schema(df, declared)
+                except (TypeError, ValueError) as exc:
+                    cast_fallback_messages.append(
+                        f"Table {path.stem!r}: its saved schema could not be "
+                        f"applied to the empty table ({exc}); it was loaded by "
+                        f"inference instead."
+                    )
+                    declared = None
+            prepared = self._prepare_table(
+                path.stem,
+                df,
+                hints=load_hints,
+                schema=declared,
+                consult_stored_schema=False,
+                consult_registry_hints=False,
+                source="load",
             )
+            # Stage, do not store. Deleting this line and committing here
+            # instead would let a load that fails on a later parquet leave a
+            # half-replaced project.
+            prepared_tables.append(prepared)
+
+        # -----------------------------------------------------------------
+        # POINT OF NO RETURN. Every parquet above parsed and validated;
+        # nothing below reads project data or can fail on it. Only now is
+        # the previously open project discarded.
+        # -----------------------------------------------------------------
+        self._reset_tables({})
+        # A project opened second must not inherit the first project's column
+        # tags. Registered types and their tags stay; only the name -> type map
+        # is cleared, to be repopulated from column_types.json below.
+        if self._registry is not None:
+            self._registry.clear_column_map()
+        # Restore the saved provenance log before the commit loop, so any
+        # "schema_adjustments" entry _commit_prepared records is appended to the
+        # restored log rather than wiped by a later replace().
+        if saved_provenance is not None:
+            self.provenance.replace(saved_provenance)
+        for prepared in prepared_tables:
+            self._commit_prepared(prepared)
 
         # Restore _id_counter (assumes int-parseable row_id from _next_id()).
         max_id = 0
@@ -1550,7 +1807,23 @@ class Dataset:
                 # No sidecar — fall back to load_folder's default tagging.
                 self._register_column("full_path", "media_path")
 
+        # An empty table whose saved schema could not be cast onto it was
+        # loaded by inference -- tell the researcher, one message per table.
+        self._schema_messages.extend(cast_fallback_messages)
+
+        # An ignored schemas.json is surfaced as a schema message and in the
+        # load provenance entry, so an older or newer project still opens and
+        # the researcher can see the schemas were re-inferred.
+        if ignored_schemas_message is not None:
+            self._schema_messages.append(ignored_schemas_message)
+            schemas_note = ignored_schemas_message
+        elif restored_schemas:
+            schemas_note = f"restored saved schemas for {sorted(restored_schemas)}"
+        else:
+            schemas_note = "no schemas.json; every table loaded by inference"
+
         self.provenance.record("load", {
             "project_path": str(project_path),
             "unparseable_media_cells": unparseable_media_cells,
+            "schemas": schemas_note,
         })

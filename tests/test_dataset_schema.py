@@ -18,6 +18,7 @@ from models.table_schema import (
     ColumnHint,
     ColumnRole,
     ColumnSpec,
+    SchemaSerialisationError,
     TableSchema,
     schema_from_dict,
 )
@@ -175,16 +176,33 @@ def _callers_of(attr: str) -> set[str]:
     return callers
 
 
-def test_only_accept_table_calls_set_table():
+def test_only_commit_prepared_calls_set_table():
+    # P1.8c-2b split _accept_table into _prepare_table (validate, mutate
+    # nothing) + _commit_prepared (store). _set_table's single caller moved
+    # from _accept_table to _commit_prepared, and _commit_prepared is only ever
+    # handed a _PreparedTable, which only _prepare_table builds -- so every
+    # stored table is still schema-validated. The guard follows that shape.
     set_table_callers = _callers_of("_set_table")
-    assert set_table_callers == {"_accept_table"}, (
-        f"_set_table must be called only by _accept_table; "
-        f"other callers: {set_table_callers - {'_accept_table'}}"
+    assert set_table_callers == {"_commit_prepared"}, (
+        f"_set_table must be called only by _commit_prepared; "
+        f"other callers: {set_table_callers - {'_commit_prepared'}}"
+    )
+
+    # _commit_prepared and _prepare_table are reached from exactly two places:
+    # _accept_table (every non-load write path) and load() (the atomic,
+    # pre-staged path).
+    commit_callers = _callers_of("_commit_prepared")
+    assert commit_callers == {"_accept_table", "load"}, (
+        f"_commit_prepared callers drifted: {commit_callers}"
+    )
+    prepare_callers = _callers_of("_prepare_table")
+    assert prepare_callers == {"_accept_table", "load"}, (
+        f"_prepare_table callers drifted: {prepare_callers}"
     )
 
     accept_callers = _callers_of("_accept_table")
     assert accept_callers, "scan found no _accept_table callers -- vacuous"
-    ten_sites = {
+    nine_sites = {
         "load_folder",
         "load_csv_as_primary",
         "confirm_merge",
@@ -194,12 +212,15 @@ def test_only_accept_table_calls_set_table():
         "aggregate",
         "create_table_from_rows",
         "create_table_from_df",
-        "load",
     }
-    assert ten_sites <= accept_callers, (
-        f"these step-3 sites do not call _accept_table: {ten_sites - accept_callers}"
+    assert nine_sites <= accept_callers, (
+        f"these step-3 sites do not call _accept_table: {nine_sites - accept_callers}"
     )
     assert "__init__" in accept_callers
+    # load() reaches the schema path through _prepare_table + _commit_prepared,
+    # not _accept_table, because it must validate every parquet BEFORE it
+    # mutates a single field (atomic load, P1.8c-2b).
+    assert "load" in prepare_callers and "load" in commit_callers
 
 
 # ---------------------------------------------------------------------------
@@ -803,3 +824,33 @@ def test_accept_table_without_declared_schema_is_unchanged(tmp_path):
     sig = inspect.signature(Dataset._accept_table)
     assert sig.parameters["schema"].default is None
     assert sig.parameters["schema"].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+# ---------------------------------------------------------------------------
+# P1.8c-2b follow-up -- schema_from_dict raises SchemaSerialisationError, never
+# TypeError, for a malformed payload
+# ---------------------------------------------------------------------------
+
+def test_schema_from_dict_raises_serialisation_error_for_an_unhashable_role():
+    # A hand edit that puts a list where the role NAME belongs. Before the fix,
+    # `[] not in ColumnRole.__members__` raised TypeError, which escaped
+    # schema_from_dict and (in load()) needed a defensive catch. Its contract
+    # is that every malformed payload raises SchemaSerialisationError.
+    payload = {
+        "columns": [
+            {
+                "name": "k",
+                "type_tag": "numeric",
+                "dtype": "int64",
+                "role": [],
+                "carry_to_children": True,
+            }
+        ]
+    }
+    with pytest.raises(SchemaSerialisationError):
+        schema_from_dict(payload)
+
+    # A dict is unhashable too -- same outcome, not a TypeError.
+    payload["columns"][0]["role"] = {"identifier": True}
+    with pytest.raises(SchemaSerialisationError):
+        schema_from_dict(payload)

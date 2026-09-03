@@ -677,9 +677,13 @@ def schema_from_dict(data) -> TableSchema:
                 )
 
         # ColumnRole is restored by name. An unknown name is refused, not
-        # coerced to a default role.
+        # coerced to a default role. The isinstance guard comes first and
+        # matters: a hand-edited schemas.json can put an unhashable value (a
+        # list, a dict) here, and `unhashable not in ColumnRole.__members__`
+        # raises TypeError -- which would escape this function, whose contract
+        # is that every malformed payload raises SchemaSerialisationError.
         role_name = entry["role"]
-        if role_name not in ColumnRole.__members__:
+        if not isinstance(role_name, str) or role_name not in ColumnRole.__members__:
             raise SchemaSerialisationError(
                 f"column entry at position {position} has unknown ColumnRole "
                 f"name {role_name!r}"

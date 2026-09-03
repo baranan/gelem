@@ -190,6 +190,19 @@ class ColumnTypeRegistry:
             )
         self._columns[column_name] = self._types[tag]
 
+    def clear_column_map(self) -> None:
+        """
+        Forgets every column-name -> ColumnType mapping, leaving the registered
+        types (and their tags) intact.
+
+        Dataset.load() calls this at its point of no return so a freshly opened
+        project does not inherit the previously open project's column tags. The
+        built-in types from setup_defaults() and any operator-registered types
+        stay available, ready for the new project's columns to be re-registered
+        against them.
+        """
+        self._columns.clear()
+
     def register_type(self, col_type: ColumnType) -> None:
         """
         Registers a new custom column type by tag.
