@@ -281,6 +281,100 @@ class ColumnTypeRegistry:
                 return _make_placeholder_widget(f"Error:\n{column_name}")
             return _make_placeholder_pixmap(size, f"Error:\n{column_name}")
 
+    def type_for_tag(self, tag: str) -> ColumnType | None:
+        """
+        Returns the ColumnType registered under a built-in type tag, or
+        None if the tag is unknown.
+
+        The tag-keyed counterpart of get(). P1.8d-2a has AppController read
+        a column's type tag off that table's TableSchema and ask the
+        registry only what the tag renders as -- so two tables that share a
+        column name no longer share one type. get() and the column-name map
+        stay for the write-path callers P1.8d-2b removes.
+
+        Args:
+            tag: A type tag, e.g. 'media_path', 'numeric', 'text'.
+
+        Returns:
+            The ColumnType, or None.
+        """
+        return self._types.get(tag, None)
+
+    def render_by_tag(
+        self,
+        tag: str | None,
+        value: Any,
+        size: int,
+        mode: str = "thumbnail",
+        context: dict | None = None,
+        *,
+        label: str | None = None,
+    ) -> Any:
+        """
+        Renders a value using the renderer for a type tag, rather than for
+        a column name. The tag-keyed counterpart of render().
+
+        Carries render()'s placeholder behaviour exactly:
+          * an unknown tag (or None) -> the "unknown" placeholder;
+          * a None or NaN value      -> the "not computed" placeholder;
+          * a renderer that raises    -> the "error" placeholder.
+
+        `label` is used only in the placeholder message. AppController
+        passes the column name it was asked about, so the three messages
+        read exactly as render()'s did: "Unknown column: <name>",
+        "Not computed: <name>", "Error: <name>". A caller with no column
+        name -- AppController.render_result_image, rendering an operator's
+        output file -- passes no label, and each message falls back to a
+        plain sentence for a researcher that names no tag.
+
+        Args:
+            tag:     The type tag to render as, or None (treated as unknown).
+            value:   The cell value from the DataFrame row.
+            size:    Target size in pixels.
+            mode:    'thumbnail' (default) or 'detail'.
+            context: Optional dict with row-level metadata, passed through
+                     to the renderer for cache lookups.
+            label:   Name of the thing being rendered, for the placeholder
+                     message only. None -> a plain no-name sentence.
+
+        Returns:
+            A QPixmap (thumbnail mode), QWidget (detail mode), or None.
+        """
+        col_type = self._types.get(tag, None) if tag is not None else None
+
+        if col_type is None:
+            message = (
+                f"Unknown column:\n{label}" if label
+                else "This value cannot be displayed."
+            )
+            return self._placeholder(mode, size, message)
+
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            message = (
+                f"Not computed:\n{label}" if label
+                else "Nothing to display yet."
+            )
+            return self._placeholder(mode, size, message)
+
+        try:
+            return col_type.render(value, size, mode, context)
+        except Exception as e:
+            print(f"[ColumnTypeRegistry] render_by_tag error for tag '{tag}': {e}")
+            message = (
+                f"Error:\n{label}" if label
+                else "This image could not be displayed."
+            )
+            return self._placeholder(mode, size, message)
+
+    @staticmethod
+    def _placeholder(mode: str, size: int, message: str):
+        """A placeholder widget (detail mode) or pixmap (thumbnail mode)
+        carrying `message`. One place for the mode split that render_by_tag's
+        three placeholder branches share."""
+        if mode == "detail":
+            return _make_placeholder_widget(message)
+        return _make_placeholder_pixmap(size, message)
+
     def list_visual_columns(self) -> list[str]:
         """
         Returns the names of all registered columns whose type produces

@@ -457,10 +457,14 @@ class FakeController(QObject):
         """Mirrors AppController.get_active_table()."""
         return self.__active_table
 
-    def get_column_names(self) -> list[str]:
+    def get_column_names(self, table_name: str | None = None) -> list[str]:
+        # Mirrors AppController.get_column_names(table_name=None). The fake
+        # has one table of generated rows, so table_name is accepted and
+        # ignored.
         return list(self._column_types.keys())
 
-    def get_visual_column_names(self) -> list[str]:
+    def get_visual_column_names(self, table_name: str | None = None) -> list[str]:
+        # Mirrors AppController.get_visual_column_names(table_name=None).
         return [
             col for col, tag in self._column_types.items()
             if tag == "media_path"
@@ -469,7 +473,7 @@ class FakeController(QObject):
     # Mirror the new AppController public methods so UI code that calls
     # them (per issue #32) works in --fake-data mode too.
 
-    def get_column_type(self, column_name: str):
+    def get_column_type(self, column_name: str, table_name: str | None = None):
         return self._registry.get(column_name)
 
     def get_all_row_ids(self, table_name: str | None = None) -> list[str]:
@@ -529,9 +533,11 @@ class FakeController(QObject):
         # The fake holds all its rows in self._row_ids (built in __init__).
         return list(self._row_ids)
 
-    def get_column_type(self, column_name: str):
+    def get_column_type(self, column_name: str, table_name: str | None = None):
         """
-        Returns the column-type object for *column_name*.
+        Returns the column-type object for *column_name* -- the active
+        table when *table_name* is None, mirroring
+        AppController.get_column_type(column_name, table_name=None).
 
         The fake has no ColumnTypeRegistry, so it returns None -- which is
         exactly what the real controller returns for an unregistered column.
@@ -610,6 +616,22 @@ class FakeController(QObject):
         if mode == "detail":
             return _make_placeholder_widget(column_name)
         return _make_placeholder_pixmap(size, column_name)
+
+    def render_result_image(
+        self,
+        artifact_path: str,
+        size: int,
+        mode: str = "detail",
+    ):
+        """
+        Mirrors AppController.render_result_image(): a result image is a
+        produced file, not a table cell, so it renders straight through the
+        media renderer with no schema lookup. DetailWidget.show_result
+        calls this in --fake-data mode too (FakeController.run_create_display
+        emits a result dict with an 'artifact_path').
+        """
+        from column_types.renderers import make_media_path_renderer
+        return make_media_path_renderer(None)(artifact_path, size, mode)
 
     def _find_row_id_for_path(self, full_path: str) -> str | None:
         for row_id, path in self._path_map.items():

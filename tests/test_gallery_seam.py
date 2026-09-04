@@ -619,3 +619,129 @@ def test_two_media_columns_on_one_row_render_different_pictures(qapp, tmp_path):
         "test_artifact_identity.py::test_second_media_column_gets_its_own_"
         "cached_artifact."
     )
+
+
+# ===========================================================================
+# PART 5 -- guardrail for P1.8d-2a.
+#
+# AppController.get_column_type reads a column's type tag off THAT table's
+# TableSchema and asks the registry only what the tag renders as. Before
+# P1.8d-2a it returned self._registry.get(column_name) -- a single
+# column-name -> ColumnType map shared across every table -- so two tables
+# with a column of the same name but different types were conflated:
+# whichever was registered last won for both.
+# ===========================================================================
+
+def _make_two_tables_sharing_a_column(dataset):
+    """Two stored tables that both carry a column named 'score', numeric in
+    one and free text in the other. Returns nothing -- the tables are
+    'score_num' and 'score_txt' on the dataset."""
+    import pandas as pd
+
+    dataset.create_table_from_df(
+        "score_num", pd.DataFrame({"score": [1.0, 2.0, 3.0]})
+    )
+    dataset.create_table_from_df(
+        "score_txt", pd.DataFrame({"score": ["high", "low", "mid"]})
+    )
+
+
+def test_get_column_type_is_per_table_not_shared(make_controller, tmp_path):
+    controller, dataset, _ = make_controller(tmp_path)
+    _make_two_tables_sharing_a_column(dataset)
+
+    # Named-table reads: each table's schema decides, independently.
+    assert controller.get_column_type("score", "score_num").tag == "numeric"
+    assert controller.get_column_type("score", "score_txt").tag == "text"
+
+    # The default (active-table) read follows set_active_table.
+    controller.set_active_table("score_num")
+    assert controller.get_column_type("score").tag == "numeric"
+    controller.set_active_table("score_txt")
+    assert controller.get_column_type("score").tag == "text"
+
+
+def test_old_registry_path_could_not_tell_the_two_tables_apart(make_controller, tmp_path):
+    """Documents the defect P1.8d-2a closes: the registry's column-name map
+    -- the OLD code path for get_column_type -- holds one ColumnType for
+    'score', the last one registered, so it answers 'text' for BOTH
+    tables. The schema-driven path above answers correctly per table."""
+    controller, dataset, _ = make_controller(tmp_path)
+    _make_two_tables_sharing_a_column(dataset)
+
+    # score_txt was registered second, so the shared map now maps 'score'
+    # to the text type regardless of which table is meant.
+    assert controller._registry.get("score").tag == "text"
+    # ...whereas the schema-driven read distinguishes them.
+    assert controller.get_column_type("score", "score_num").tag == "numeric"
+
+
+# ===========================================================================
+# PART 6 -- P1.8d-2a follow-up: a create_display result image is not a column.
+#
+# DetailWidget.show_result renders an operator's artifact_path. A produced
+# file is not a cell in any table, so it must render through the media type
+# tag directly (AppController.render_result_image), not through
+# render_column_value("full_path", ...), whose tag comes from the active
+# table's schema. When that schema has no 'full_path' column the old path
+# resolved the tag to None and the result image became a placeholder.
+# ===========================================================================
+
+def test_show_result_renders_a_real_image_with_a_non_media_table_active(
+    make_controller, qapp, tmp_path
+):
+    from PySide6.QtWidgets import QLabel
+    from PIL import Image
+    from shared_widgets.zoomable_image_view import ZoomableImageView
+    from ui.detail_widget import DetailWidget
+    import pandas as pd
+
+    controller, dataset, _ = make_controller(tmp_path)
+
+    # A second table with no 'full_path' column, made active.
+    dataset.create_table_from_df(
+        "summary", pd.DataFrame({"mean_jaw": [0.1, 0.2, 0.3]})
+    )
+    controller.set_active_table("summary")
+    assert "full_path" not in controller.get_column_names()
+
+    # A real image file standing in for an operator's output artifact.
+    art = tmp_path / "mean_face.png"
+    Image.new("RGB", (64, 64), (10, 200, 10)).save(art)
+
+    detail = DetailWidget(controller)
+    detail.show_result({"artifact_path": str(art), "operator_name": "mean_face"})
+
+    # The media area holds a real zoomable image view, not a placeholder
+    # QLabel. Against the pre-round code (render_column_value("full_path",
+    # ...) with a full_path-less active table) this is a QLabel and the
+    # assertion fails.
+    assert isinstance(detail._media_widget, ZoomableImageView), (
+        f"show_result put a {type(detail._media_widget).__name__} in the "
+        f"media area, not a real image view -- the result image fell "
+        f"through to a placeholder"
+    )
+    assert not isinstance(detail._media_widget, QLabel)
+
+
+def test_render_result_image_ignores_the_active_table_schema(
+    make_controller, qapp, tmp_path
+):
+    """The controller seam under the widget: render_result_image renders a
+    real image regardless of what the active table's schema says, because
+    it never consults a schema."""
+    from PIL import Image
+    from shared_widgets.zoomable_image_view import ZoomableImageView
+    import pandas as pd
+
+    controller, dataset, _ = make_controller(tmp_path)
+    dataset.create_table_from_df(
+        "summary", pd.DataFrame({"mean_jaw": [0.1, 0.2]})
+    )
+    controller.set_active_table("summary")
+
+    art = tmp_path / "artifact.png"
+    Image.new("RGB", (48, 48), (200, 10, 10)).save(art)
+
+    widget = controller.render_result_image(str(art), 400, "detail")
+    assert isinstance(widget, ZoomableImageView)

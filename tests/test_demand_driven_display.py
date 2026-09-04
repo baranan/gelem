@@ -602,3 +602,70 @@ def test_image_tile_passes_its_table_name_in_the_render_context(qapp):
         "ImageTile did not pass its active table name in the render context"
     )
     assert controller.seen_context.get("row_id") == "r1"
+
+
+# ===========================================================================
+# 10. P1.8d-2a: render_column_value resolves the column's type tag from the
+#     schema of the table named in the context dict, and falls back to the
+#     ACTIVE table's schema when that table has no schema.
+#
+#     The deciding line in AppController.render_column_value is:
+#         if tag is None:
+#             tag = self._schema_tag_for(column_name, self._active_table)
+#     Named review check 2.
+# ===========================================================================
+
+def test_render_context_table_without_schema_falls_back_to_active_schema(
+    qapp, tmp_path
+):
+    folder = tmp_path / "media"
+    folder.mkdir()
+    _solid_png(folder / "a.png", (10, 20, 200))
+
+    controller, _, store = _build_controller(tmp_path)
+    controller.load_folder(folder)
+
+    # "ghost" is a table that was never accepted: schema_for("ghost") is
+    # None. full_path IS media_path in the active table's schema, so the
+    # fallback line above must still resolve the tag -- and a demand
+    # thumbnail request is queued for the cache miss.
+    assert controller._dataset.schema_for("ghost") is None
+
+    row_id = controller.get_all_row_ids()[0]
+    row = controller.get_row(row_id)
+
+    submitted = _capture_submits(store)
+    pixmap = controller.render_column_value(
+        "full_path", row["full_path"], 150, "thumbnail",
+        {"row_id": row_id, "column_name": "full_path", "table_name": "ghost"},
+    )
+
+    assert pixmap is not None and not pixmap.isNull(), (
+        "a media cell rendered as an Unknown placeholder -- the tag was "
+        "lost instead of falling back to the active table's schema"
+    )
+    assert len(submitted) == 1, (
+        f"expected the media tag to resolve via the active-table fallback "
+        f"and queue one request, got {len(submitted)} queued jobs"
+    )
+    # The request is still attributed to the tile's own (bogus) table --
+    # that attribution is the caller's, unchanged by the tag fallback.
+    assert _queued_subscribers(store) == [("ghost", row_id)]
+
+
+def test_render_unknown_column_is_a_placeholder_never_an_exception(qapp, tmp_path):
+    """A column no schema names renders exactly as an unregistered column
+    did before P1.8d-2a: a placeholder, not a raise."""
+    folder = tmp_path / "media"
+    folder.mkdir()
+    _solid_png(folder / "a.png", (1, 2, 3))
+
+    controller, _, _store = _build_controller(tmp_path)
+    controller.load_folder(folder)
+
+    row_id = controller.get_all_row_ids()[0]
+    pixmap = controller.render_column_value(
+        "no_such_column", "whatever", 150, "thumbnail",
+        {"row_id": row_id, "column_name": "no_such_column"},
+    )
+    assert pixmap is not None and not pixmap.isNull()

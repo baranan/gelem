@@ -364,8 +364,10 @@ class DetailWidget(QWidget):
         statistics). Called when display_result_ready signal arrives.
 
         If the result has an 'artifact_path', it's rendered in the media
-        area via the same render_column_value pathway used for per-row
-        media. If it has a 'summary', 'table', or 'interpretation', the
+        area via controller.render_result_image() -- a result image is a
+        produced file, not a cell in any table, so it does not go through
+        the per-row render_column_value pathway. If it has a 'summary',
+        'table', or 'interpretation', the
         bottom panel switches to the stats page to show them alongside
         the image. Either part can be absent — a pure-stats result
         (SummaryStatsOperator) shows only the stats page.
@@ -377,8 +379,8 @@ class DetailWidget(QWidget):
         # ── Media area ────────────────────────────────────────────────
         artifact_path = result.get("artifact_path", "")
         if artifact_path:
-            widget = self._controller.render_column_value(
-                "full_path", artifact_path, size=600, mode="detail"
+            widget = self._controller.render_result_image(
+                artifact_path, size=600, mode="detail"
             )
             self._swap_media_widget(widget)
 

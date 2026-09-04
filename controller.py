@@ -477,7 +477,7 @@ class AppController(QObject):
                 )
             self._deregister_run(operation_id)
             self.operator_complete.emit(operator_name)
-            self.columns_updated.emit(self._registry.list_all_columns())
+            self.columns_updated.emit(self.get_column_names())
             self._refresh_result()
 
         elif mode == "setup_error":
@@ -772,14 +772,18 @@ class AppController(QObject):
         filesystem). The cost is O(visible tiles), the same order as
         painting them.
         """
-        # 1. The media columns are the registered columns whose type is
-        #    tagged "media_path" -- the same test render_column_value()
-        #    uses. This set does not change from row to row, so resolve it
-        #    once here rather than re-checking every column of every row.
+        # 1. The media columns are the active table's schema columns whose
+        #    type tag is "media_path" -- the same test render_column_value()
+        #    uses (P1.8d-2a: the schema, not the registry's column-name map,
+        #    is the authority for what a named column is). This set does not
+        #    change from row to row, so resolve it once here rather than
+        #    re-checking every column of every row.
+        schema = self._dataset.schema_for(self._active_table)
+        if schema is None:
+            self._store.set_wanted_addresses(set())
+            return
         media_columns = [
-            name
-            for name in self._registry.list_all_columns()
-            if getattr(self._registry.get(name), "tag", None) == "media_path"
+            spec.name for spec in schema.columns_with_tag("media_path")
         ]
         if not media_columns:
             self._store.set_wanted_addresses(set())
@@ -840,7 +844,7 @@ class AppController(QObject):
 
             self._dataset.load_folder(folder_path)
 
-            self.columns_updated.emit(self._registry.list_all_columns())
+            self.columns_updated.emit(self.get_column_names())
             self.tables_updated.emit(self._dataset.list_tables())
             self._refresh_result()
 
@@ -875,7 +879,7 @@ class AppController(QObject):
             # Thumbnails are generated on demand as tiles paint
             # (P0.5b-3i), not in an eager whole-table pass here.
 
-            self.columns_updated.emit(self._registry.list_all_columns())
+            self.columns_updated.emit(self.get_column_names())
             self.tables_updated.emit(self._dataset.list_tables())
             self._refresh_result()
 
@@ -911,7 +915,7 @@ class AppController(QObject):
         """
         try:
             self._dataset.confirm_merge(report)
-            self.columns_updated.emit(self._registry.list_all_columns())
+            self.columns_updated.emit(self.get_column_names())
             self._refresh_result()
         except Exception as e:
             self.error_occurred.emit(f"Failed to confirm merge: {e}")
@@ -984,7 +988,7 @@ class AppController(QObject):
         """
         if self.has_visible_columns_preference():
             return list(self._visible_cols)
-        if DEFAULT_MEDIA_COLUMN_NAME in self._registry.list_visual_columns():
+        if DEFAULT_MEDIA_COLUMN_NAME in self.get_visual_column_names():
             return [DEFAULT_MEDIA_COLUMN_NAME]
         return []
 
@@ -1171,7 +1175,7 @@ class AppController(QObject):
             self._dataset.add_computed_column(
                 name, expression, col_type, self._active_table
             )
-            self.columns_updated.emit(self._registry.list_all_columns())
+            self.columns_updated.emit(self.get_column_names())
             self._refresh_result()
         except Exception as e:
             self.error_occurred.emit(f"Failed to add column: {e}")
@@ -1220,7 +1224,7 @@ class AppController(QObject):
             self._group_by       = None
             self._visible_cols   = None
             self.active_table_changed.emit(name)
-            self.columns_updated.emit(self._registry.list_all_columns())
+            self.columns_updated.emit(self.get_column_names())
             self._refresh_result()
         except KeyError as e:
             self.error_occurred.emit(f"Table not found: {e}")
@@ -1362,7 +1366,7 @@ class AppController(QObject):
             if index_is_authoritative:
                 self._store.reconcile_and_evict()
             self.tables_updated.emit(self._dataset.list_tables())
-            self.columns_updated.emit(self._registry.list_all_columns())
+            self.columns_updated.emit(self.get_column_names())
             self._refresh_result()
         except Exception as e:
             self.error_occurred.emit(f"Failed to load project: {e}")
@@ -1384,13 +1388,41 @@ class AppController(QObject):
         """
         return self._active_table
 
-    def get_column_names(self) -> list[str]:
-        """Returns all registered column names."""
-        return self._registry.list_all_columns()
+    def get_column_names(self, table_name: str | None = None) -> list[str]:
+        """
+        Returns the column names the given table's TableSchema declares --
+        the active table when *table_name* is None.
 
-    def get_visual_column_names(self) -> list[str]:
-        """Returns column names that produce visual output in tiles."""
-        return self._registry.list_visual_columns()
+        P1.8d-2a: the schema, not the registry's column-name map, is the
+        authority for what a table's columns are, so two tables that share
+        a column name are no longer conflated. A table with no schema
+        (only reachable by a test assigning straight into Dataset._tables)
+        yields an empty list. row_id is schema-exempt and never appears.
+        """
+        name = table_name if table_name is not None else self._active_table
+        schema = self._dataset.schema_for(name)
+        if schema is None:
+            return []
+        return list(schema.column_names())
+
+    def get_visual_column_names(self, table_name: str | None = None) -> list[str]:
+        """
+        Returns the given table's columns that render as visual output in
+        tiles -- the active table when *table_name* is None.
+
+        A column is visual when the registry maps its schema type tag to a
+        ColumnType with visual=True.
+        """
+        name = table_name if table_name is not None else self._active_table
+        schema = self._dataset.schema_for(name)
+        if schema is None:
+            return []
+        visual: list[str] = []
+        for spec in schema.columns:
+            col_type = self._registry.type_for_tag(spec.type_tag)
+            if col_type is not None and col_type.visual:
+                visual.append(spec.name)
+        return visual
 
     def get_group_values(self, column: str) -> list:
         """
@@ -1526,14 +1558,26 @@ class AppController(QObject):
         """
         ctx = dict(context) if context else {}
 
+        # Resolve the column's display type tag from the schema of the
+        # table the calling tile named (P1.8d-2a). Fall back to the active
+        # table's schema when the caller named no table, or named a table
+        # that has no schema -- so a stale or unknown table_name degrades
+        # to the active table rather than losing the tag entirely. A tag
+        # that stays None renders exactly as an unregistered column did:
+        # render_by_tag returns a placeholder, never an exception.
+        context_table = ctx.get("table_name")
+        tag = None
+        if context_table is not None:
+            tag = self._schema_tag_for(column_name, context_table)
+        if tag is None:
+            tag = self._schema_tag_for(column_name, self._active_table)
+
         # For a media column, resolve the cell once here and hand the
         # renderer a canonical address (its artifact-cache key) and an
         # absolute source path. The renderer then needs no project root
         # and does no address parsing (docs/media_architecture.md 4.5).
-        col_type = self._registry.get(column_name)
         if (
-            col_type is not None
-            and getattr(col_type, "tag", None) == "media_path"
+            tag == "media_path"
             and isinstance(value, str)
             and value
         ):
@@ -1579,22 +1623,107 @@ class AppController(QObject):
                     request_table,
                 )
 
-        return self._registry.render(column_name, value, size, mode, ctx)
+        return self._registry.render_by_tag(
+            tag, value, size, mode, ctx, label=column_name
+        )
 
-    def get_column_type(self, column_name: str):
+    def render_result_image(
+        self,
+        artifact_path: str,
+        size: int,
+        mode: str = "detail",
+    ):
         """
-        Returns the column-type object registered for *column_name*.
+        Renders an operator's result artifact -- an image file the
+        operator wrote -- for the detail panel.
 
-        Gives the UI read access to column type metadata without reaching
-        into _registry directly.
+        An operator result is a produced file, not a cell in any table, so
+        it is rendered straight through the media type tag and consults no
+        table's schema. This is the difference from render_column_value,
+        whose tag comes from the row's own table: DetailWidget.show_result
+        was calling render_column_value("full_path", ...) as a fiction, and
+        P1.8d-2a broke it whenever the active table's schema had no
+        'full_path' column (the tag resolved to None and the result image
+        became a placeholder).
+
+        The UI hands this a path and gets a widget back; it never learns
+        what a tag is.
+
+        A relative artifact_path is resolved against the project root the
+        same way a media cell is, so an operator that writes into the
+        project folder and returns a relative path still renders -- this
+        matches what render_column_value("full_path", ...) did before.
+        A result file has no ArtifactStore cache entry, so 'thumbnail'
+        mode returns the media renderer's grey placeholder, not a scaled
+        picture; the detail panel is the real caller.
+
+        Args:
+            artifact_path: Path to the image the operator produced.
+            size:          Target size in pixels.
+            mode:          'detail' (default) or 'thumbnail'.
+
+        Returns:
+            A QWidget (detail mode), a placeholder QPixmap (thumbnail
+            mode), or a placeholder if the file cannot be rendered.
+        """
+        # Resolve a project-relative path to an absolute one, exactly as
+        # the media-cell path does. A value that is not a well-formed
+        # address (a stray '#') is handed to the renderer unchanged.
+        try:
+            _canonical_address, source_path = self._resolve_media_cell(
+                artifact_path
+            )
+        except MediaAddressError:
+            source_path = str(artifact_path)
+        return self._registry.render_by_tag(
+            "media_path", source_path, size, mode
+        )
+
+    def _schema_tag_for(
+        self, column_name: str, table_name: str
+    ) -> str | None:
+        """The display type tag a table's TableSchema carries for a column,
+        or None when the table has no schema or the schema does not name
+        the column.
+
+        P1.8d-2a: the schema, not the registry's column-name map, is the
+        authority for what a named column is. Shared by render_column_value
+        (a per-tile paint-path caller) and get_column_type, so it does one
+        pass over the schema's columns -- spec_for raises KeyError for a
+        name the schema does not carry -- rather than an `in` scan followed
+        by a second lookup.
+        """
+        schema = self._dataset.schema_for(table_name)
+        if schema is None:
+            return None
+        try:
+            return schema.spec_for(column_name).type_tag
+        except KeyError:
+            return None
+
+    def get_column_type(self, column_name: str, table_name: str | None = None):
+        """
+        Returns the ColumnType for a column of the given table -- the
+        active table when *table_name* is None -- or None.
+
+        P1.8d-2a: the column's type tag is read off that table's
+        TableSchema and the registry is asked only what the tag renders
+        as. A column the schema does not name returns None, exactly as an
+        unregistered column did before.
 
         Args:
             column_name: The column whose type to look up.
+            table_name:  The table containing the column. Defaults to the
+                         active table.
 
         Returns:
-            The registered column-type object, or None if not found.
+            The ColumnType, or None if the table or column is not known.
         """
-        return self._registry.get(column_name)
+        name = table_name if table_name is not None else self._active_table
+        tag = self._schema_tag_for(column_name, name)
+        if tag is None:
+            return None
+        return self._registry.type_for_tag(tag)
 
     def get_all_row_ids(self, table_name: str | None = None) -> list[str]:
         """
