@@ -194,10 +194,13 @@ documents `plot_html`, which `ResultsPanel` only accepts as legacy fallback.
   Operators currently default to a global temp folder and store it as
   `self._output_dir`; older documentation called this `self.output_dir`, which
   never existed.
-- **`[TARGET -> P1.11]` Every declared type tag must be registered.** Declaring an
-  unregistered tag currently raises, gets swallowed as a printed warning at
-  `controller.py:471-472`, and the column renders as "Unknown column".
-  `avatar_path` and `plot_image` are both in this state today.
+- **`[NOW]` A declared type tag need not be registered, but an unregistered one
+  costs the researcher a placeholder.** The tag still reaches the column's
+  `TableSchema`; `AppController` only prints a once-per-run warning when
+  `ColumnTypeRegistry` has no renderer for it, and that column renders as
+  "Unknown column" instead. Declare a registered tag -- reuse `media_path`,
+  `numeric`, `text` or `boolean_flag`, or register a new one -- so the column
+  actually displays. Tests: `tests/test_operator_tag_hints.py`.
 - **`[TARGET -> P1.8]` Declare intended types; do not enforce dtypes yourself.**
   Dataset validates and normalises a table against its schema when it accepts it.
 - **`[TARGET -> P1.2]` Never open a media file.** Use the resolver -- see

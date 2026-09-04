@@ -40,23 +40,6 @@ to P1.8d, and the two OS-native / non-parsing media-cell entries to P1.8e.
 
 ---
 
-## Open -- wrong output, not just slow
-
-- **Operator result columns declare unregistered types.**
-  `BlendshapeAvatarOperator` declares tag `avatar_path` and `PlotOperator`
-  declares `plot_image`. Neither is a registered type, so `register_by_tag`
-  raises, `controller.py:471-472` swallows it as a printed warning, and those
-  columns render as "Unknown column".
-- **`ColumnTypeRegistry.infer_type()` mistags any column whose values end in a
-  media extension.** A column of `.mp4` filenames becomes `media_path`. It
-  decides by `value.lower().endswith(ext)`, so it also **fails to recognise a
-  media address**, which ends in a fragment such as `#f=1234`. This matters more
-  since P0.5b-1, which keys the artifact cache on those address strings. Fixing
-  the address half belongs with P1.8d, which demotes `ColumnTypeRegistry` to a
-  tag-to-renderer map and routes column-type lookup through the schema instead.
-- **`Dataset.load()` does not clear `ColumnTypeRegistry`**, so column types from
-  the previous project persist.
-
 ## Open -- dead or inconsistent
 
 - **`operators_config.yaml` claims to control which operators are enabled.**
@@ -64,8 +47,6 @@ to P1.8d, and the two OS-native / non-parsing media-cell entries to P1.8e.
   registered in code and absent from the YAML.
 - **`operators/base.py` documents a `plot_html` result key**; `ResultsPanel` and
   `PlotAdvancedOperator` use `html_path`.
-- **`Dataset.load_folder()` never registers `file_name` in the registry**, unlike
-  the CSV import paths.
 - **`_id_counter` assumes `row_id` parses as an int**, and there is no stale-file
   cleanup on re-save. (The parsing half is also the `[MIGRATING]` violation under
   "Row identity and lineage" in `CLAUDE.md`.)
@@ -392,3 +373,44 @@ to P1.8d, and the two OS-native / non-parsing media-cell entries to P1.8e.
   *(P0.2b: `BaseOperator.display_label` owns that fallback chain and
   `OperatorRegistry` passes the ready label into the callbacks. Guarded by
   `tests/test_controller_async_contracts.py::test_worker_callbacks_touch_no_component_state`.)*
+- **Operator result columns declared unregistered types.**
+  `BlendshapeAvatarOperator` declared tag `avatar_path` and `PlotOperator`
+  declared `plot_image`. Neither was a registered type, so the old
+  `register_by_tag` raised, `controller.py:471-472` swallowed it as a printed
+  warning, and those columns rendered as "Unknown column". *(P1.8d-2b-2: both
+  operators now declare `media_path`, a registered tag, and the mechanism they
+  tripped is gone -- an operator's declared tag reaches the target table's
+  `TableSchema` as a `ColumnHint(type_tag=...)`
+  (`Dataset.apply_row_updates()`, `models/dataset.py`), and an unknown tag is
+  stored on the schema as given rather than raising; a tag the registry has no
+  renderer for only prints a once-per-run warning
+  (`AppController.run_create_columns`, `controller.py`) and the column renders
+  as a placeholder. Tests: `tests/test_operator_tag_hints.py`.)*
+- **`ColumnTypeRegistry.infer_type()` mistagged any column whose values end in
+  a media extension**, and separately **failed to recognise a media address**
+  ending in a fragment such as `#f=1234`. *(P1.8d-1: `ColumnTypeRegistry.infer_type`
+  is deleted; `infer_type_tag` in `models/table_schema.py` is the single
+  authority now. Both halves were checked against the current code and are
+  fixed, not just moved: a value is `media_path` only when its path portion
+  both ends in a media extension AND carries a directory separator or an
+  address fragment (`_looks_like_media_path`), so a bare filename such as
+  `face.jpg` with neither is `text`, and `#f=1234` is recognised because the
+  address is parsed before the extension check runs. Tests:
+  `tests/test_table_schema.py`
+  (`test_infer_type_tag_column_of_bare_media_filenames_is_text`,
+  `test_infer_type_tag_media_value_with_a_frame_fragment_is_media_path`).)*
+- **`Dataset.load()` did not clear `ColumnTypeRegistry`**, so column types from
+  the previous project persisted. *(P1.8d-2b-1: `Dataset` no longer holds or
+  reads a `ColumnTypeRegistry` reference at all, so there is nothing left for
+  `load()` to clear -- a loaded project's column tags come from the schema
+  `_commit_prepared` installs (restored from `schemas.json` when present, else
+  re-inferred). Tests: `tests/test_dataset.py`
+  (`test_load_without_column_types_json_keeps_full_path_media`),
+  `tests/test_project_load.py`.)*
+- **`Dataset.load_folder()` never registered `file_name` in the registry**,
+  unlike the CSV import paths. *(P1.8d-2b-1: neither path registers anything
+  in a registry any more -- `Dataset` holds no `ColumnTypeRegistry` reference
+  at all, and `file_name`'s display tag now comes from `infer_type_tag` /
+  `infer_schema` (`models/table_schema.py`) exactly like every other inferred
+  column, `load_folder()` included. The asymmetry this entry described no
+  longer exists on either path.)*

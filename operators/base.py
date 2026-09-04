@@ -150,7 +150,7 @@ class BaseOperator:
         output_columns = [
             ("bs_jawOpen",      "numeric"),
             ("bs_mouthSmile_L", "numeric"),
-            ("avatar_path",     "avatar_path"),
+            ("avatar_path",     "media_path"),
         ]
     """
 

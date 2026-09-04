@@ -222,7 +222,7 @@ operator that declares its own output schema. Each table has a **`TableSchema`**
 owned by Dataset:
 
 - column name
-- type tag (`media_address`, `numeric`, `text`, `boolean_flag`, ...)
+- type tag (`media_path`, `numeric`, `text`, `boolean_flag`, ...)
 - dtype
 - **role** -- `identifier`, `index`, or `measurement`
 - **`carry_to_children`** -- whether a splitting operator copies this column onto
@@ -234,14 +234,21 @@ object, but nothing in the code sets or reads either one yet: every column is a
 `measurement` by default, §4.2 is the authority for what carrying down should
 mean, and those semantics are still an open decision -- not settled here.
 
-`ColumnTypeRegistry` maps a **type tag** to its renderer, filter control, and
-display rules. It does not store what type a named column is.
+`[NOW]` `ColumnTypeRegistry` maps a **type tag** to its renderer, filter
+control, and display rules. It does not store what type a named column is --
+that lives on the column's own `TableSchema` above. `AppController` reads a
+column's type tag off that table's schema and asks the registry only what the
+tag renders as (`get_column_type()`, `render_column_value()`). `Dataset`
+never writes to `ColumnTypeRegistry` and holds no reference to it at all.
+Tests: `tests/test_gallery_seam.py`, `tests/test_operator_tag_hints.py`.
 
 The split matters because a project holds many tables and only the second half is
-genuinely global. Today the registry maps `column_name -> ColumnType` for the
-whole project, so a `score` column that is numeric in one table and text in
-another silently takes whichever was registered last, and switching tables emits
-every column registered anywhere rather than the active table's columns.
+genuinely global. Before P1.8d the registry instead mapped `column_name ->
+ColumnType` for the whole project, so a `score` column that was numeric in one
+table and text in another silently took whichever was registered last, and
+switching tables emitted every column registered anywhere rather than the
+active table's columns. That map is gone; `docs/known_defects.md` (Fixed) has
+the detail.
 
 Dtypes are set explicitly when a table is created, never inferred, and
 **validated by Dataset when it accepts a table** -- not left to each operator to
@@ -280,14 +287,22 @@ Tables live in memory as pandas DataFrames and are saved as Parquet. See
 `docs/media_architecture.md` §5 for why they stay in memory and what would change
 that.
 
-`[NOW]` A saved project folder holds one Parquet file per table plus three JSON
-sidecars: `provenance.json` (the provenance log), `column_types.json` (the
-column-name -> type-tag map) and `schemas.json` (each stored table's serialised
-`TableSchema`, written since P1.8c-2a). `schemas.json` carries `format_version`
-1; an unknown version or a corrupt file is ignored -- the project still opens,
-with every table's schema re-inferred and a message recorded -- and a table the
-file does not name is re-inferred the same way. `models/table_schema.py`'s
-`to_dict` / `schema_from_dict` are the authority on the per-table encoding.
+`[NOW]` A saved project folder holds one Parquet file per table plus two JSON
+sidecars: `provenance.json` (the provenance log) and `schemas.json` (each
+stored table's serialised `TableSchema`, including every column's display type
+tag, written since P1.8c-2a). `schemas.json` is written whenever at least one
+stored table has a schema -- true for every table that reached storage through
+the accept path -- and carries `format_version` 1; an unknown version or a
+corrupt file is ignored -- the project still opens, with every table's schema
+re-inferred and a message recorded -- and a table the file does not name is
+re-inferred the same way. `models/table_schema.py`'s `to_dict` /
+`schema_from_dict` are the authority on the per-table encoding.
+
+`column_types.json` (a column-name -> type-tag map covering the whole project)
+was retired by P1.8d: `save()` no longer writes it. `load()` still reads it,
+but only as a fallback for a project saved before P1.8c-2a that has no usable
+`schemas.json`; a project with neither file opens by inference. Tests:
+`tests/test_dataset.py`, `tests/test_project_load.py`.
 
 ---
 
@@ -295,17 +310,24 @@ file does not name is re-inferred the same way. `models/table_schema.py`'s
 
 Every column has a registered type tag describing how its values display:
 
-- **`media_address`** -- an image, a video, or a piece of one. The renderer
-  dispatches internally. `media_path` remains as an alias so old projects load;
-  once a value can carry `#f=` or `#t=` it is no longer a path.
+- **`media_path`** -- an image, a video, or a piece of one. The renderer
+  dispatches internally. The cell's value may be a plain file path or a media
+  address carrying a fragment (`#f=`, `#t=`, `#r=`, a stream selector); either
+  form gets this tag. `docs/media_architecture.md` §3.6 is the authority on
+  the address grammar.
 - **`numeric`** -- a number, including timestamps, durations, computed scores.
 - **`text`** -- any string. The filter panel shows toggle buttons when there are few
   unique values, a search box when there are many.
 - **`boolean_flag`** -- True/False, shown as a tick or cross.
 
-`[TARGET -> P1.11]` A type tag declared by an operator must exist in the registry.
-Today `avatar_path` and `plot_image` are declared and not registered; the error is
-swallowed and the column renders as "Unknown column".
+`[NOW]` A type tag an operator declares need not be registered -- it reaches the
+column's `TableSchema` either way (P1.8d-2b-2, §4.3 above). An unregistered tag
+costs the researcher a placeholder, not a crash: `AppController` prints a
+once-per-run warning when `ColumnTypeRegistry` has no renderer for a declared
+tag, and the column renders as "Unknown column" until the operator declares a
+registered tag instead. `BlendshapeAvatarOperator` and `PlotOperator`, the two
+operators that used to hit this with `avatar_path` and `plot_image`, both now
+declare `media_path`. Tests: `tests/test_operator_tag_hints.py`.
 
 Renderers live in `column_types/renderers.py` with the signature:
 

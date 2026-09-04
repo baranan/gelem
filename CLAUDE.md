@@ -94,6 +94,19 @@ state. This rule carries no violation list of its own -- it points at the three
   bypasses this; `schema_for()` then returns `None`.) `docs/architecture.md`
   §4.3 is the authority for the schema and its dtype policy. Guarded by an AST
   check and behaviour tests in `tests/test_dataset_schema.py`.
+- **`[NOW]`** A column's display type tag lives on its table's `TableSchema`,
+  not in a project-wide map. `ColumnTypeRegistry` maps a tag to a renderer
+  only and holds no column-name map; `Dataset` holds no reference to it at
+  all. Made true by P1.8d. `docs/architecture.md` §4.3 and §5 are the
+  authority. Tests: `tests/test_gallery_seam.py`
+  (`test_get_column_type_is_per_table_not_shared`), `tests/test_table_schema.py`.
+- **`[NOW]`** `models/dataset.py` imports nothing from `column_types` -- the
+  boundary P1.8d-2b-1 established. Guarded by
+  `tests/test_architecture_imports.py::test_dataset_does_not_import_column_types`.
+- **`[NOW]`** An operator's declared output-column tag reaches its table's
+  schema as a `ColumnHint`, registered or not -- the schema does not validate
+  it. An unregistered tag costs a placeholder tile, never a dropped column or
+  a raised exception. Made true by P1.8d. Tests: `tests/test_operator_tag_hints.py`.
 - **`[NOW]`** `Dataset.load()` is atomic: every parquet is read and validated
   before any in-memory state is replaced, so a failed load leaves the open
   project untouched -- tables, schemas, provenance log and id counter.

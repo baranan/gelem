@@ -10,6 +10,8 @@ Rules enforced:
   - operators/operator_registry.py must not import from ui.*
   - UI tile files must not import data-processing libraries at module level
     (pandas, PIL, cv2, mediapipe, numpy belong in operators/models, not UI)
+  - models/dataset.py must not import from column_types.* (P1.8d-2b-1:
+    Dataset holds no reference to ColumnTypeRegistry)
 """
 
 import ast
@@ -60,6 +62,19 @@ def test_ui_tiles_do_not_import_data_libs():
         if hits:
             violations[py_file.name] = hits
     assert not violations, f"UI tile files import data libs: {violations}"
+
+
+def test_dataset_does_not_import_column_types():
+    """models/dataset.py must not import from column_types.* -- P1.8d-2b-1
+    removed Dataset's reference to ColumnTypeRegistry entirely; a column's
+    display type tag lives on the table's own TableSchema instead."""
+    modules = _imported_modules(ROOT / "models" / "dataset.py")
+    registry_imports = [
+        m for m in modules if m == "column_types" or m.startswith("column_types.")
+    ]
+    assert not registry_imports, (
+        f"models/dataset.py imports column_types: {registry_imports}"
+    )
 
 
 def test_ui_widgets_do_not_import_data_libs():

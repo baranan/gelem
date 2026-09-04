@@ -1259,11 +1259,16 @@ sharing the parser and not the decoder.
 **P1.14 Demote `VideoFramesOperator`** to "Export frames as files".
 
 **P1.11 Operator registration and output contract.** Make
-`operators_config.yaml` drive registration or delete it. Register the missing type
-tags (`avatar_path`, `plot_image`) or map them to `media_address`. Settle
-`html_path` versus `plot_html`. Promote a real operator as the thumbnail-era
-reference (`operators/thumbnail.py` itself was deleted in P0.5b-2i). Fix
-`self.output_dir` versus `self._output_dir` in the docs.
+`operators_config.yaml` drive registration or delete it -- `main.py` still
+registers every operator by hand and the two lists still disagree
+(`StatsOperator` is registered in code and absent from the YAML). Settle
+`html_path` versus `plot_html` -- `operators/base.py` still documents the
+latter (`docs/known_defects.md`). Promote a real operator as the
+thumbnail-era reference (`operators/thumbnail.py` itself was deleted in
+P0.5b-2i). Two sub-tasks this item used to list are done and dropped: the
+type-tag half (P1.8d-2b-2 -- both operators now declare the registered
+`media_path`, and `media_address` never existed as a tag to map anything to)
+and the `self.output_dir` doc fix (`operators/CLAUDE.md`).
 
 **P1.13 Remaining UI boundary cleanup.** Replace the private-attribute access
 listed in `CLAUDE.md` with the public methods that already exist -- `_op_registry`,
@@ -1400,7 +1405,9 @@ document.** Extend the existing pattern in `tests/test_architecture_imports.py`,
 - No UI file accesses `controller._*`.
 - No widget reads another widget's private state.
 - Operator modules construct no Qt objects (after P1.12).
-- Every declared output type tag is registered and valid.
+- A declared output type tag reaches the schema whether or not it is
+  registered -- `CLAUDE.md` is the authority on this rule, not this line
+  (P1.8d).
 - No synchronous media decode in any renderer paint path.
 - Schemas are per table: the same column name may hold different types in two
   tables.
