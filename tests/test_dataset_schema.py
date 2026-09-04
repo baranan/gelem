@@ -832,25 +832,18 @@ def test_accept_table_without_declared_schema_is_unchanged(tmp_path):
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# P1.8d-1 -- TableSchema is the authority for a column's display tag, and the
-#            registry's tag agrees with it
+# P1.8d-1 -- TableSchema is the authority for a column's display tag
+# P1.8d-2b-1 -- Dataset no longer writes that tag into ColumnTypeRegistry, so
+#               this test dropped its "and the registry agrees" half.
 # ---------------------------------------------------------------------------
 
-def test_accepted_media_column_tag_comes_from_the_schema_and_registry_agrees(tmp_path):
+def test_accepted_media_column_tag_comes_from_the_schema(tmp_path):
     # A table accepted with a column of media addresses (one carrying a frame
     # fragment, the case ColumnTypeRegistry.infer_type got wrong): the built
-    # schema's spec.type_tag is "media_path", and the tag the registry now
-    # holds for that column is the SAME string -- because Dataset registered it
-    # straight off the schema, not by asking the registry to infer.
+    # schema's spec.type_tag is "media_path".
     # P1.8d-2: the values carry a directory or a fragment; a bare "a.mp4" is
     # text now, so this test's values gained a directory.
-    from artifacts.artifact_store import ArtifactStore
-    from column_types.registry import ColumnTypeRegistry
-
-    registry = ColumnTypeRegistry()
-    registry.setup_defaults(ArtifactStore(tmp_path / "artifacts"))
     ds = Dataset()
-    ds.set_registry(registry)
 
     ds.create_table_from_df(
         "clips",
@@ -859,10 +852,6 @@ def test_accepted_media_column_tag_comes_from_the_schema_and_registry_agrees(tmp
 
     schema_tag = ds.schema_for("clips").spec_for("clip").type_tag
     assert schema_tag == "media_path"
-
-    registered = registry.get("clip")
-    assert registered is not None
-    assert registered.tag == schema_tag
 
 
 def test_schema_from_dict_raises_serialisation_error_for_an_unhashable_role():

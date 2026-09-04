@@ -130,27 +130,22 @@ def test_load_folder_resets_on_second_call():
         f"row_ids should reset on second load, got '{first_id}'"
     )
 
-def test_load_folder_registers_media_path_type():
+def test_load_folder_tags_full_path_as_media_path_in_the_schema():
     """
-    load_folder should register full_path as 'media_path' (not 'image_path').
-    This ensures images and videos are both handled by the media renderer.
+    load_folder tags full_path as 'media_path' (not 'image_path') so images
+    and videos are both handled by the media renderer.
+
+    P1.8d-2b-1: Dataset no longer writes to ColumnTypeRegistry; the frames
+    TableSchema is the single authority for the tag.
     """
     from models.dataset import Dataset
-    from column_types.registry import ColumnTypeRegistry
-    from artifacts.artifact_store import ArtifactStore
-
-    store    = ArtifactStore(TEMP_DIR / "gelem_test_artifacts")
-    registry = ColumnTypeRegistry()
-    registry.setup_defaults(store)
 
     ds = Dataset()
-    ds.set_registry(registry)
     ds.load_folder(TEST_IMAGES)
 
-    col_type = registry.get("full_path")
-    assert col_type is not None, "full_path not registered with registry"
-    assert col_type.tag == "media_path", (
-        f"full_path should be registered as 'media_path', got '{col_type.tag}'"
+    spec = ds.schema_for("frames").spec_for("full_path")
+    assert spec.type_tag == "media_path", (
+        f"full_path should be tagged 'media_path', got '{spec.type_tag}'"
     )
 
 def test_load_folder_only_loads_supported_extensions():
@@ -183,7 +178,7 @@ run_test("row_ids are zero-padded strings", test_load_folder_row_ids_are_padded_
 run_test("row_ids are unique", test_load_folder_row_ids_are_unique)
 run_test("full_path values point to real files", test_load_folder_full_paths_exist)
 run_test("Second call resets the table", test_load_folder_resets_on_second_call)
-run_test("Registers full_path as media_path type", test_load_folder_registers_media_path_type)
+run_test("Tags full_path as media_path in schema", test_load_folder_tags_full_path_as_media_path_in_the_schema)
 run_test("Only loads supported media extensions", test_load_folder_only_loads_supported_extensions)
 
 
@@ -241,29 +236,24 @@ else:
         assert "session_id" in df.columns, "session_id column missing after merge"
         assert "trial_id" in df.columns,   "trial_id column missing after merge"
 
-    def test_confirm_merge_registers_text_type():
+    def test_confirm_merge_tags_string_column_as_text_in_the_schema():
         """
-        After confirm_merge, CSV string columns should be registered
-        as 'text' (not 'categorical').
+        After confirm_merge, a CSV string column is tagged 'text' (not
+        'categorical') by the frames TableSchema.
+
+        P1.8d-2b-1: Dataset no longer writes to ColumnTypeRegistry, so this
+        reads the tag off schema_for() -- the single authority since P1.8d-1.
         """
         from models.dataset import Dataset
-        from column_types.registry import ColumnTypeRegistry
-        from artifacts.artifact_store import ArtifactStore
-
-        store    = ArtifactStore(TEMP_DIR / "gelem_test_artifacts")
-        registry = ColumnTypeRegistry()
-        registry.setup_defaults(store)
 
         ds = Dataset()
-        ds.set_registry(registry)
         ds.load_folder(TEST_IMAGES)
         report = ds.merge_csv(METADATA_CSV, join_on="file_name")
         ds.confirm_merge(report)
 
-        col_type = registry.get("condition")
-        assert col_type is not None, "condition not registered"
-        assert col_type.tag == "text", (
-            f"condition should be registered as 'text', got '{col_type.tag}'"
+        spec = ds.schema_for("frames").spec_for("condition")
+        assert spec.type_tag == "text", (
+            f"condition should be tagged 'text', got '{spec.type_tag}'"
         )
 
     def test_confirm_merge_row_count_unchanged():
@@ -283,7 +273,7 @@ else:
     run_test("MergeReport counts are correct", test_merge_report_counts)
     run_test("Table unchanged before confirm", test_merge_does_not_commit_before_confirm)
     run_test("confirm_merge adds CSV columns", test_confirm_merge_adds_columns)
-    run_test("confirm_merge registers text type", test_confirm_merge_registers_text_type)
+    run_test("confirm_merge tags string column text in schema", test_confirm_merge_tags_string_column_as_text_in_the_schema)
     run_test("Row count unchanged after merge", test_confirm_merge_row_count_unchanged)
 
     # --- MANUALLY ADDED (Student B): merge edge cases. Tests above unchanged.
@@ -1125,42 +1115,42 @@ def test_save_load_preserves_provenance():
             f"load() should record itself as the last entry; got {actions_after}"
         )
 
-def test_save_load_re_registers_column_types():
-    # After load, the registry knows about the loaded columns so the gallery
-    # can render them (per the guide's "re-register column types" step).
+def test_save_load_restores_column_tags_from_the_schema():
+    # NAMED REVIEW CHECK 1: every column's type tag survives save -> load,
+    # read off ds2.schema_for, with NO column_types.json present.
+    # P1.8d-2b-1: Dataset no longer re-registers column types; schemas.json
+    # carries the tags and load() restores each table's schema from it.
     from models.dataset import Dataset
-    from column_types.registry import ColumnTypeRegistry
-    from artifacts.artifact_store import ArtifactStore
 
     with tempfile.TemporaryDirectory() as d:
-        root      = Path(d)
-        store     = ArtifactStore(root / "artifacts")
-        registry  = ColumnTypeRegistry()
-        registry.setup_defaults(store)
+        root = Path(d)
         ds = Dataset()
-        ds.set_registry(registry)
         ds.load_folder(TEST_IMAGES)
         project = root / "project"
         ds.save(project)
 
-        registry2 = ColumnTypeRegistry()
-        registry2.setup_defaults(store)
+        assert not (project / "column_types.json").exists(), (
+            "save() must no longer write column_types.json"
+        )
+        assert (project / "schemas.json").exists(), (
+            "save() still writes schemas.json"
+        )
+
+        schema_before = ds.schema_for("frames")
+
         ds2 = Dataset()
-        ds2.set_registry(registry2)
         ds2.load(project)
-        full_path_type = registry2.get("full_path")
-        assert full_path_type is not None, (
-            "full_path should be re-registered after load"
-        )
-        assert full_path_type.tag == "media_path", (
-            f"full_path should be registered as 'media_path'; "
-            f"got '{full_path_type.tag}'"
-        )
-        file_name_type = registry2.get("file_name")
-        assert file_name_type is None or file_name_type.tag != "media_path", (
-            f"file_name should not be tagged 'media_path'; got "
-            f"'{file_name_type.tag if file_name_type else None}'"
-        )
+        schema_after = ds2.schema_for("frames")
+
+        assert schema_after is not None
+        # Every column's tag round-trips.
+        for name in schema_before.column_names():
+            assert (
+                schema_after.spec_for(name).type_tag
+                == schema_before.spec_for(name).type_tag
+            ), f"tag for {name!r} changed across save/load"
+        assert schema_after.spec_for("full_path").type_tag == "media_path"
+        assert schema_after.spec_for("file_name").type_tag != "media_path"
 
 run_test("load(): missing project folder raises clear error", test_load_missing_project_raises_clear_error)
 run_test("load(): empty folder raises clear error",           test_load_empty_folder_raises_clear_error)
@@ -1170,7 +1160,7 @@ run_test("save/load preserves multiple tables",               test_save_load_pre
 run_test("save/load full_path round-trips identically",       test_save_load_full_path_roundtrips)
 run_test("save uses relative path when images inside project", test_save_uses_relative_path_when_images_inside_project)
 run_test("save/load preserves provenance log",                test_save_load_preserves_provenance)
-run_test("save/load re-registers column types",               test_save_load_re_registers_column_types)
+run_test("save/load restores column tags from the schema",    test_save_load_restores_column_tags_from_the_schema)
 
 def test_save_load_relative_source_path_resolves_correctly():
     # Locks finding #1: a relative full_path (e.g. from load_folder called
@@ -1197,12 +1187,12 @@ def test_save_load_relative_source_path_resolves_correctly():
 
 run_test("save/load: relative source path resolves correctly", test_save_load_relative_source_path_resolves_correctly)
 
-def test_save_load_relativizes_all_media_path_columns():
-    # Locks finding #4: any column the registry tags as media_path gets
-    # relativized on save and restored on load — not only full_path.
+def test_save_load_relativizes_a_schema_tagged_media_column():
+    # Locks finding #4, re-expressed for P1.8d-2b-1: any column the frames
+    # TableSchema tags media_path gets relativized on save and restored on
+    # load -- not only full_path. The tag now comes from the schema, not the
+    # ColumnTypeRegistry.
     from models.dataset import Dataset
-    from column_types.registry import ColumnTypeRegistry
-    from artifacts.artifact_store import ArtifactStore
     with tempfile.TemporaryDirectory() as d:
         project = Path(d) / "proj"
         avatars = project / "avatars"
@@ -1210,148 +1200,131 @@ def test_save_load_relativizes_all_media_path_columns():
         avatar_file = avatars / "av1.jpg"
         avatar_file.touch()
 
-        store    = ArtifactStore(Path(d) / "artifacts")
-        registry = ColumnTypeRegistry()
-        registry.setup_defaults(store)
         ds = Dataset()
-        ds.set_registry(registry)
-        ds._tables["frames"] = pd.DataFrame({
-            "row_id":      ["000001"],
-            "avatar_path": [str(avatar_file)],
-        })
-        registry.register_by_tag("avatar_path", "media_path")
+        # The cell value is an absolute media path, so infer_type_tag tags
+        # the column media_path in the schema the accept builds.
+        ds.create_table_from_df(
+            "frames",
+            pd.DataFrame({"avatar_path": [str(avatar_file)]}),
+        )
+        assert (
+            ds.schema_for("frames").spec_for("avatar_path").type_tag
+            == "media_path"
+        ), "sanity: avatar_path must be schema-tagged media_path"
         ds.save(project)
 
-        # Stored avatar_path must be relative (registry tagged it media_path).
+        # Stored avatar_path must be relative (schema tags it media_path).
         stored = pd.read_parquet(project / "frames.parquet")["avatar_path"].iloc[0]
         assert not Path(stored).is_absolute(), (
-            f"avatar_path (registered as media_path) should be stored relative; got {stored}"
+            f"avatar_path (schema-tagged media_path) should be stored "
+            f"relative; got {stored}"
         )
 
         # Load must restore avatar_path back to absolute.
-        registry2 = ColumnTypeRegistry()
-        registry2.setup_defaults(store)
         ds2 = Dataset()
-        ds2.set_registry(registry2)
         ds2.load(project)
         loaded = ds2.get_table("frames")["avatar_path"].iloc[0]
         # Compare file identity, not string spelling. Since P0.2c, load()
-        # returns the canonical POSIX form (media_architecture.md decision 9),
-        # not str(root / p). The "stored relative" assertion above is the
-        # spec point this test guards.
+        # returns the canonical POSIX form (media_architecture.md decision 9).
         assert Path(loaded).resolve() == Path(avatar_file).resolve(), (
             f"avatar_path should resolve back to the original file; got {loaded}"
         )
 
-run_test("save/load relativizes all media_path columns", test_save_load_relativizes_all_media_path_columns)
+run_test("save/load relativizes a schema-tagged media column", test_save_load_relativizes_a_schema_tagged_media_column)
 
-def test_load_without_sidecar_still_registers_full_path():
-    # Locks round-2 finding #1: a project saved without a registry has no
-    # column_types.json. Load must still register full_path as media_path
-    # (mirror load_folder's default) so the gallery renders thumbnails.
+def test_load_without_column_types_json_keeps_full_path_media():
+    # NAMED REVIEW CHECK 1 companion: a project saved by current Gelem has
+    # schemas.json and NO column_types.json. Load restores full_path as
+    # media_path from the schema, so the gallery still renders thumbnails.
     from models.dataset import Dataset
-    from column_types.registry import ColumnTypeRegistry
-    from artifacts.artifact_store import ArtifactStore
     with tempfile.TemporaryDirectory() as d:
         project = Path(d) / "proj"
-        # Save WITHOUT a registry -> no sidecar gets written.
         ds = Dataset()
         ds.load_folder(TEST_IMAGES)
         ds.save(project)
         assert not (project / "column_types.json").exists(), (
-            "sanity: this test relies on no sidecar being written"
+            "save() must no longer write column_types.json"
         )
-        # Now load WITH a registry attached.
-        store    = ArtifactStore(Path(d) / "artifacts")
-        registry = ColumnTypeRegistry()
-        registry.setup_defaults(store)
         ds2 = Dataset()
-        ds2.set_registry(registry)
         ds2.load(project)
-        ct = registry.get("full_path")
-        assert ct is not None and ct.tag == "media_path", (
-            f"full_path should fall back to media_path when sidecar is missing; "
-            f"got tag={ct.tag if ct else None}"
+        assert (
+            ds2.schema_for("frames").spec_for("full_path").type_tag
+            == "media_path"
         )
 
-def test_load_unknown_tag_does_not_crash():
-    # Locks round-2 finding #2: an unknown tag in column_types.json (e.g.
-    # a custom type from an operator not available in this build) must
-    # not sink the load — that one column stays unregistered, the rest
-    # still register normally.
+def test_legacy_column_types_json_restores_a_media_column_and_ignores_unknown_tags():
+    # NAMED REVIEW CHECK 2: a pre-P1.8c-2a project -- column_types.json and
+    # NO schemas.json. The legacy fallback must (a) restore a non-full_path
+    # media column named only by the sidecar -- its project-relative stored
+    # path is resolved back to absolute on load -- and (b) ignore any tag
+    # that is not 'media_path', raising nothing.
     import json as _json
     from models.dataset import Dataset
-    from column_types.registry import ColumnTypeRegistry
-    from artifacts.artifact_store import ArtifactStore
     with tempfile.TemporaryDirectory() as d:
         project = Path(d) / "proj"
-        store    = ArtifactStore(Path(d) / "artifacts")
-        registry = ColumnTypeRegistry()
-        registry.setup_defaults(store)
-        ds = Dataset()
-        ds.set_registry(registry)
-        ds.load_folder(TEST_IMAGES)
-        ds.save(project)
-        # Hand-edit the sidecar to inject an unknown tag.
-        ct_path = project / "column_types.json"
-        column_types = _json.loads(ct_path.read_text())
-        column_types["mystery_col"] = "totally_unknown_tag"
-        ct_path.write_text(_json.dumps(column_types))
-        # Load should not crash.
-        registry2 = ColumnTypeRegistry()
-        registry2.setup_defaults(store)
+        avatars = project / "avatars"
+        avatars.mkdir(parents=True)
+        avatar_file = avatars / "av1.jpg"
+        avatar_file.touch()
+
+        # Hand-build a legacy project: a frames.parquet whose avatar_path is
+        # stored project-relative (as a pre-P1.8c-2a save would leave it), a
+        # column_types.json naming it media, and NO schemas.json.
+        pd.DataFrame({
+            "row_id":      ["000001"],
+            "avatar_path": ["avatars/av1.jpg"],
+        }).to_parquet(project / "frames.parquet")
+        (project / "column_types.json").write_text(_json.dumps({
+            "avatar_path": "media_path",
+            "mystery_col": "totally_unknown_tag",
+        }))
+
         ds2 = Dataset()
-        ds2.set_registry(registry2)
-        ds2.load(project)
-        assert registry2.get("full_path") is not None, (
-            "known tags should still register despite an unknown tag in the sidecar"
+        ds2.load(project)  # must not raise
+
+        loaded = ds2.get_table("frames")["avatar_path"].iloc[0]
+        assert Path(loaded).is_absolute(), (
+            f"legacy sidecar should have marked avatar_path a media column so "
+            f"load() resolved it to absolute; got {loaded!r}"
         )
+        assert Path(loaded).resolve() == avatar_file.resolve()
 
 def test_save_load_realistic_merge_roundtrip():
     # End-to-end real-research scenario: load_folder + merge_csv + save +
-    # load, with a registry attached. Asserts non-media column types
-    # (numeric, text) also round-trip via the sidecar.
+    # load. Non-media column tags (numeric, text) round-trip via schemas.json.
     from models.dataset import Dataset
-    from column_types.registry import ColumnTypeRegistry
-    from artifacts.artifact_store import ArtifactStore
     if not METADATA_CSV.exists():
         return  # SKIP — metadata.csv not available
     with tempfile.TemporaryDirectory() as d:
         project = Path(d) / "proj"
-        store    = ArtifactStore(Path(d) / "artifacts")
-        registry = ColumnTypeRegistry()
-        registry.setup_defaults(store)
         ds = Dataset()
-        ds.set_registry(registry)
         ds.load_folder(TEST_IMAGES)
         ds.confirm_merge(ds.merge_csv(METADATA_CSV, join_on="file_name"))
-        # Sanity: registry should have tagged the merged columns.
-        cond_before = registry.get("condition")
-        ts_before   = registry.get("timestamp")
-        assert cond_before is not None and cond_before.tag == "text", (
-            f"sanity: condition should be 'text' before save; got {cond_before.tag if cond_before else None}"
+        sch = ds.schema_for("frames")
+        assert sch.spec_for("condition").type_tag == "text", (
+            f"sanity: condition should be 'text' before save; got "
+            f"{sch.spec_for('condition').type_tag}"
         )
-        assert ts_before is not None and ts_before.tag == "numeric", (
-            f"sanity: timestamp should be 'numeric' before save; got {ts_before.tag if ts_before else None}"
+        assert sch.spec_for("timestamp").type_tag == "numeric", (
+            f"sanity: timestamp should be 'numeric' before save; got "
+            f"{sch.spec_for('timestamp').type_tag}"
         )
         ds.save(project)
-        # Reload into fresh dataset + registry.
-        registry2 = ColumnTypeRegistry()
-        registry2.setup_defaults(store)
+
         ds2 = Dataset()
-        ds2.set_registry(registry2)
         ds2.load(project)
-        cond_after = registry2.get("condition")
-        ts_after   = registry2.get("timestamp")
-        assert cond_after is not None and cond_after.tag == "text", (
-            f"condition should be 'text' after round-trip; got {cond_after.tag if cond_after else None}"
+        sch2 = ds2.schema_for("frames")
+        assert sch2.spec_for("condition").type_tag == "text", (
+            f"condition should be 'text' after round-trip; got "
+            f"{sch2.spec_for('condition').type_tag}"
         )
-        assert ts_after is not None and ts_after.tag == "numeric", (
-            f"timestamp should be 'numeric' after round-trip; got {ts_after.tag if ts_after else None}"
+        assert sch2.spec_for("timestamp").type_tag == "numeric", (
+            f"timestamp should be 'numeric' after round-trip; got "
+            f"{sch2.spec_for('timestamp').type_tag}"
         )
 
-run_test("load(): no sidecar still registers full_path",      test_load_without_sidecar_still_registers_full_path)
-run_test("load(): unknown tag in sidecar does not crash",     test_load_unknown_tag_does_not_crash)
+run_test("load(): no column_types.json keeps full_path media", test_load_without_column_types_json_keeps_full_path_media)
+run_test("load(): legacy sidecar restores a media column, ignores unknown tags", test_legacy_column_types_json_restores_a_media_column_and_ignores_unknown_tags)
 run_test("save/load realistic merge round-trip preserves types", test_save_load_realistic_merge_roundtrip)
 
 

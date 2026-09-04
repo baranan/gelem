@@ -1,9 +1,10 @@
 """
 tests/test_project_load.py
 
-P1.8c-2b: Dataset.load() restores the schemas save() wrote, is atomic (a bad
-project leaves the open one untouched), and clears the column registry's
-name -> type map so a second project does not inherit the first's column tags.
+P1.8c-2b: Dataset.load() restores the schemas save() wrote and is atomic (a bad
+project leaves the open one untouched). P1.8d-2b-1: Dataset no longer touches
+ColumnTypeRegistry, so "a second project does not inherit the first's column
+tags" is now guaranteed by consult_stored_schema=False and the restored schema.
 
 Real Dataset + pandas, no Qt. strict_schema is on for the whole suite
 (tests/conftest.py).
@@ -328,19 +329,14 @@ def test_a_table_not_named_by_saved_schemas_ignores_the_prior_projects_spec(tmp_
 # registry: a second project does not inherit the first project's column tags
 # ---------------------------------------------------------------------------
 
-def test_loading_a_second_project_does_not_keep_the_first_projects_column_tags(tmp_path):
-    from artifacts.artifact_store import ArtifactStore
-    from column_types.registry import ColumnTypeRegistry
-
-    store = ArtifactStore(tmp_path / "art")
-
+def test_loading_a_second_project_does_not_keep_the_first_projects_columns(tmp_path):
+    # P1.8d-2b-1: Dataset no longer writes to ColumnTypeRegistry, so "column
+    # tags" now means the restored TableSchema. Opening B after A must leave
+    # the frames schema describing B alone -- no 'mood' column carried over.
     # Project A: a CSV whose columns include 'mood'.
     csv_a = tmp_path / "a.csv"
     csv_a.write_text("mood,val\nhappy,1\nsad,2\n")
-    reg_a = ColumnTypeRegistry()
-    reg_a.setup_defaults(store)
     ds_a = Dataset()
-    ds_a.set_registry(reg_a)
     ds_a.load_csv_as_primary(csv_a)
     proj_a = tmp_path / "A"
     ds_a.save(proj_a)
@@ -348,76 +344,55 @@ def test_loading_a_second_project_does_not_keep_the_first_projects_column_tags(t
     # Project B: a different CSV, no 'mood' column.
     csv_b = tmp_path / "b.csv"
     csv_b.write_text("temperature,val\n20,1\n21,2\n")
-    reg_b = ColumnTypeRegistry()
-    reg_b.setup_defaults(store)
     ds_b = Dataset()
-    ds_b.set_registry(reg_b)
     ds_b.load_csv_as_primary(csv_b)
     proj_b = tmp_path / "B"
     ds_b.save(proj_b)
 
-    # One dataset + registry opens A, then B.
-    reg = ColumnTypeRegistry()
-    reg.setup_defaults(store)
+    # One dataset opens A, then B.
     ds = Dataset()
-    ds.set_registry(reg)
 
     ds.load(proj_a)
-    assert reg.get("mood") is not None, "sanity: project A registered 'mood'"
+    assert "mood" in ds.schema_for("frames").column_names(), (
+        "sanity: project A's frames schema has 'mood'"
+    )
 
     ds.load(proj_b)
-    assert reg.get("mood") is None, "project B must not inherit A's 'mood' tag"
-    assert reg.get("temperature") is not None
-    # The built-in types survive the clear -- 'temperature' could be
-    # re-registered against them.
-    assert reg.get("val") is not None
+    names_b = ds.schema_for("frames").column_names()
+    assert "mood" not in names_b, "project B must not inherit A's 'mood' column"
+    assert "temperature" in names_b
+    assert "val" in names_b
 
 
 def test_a_second_project_does_not_inherit_a_media_tag_via_inference(tmp_path):
-    # P1.8c-2b follow-up (Fix 4). load()'s _prepare_table must not consult the
-    # registry, which during a load still holds the OUTGOING project's tags.
-    # Project A tags column 'clip' as media_path; project B has its own 'clip'
-    # column of plain text and no schemas.json entry for it, so B's 'clip' spec
-    # is inferred. Its type_tag must come from inference ('text'), not from A's
-    # lingering registry tag.
-    from artifacts.artifact_store import ArtifactStore
-    from column_types.registry import ColumnTypeRegistry
-
-    store = ArtifactStore(tmp_path / "art")
-
+    # P1.8c-2b follow-up (Fix 4), re-expressed for P1.8d-2b-1. Project A's
+    # frames schema tags column 'clip' as media_path. Project B has its own
+    # 'clip' column of plain text and NO schemas.json, so B's 'clip' spec is
+    # inferred. Its type_tag must come from inference ('text'), never from A's
+    # schema still sitting in memory -- load() passes consult_stored_schema
+    # =False so the outgoing project cannot shape the incoming one.
     csv_a = tmp_path / "a.csv"
-    csv_a.write_text("clip,val\na.mp4,1\nb.mp4,2\n")
-    reg_a = ColumnTypeRegistry()
-    reg_a.setup_defaults(store)
+    csv_a.write_text("clip,val\nvids/a.mp4,1\nvids/b.mp4,2\n")
     ds_a = Dataset()
-    ds_a.set_registry(reg_a)
     ds_a.load_csv_as_primary(csv_a)
-    reg_a.register_by_tag("clip", "media_path")  # force the media tag
+    assert (
+        ds_a.schema_for("frames").spec_for("clip").type_tag == "media_path"
+    ), "sanity: A's 'clip' (paths with a separator) is schema-tagged media_path"
     proj_a = tmp_path / "A"
     ds_a.save(proj_a)
 
     csv_b = tmp_path / "b.csv"
     csv_b.write_text("clip,val\nhello,1\nworld,2\n")
-    reg_b = ColumnTypeRegistry()
-    reg_b.setup_defaults(store)
     ds_b = Dataset()
-    ds_b.set_registry(reg_b)
     ds_b.load_csv_as_primary(csv_b)
     proj_b = tmp_path / "B"
     ds_b.save(proj_b)
     (proj_b / "schemas.json").unlink()  # so 'clip' is inferred, not restored
 
-    reg = ColumnTypeRegistry()
-    reg.setup_defaults(store)
     ds = Dataset()
-    ds.set_registry(reg)
-
-    ds.load(proj_a)
-    # After loading A the registry maps 'clip' -> media_path. That is exactly
-    # the tag that must NOT leak into B's freshly inferred 'clip' spec.
-    assert reg.get("clip") is not None and reg.get("clip").tag == "media_path"
-
+    ds.load(proj_a)  # A's media_path 'clip' schema is now in memory
     ds.load(proj_b)
+
     spec = ds.schema_for("frames").spec_for("clip")
     assert spec.type_tag == "text", (
         f"B's inferred 'clip' spec inherited A's media tag: {spec.type_tag}"
@@ -536,3 +511,29 @@ def test_a_failing_load_project_leaves_the_controller_root_unchanged(tmp_path, m
 
     assert controller._project_root == root_before
     assert dataset.list_tables() == tables_before
+
+
+# ---------------------------------------------------------------------------
+# P1.8d-2b-1: column_types.json retired; a project with neither sidecar opens
+# ---------------------------------------------------------------------------
+
+def test_load_project_with_neither_sidecar_opens_and_infers(tmp_path):
+    # NAMED REVIEW CHECK 3: a project with a parquet but NO schemas.json and
+    # NO column_types.json opens, infers every schema, and raises nothing.
+    project = tmp_path / "proj"
+    project.mkdir(parents=True)
+    pd.DataFrame({
+        "row_id": ["000001", "000002"],
+        "score":  [1.0, 2.0],
+        "label":  ["a", "b"],
+    }).to_parquet(project / "frames.parquet")
+    assert not (project / "schemas.json").exists()
+    assert not (project / "column_types.json").exists()
+
+    ds = Dataset()
+    ds.load(project)  # must not raise
+
+    sch = ds.schema_for("frames")
+    assert sch is not None
+    assert sch.spec_for("score").type_tag == "numeric"
+    assert sch.spec_for("label").type_tag == "text"

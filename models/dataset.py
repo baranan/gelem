@@ -342,7 +342,6 @@ class Dataset:
     def __init__(self):
         self.provenance = ProvenanceLog()
         self._id_counter: int = 0
-        self._registry = None
 
         # row_id -> positional index, one dict per table. Lazily built and
         # self-healing -- see _row_index_for().
@@ -376,56 +375,26 @@ class Dataset:
         )
 
     def set_registry(self, registry) -> None:
-        """
-        Stores a reference to the ColumnTypeRegistry so Dataset can
-        register column types when new columns are added.
+        """Retained as a no-op only so existing callers do not break.
 
-        Args:
-            registry: The ColumnTypeRegistry instance.
+        P1.8d-2b-1: Dataset no longer writes to ColumnTypeRegistry at all.
+        After P1.8d-2a nothing reads the registry's column-name map on the
+        display path (AppController reads a column's display tag off the
+        TableSchema instead), so the map's only remaining writer is the
+        operator output-column path in the controller. Dataset holds no
+        registry reference and this method deliberately ignores its argument.
+        AppController's construction and several test fixtures
+        (tests/conftest.py, tests/test_dataset_access_paths.py, ...) still
+        call it; keeping the method a no-op means none of them need editing
+        in this item.
         """
-        self._registry = registry
+        # Intentionally does nothing -- see the docstring.
+        return
 
     def _next_id(self) -> str:
         """Generates a new unique row_id string."""
         self._id_counter += 1
         return f"{self._id_counter:06d}"
-
-    def _register_column(self, column_name: str, col_type: str) -> None:
-        """
-        Registers a column with ColumnTypeRegistry if available.
-
-        Args:
-            column_name: The column name to register.
-            col_type:    The column type tag, e.g. 'media_path', 'numeric'.
-        """
-        if self._registry is not None:
-            self._registry.register_by_tag(column_name, col_type)
-
-    def _register_schema_tags(
-        self, table_name: str, columns: list[str] | None = None
-    ) -> None:
-        """Register columns of a just-accepted table with the display type tag
-        their TableSchema carries.
-
-        P1.8d-1: the schema built by _prepare_table is the single authority for
-        a column's tag, so Dataset no longer asks ColumnTypeRegistry.infer_type
-        what a column is. The tag on every inferred spec is one of the four
-        built-in tags register_by_tag already knows.
-
-        `columns` limits the work to a subset -- confirm_merge registers only
-        the columns the merge added. None means every column the schema names.
-        row_id and any other schema-exempt column has no spec and is skipped.
-        """
-        if self._registry is None:
-            return
-        schema = self.schema_for(table_name)
-        if schema is None:
-            return
-        names = schema.column_names() if columns is None else columns
-        for name in names:
-            if name in _SCHEMA_EXEMPT_COLUMNS:
-                continue
-            self._register_column(name, schema.spec_for(name).type_tag)
 
     # ------------------------------------------------------------------
     # Row-id index (row_id -> positional index, per table)
@@ -499,19 +468,27 @@ class Dataset:
     # ------------------------------------------------------------------
 
     def _media_column_hints(self, df: pd.DataFrame) -> dict[str, ColumnHint]:
-        """The only hints P1.8b-1 gives infer_schema: a media type tag for
-        'full_path' always, plus any column ColumnTypeRegistry already tags
-        'media_path'. No role hints -- that decision has not been taken."""
-        media_cols = {"full_path"}
-        if self._registry is not None:
-            for col in self._registry.list_all_columns():
-                ct = self._registry.get(col)
-                if ct is not None and ct.tag == "media_path":
-                    media_cols.add(col)
+        """The only hint infer_schema gets: a media type tag for 'full_path'.
+
+        P1.8d-2b-1 removed the ColumnTypeRegistry read that used to widen this
+        to every column the registry tagged 'media_path'. That read is no
+        longer needed:
+
+          * A column the stored TableSchema already names keeps its ColumnSpec
+            unchanged on re-accept -- _prepare_table resolves such a column
+            against the authoritative schema and never re-infers it -- so an
+            existing media column keeps its 'media_path' tag with no hint.
+          * A brand-new column's media tag is now decided by infer_type_tag
+            from its values (models/table_schema.py), which recognises a path
+            or a media-address fragment.
+
+        'full_path' still needs the hint because on an empty frames table its
+        column carries no values for infer_type_tag to read. No role hints --
+        that decision has not been taken."""
         return {
             col: ColumnHint(type_tag="media_path")
             for col in df.columns
-            if col in media_cols and col not in _SCHEMA_EXEMPT_COLUMNS
+            if col == "full_path" and col not in _SCHEMA_EXEMPT_COLUMNS
         }
 
     def _prepare_table(
@@ -522,7 +499,6 @@ class Dataset:
         hints: dict[str, ColumnHint] | None = None,
         schema: TableSchema | None = None,
         consult_stored_schema: bool = True,
-        consult_registry_hints: bool = True,
         source: str = "",
     ) -> _PreparedTable:
         """All of _accept_table's work up to and including validation and
@@ -559,13 +535,14 @@ class Dataset:
         project being loaded -- not for a table schemas.json names, and not for
         one it does not.
 
-        `consult_registry_hints` is the same idea for the OTHER piece of prior
-        in-memory state: _media_column_hints() reads the ColumnTypeRegistry,
-        which during a load still holds the outgoing project's column tags, so
-        an incoming column could inherit a `media_path` tag from the project
-        being replaced. load() passes False here too; it has already read the
-        incoming project's own media columns from column_types.json and passes
-        them in `hints`, so nothing is lost.
+        P1.8d-2b-1 removed the companion `consult_registry_hints` flag. It
+        existed because _media_column_hints() used to read the
+        ColumnTypeRegistry, which during a load still holds the outgoing
+        project's column tags -- so an incoming column could inherit a
+        `media_path` tag from the project being replaced. _media_column_hints()
+        now only ever hints 'full_path', which load() already passes in
+        `hints` from the incoming project's own restored schema, so there is
+        nothing left to suppress.
         """
         schema_columns = _non_exempt_columns(df)
 
@@ -599,13 +576,10 @@ class Dataset:
 
         inferred_by_name: dict[str, object] = {}
         if new_columns:
-            # _media_column_hints reads the registry; a load must not consult it
-            # (see consult_registry_hints in the docstring) and relies on the
-            # `hints` the caller passes instead.
-            if consult_registry_hints:
-                effective_hints = dict(self._media_column_hints(df))
-            else:
-                effective_hints = {}
+            # _media_column_hints only ever hints 'full_path' now (P1.8d-2b-1).
+            # An explicit `hints` from the caller -- load() passes the incoming
+            # project's restored media columns -- wins on any key collision.
+            effective_hints = dict(self._media_column_hints(df))
             if hints:
                 effective_hints.update(hints)
             sub_hints = {
@@ -779,8 +753,8 @@ class Dataset:
         """
         Scans a folder for supported media files (images and videos)
         and creates one row per file in the frames table with row_id,
-        full_path, and file_name. Registers full_path as 'media_path'
-        with ColumnTypeRegistry.
+        full_path, and file_name. The accepted table's TableSchema tags
+        full_path as 'media_path'.
 
         Supported formats are the frozenset in media/extensions.py,
         imported as MEDIA_EXTENSIONS. To add a new format, add its
@@ -822,14 +796,10 @@ class Dataset:
                 source="load_folder",
             )
 
-        # Register every frames column from the schema the accept just built.
-        # 'full_path' is tagged media_path by _media_column_hints, so the
-        # blanket call covers it -- no separate _register_column line is
-        # needed. 'file_name' is a column of bare filenames, which P1.8d-2's
-        # tag rule classifies as text, not media_path, so registering it
-        # straight from the schema is now correct.
-        self._register_schema_tags("frames")
-
+        # P1.8d-2b-1: Dataset no longer writes column tags into
+        # ColumnTypeRegistry. The 'frames' schema built by the accept above is
+        # the single authority for every column's display tag; AppController
+        # reads it straight off schema_for().
         self.provenance.record(
             "load_folder", {"folder_path": str(folder_path)}
         )
@@ -887,12 +857,8 @@ class Dataset:
             "frames", pd.DataFrame(rows), source="load_csv_as_primary"
         )
 
-        # Register every frames column from the schema the accept just built.
-        # 'full_path' is tagged media_path by _media_column_hints whether or
-        # not an image_column was given, so the blanket call covers it.
-        # 'file_name' holds bare filenames, which P1.8d-2's tag rule classifies
-        # as text; the CSV's own columns are tagged from their inferred specs.
-        self._register_schema_tags("frames")
+        # P1.8d-2b-1: no ColumnTypeRegistry write. The schema the accept built
+        # is the single authority for every column's display tag.
 
         self.provenance.record("load_csv_as_primary", {
             "csv_path":     str(csv_path),
@@ -1039,10 +1005,8 @@ class Dataset:
                 "frames", report._pending_df.copy(), source="confirm_merge"
             )
 
-        # P1.8d-1: tag the merged-in columns from the schema the accept built,
-        # not from ColumnTypeRegistry.infer_type.
-        self._register_schema_tags("frames", report._new_columns)
-
+        # P1.8d-2b-1: no ColumnTypeRegistry write. The merged-in columns are
+        # tagged by the schema the accept above rebuilt.
         self.provenance.record(
             "confirm_merge", {"matched_rows": report.matched_rows}
         )
@@ -1074,7 +1038,9 @@ class Dataset:
         df[name] = df.eval(expression)
         self._accept_table(table_name, df, source="add_computed_column")
 
-        self._register_column(name, col_type)
+        # P1.8d-2b-1: no ColumnTypeRegistry write. `col_type` is kept in the
+        # signature for callers but the accepted table's schema is now the
+        # authority for the new column's display tag.
         self.provenance.record("add_computed_column", {
             "name":       name,
             "expression": expression,
@@ -1102,7 +1068,9 @@ class Dataset:
         df = self._get_stored_table(table_name).copy()
         df[name] = df["row_id"].map(values)
         self._accept_table(table_name, df, source="add_column")
-        self._register_column(name, col_type)
+        # P1.8d-2b-1: no ColumnTypeRegistry write -- the schema the accept
+        # built is the authority for the new column's display tag. `col_type`
+        # stays in the signature for callers.
 
     def update_row(
         self,
@@ -1265,15 +1233,11 @@ class Dataset:
         # Step 2: Assign a new row_id to each aggregated row.
         agg_df["row_id"] = [self._next_id() for _ in range(len(agg_df))]
 
-        # Step 3: Store the new table.
+        # Step 3: Store the new table. P1.8d-2b-1: no ColumnTypeRegistry
+        # write -- the schema the accept built carries every column's tag.
         self._accept_table(name, agg_df, source="aggregate")
 
-        # Step 4: Register the column types for the new table, from the schema
-        # the accept built (P1.8d-1) rather than ColumnTypeRegistry.infer_type.
-        # row_id is schema-exempt and skipped inside the helper.
-        self._register_schema_tags(name)
-
-        # Step 5: Record the operation in the provenance log.
+        # Step 4: Record the operation in the provenance log.
         self.provenance.record("aggregate", {
             "name":         name,
             "source_table": source_table,
@@ -1334,11 +1298,9 @@ class Dataset:
             "row_id",
             [self._next_id() for _ in range(len(result))],
         )
+        # P1.8d-2b-1: no ColumnTypeRegistry write -- the schema the accept
+        # built carries every column's display tag.
         self._accept_table(name, result, source="create_table_from_df")
-
-        # P1.8d-1: register from the schema the accept built, not from
-        # ColumnTypeRegistry.infer_type. row_id is schema-exempt.
-        self._register_schema_tags(name)
 
         self.provenance.record("create_table_from_df", {
             "name":    name,
@@ -1505,19 +1467,23 @@ class Dataset:
         """
         project_path.mkdir(parents=True, exist_ok=True)
 
-        # Which columns hold media paths? full_path always; registry adds the rest.
-        media_cols = {"full_path"}
-        if self._registry is not None:
-            for col in self._registry.list_all_columns():
-                ct = self._registry.get(col)
-                if ct is not None and ct.tag == "media_path":
-                    media_cols.add(col)
-
         # Count media cells that will not parse as an address, across every
         # table, so the "save" provenance entry can report them.
         unparseable_media_cells = 0
 
         for name, df in self._tables.items():
+            # Which columns of THIS table hold media paths? 'full_path' always;
+            # every other column the table's own TableSchema tags 'media_path'.
+            # P1.8d-2b-1: this used to come from ColumnTypeRegistry; the schema
+            # is now the single authority. A table assigned straight into
+            # _tables by a test has no schema, so only 'full_path' is rewritten
+            # for it -- the same columns the old registry-less path handled.
+            media_cols = {"full_path"}
+            schema = self.schema_for(name)
+            if schema is not None:
+                for spec in schema.columns_with_tag("media_path"):
+                    media_cols.add(spec.name)
+
             df_out = df
             cols_to_rewrite = [c for c in df.columns if c in media_cols]
             if cols_to_rewrite:
@@ -1541,7 +1507,6 @@ class Dataset:
         # restore it exactly instead of re-inferring. A table assigned
         # straight into _tables by a test has no schema (schema_for() returns
         # None) and is simply left out.
-        # P1.8c-2a writes this file; making load() read it is the next item.
         table_schemas = {}
         for name in self._tables:
             schema = self.schema_for(name)
@@ -1563,17 +1528,11 @@ class Dataset:
                 json.dumps(schemas_file, indent=2)
             )
 
-        # Store the column -> tag map so load() restores types exactly.
-        if self._registry is not None:
-            column_types = {}
-            for col in self._registry.list_all_columns():
-                ct = self._registry.get(col)
-                if ct is not None:
-                    column_types[col] = ct.tag
-            if column_types:
-                (project_path / "column_types.json").write_text(
-                    json.dumps(column_types, indent=2)
-                )
+        # P1.8d-2b-1: column_types.json is retired. schemas.json (written
+        # above) now carries every column's display tag, and load() restores
+        # each table's tags from it. save() no longer writes the sidecar at
+        # all; a project saved by an earlier Gelem still has one and load()
+        # reads it as a fallback when there is no schemas.json.
 
         (project_path / "provenance.json").write_text(
             json.dumps(self.provenance.to_list(), indent=2)
@@ -1654,10 +1613,9 @@ class Dataset:
         read and validated against its saved schema BEFORE any in-memory state
         is touched, so a project with a bad table leaves the currently open
         project exactly as it was -- same tables, schemas, provenance log and id
-        counter. On success this replaces all tables, the provenance log, the id
-        counter and (via the registry) the column-type map with the saved
-        project's. Relative media paths are resolved back to absolute against
-        project_path.
+        counter. On success this replaces all tables, the provenance log and the
+        id counter with the saved project's. Relative media paths are resolved
+        back to absolute against project_path.
 
         schemas.json (written by save() since P1.8c-2a) is honoured when its
         format_version is one this build knows; an unknown version or a corrupt
@@ -1665,6 +1623,12 @@ class Dataset:
         A table with no entry in schemas.json is inferred. No schema from the
         previously open project is ever consulted -- see _prepare_table's
         consult_stored_schema argument.
+
+        Each restored schema also carries every column's display tag, so a
+        loaded project's media columns come from schemas.json. P1.8d-2b-1
+        retired column_types.json: save() no longer writes it, and load() reads
+        it only as a fallback for a project saved before P1.8c-2a (no
+        schemas.json). A missing column_types.json is never an error.
 
         Args:
             project_path: Path to an existing project folder.
@@ -1689,18 +1653,29 @@ class Dataset:
                 f"No tables (.parquet) found in '{project_path}'."
             )
 
-        # Read column types first so we know which columns are media paths.
-        column_types = {}
-        ct_path = project_path / "column_types.json"
-        if ct_path.exists():
-            column_types = json.loads(ct_path.read_text())
-        media_cols = {col for col, tag in column_types.items() if tag == "media_path"}
-        media_cols.add("full_path")  # fallback if no sidecar (saved without registry)
-
         # Saved schemas, if any and if this build understands them.
         restored_schemas, ignored_schemas_message = self._read_saved_schemas(
             project_path
         )
+
+        # Which columns hold media paths? 'full_path' always. Every other
+        # media column comes from the restored schemas.
+        # P1.8d-2b-1: column_types.json is retired. It is read here ONLY as a
+        # fallback for a project with no usable schemas.json -- any project
+        # saved before P1.8c-2a. A missing column_types.json is normal and is
+        # never an error or a message.
+        media_cols = {"full_path"}
+        if restored_schemas:
+            for schema in restored_schemas.values():
+                for spec in schema.columns_with_tag("media_path"):
+                    media_cols.add(spec.name)
+        else:
+            ct_path = project_path / "column_types.json"
+            if ct_path.exists():
+                legacy_types = json.loads(ct_path.read_text())
+                for col, tag in legacy_types.items():
+                    if tag == "media_path":
+                        media_cols.add(col)
 
         # Saved provenance log -- read now, install only after the point of no
         # return, so a load that fails below does not replace the log.
@@ -1760,7 +1735,6 @@ class Dataset:
                 hints=load_hints,
                 schema=declared,
                 consult_stored_schema=False,
-                consult_registry_hints=False,
                 source="load",
             )
             # Stage, do not store. Deleting this line and committing here
@@ -1774,11 +1748,9 @@ class Dataset:
         # the previously open project discarded.
         # -----------------------------------------------------------------
         self._reset_tables({})
-        # A project opened second must not inherit the first project's column
-        # tags. Registered types and their tags stay; only the name -> type map
-        # is cleared, to be repopulated from column_types.json below.
-        if self._registry is not None:
-            self._registry.clear_column_map()
+        # P1.8d-2b-1: Dataset no longer touches ColumnTypeRegistry. A project
+        # opened second gets its column tags from the schemas the commit loop
+        # below installs; there is no registry column map for Dataset to clear.
         # Restore the saved provenance log before the commit loop, so any
         # "schema_adjustments" entry _commit_prepared records is appended to the
         # restored log rather than wiped by a later replace().
@@ -1793,17 +1765,6 @@ class Dataset:
             if "row_id" in df.columns and not df.empty:
                 max_id = max(max_id, int(df["row_id"].astype(int).max()))
         self._id_counter = max_id
-
-        if self._registry is not None:
-            if column_types:
-                for col, tag in column_types.items():
-                    try:
-                        self._register_column(col, tag)
-                    except KeyError:
-                        pass  # tag unknown in this build; skip rather than sink the whole load
-            elif "full_path" in self._tables.get("frames", pd.DataFrame()).columns:
-                # No sidecar — fall back to load_folder's default tagging.
-                self._register_column("full_path", "media_path")
 
         # An empty table whose saved schema could not be cast onto it was
         # loaded by inference -- tell the researcher, one message per table.

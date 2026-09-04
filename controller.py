@@ -109,7 +109,11 @@ class AppController(QObject):
         # imports settings/ and holds no GelemSettings or SettingsStore.
         self._settings_gateway = settings_gateway
 
-        self._dataset.set_registry(registry)
+        # P1.8d-2b-1: Dataset no longer writes to ColumnTypeRegistry, so there
+        # is nothing to wire here. Dataset.set_registry() is now a no-op kept
+        # only for callers that have not been updated. The controller still
+        # owns `registry` and is the sole writer of its column-name map, via
+        # the operator output-column path in run_create_columns().
         self._store.on_thumbnail_ready = self._on_thumbnail_ready
 
         # Result queues. Each is drained by at most self._drain_budget

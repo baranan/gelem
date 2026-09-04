@@ -661,19 +661,13 @@ def test_get_column_type_is_per_table_not_shared(make_controller, tmp_path):
     assert controller.get_column_type("score").tag == "text"
 
 
-def test_old_registry_path_could_not_tell_the_two_tables_apart(make_controller, tmp_path):
-    """Documents the defect P1.8d-2a closes: the registry's column-name map
-    -- the OLD code path for get_column_type -- holds one ColumnType for
-    'score', the last one registered, so it answers 'text' for BOTH
-    tables. The schema-driven path above answers correctly per table."""
-    controller, dataset, _ = make_controller(tmp_path)
-    _make_two_tables_sharing_a_column(dataset)
-
-    # score_txt was registered second, so the shared map now maps 'score'
-    # to the text type regardless of which table is meant.
-    assert controller._registry.get("score").tag == "text"
-    # ...whereas the schema-driven read distinguishes them.
-    assert controller.get_column_type("score", "score_num").tag == "numeric"
+# (Removed in P1.8d-2b-1: test_old_registry_path_could_not_tell_the_two_tables
+# _apart asserted that Dataset had populated the registry's shared column-name
+# map -- one ColumnType for 'score', last write wins -- to demonstrate the
+# defect P1.8d-2a closed. P1.8d-2b-1 stops Dataset writing to that map at all,
+# so there is no shared entry left to demonstrate the old confusion with. The
+# live P1.8d-2a contract -- get_column_type reads per-table off the schema --
+# is still guarded by test_get_column_type_is_per_table_not_shared above.)
 
 
 # ===========================================================================
