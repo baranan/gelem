@@ -1036,11 +1036,16 @@ class Dataset:
         # must leave the stored table untouched (SchemaRejection's contract).
         df = self._get_stored_table(table_name).copy()
         df[name] = df.eval(expression)
-        self._accept_table(table_name, df, source="add_computed_column")
-
-        # P1.8d-2b-1: no ColumnTypeRegistry write. `col_type` is kept in the
-        # signature for callers but the accepted table's schema is now the
-        # authority for the new column's display tag.
+        # P1.8d-2b-2: `col_type` is no longer dead. It travels to the accept
+        # path as a ColumnHint(type_tag=...), so the new column carries the
+        # tag the caller asked for instead of the one value inference would
+        # pick. A recompute of an existing column keeps its stored tag.
+        self._accept_table(
+            table_name,
+            df,
+            hints={name: ColumnHint(type_tag=col_type)},
+            source="add_computed_column",
+        )
         self.provenance.record("add_computed_column", {
             "name":       name,
             "expression": expression,
@@ -1067,10 +1072,16 @@ class Dataset:
         # Work on a copy so a schema rejection leaves the stored table intact.
         df = self._get_stored_table(table_name).copy()
         df[name] = df["row_id"].map(values)
-        self._accept_table(table_name, df, source="add_column")
-        # P1.8d-2b-1: no ColumnTypeRegistry write -- the schema the accept
-        # built is the authority for the new column's display tag. `col_type`
-        # stays in the signature for callers.
+        # P1.8d-2b-2: `col_type` travels to the accept path as a
+        # ColumnHint(type_tag=...), so the new column carries the caller's
+        # tag rather than the inferred one. Re-inserting an existing column
+        # keeps its stored tag (the stored schema wins in _prepare_table).
+        self._accept_table(
+            table_name,
+            df,
+            hints={name: ColumnHint(type_tag=col_type)},
+            source="add_column",
+        )
 
     def update_row(
         self,
@@ -1099,6 +1110,8 @@ class Dataset:
         self,
         table_name: str,
         updates: dict[str, dict],
+        *,
+        column_tags: dict[str, str] | None = None,
     ) -> list[str]:
         """
         Applies a batch of per-row updates in one call. This is the
@@ -1115,6 +1128,14 @@ class Dataset:
                         new value. A column that does not exist yet is
                         created first and every row not covered by this
                         batch gets None/NaN in it.
+            column_tags: Optional {column_name: type_tag} mapping. For a
+                        column this call CREATES, the named tag is applied
+                        to the new ColumnSpec as a ColumnHint(type_tag=...)
+                        instead of the tag value inference would pick
+                        (P1.8d-2b-2). A name already in the table's schema
+                        keeps its stored spec, so the tag is ignored there.
+                        The schema does not validate the tag -- an unknown
+                        tag is stored as given. Keyword-only.
 
         Returns:
             The list of row_ids that could not be placed because they
@@ -1178,8 +1199,18 @@ class Dataset:
                 else:
                     df[col] = series
 
+            # Turn the caller's {name: tag} into ColumnHints for the accept
+            # path. _prepare_table only applies a hint to a column it is
+            # newly inferring a spec for, so a re-run over an existing
+            # column keeps its stored tag regardless of what is passed here.
+            hints = None
+            if column_tags:
+                hints = {
+                    name: ColumnHint(type_tag=tag)
+                    for name, tag in column_tags.items()
+                }
             self._accept_table(
-                table_name, df, source="apply_row_updates"
+                table_name, df, hints=hints, source="apply_row_updates"
             )
         except (SchemaRejection, TypeError, ValueError) as exc:
             # Roll back every in-place edit, including a partial one from a

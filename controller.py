@@ -221,13 +221,23 @@ class AppController(QObject):
         operation_id: str,
         label: str,
         table_name: str,
+        column_tags: dict[str, str] | None = None,
     ) -> None:
-        """Records a started operator run as live. See _live_runs."""
+        """Records a started operator run as live. See _live_runs.
+
+        column_tags is the operator's declared output_columns as a
+        {column_name: type_tag} mapping (P1.8d-2b-2). The item drain reads
+        it back and hands it to Dataset.apply_row_updates() so a column the
+        run creates is tagged in the table's schema by what the operator
+        declared, not by value inference. Empty for create_table /
+        create_display runs, which create no per-row columns.
+        """
         self._live_runs[operation_id] = {
             "label":       label,
             "table_name":  table_name,
             "applied":     0,
             "unplaceable": [],
+            "column_tags": dict(column_tags) if column_tags else {},
         }
 
     def _deregister_run(self, operation_id: str) -> None:
@@ -283,6 +293,14 @@ class AppController(QObject):
         """
         batches: dict[str, dict[str, dict]] = {}
         row_owner: dict[tuple[str, str], str] = {}
+        # P1.8d-2b-2: the declared output-column tags of every live run that
+        # put a row into a given table's batch, unioned. A column the batch
+        # creates is then tagged in the schema by what the operator declared
+        # rather than by value inference. A later run wins a name collision,
+        # the same last-write-wins this drain already applies to values.
+        # Built in the drain loop below so this is one pass, not one per
+        # table.
+        tags_by_table: dict[str, dict[str, str]] = {}
 
         for _ in range(self._drain_budget):
             try:
@@ -302,9 +320,15 @@ class AppController(QObject):
             run["applied"] += 1
             batches.setdefault(table_name, {})[row_id] = result
             row_owner[(table_name, row_id)] = operation_id
+            run_tags = run.get("column_tags")
+            if run_tags:
+                tags_by_table.setdefault(table_name, {}).update(run_tags)
 
         for table_name, updates in batches.items():
-            unplaceable = self._dataset.apply_row_updates(table_name, updates)
+            column_tags = tags_by_table.get(table_name)
+            unplaceable = self._dataset.apply_row_updates(
+                table_name, updates, column_tags=column_tags or None
+            )
             unplaceable_set = set(unplaceable)
             for row_id in unplaceable_set:
                 operation_id = row_owner.get((table_name, row_id))
@@ -1036,18 +1060,40 @@ class AppController(QObject):
                     f'Operator "{operator_name}" cannot add columns.'
                 )
                 return
-            for col_name, col_type in operator.output_columns:
-                try:
-                    self._registry.register_by_tag(col_name, col_type)
-                except KeyError as e:
-                    print(f"[Controller] Warning: {e}")
+            # P1.8d-2b-2: the operator's declared output-column tags no
+            # longer go into ColumnTypeRegistry's column-name map. They
+            # travel to the target table's TableSchema as ColumnHints on
+            # the accept path -- carried on the live run (see
+            # _register_run) and handed to Dataset.apply_row_updates() by
+            # the item drain. The schema does not police tags, so an
+            # unknown tag still reaches it; but such a column renders as a
+            # placeholder, so warn once per run about any tag the registry
+            # has no renderer for -- the same thing the register_by_tag
+            # KeyError warned about before, at the same point.
+            column_tags = {
+                col_name: col_tag
+                for col_name, col_tag in operator.output_columns
+            }
+            unknown_tags = sorted(
+                tag for tag in set(column_tags.values())
+                if self._registry.type_for_tag(tag) is None
+            )
+            if unknown_tags:
+                print(
+                    f"[Controller] Warning: operator {operator_name!r} "
+                    f"declares column type tag(s) {unknown_tags} that "
+                    f"ColumnTypeRegistry has no renderer for; those columns "
+                    f"will show a placeholder."
+                )
             operation_id = str(uuid.uuid4())
             table_name   = self._active_table
             # One snapshot of exactly the selected rows, taken once here
             # on the main thread -- not one Dataset.get_row() call (and
             # one full-table copy) per row.
             snapshot = self._dataset.snapshot_rows(table_name, row_ids)
-            self._register_run(operation_id, operator.display_label, table_name)
+            self._register_run(
+                operation_id, operator.display_label, table_name, column_tags
+            )
             try:
                 started = self._op_registry.run_create_columns(
                     operator_name,

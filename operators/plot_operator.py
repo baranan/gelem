@@ -36,7 +36,12 @@ class PlotOperator(BaseOperator):
 
     name = "plot"
     create_columns_label = "Plot columns (bar chart)"
-    output_columns = [("plot_path", "plot_image")]
+    # 'plot_path' holds the path to a PNG file this operator writes to disk
+    # (see create_columns), so it is a media path -- the same tag a folder
+    # of images gets. P1.8d-2b-2 makes this declared tag authoritative for
+    # the column's TableSchema spec; 'plot_image' was never a registered
+    # type and left the column rendering as an "Unknown column" placeholder.
+    output_columns = [("plot_path", "media_path")]
     requires_image = False  # Reads column values from metadata.
 
     def __init__(
