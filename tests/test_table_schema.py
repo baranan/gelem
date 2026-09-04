@@ -21,6 +21,7 @@ from models.table_schema import (
     TableSchema,
     check_frame,
     infer_schema,
+    infer_type_tag,
     normalise_frame,
     schema_from_dict,
 )
@@ -650,6 +651,90 @@ def test_infer_schema_hint_sets_media_address_tag():
         df, hints={"clip_path": ColumnHint(type_tag="media_address")}
     )
     assert schema.spec_for("clip_path").type_tag == "media_address"
+
+
+# --- P1.8d-1 / P1.8d-2: infer_type_tag, the single authority for a tag ------
+
+
+def test_infer_type_tag_bool_column_is_boolean_flag():
+    series = pd.Series([True, False, True], dtype="bool")
+    assert infer_type_tag(series) == "boolean_flag"
+
+
+def test_infer_type_tag_int_and_float_columns_are_numeric():
+    assert infer_type_tag(pd.Series([1, 2, 3], dtype="int64")) == "numeric"
+    assert infer_type_tag(pd.Series([0.5, 1.5, 2.5], dtype="float64")) == "numeric"
+
+
+# P1.8d-2: a value with a directory separator and a media extension is media.
+# (Was test_infer_type_tag_column_of_media_filenames_is_media_path, which
+# asserted bare "a.mp4" -> media_path; P1.8d-2 makes a bare filename text, so
+# the values gained a directory.)
+def test_infer_type_tag_column_of_media_paths_is_media_path():
+    series = pd.Series(["media/a.mp4", "media/b.mov"])
+    assert infer_type_tag(series) == "media_path"
+
+
+# P1.8d-2: a column of BARE media filenames -- no directory, no fragment -- is
+# text, not media_path. A bare name is a label; the media resolver cannot open
+# it, and tagging it media_path would show every cell as a broken thumbnail.
+def test_infer_type_tag_column_of_bare_media_filenames_is_text():
+    series = pd.Series(["face.jpg", "b.png"])
+    assert infer_type_tag(series) == "text"
+
+
+# P1.8d-2: a relative path with a forward-slash separator is media.
+def test_infer_type_tag_relative_path_with_separator_is_media_path():
+    series = pd.Series(["videos/clip.mp4", "videos/clip2.mp4"])
+    assert infer_type_tag(series) == "media_path"
+
+
+# P1.8d-2: a Windows-separator path is media -- media_address.parse normalises
+# the backslashes to '/', so the separator gate still sees a separator.
+def test_infer_type_tag_windows_separator_path_is_media_path():
+    series = pd.Series([r"C:\Users\me\a.mp4", r"C:\Users\me\b.mov"])
+    assert infer_type_tag(series) == "media_path"
+
+
+# A media value carrying a frame fragment is media even with no separator: the
+# fragment is what makes it a location. (Also the case that failed before
+# P1.8d-1 -- ColumnTypeRegistry.infer_type tested
+# "clip.mp4#f=1234".endswith(".mp4"), which is False.)
+def test_infer_type_tag_media_value_with_a_frame_fragment_is_media_path():
+    series = pd.Series(["clip.mp4#f=1234", "second.mov#t=1.5-2.0"])
+    assert infer_type_tag(series) == "media_path"
+
+
+def test_infer_type_tag_mixed_media_and_non_media_column_is_text():
+    # One value is a media path, the other is a plain word -> NOT every
+    # non-null value looks like media, so the whole column is text.
+    series = pd.Series(["videos/clip.mp4", "hello"])
+    assert infer_type_tag(series) == "text"
+
+
+def test_infer_type_tag_all_null_text_column_is_text():
+    series = pd.Series([None, None], dtype="object")
+    assert infer_type_tag(series) == "text"
+
+
+def test_infer_type_tag_strings_that_are_not_addresses_are_text_without_raising():
+    # A stray '#' with a fragment that is not a valid address component makes
+    # media_address.parse raise MediaAddressError. infer_type_tag must swallow
+    # that and treat the value as not-a-path, never propagate the exception.
+    series = pd.Series(["note #1: see below", "weird#no-equals-here", "just text"])
+    assert infer_type_tag(series) == "text"
+
+
+# NAMED CHECK 4 (P1.8d-2): infer_schema calls infer_type_tag for a categorical
+# column too, where before P1.8d-1 a categorical was always tagged "text". A
+# categorical column whose categories are media paths is now tagged media_path.
+# Reported, not a behaviour change introduced here -- documented so the case is
+# not silently uncovered.
+def test_infer_type_tag_categorical_column_of_media_paths_is_media_path():
+    series = pd.Series(
+        ["clips/a.mp4", "clips/b.mp4", "clips/a.mp4"], dtype="category"
+    )
+    assert infer_type_tag(series) == "media_path"
 
 
 # --- read-only queries ---------------------------------------------------

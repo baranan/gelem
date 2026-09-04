@@ -305,52 +305,6 @@ class ColumnTypeRegistry:
         """
         return list(self._columns.keys())
 
-    def infer_type(self, series: pd.Series) -> str:
-        """
-        Inspects a pandas Series and returns a best-guess column type
-        tag. Used by Dataset.merge_csv() to automatically register
-        column types for CSV columns.
-
-        Rules applied in order:
-            1. Boolean dtype       -> 'boolean_flag'
-            2. Numeric dtype       -> 'numeric'
-            3. String values that all end in a known media extension
-                                   -> 'media_path'
-            4. Everything else     -> 'text'
-
-        Note: datetime columns are now inferred as 'numeric' since
-        timestamps and durations are both numeric values with
-        formatting handled by the renderer.
-
-        Args:
-            series: The column data to inspect.
-
-        Returns:
-            A column type tag string.
-        """
-        if pd.api.types.is_bool_dtype(series):
-            return "boolean_flag"
-
-        if pd.api.types.is_numeric_dtype(series):
-            return "numeric"
-
-        # Check if values look like media file paths.
-        media_extensions = {
-            ".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif",
-            ".mp4", ".mov", ".avi", ".mkv", ".webm",
-        }
-        non_null = series.dropna().astype(str)
-        if len(non_null) > 0:
-            looks_like_paths = all(
-                any(v.lower().endswith(ext) for ext in media_extensions)
-                for v in non_null
-            )
-            if looks_like_paths:
-                return "media_path"
-
-        # Default: treat as text.
-        return "text"
-
 
 # ---------------------------------------------------------------------------
 # Placeholder helpers

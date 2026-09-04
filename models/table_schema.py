@@ -48,9 +48,18 @@ the enum later cannot silently change a saved project's meaning. A malformed
 payload -- a missing field, an unknown role name, an unsupported dtype name --
 raises SchemaSerialisationError rather than defaulting silently.
 
+Type tags (P1.8d-1): infer_type_tag() is the single authority for a column's
+display type tag ("boolean_flag", "numeric", "media_path", "text").
+infer_schema() calls it, and Dataset reads the resulting tag out of the built
+schema rather than asking ColumnTypeRegistry.infer_type. A
+ColumnHint(type_tag=...) still overrides it.
+
 Qt-free. pandas and numpy are permitted here (this is the data layer). This
 module imports nothing from models/dataset.py, controller.py, column_types/ or
-ui/.
+ui/. It does import from media/ -- media_address.py (pure address logic, no
+I/O) so infer_type_tag can strip a media-address fragment, and extensions.py
+(a stdlib-only frozenset) so the media extension list is declared once and
+shared with models/dataset.py.
 """
 
 from __future__ import annotations
@@ -61,6 +70,10 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+
+from media.extensions import MEDIA_EXTENSIONS
+from media.media_address import MediaAddressError
+from media.media_address import parse as parse_address
 
 
 class SchemaSerialisationError(ValueError):
@@ -513,6 +526,94 @@ def normalise_frame(
     return out
 
 
+def _looks_like_media_path(value) -> bool:
+    """True when `value` looks like a path that resolves to a media file.
+
+    Two conditions must BOTH hold (P1.8d-2):
+      * the path portion ends in a media extension (media/extensions.py), and
+      * the value looks like a location, not a bare name -- either the path
+        portion carries a directory separator, or the original value carried
+        an address fragment (#f=, #t=, #r=, a stream selector).
+
+    A bare filename such as "face.jpg" is deliberately NOT media: it is a
+    label, not something the media resolver can open (there is no directory
+    to find it in and no fragment pinning a frame or clip). Tagging such a
+    column media_path would make every cell render as a broken thumbnail and
+    offer the column as a gallery image column. "videos/clip.mp4",
+    "C:/vids/face.jpg" and "clip.mp4#f=1234" are locations and do count.
+    """
+    # media_address.parse() takes a string; coerce first so a stray non-string
+    # cell (already rare -- callers pass dropna()'d Series values) cannot raise.
+    text = str(value)
+
+    # A literal '#' is what introduces an address fragment. parse() below
+    # raises on an empty or malformed fragment, so if a '#' is present AND
+    # the parse succeeds, the value genuinely carried a fragment.
+    had_fragment = "#" in text
+
+    try:
+        # parse() splits the fragment off at the first unescaped '#'; .path is
+        # exactly the portion before it, normalised to forward slashes. A
+        # string with no '#' parses as a bare path and never raises.
+        path_portion = parse_address(text).path
+    except MediaAddressError:
+        # Not a well-formed address (a stray '#', a bad fragment) -> not a
+        # path. Never raised out of type inference.
+        return False
+
+    # Gate 1: the extension. Case-insensitive, matching the old infer_type's
+    # `v.lower().endswith(ext)`.
+    lowered = path_portion.lower()
+    if not any(lowered.endswith(ext) for ext in MEDIA_EXTENSIONS):
+        return False
+
+    # Gate 2: it must look like a location. parse() has already normalised
+    # backslashes to '/', so a Windows path arrives here containing '/'; the
+    # backslash test is kept only for a value that somehow skipped
+    # normalisation.
+    has_separator = ("/" in path_portion) or ("\\" in path_portion)
+    return has_separator or had_fragment
+
+
+def infer_type_tag(series: pd.Series) -> str:
+    """The display type tag for a column, decided from its values alone.
+
+    Returns one of "boolean_flag", "numeric", "media_path" or "text". This is
+    the single authority for a column's tag (P1.8d-1): infer_schema() calls it,
+    and Dataset registers the tag it finds on the built schema instead of
+    calling ColumnTypeRegistry.infer_type.
+
+    Rule order, unchanged from the old ColumnTypeRegistry.infer_type:
+      1. a bool dtype                                  -> "boolean_flag"
+      2. any other numeric dtype                       -> "numeric"
+      3. every non-null value looks like a media file  -> "media_path"
+      4. anything else                                 -> "text"
+    """
+    # Step 1: a real bool dtype. Tested before numeric because pandas counts
+    # bool as a numeric dtype, and a flag column must not fall through to
+    # "numeric".
+    if pd.api.types.is_bool_dtype(series):
+        return "boolean_flag"
+
+    # Step 2: any other numeric dtype -- ints and floats, and (per the old
+    # infer_type's note) timestamps and durations, which are numbers the
+    # renderer formats.
+    if pd.api.types.is_numeric_dtype(series):
+        return "numeric"
+
+    # Step 3: a media column is one where EVERY non-null value reads as a path
+    # to a media file. An empty or all-null column has nothing to judge, so it
+    # is not a media column.
+    non_null = series.dropna()
+    if len(non_null) > 0 and all(
+        _looks_like_media_path(value) for value in non_null
+    ):
+        return "media_path"
+
+    # Step 4: everything else is text.
+    return "text"
+
+
 @dataclass(frozen=True)
 class ColumnHint:
     # Every field optional. infer_schema computes its own default spec for a
@@ -580,18 +681,34 @@ def infer_schema(
                 f"not support yet"
             )
 
+        # The display type tag is decided from the column's values, by one
+        # rule in one place (infer_type_tag). P1.8d-1: this is where a media
+        # column -- "videos/clip.mp4" or "clip.mp4#f=1234" alike -- is
+        # recognised, not a later ColumnTypeRegistry.infer_type call.
+        #
+        # A ColumnHint.type_tag wins outright, and when one is given the
+        # value scan is skipped entirely: infer_type_tag walks every non-null
+        # value (a media-address parse each), and load_folder /
+        # load_csv_as_primary hint 'full_path' as media_path on every row, so
+        # running it there is pure waste.
+        hint = hints.get(name)
+        if hint is not None and hint.type_tag is not None:
+            tag = hint.type_tag
+        else:
+            tag = infer_type_tag(series)
+
         # Inference keeps the dtype the column arrived in and never narrows.
         # After the guard above, dt is a plain numpy integer/float/bool dtype,
         # an object-kind text dtype, or a pandas categorical.
         if isinstance(dt, pd.CategoricalDtype):
             # Already categorical on arrival: that IS its dtype, so keep it.
-            role, dtype, tag = ColumnRole.measurement, "category", "text"
+            role, dtype = ColumnRole.measurement, "category"
         elif dt.kind == "b":
-            role, dtype, tag = ColumnRole.measurement, "bool", "boolean_flag"
+            role, dtype = ColumnRole.measurement, "bool"
         elif dt.kind in ("i", "u"):
-            role, dtype, tag = ColumnRole.measurement, "int64", "numeric"
+            role, dtype = ColumnRole.measurement, "int64"
         elif dt.kind == "f":
-            role, dtype, tag = ColumnRole.measurement, "float64", "numeric"
+            role, dtype = ColumnRole.measurement, "float64"
         else:
             # Every text column -- whether its values repeat or not -- keeps the
             # dtype it arrived in (numpy "object" or the pandas string dtype).
@@ -599,16 +716,14 @@ def infer_schema(
             # because Gelem cannot tell a closed vocabulary from a column a
             # researcher will keep adding labels to, and a closed dtype refuses
             # a new label at write time.
-            role, dtype, tag = ColumnRole.measurement, actual, "text"
+            role, dtype = ColumnRole.measurement, actual
         carry = True
 
-        # Apply the caller's hint over the inferred spec.
-        hint = hints.get(name)
+        # Apply the caller's remaining hint fields over the inferred spec.
+        # (type_tag was already applied above, before the value scan.)
         if hint is not None:
             if hint.role is not None:
                 role = hint.role
-            if hint.type_tag is not None:
-                tag = hint.type_tag
             if hint.dtype is not None:
                 dtype = hint.dtype
             if hint.carry_to_children is not None:

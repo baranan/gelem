@@ -20,6 +20,7 @@ import json
 import weakref
 import pandas as pd
 
+from media.extensions import MEDIA_EXTENSIONS
 from media.media_address import (
     MediaAddressError,
     absolutise,
@@ -38,31 +39,10 @@ from models.table_schema import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Media extensions supported by Gelem
-# ---------------------------------------------------------------------------
-
-# Maps file extension (lowercase) to the column type tag it produces.
-# Add new extensions here to support additional media formats.
-# The column type tag must be registered in ColumnTypeRegistry.
-MEDIA_EXTENSIONS: dict[str, str] = {
-    # Images
-    ".jpg":  "media_path",
-    ".jpeg": "media_path",
-    ".png":  "media_path",
-    ".bmp":  "media_path",
-    ".tiff": "media_path",
-    ".tif":  "media_path",
-    # Videos
-    ".mp4":  "media_path",
-    ".mov":  "media_path",
-    ".avi":  "media_path",
-    ".mkv":  "media_path",
-    ".webm": "media_path",
-    # Future: audio
-    # ".wav":  "audio_path",
-    # ".mp3":  "audio_path",
-}
+# The set of media file extensions is declared once in media/extensions.py
+# (P1.8d-2) and imported above -- folder scanning here and the schema-layer
+# tag rule in models/table_schema.py now read the same list. `f.suffix.lower()
+# in MEDIA_EXTENSIONS` works unchanged: it is a frozenset membership test.
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +401,32 @@ class Dataset:
         if self._registry is not None:
             self._registry.register_by_tag(column_name, col_type)
 
+    def _register_schema_tags(
+        self, table_name: str, columns: list[str] | None = None
+    ) -> None:
+        """Register columns of a just-accepted table with the display type tag
+        their TableSchema carries.
+
+        P1.8d-1: the schema built by _prepare_table is the single authority for
+        a column's tag, so Dataset no longer asks ColumnTypeRegistry.infer_type
+        what a column is. The tag on every inferred spec is one of the four
+        built-in tags register_by_tag already knows.
+
+        `columns` limits the work to a subset -- confirm_merge registers only
+        the columns the merge added. None means every column the schema names.
+        row_id and any other schema-exempt column has no spec and is skipped.
+        """
+        if self._registry is None:
+            return
+        schema = self.schema_for(table_name)
+        if schema is None:
+            return
+        names = schema.column_names() if columns is None else columns
+        for name in names:
+            if name in _SCHEMA_EXEMPT_COLUMNS:
+                continue
+            self._register_column(name, schema.spec_for(name).type_tag)
+
     # ------------------------------------------------------------------
     # Row-id index (row_id -> positional index, per table)
     # ------------------------------------------------------------------
@@ -776,9 +782,9 @@ class Dataset:
         full_path, and file_name. Registers full_path as 'media_path'
         with ColumnTypeRegistry.
 
-        Supported formats are defined in the MEDIA_EXTENSIONS dict at
-        the top of this file. To add a new format, add its extension
-        there — no other changes are needed.
+        Supported formats are the frozenset in media/extensions.py,
+        imported as MEDIA_EXTENSIONS. To add a new format, add its
+        extension there — no other changes are needed.
 
         Args:
             folder_path: Absolute path to the folder containing files.
@@ -816,9 +822,13 @@ class Dataset:
                 source="load_folder",
             )
 
-        
-        # Register full_path as media_path — works for images and videos.
-        self._register_column("full_path", "media_path")
+        # Register every frames column from the schema the accept just built.
+        # 'full_path' is tagged media_path by _media_column_hints, so the
+        # blanket call covers it -- no separate _register_column line is
+        # needed. 'file_name' is a column of bare filenames, which P1.8d-2's
+        # tag rule classifies as text, not media_path, so registering it
+        # straight from the schema is now correct.
+        self._register_schema_tags("frames")
 
         self.provenance.record(
             "load_folder", {"folder_path": str(folder_path)}
@@ -877,13 +887,12 @@ class Dataset:
             "frames", pd.DataFrame(rows), source="load_csv_as_primary"
         )
 
-        if image_column and image_column in csv_df.columns:
-            self._register_column("full_path", "media_path")
-
-        for col in csv_df.columns:
-            if self._registry is not None:
-                inferred = self._registry.infer_type(csv_df[col])
-                self._register_column(col, inferred)
+        # Register every frames column from the schema the accept just built.
+        # 'full_path' is tagged media_path by _media_column_hints whether or
+        # not an image_column was given, so the blanket call covers it.
+        # 'file_name' holds bare filenames, which P1.8d-2's tag rule classifies
+        # as text; the CSV's own columns are tagged from their inferred specs.
+        self._register_schema_tags("frames")
 
         self.provenance.record("load_csv_as_primary", {
             "csv_path":     str(csv_path),
@@ -1030,12 +1039,9 @@ class Dataset:
                 "frames", report._pending_df.copy(), source="confirm_merge"
             )
 
-        for col in report._new_columns:
-            if self._registry is not None:
-                inferred = self._registry.infer_type(self._tables["frames"][col])
-            else:
-                inferred = "text"
-            self._register_column(col, inferred)
+        # P1.8d-1: tag the merged-in columns from the schema the accept built,
+        # not from ColumnTypeRegistry.infer_type.
+        self._register_schema_tags("frames", report._new_columns)
 
         self.provenance.record(
             "confirm_merge", {"matched_rows": report.matched_rows}
@@ -1262,15 +1268,10 @@ class Dataset:
         # Step 3: Store the new table.
         self._accept_table(name, agg_df, source="aggregate")
 
-        # Step 4: Register the column types for the new table.
-        for col in agg_df.columns:
-            if col == "row_id":
-                continue
-            if self._registry is not None:
-                inferred = self._registry.infer_type(agg_df[col])
-            else:
-                inferred = "text"
-            self._register_column(col, inferred)
+        # Step 4: Register the column types for the new table, from the schema
+        # the accept built (P1.8d-1) rather than ColumnTypeRegistry.infer_type.
+        # row_id is schema-exempt and skipped inside the helper.
+        self._register_schema_tags(name)
 
         # Step 5: Record the operation in the provenance log.
         self.provenance.record("aggregate", {
@@ -1335,12 +1336,9 @@ class Dataset:
         )
         self._accept_table(name, result, source="create_table_from_df")
 
-        if self._registry is not None:
-            for col in result.columns:
-                if col == "row_id":
-                    continue
-                inferred = self._registry.infer_type(result[col])
-                self._register_column(col, inferred)
+        # P1.8d-1: register from the schema the accept built, not from
+        # ColumnTypeRegistry.infer_type. row_id is schema-exempt.
+        self._register_schema_tags(name)
 
         self.provenance.record("create_table_from_df", {
             "name":    name,
