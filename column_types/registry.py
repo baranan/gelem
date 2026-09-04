@@ -1,39 +1,41 @@
 """
 column_types/registry.py
 
-ColumnTypeRegistry is the bridge between data and display.
-It maps each column name to a column type, and each column type
-to a render function.
+ColumnTypeRegistry maps a column *type tag* to a renderer -- nothing else.
 
-When a tile needs to display a column's value, it asks the registry
-for the render function, calls it with the value, a target size, and
-a display mode, and receives a QPixmap or QWidget back. The tile does
-not know or care whether the value is a file path, a number, or a
-label — the render function handles all of that.
+A type tag is a short string such as 'media_path', 'numeric', 'text' or
+'boolean_flag'. Each tag owns one ColumnType, which carries the tag's
+human-readable label, whether it produces a visual (image-like) output,
+and the render function that turns a cell value into a QPixmap
+(thumbnail mode) or a QWidget (detail mode).
 
-Display modes:
-    'thumbnail' — used by gallery tiles; always returns a QPixmap.
-    'detail'    — used by DetailWidget; returns a QWidget (e.g. a
-                  video player or zoomable image view).
+What the registry no longer does:
+    Until P1.8d it also held a second map, column name -> ColumnType,
+    that Dataset and the operator output path wrote to and that
+    FilterPanel and the gallery read back. That map made two tables
+    sharing a column name share one type, which is wrong. It is gone.
+    The authority for what a named column is now the table's own
+    TableSchema (docs/architecture.md 4.3); AppController reads the
+    column's type tag off that schema and asks this registry only what
+    the tag renders as.
 
 Who populates the registry:
-    - Dataset registers columns when it loads a folder or merges a CSV.
-    - OperatorRegistry registers columns before an operator runs,
-      so tiles can show informative placeholders immediately.
+    - main.py calls setup_defaults() once at startup to register the
+      four built-in tags against their render functions.
+    - A new custom visual type is added with register_type().
 
 Who reads the registry:
-    - ImageTile calls render() with mode='thumbnail' to get a QPixmap.
-    - DetailWidget calls render() with mode='detail' to get a QWidget.
-    - FilterPanel calls get() to decide what control to show.
-    - GalleryWidget calls list_visual_columns() to populate the
-      column selector.
+    - AppController.render_column_value() / render_result_image() call
+      render_by_tag() to paint a cell or an operator result.
+    - AppController.get_column_type() calls type_for_tag() to answer the
+      UI's "what kind of column is this" question.
 
 This file is written centrally (not by a student).
-Student A adds new render functions in renderers.py.
+New render functions are added in renderers.py.
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Any
 import pandas as pd
 
@@ -79,29 +81,31 @@ class ColumnType:
 
 class ColumnTypeRegistry:
     """
-    Maps column names to ColumnType objects and provides rendering.
+    Maps a type tag to its ColumnType (label, visual flag, renderer).
 
-    All components interact with columns through this registry rather
-    than making assumptions about what a column contains.
+    It holds no knowledge of any particular column -- two tables whose
+    schemas both call a column 'score' but tag it differently get
+    different renderers, because the caller passes the tag, not the
+    column name.
 
     Usage:
         registry = ColumnTypeRegistry()
-        registry.register_by_tag('full_path', 'media_path')
+        registry.setup_defaults(artifact_store)
 
         # Gallery tile (thumbnail mode):
-        pixmap = registry.render('full_path', '/path/to/video.mp4', 150)
+        pixmap = registry.render_by_tag('media_path', '/path/to/video.mp4', 150)
 
         # Detail view (detail mode):
-        widget = registry.render('full_path', '/path/to/video.mp4', 600,
-                                 mode='detail')
+        widget = registry.render_by_tag('media_path', '/path/to/video.mp4',
+                                        600, mode='detail')
+
+        # "What kind of column is this?"
+        col_type = registry.type_for_tag('numeric')
     """
 
     def __init__(self):
-        # Maps column name -> ColumnType.
-        self._columns: dict[str, ColumnType] = {}
-
         # Maps type tag -> ColumnType.
-        # Built-in types are registered here by setup_defaults().
+        # Built-in tags are registered here by setup_defaults().
         self._types: dict[str, ColumnType] = {}
 
     def setup_defaults(self, artifact_store) -> None:
@@ -157,140 +161,24 @@ class ColumnTypeRegistry:
             ),
         }
 
-    def register(self, column_name: str, col_type: ColumnType) -> None:
-        """
-        Registers a column name with a fully specified ColumnType object.
-        Used when an operator wants to provide a custom label or render
-        function for a column it produces.
-
-        Args:
-            column_name: The column name as it appears in the DataFrame.
-            col_type:    The ColumnType object describing this column.
-        """
-        self._columns[column_name] = col_type
-
-    def register_by_tag(self, column_name: str, tag: str) -> None:
-        """
-        Registers a column name using a built-in type tag.
-        The most common way for Dataset and OperatorRegistry to register
-        columns.
-
-        Args:
-            column_name: The column name as it appears in the DataFrame.
-            tag:         A built-in type tag, e.g. 'media_path',
-                         'numeric', 'text'.
-
-        Raises:
-            KeyError: If the tag is not a known built-in type.
-        """
-        if tag not in self._types:
-            raise KeyError(
-                f"Unknown column type tag '{tag}'. "
-                f"Known tags: {list(self._types.keys())}"
-            )
-        self._columns[column_name] = self._types[tag]
-
-    def clear_column_map(self) -> None:
-        """
-        Forgets every column-name -> ColumnType mapping, leaving the registered
-        types (and their tags) intact.
-
-        Dataset.load() calls this at its point of no return so a freshly opened
-        project does not inherit the previously open project's column tags. The
-        built-in types from setup_defaults() and any operator-registered types
-        stay available, ready for the new project's columns to be re-registered
-        against them.
-        """
-        self._columns.clear()
-
     def register_type(self, col_type: ColumnType) -> None:
         """
         Registers a new custom column type by tag.
-        Used by Student A to add new visual types alongside new operators.
+        Used to add a new visual type alongside a new operator.
 
         Args:
             col_type: The new ColumnType to register.
         """
         self._types[col_type.tag] = col_type
 
-    def get(self, column_name: str) -> ColumnType | None:
-        """
-        Returns the ColumnType for a given column name, or None if
-        the column has not been registered.
-
-        Args:
-            column_name: The column name to look up.
-
-        Returns:
-            The ColumnType, or None.
-        """
-        return self._columns.get(column_name, None)
-
-    def render(
-        self,
-        column_name: str,
-        value: Any,
-        size: int,
-        mode: str = "thumbnail",
-        context: dict | None = None,
-    ) -> Any:
-        """
-        Looks up the render function for the column and calls it.
-
-        In 'thumbnail' mode, returns a QPixmap ready for display in a
-        gallery tile.
-
-        In 'detail' mode, returns a QWidget ready for display in
-        DetailWidget (e.g. a ZoomableImageView or a QVideoWidget).
-
-        If the column is not registered, returns a gray placeholder
-        QPixmap (thumbnail mode) or a placeholder QLabel (detail mode).
-
-        If the value is None (operator has not run yet), returns an
-        informative placeholder.
-
-        Args:
-            column_name: The column to render.
-            value:       The cell value from the DataFrame row.
-            size:        Target size in pixels.
-            mode:        'thumbnail' (default) or 'detail'.
-            context:     Optional dict with row-level metadata, e.g.
-                         {'row_id': ..., 'column_name': ...}. Passed
-                         through to renderers for cache lookups.
-
-        Returns:
-            A QPixmap (thumbnail mode), QWidget (detail mode), or None.
-        """
-        col_type = self._columns.get(column_name, None)
-
-        if col_type is None:
-            if mode == "detail":
-                return _make_placeholder_widget(f"Unknown column:\n{column_name}")
-            return _make_placeholder_pixmap(size, f"Unknown:\n{column_name}")
-
-        if value is None or (isinstance(value, float) and pd.isna(value)):
-            if mode == "detail":
-                return _make_placeholder_widget(f"Not computed:\n{column_name}")
-            return _make_placeholder_pixmap(size, f"Not computed:\n{column_name}")
-
-        try:
-            return col_type.render(value, size, mode, context)
-        except Exception as e:
-            print(f"[ColumnTypeRegistry] render error for '{column_name}': {e}")
-            if mode == "detail":
-                return _make_placeholder_widget(f"Error:\n{column_name}")
-            return _make_placeholder_pixmap(size, f"Error:\n{column_name}")
-
     def type_for_tag(self, tag: str) -> ColumnType | None:
         """
-        Returns the ColumnType registered under a built-in type tag, or
-        None if the tag is unknown.
+        Returns the ColumnType registered under a type tag, or None if
+        the tag is unknown.
 
-        The tag-keyed counterpart of get(). P1.8d-2a has AppController read
-        a column's type tag off that table's TableSchema and ask the
-        registry only what the tag renders as -- so two tables that share a
-        column name no longer share one type. get() and the column-name map
-        stay for the write-path callers P1.8d-2b removes.
+        AppController reads a column's type tag off that table's
+        TableSchema and asks this method what the tag renders as -- so
+        two tables that share a column name no longer share one type.
 
         Args:
             tag: A type tag, e.g. 'media_path', 'numeric', 'text'.
@@ -311,21 +199,20 @@ class ColumnTypeRegistry:
         label: str | None = None,
     ) -> Any:
         """
-        Renders a value using the renderer for a type tag, rather than for
-        a column name. The tag-keyed counterpart of render().
+        Renders a value using the renderer for a type tag.
 
-        Carries render()'s placeholder behaviour exactly:
+        Placeholder behaviour:
           * an unknown tag (or None) -> the "unknown" placeholder;
           * a None or NaN value      -> the "not computed" placeholder;
           * a renderer that raises    -> the "error" placeholder.
 
         `label` is used only in the placeholder message. AppController
         passes the column name it was asked about, so the three messages
-        read exactly as render()'s did: "Unknown column: <name>",
-        "Not computed: <name>", "Error: <name>". A caller with no column
-        name -- AppController.render_result_image, rendering an operator's
-        output file -- passes no label, and each message falls back to a
-        plain sentence for a researcher that names no tag.
+        read "Unknown column: <name>", "Not computed: <name>",
+        "Error: <name>". A caller with no column name --
+        AppController.render_result_image, rendering an operator's output
+        file -- passes no label, and each message falls back to a plain
+        sentence for a researcher that names no tag.
 
         Args:
             tag:     The type tag to render as, or None (treated as unknown).
@@ -374,30 +261,6 @@ class ColumnTypeRegistry:
         if mode == "detail":
             return _make_placeholder_widget(message)
         return _make_placeholder_pixmap(size, message)
-
-    def list_visual_columns(self) -> list[str]:
-        """
-        Returns the names of all registered columns whose type produces
-        a visual output (visual=True). Used by the column selector in
-        the gallery to show only renderable columns.
-
-        Returns:
-            List of column names with visual=True column types.
-        """
-        return [
-            name for name, ct in self._columns.items()
-            if ct.visual
-        ]
-
-    def list_all_columns(self) -> list[str]:
-        """
-        Returns the names of all registered columns regardless of type.
-        Used by FilterPanel to know which columns are available.
-
-        Returns:
-            List of all registered column names.
-        """
-        return list(self._columns.keys())
 
 
 # ---------------------------------------------------------------------------

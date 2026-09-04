@@ -87,7 +87,6 @@ def make_controller():
         registry.setup_defaults(store)
 
         dataset = Dataset()
-        dataset.set_registry(registry)
         dataset.load_folder(TEST_IMAGES)
         if merge_csv:
             dataset.confirm_merge(

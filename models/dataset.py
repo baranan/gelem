@@ -374,23 +374,6 @@ class Dataset:
             source="__init__",
         )
 
-    def set_registry(self, registry) -> None:
-        """Retained as a no-op only so existing callers do not break.
-
-        P1.8d-2b-1: Dataset no longer writes to ColumnTypeRegistry at all.
-        After P1.8d-2a nothing reads the registry's column-name map on the
-        display path (AppController reads a column's display tag off the
-        TableSchema instead), so the map's only remaining writer is the
-        operator output-column path in the controller. Dataset holds no
-        registry reference and this method deliberately ignores its argument.
-        AppController's construction and several test fixtures
-        (tests/conftest.py, tests/test_dataset_access_paths.py, ...) still
-        call it; keeping the method a no-op means none of them need editing
-        in this item.
-        """
-        # Intentionally does nothing -- see the docstring.
-        return
-
     def _next_id(self) -> str:
         """Generates a new unique row_id string."""
         self._id_counter += 1

@@ -109,11 +109,11 @@ class AppController(QObject):
         # imports settings/ and holds no GelemSettings or SettingsStore.
         self._settings_gateway = settings_gateway
 
-        # P1.8d-2b-1: Dataset no longer writes to ColumnTypeRegistry, so there
-        # is nothing to wire here. Dataset.set_registry() is now a no-op kept
-        # only for callers that have not been updated. The controller still
-        # owns `registry` and is the sole writer of its column-name map, via
-        # the operator output-column path in run_create_columns().
+        # P1.8d-2b-3: Dataset holds no registry reference and there is
+        # nothing to wire between them. The controller owns `registry` only
+        # to answer "what does this tag render as" -- it maps a type tag to
+        # a renderer and nothing else (see column_types/registry.py). A
+        # column's type tag comes from that table's TableSchema.
         self._store.on_thumbnail_ready = self._on_thumbnail_ready
 
         # Result queues. Each is drained by at most self._drain_budget
@@ -1068,8 +1068,7 @@ class AppController(QObject):
             # the item drain. The schema does not police tags, so an
             # unknown tag still reaches it; but such a column renders as a
             # placeholder, so warn once per run about any tag the registry
-            # has no renderer for -- the same thing the register_by_tag
-            # KeyError warned about before, at the same point.
+            # has no renderer for.
             column_tags = {
                 col_name: col_tag
                 for col_name, col_tag in operator.output_columns

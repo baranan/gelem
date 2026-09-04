@@ -51,8 +51,9 @@ class DictBackend:
 
 
 class _StubDataset:
-    def set_registry(self, registry) -> None:
-        pass
+    """A dataset the settings tests never call into -- AppController's
+    constructor stores it but touches no dataset method."""
+    pass
 
 
 class _StubStore:

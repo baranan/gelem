@@ -57,13 +57,17 @@ _passed = 0
 _failed = 0
 
 
-def check_thumbnail(column_name: str, value, filename: str) -> None:
+def check_thumbnail(tag, value, filename: str) -> None:
     """
     Renders a value in thumbnail mode and saves it as a PNG file.
     A QPixmap is expected.
+
+    P1.8d-2b-3: the registry maps a type tag to a renderer, so this
+    passes a tag ('media_path', 'numeric', ..., or None for the
+    unknown-column case) rather than a column name.
     """
     global _passed, _failed
-    pixmap = registry.render(column_name, value, SIZE, mode="thumbnail")
+    pixmap = registry.render_by_tag(tag, value, SIZE, mode="thumbnail", label=tag)
     if pixmap is not None:
         path = output_dir / filename
         pixmap.save(str(path), "PNG")
@@ -74,13 +78,13 @@ def check_thumbnail(column_name: str, value, filename: str) -> None:
         _failed += 1
 
 
-def check_detail(column_name: str, value, label: str) -> None:
+def check_detail(tag, value, label: str) -> None:
     """
     Renders a value in detail mode and checks that a QWidget is returned.
     Does not save to disk (widgets can't be saved as PNG directly).
     """
     global _passed, _failed
-    widget = registry.render(column_name, value, SIZE, mode="detail")
+    widget = registry.render_by_tag(tag, value, SIZE, mode="detail", label=tag)
     if isinstance(widget, QWidget):
         print(f"  PASS  {label} (detail mode — QWidget returned)")
         _passed += 1
@@ -100,10 +104,8 @@ test_images = list((project_root / "test_images").glob("*.jpg"))
 test_images += list((project_root / "test_images").glob("*.png"))
 
 if test_images:
-    # Register full_path as media_path so the renderer is found.
-    registry.register_by_tag("full_path", "media_path")
-    check_thumbnail("full_path", str(test_images[0]), "test_image_thumbnail.png")
-    check_detail("full_path", str(test_images[0]), "image detail mode")
+    check_thumbnail("media_path", str(test_images[0]), "test_image_thumbnail.png")
+    check_detail("media_path", str(test_images[0]), "image detail mode")
 else:
     print("  SKIP  image tests — no .jpg/.png files found in test_images/")
 
@@ -116,8 +118,8 @@ test_videos = list((project_root / "test_images").glob("*.mp4"))
 test_videos += list((project_root / "test_images").glob("*.mov"))
 
 if test_videos:
-    check_thumbnail("full_path", str(test_videos[0]), "test_video_thumbnail.png")
-    check_detail("full_path", str(test_videos[0]), "video detail mode")
+    check_thumbnail("media_path", str(test_videos[0]), "test_video_thumbnail.png")
+    check_detail("media_path", str(test_videos[0]), "video detail mode")
 else:
     print("  SKIP  video tests — no .mp4/.mov files found in test_images/")
     print("        Add a short video to test_images/ to test video rendering.")
@@ -127,46 +129,38 @@ else:
 print()
 print("── numeric ─────────────────────────────────────────────────────")
 
-registry.register_by_tag("some_number",  "numeric")
-registry.register_by_tag("some_integer", "numeric")
-
-check_thumbnail("some_number",  3.14159, "test_numeric_float.png")
-check_thumbnail("some_integer", 42,      "test_numeric_int.png")
-check_detail("some_number", 3.14159, "numeric detail mode")
+check_thumbnail("numeric",  3.14159, "test_numeric_float.png")
+check_thumbnail("numeric", 42,      "test_numeric_int.png")
+check_detail("numeric", 3.14159, "numeric detail mode")
 
 # ── text renderer ─────────────────────────────────────────────────────────
 
 print()
 print("── text ────────────────────────────────────────────────────────")
 
-registry.register_by_tag("condition",  "text")
-registry.register_by_tag("long_label", "text")
-
-check_thumbnail("condition",  "positive", "test_text_short.png")
-check_thumbnail("long_label", "A very long label that might overflow", "test_text_long.png")
-check_detail("condition", "positive", "text detail mode")
+check_thumbnail("text",  "positive", "test_text_short.png")
+check_thumbnail("text", "A very long label that might overflow", "test_text_long.png")
+check_detail("text", "positive", "text detail mode")
 
 # ── boolean_flag renderer ─────────────────────────────────────────────────
 
 print()
 print("── boolean_flag ────────────────────────────────────────────────")
 
-registry.register_by_tag("is_valid",   "boolean_flag")
-
-check_thumbnail("is_valid", True,  "test_boolean_true.png")
-check_thumbnail("is_valid", False, "test_boolean_false.png")
-check_detail("is_valid", True, "boolean_flag detail mode")
+check_thumbnail("boolean_flag", True,  "test_boolean_true.png")
+check_thumbnail("boolean_flag", False, "test_boolean_false.png")
+check_detail("boolean_flag", True, "boolean_flag detail mode")
 
 # ── placeholder cases ─────────────────────────────────────────────────────
 
 print()
 print("── placeholders ────────────────────────────────────────────────")
 
-# Unknown column — not registered with registry.
-check_thumbnail("unknown_column", "some_value", "test_unknown_column.png")
+# Unknown tag — no renderer registered for it.
+check_thumbnail(None, "some_value", "test_unknown_column.png")
 
-# None value — registered column but value is None.
-check_thumbnail("full_path", None, "test_none_value.png")
+# None value — known tag but value is None.
+check_thumbnail("media_path", None, "test_none_value.png")
 
 # ── ZoomableImageView import (regression after move to shared_widgets) ────────
 
@@ -189,22 +183,22 @@ print("── render with context parameter ────────────
 
 try:
     ctx = {"row_id": "test_row_001", "column_name": "some_number"}
-    result = registry.render("some_number", 3.14, SIZE, mode="thumbnail", context=ctx)
+    result = registry.render_by_tag("numeric", 3.14, SIZE, mode="thumbnail", context=ctx)
     if result is not None:
-        print("  PASS  registry.render() accepts context= without error")
+        print("  PASS  registry.render_by_tag() accepts context= without error")
         _passed += 1
     else:
-        print("  FAIL  registry.render() with context returned None")
+        print("  FAIL  registry.render_by_tag() with context returned None")
         _failed += 1
 except TypeError as e:
-    print(f"  FAIL  registry.render() does not accept context= kwarg: {e}")
+    print(f"  FAIL  registry.render_by_tag() does not accept context= kwarg: {e}")
     _failed += 1
 
 if test_images:
     try:
         ctx = {"row_id": "test_row_001", "column_name": "full_path"}
-        result = registry.render(
-            "full_path", str(test_images[0]), SIZE,
+        result = registry.render_by_tag(
+            "media_path", str(test_images[0]), SIZE,
             mode="thumbnail", context=ctx,
         )
         if result is not None:

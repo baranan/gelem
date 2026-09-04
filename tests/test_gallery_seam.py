@@ -547,7 +547,6 @@ def test_two_media_columns_on_one_row_render_different_pictures(qapp, tmp_path):
     registry = ColumnTypeRegistry()
     registry.setup_defaults(store)
     dataset = Dataset()
-    dataset.set_registry(registry)
     op_registry = OperatorRegistry()
     controller = AppController(dataset, QueryEngine(), store, registry, op_registry)
 

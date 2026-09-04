@@ -58,7 +58,7 @@ class FakeController(QObject):
         self._folder = test_images_folder
 
         # Scan for real media files (images and videos).
-        from models.dataset import MEDIA_EXTENSIONS
+        from media.extensions import MEDIA_EXTENSIONS
         self._image_files: list[Path] = []
         if test_images_folder.exists():
             for f in sorted(test_images_folder.iterdir()):
@@ -472,14 +472,44 @@ class FakeController(QObject):
 
     # Mirror the new AppController public methods so UI code that calls
     # them (per issue #32) works in --fake-data mode too.
+    #
+    # P1.8d-2b-3: each of these was defined twice in this file. The
+    # second copy won at class-build time, and its bodies were all
+    # inert stubs -- get_column_type in particular returned None for
+    # every column, which is why FilterPanel (ui/filter_panel.py:199)
+    # built no per-column filter control in --fake-data mode. The live
+    # bodies below are kept; the stub copies are gone.
 
     def get_column_type(self, column_name: str, table_name: str | None = None):
+        """
+        Returns a column-type object carrying at least `.tag`, mirroring
+        AppController.get_column_type(column_name, table_name=None).
+
+        The fake keeps its own tag map (self._column_types) rather than a
+        TableSchema, so table_name is accepted and ignored -- there is
+        one table. _registry is the fake's _FakeRegistry stand-in, whose
+        get() wraps the tag in an object FilterPanel can read .tag off,
+        exactly as the real ColumnType does.
+        """
         return self._registry.get(column_name)
 
     def get_all_row_ids(self, table_name: str | None = None) -> list[str]:
+        """
+        Returns every row_id in the fake's single table.
+
+        The real controller looks up *table_name* in the dataset; the
+        fake has only one table of generated rows, so it returns those
+        row_ids regardless of which table name is asked for.
+        """
         return list(self._row_ids)
 
     def get_operator(self, operator_name: str):
+        """
+        Returns the operator registered under *operator_name*, mirroring
+        AppController.get_operator(). _op_registry is the fake's
+        FakeOpRegistry stand-in, whose get() returns None for every name
+        -- matching the real controller when a name is not found.
+        """
         return self._op_registry.get(operator_name)
 
     # Settings pass-throughs -- mirror AppController.get_settings_fields
@@ -517,43 +547,6 @@ class FakeController(QObject):
     def get_row(self, row_id: str, _table_name: str = "frames") -> dict:
         return self._metadata.get(row_id, {"row_id": row_id})
 
-# ── Accessors added to mirror AppController's public contract ─────
-    # These three were added to the real controller by the
-    # "add-controller-public-methods" PR. The fake must expose them too,
-    # or any UI widget that calls them will crash only in fake-data mode.
-
-    def get_all_row_ids(self, table_name: str | None = None) -> list[str]:
-        """
-        Returns every row_id in the fake's single table.
-
-        The real controller looks up *table_name* in the dataset; the fake
-        has only one table of generated rows, so it returns those row_ids
-        regardless of which table name is asked for.
-        """
-        # The fake holds all its rows in self._row_ids (built in __init__).
-        return list(self._row_ids)
-
-    def get_column_type(self, column_name: str, table_name: str | None = None):
-        """
-        Returns the column-type object for *column_name* -- the active
-        table when *table_name* is None, mirroring
-        AppController.get_column_type(column_name, table_name=None).
-
-        The fake has no ColumnTypeRegistry, so it returns None -- which is
-        exactly what the real controller returns for an unregistered column.
-        UI code already has to handle the None case, so this stays safe.
-        """
-        return None
-
-    def get_operator(self, operator_name: str):
-        """
-        Returns the operator registered under *operator_name*.
-
-        The fake has no OperatorRegistry, so it returns None -- matching the
-        real controller's behaviour when an operator name is not found.
-        """
-        return None
-    
     def get_artifact_pixmap(
         self,
         address: str,

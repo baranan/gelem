@@ -101,7 +101,6 @@ def test_run_create_columns_does_not_copy_table_per_row(monkeypatch, tmp_path):
     registry.setup_defaults(store)
 
     dataset = Dataset()
-    dataset.set_registry(registry)
     dataset.load_folder(TEST_IMAGES)
 
     op_registry = OperatorRegistry()
@@ -219,7 +218,6 @@ def test_run_create_columns_pairs_snapshot_rows_with_correct_row_id(monkeypatch,
     registry.setup_defaults(store)
 
     dataset = Dataset()
-    dataset.set_registry(registry)
     dataset.load_folder(TEST_IMAGES)
 
     op_registry = OperatorRegistry()

@@ -54,7 +54,6 @@ def _make_controller(tmp_path):
     registry.setup_defaults(store)
 
     dataset = Dataset()
-    dataset.set_registry(registry)
     dataset.load_folder(TEST_IMAGES)
 
     op_registry = OperatorRegistry()

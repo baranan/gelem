@@ -65,7 +65,6 @@ def _build_controller(tmp_path):
     registry = ColumnTypeRegistry()
     registry.setup_defaults(store)
     dataset = Dataset()
-    dataset.set_registry(registry)
     op_registry = OperatorRegistry()
     controller = AppController(dataset, QueryEngine(), store, registry, op_registry)
     return controller, dataset, store
