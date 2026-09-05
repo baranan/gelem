@@ -24,6 +24,8 @@ from media.extensions import MEDIA_EXTENSIONS
 from media.media_address import (
     MediaAddressError,
     absolutise,
+    canonicalise_cell,
+    canonicalise_path,
     relativise,
 )
 from media.media_address import parse as parse_address
@@ -765,7 +767,7 @@ class Dataset:
             for f in sorted(found_files):
                 rows.append({
                     "row_id":    self._next_id(),
-                    "full_path": str(f),
+                    "full_path": canonicalise_path(str(f)),
                     "file_name": f.name,
                 })
 
@@ -825,7 +827,13 @@ class Dataset:
 
             if image_column and image_column in csv_df.columns:
                 path_val = csv_row.get(image_column, "")
-                row["full_path"] = str(path_val)
+                # canonicalise_cell does not accept None, NaN or a
+                # non-string value -- _is_blank_cell is the project's one
+                # guard for exactly that, so a blank cell is stored as-is.
+                if _is_blank_cell(path_val):
+                    row["full_path"] = str(path_val)
+                else:
+                    row["full_path"] = canonicalise_cell(path_val)
                 row["file_name"] = Path(str(path_val)).name
             else:
                 row["full_path"] = ""
