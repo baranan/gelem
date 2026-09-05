@@ -42,6 +42,8 @@ __all__ = [
     "from_path",
     "parse",
     "format",
+    "canonicalise_path",
+    "canonicalise_cell",
     "absolutise",
     "relativise",
     "canonical_key",
@@ -432,6 +434,80 @@ def format(addr: MediaAddress) -> str:
     if not parts:
         return escaped_path
     return escaped_path + "#" + "&".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# canonicalise_path() / canonicalise_cell() -- turning an ordinary string
+# into the canonical stored form, for the two different situations a caller
+# can be in about what that string already is (P1.8e-1).
+# ---------------------------------------------------------------------------
+
+def canonicalise_path(path: str) -> str:
+    """Canonicalise a value known to be a filesystem path, never an address.
+
+    Returns format(from_path(path)): separators are normalised to forward
+    slashes, and every literal '#' and '%' in the path is escaped (decision
+    1), because a bare path may legitimately contain either character in a
+    real filename and neither may be mistaken for fragment syntax once this
+    value sits in a media cell. This is what a folder scan calls on every
+    path it reads off disk.
+
+    Does not touch the filesystem, and does not accept None, NaN, or a
+    non-string -- the caller guards those before calling.
+
+    This function is a one-way encoder, not a normaliser, and is
+    deliberately NOT idempotent: canonicalise_path(canonicalise_path(x))
+    does not equal canonicalise_path(x) whenever x already contains a
+    literal '#' or '%', because the second call escapes the '%' that the
+    first call just introduced. This is intentional, not a defect to be
+    fixed by detecting "already-escaped" input: nothing can distinguish a
+    file genuinely named "a%23b.png" from the escaped form of "a#b.png"
+    -- that ambiguity is inherent to this escape scheme, and guessing
+    would silently pick a side of it. A caller must call this function
+    exactly once, on a genuine raw path, never on another canonicalise
+    call's output. (canonicalise_cell(canonicalise_path(x)) ==
+    canonicalise_path(x) does hold, because canonicalise_path's output is
+    already a canonical address string, and passing an already-canonical
+    string through parse()/format() again is a no-op -- see
+    canonicalise_cell below.)
+    """
+    return format(from_path(path))
+
+
+def canonicalise_cell(value: str) -> str:
+    """Canonicalise a value that came from user text and may already be an
+    address carrying a fragment.
+
+    Tries parse(value) and returns format(addr) on success, so an already
+    well-formed address (with a frame, time, range, region or stream
+    selector) keeps its fragment. On MediaAddressError -- the value is not
+    a parseable address, most often because it contains a literal '#'
+    that is not a valid fragment -- falls back to canonicalise_path(value),
+    treating the entire string as a literal path. This is what a CSV
+    import calls on every cell it reads.
+
+    Does not touch the filesystem, and does not accept None, NaN, or a
+    non-string -- the caller guards those before calling.
+
+    A value that already looks like an escaped address carries the one
+    consequence inherent to this module's escape scheme (decision 1),
+    and it does not come from the fallback: a cell already spelled
+    "photos/a%23b.png" parses successfully on the first try (there is no
+    literal '#' in it, so nothing here is malformed), so
+    canonicalise_cell returns it completely unchanged. The ambiguity
+    shows up one step later, whenever that canonical cell is parsed:
+    parse("photos/a%23b.png").path is "photos/a#b.png", so a file
+    genuinely named "a%23b.png" on disk is read downstream under the
+    filename "a#b.png" instead. The escape scheme cannot tell a literal
+    '%23' apart from an escaped '#' -- that ambiguity is inherent to the
+    scheme, and this item does not resolve it, only leaves it exactly
+    where it already was.
+    """
+    try:
+        addr = parse(value)
+    except MediaAddressError:
+        return canonicalise_path(value)
+    return format(addr)
 
 
 # ---------------------------------------------------------------------------
