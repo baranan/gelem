@@ -14,10 +14,19 @@ protection today -- one cell with an unescaped '#' fails
 media_address.parse(), so infer_type_tag demotes the WHOLE column to
 "text" and every row in it loses its thumbnail.
 
-apply_row_updates' value path, save(), the import sites (load_folder,
-load_csv_as_primary), and load()'s own code are none of them EDITED by
-this item -- see tests/test_import_canonicalisation.py for the import
-sites' own tests (run separately; this file does not re-invoke it).
+save(), the import sites (load_folder, load_csv_as_primary), and load()'s
+own code are none of them EDITED by P1.8e-2b-1 -- see
+tests/test_import_canonicalisation.py for the import sites' own tests (run
+separately; this file does not re-invoke it).
+
+P1.8e-2b-2 completes the rule for the one path P1.8e-2b-1 left out:
+apply_row_updates' per-row VALUE path. A value written into a column whose
+STORED schema tag is already "media_path" is canonicalised
+(media_address.canonicalise_cell) before it lands, so an operator that
+writes a path with a literal '#' or '%' into an existing media column
+produces a renderable cell -- exactly as the same value would through
+folder scan, CSV import or a brand-new column. Its tests are the
+"P1.8e-2b-2" section at the foot of this file.
 load()'s BEHAVIOUR is not immune, though: it calls the same
 _prepare_table this item changed, and a table absent from schemas.json
 (or one whose empty-frame cast to its saved schema fails) gets every
@@ -281,3 +290,160 @@ def test_escaped_hash_before_a_non_media_extension_does_not_look_like_media():
 
     assert ds.schema_for("t").spec_for("notes").type_tag == "text"
     assert ds.get_table("t")["notes"].tolist() == values
+
+
+# ===========================================================================
+# P1.8e-2b-2 -- apply_row_updates' per-row VALUE path.
+#
+# The rule: a value written by apply_row_updates into a column whose STORED
+# schema tag is already "media_path" is canonicalised (canonicalise_cell)
+# before it lands, but only when it is a non-blank string. A blank value, a
+# non-string value, and any value going into an ordinary column are written
+# exactly as they arrived. The stored DataFrame object identity must survive
+# a batch of already-canonical writes -- apply_row_updates mutates in place
+# so its row-id index does not rebuild every tick.
+#
+# These tests build the media column the realistic way the item names: a
+# first apply_row_updates call that CREATES it with
+# column_tags={name: "media_path"}, then a second call that writes into it.
+# The column is deliberately NOT named 'full_path' -- _media_column_hints
+# force-hints that name media_path regardless of its values, so it cannot
+# exercise "the STORED tag is already media_path" as a real condition.
+# ===========================================================================
+
+
+def _table_with_two_rows(ds: Dataset) -> list[str]:
+    """A 't' table with two rows and their row_ids, ready for
+    apply_row_updates to add an operator-style column to."""
+    ds.create_table_from_df(
+        "t", pd.DataFrame({"participant": ["p1", "p2"]})
+    )
+    return ds.get_table("t")["row_id"].tolist()
+
+
+def test_apply_row_updates_canonicalises_a_hash_value_into_existing_media_column():
+    ds = Dataset()
+    ids = _table_with_two_rows(ds)
+
+    # First call CREATES the media column with the caller's tag.
+    ds.apply_row_updates(
+        "t",
+        {ids[0]: {"clip_path": "videos/a.png"},
+         ids[1]: {"clip_path": "videos/b.png"}},
+        column_tags={"clip_path": "media_path"},
+    )
+    assert ds.schema_for("t").spec_for("clip_path").type_tag == "media_path"
+
+    # Second call writes a value with a literal '#' into that existing column.
+    unplaceable = ds.apply_row_updates(
+        "t", {ids[1]: {"clip_path": "videos/c#2.png"}}
+    )
+    assert unplaceable == []
+
+    # The '#' is escaped to '%23' -- the canonical address form -- so the
+    # cell still parses as a media address and renders.
+    assert ds.get_table("t")["clip_path"].tolist() == [
+        "videos/a.png", "videos/c%232.png",
+    ]
+
+
+def test_apply_row_updates_leaves_a_hash_value_in_an_ordinary_column_untouched():
+    ds = Dataset()
+    ids = _table_with_two_rows(ds)
+
+    # 'note' infers as ordinary text -- no media extension, no fragment.
+    ds.apply_row_updates(
+        "t",
+        {ids[0]: {"note": "rating #1"}, ids[1]: {"note": "x"}},
+    )
+    assert ds.schema_for("t").spec_for("note").type_tag == "text"
+
+    ds.apply_row_updates(
+        "t", {ids[1]: {"note": "weird # value % here"}}
+    )
+    # Byte-for-byte: an ordinary column's values are never canonicalised.
+    assert ds.get_table("t")["note"].tolist() == [
+        "rating #1", "weird # value % here",
+    ]
+
+
+def test_apply_row_updates_writes_a_blank_into_a_media_column_unchanged():
+    ds = Dataset()
+    ids = _table_with_two_rows(ds)
+
+    ds.apply_row_updates(
+        "t",
+        {ids[0]: {"clip_path": "videos/a.png"},
+         ids[1]: {"clip_path": "videos/b.png"}},
+        column_tags={"clip_path": "media_path"},
+    )
+
+    # A blank value (None) is not a string canonicalise_cell accepts; it is
+    # written exactly as it arrived and does not raise.
+    unplaceable = ds.apply_row_updates(
+        "t", {ids[0]: {"clip_path": None}}
+    )
+    assert unplaceable == []
+    clip = ds.get_table("t")["clip_path"]
+    assert bool(pd.isna(clip.iloc[0]))
+    assert clip.iloc[1] == "videos/b.png"
+
+
+def test_apply_row_updates_does_not_raise_on_a_non_string_into_a_media_column():
+    ds = Dataset()
+    # The real app runs the lenient path: a bad per-row value must not abort
+    # the QTimer drain. The suite defaults Dataset to strict_schema (conftest
+    # job 3), which re-raises by design -- so opt this one instance out, the
+    # way conftest's docstring prescribes.
+    ds.strict_schema = False
+    ids = _table_with_two_rows(ds)
+
+    ds.apply_row_updates(
+        "t",
+        {ids[0]: {"clip_path": "videos/a.png"},
+         ids[1]: {"clip_path": "videos/b.png"}},
+        column_tags={"clip_path": "media_path"},
+    )
+
+    # A non-string in a media column is the accept path's to reject, not this
+    # code's to convert: canonicalise_cell is never called on it (the
+    # isinstance(str) guard), so no AttributeError/MediaAddressError escapes.
+    # Under the default non-strict Dataset the rejected batch is downgraded to
+    # "not placed" and rolled back -- the existing cell is left untouched.
+    unplaceable = ds.apply_row_updates(
+        "t", {ids[1]: {"clip_path": 7}}
+    )
+    assert unplaceable == [ids[1]]
+    assert ds.get_table("t")["clip_path"].tolist() == [
+        "videos/a.png", "videos/b.png",
+    ]
+
+
+def test_apply_row_updates_keeps_frame_identity_when_all_values_already_canonical():
+    ds = Dataset()
+    ids = _table_with_two_rows(ds)
+
+    ds.apply_row_updates(
+        "t",
+        {ids[0]: {"clip_path": "videos/a.png"},
+         ids[1]: {"clip_path": "videos/b.png"}},
+        column_tags={"clip_path": "media_path"},
+    )
+
+    # Capture the stored frame object, then write only already-canonical
+    # values into the media column.
+    before = ds.read_only_view("t")
+    ds.apply_row_updates(
+        "t",
+        {ids[0]: {"clip_path": "videos/x.png"},
+         ids[1]: {"clip_path": "videos/y.png"}},
+    )
+
+    assert ds.read_only_view("t") is before, (
+        "a batch of already-canonical writes must mutate the stored frame in "
+        "place -- a new object would force apply_row_updates' row-id index to "
+        "rebuild every timer tick"
+    )
+    assert ds.get_table("t")["clip_path"].tolist() == [
+        "videos/x.png", "videos/y.png",
+    ]

@@ -1321,6 +1321,28 @@ class Dataset:
             col: df[col].copy() for col in touched_columns if col in df.columns
         }
 
+        # P1.8e-2b-2: a value written into a column whose STORED schema tag is
+        # already "media_path" must be canonicalised (media_address.
+        # canonicalise_cell) before it lands, so an operator that emits a path
+        # containing a literal '#' or '%' produces a renderable cell -- exactly
+        # as the same value would if it arrived through folder scan, CSV import
+        # or a brand-new column (P1.8e-2b-1 handles those). Read the stored
+        # schema ONCE here, before the cell-write loop: this method runs once
+        # per table per timer tick, and a per-cell schema_for() lookup would
+        # make it O(rows). A column the schema does not name is not in the set
+        # -- schema.column_names() gates spec_for() so it never raises -- and a
+        # column this call CREATES cannot appear here, because the stored
+        # schema is only updated by the _accept_table at the end of this try.
+        stored_schema = self.schema_for(table_name)
+        media_path_columns: set[str] = set()
+        if stored_schema is not None:
+            schema_names = set(stored_schema.column_names())
+            for col in touched_columns:
+                if col in schema_names and (
+                    stored_schema.spec_for(col).type_tag == "media_path"
+                ):
+                    media_path_columns.add(col)
+
         unplaceable: list[str] = []
         created_columns: list[str] = []
         try:
@@ -1343,6 +1365,21 @@ class Dataset:
                     unplaceable.append(row_id)
                     continue
                 for col, val in col_updates.items():
+                    # Canonicalise only a BATCH value going into an existing
+                    # media_path column, and only when it is a non-blank
+                    # string: canonicalise_cell accepts a string only, and a
+                    # non-string in a media column is the accept path's to
+                    # reject, not this code's to convert. A blank value
+                    # (_is_blank_cell -- None, NaN, "") is written as it
+                    # arrived. Only these batch values pass through; the rest
+                    # of the column is never scanned or rewritten, which on a
+                    # large table would cost seconds every tick.
+                    if (
+                        col in media_path_columns
+                        and isinstance(val, str)
+                        and not _is_blank_cell(val)
+                    ):
+                        val = canonicalise_cell(val)
                     df.iat[pos, col_locs[col]] = val
 
             # A column this call created was seeded with None and written cell
