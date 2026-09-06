@@ -71,7 +71,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from media.extensions import MEDIA_EXTENSIONS
+from media.extensions import ends_with_media_extension
 from media.media_address import MediaAddressError
 from media.media_address import parse as parse_address
 
@@ -561,10 +561,21 @@ def _looks_like_media_path(value) -> bool:
         # path. Never raised out of type inference.
         return False
 
-    # Gate 1: the extension. Case-insensitive, matching the old infer_type's
-    # `v.lower().endswith(ext)`.
-    lowered = path_portion.lower()
-    if not any(lowered.endswith(ext) for ext in MEDIA_EXTENSIONS):
+    # Gate 1: the extension. media.extensions.ends_with_media_extension is
+    # the one shared atomic check -- models.dataset's cheap pre-gate is
+    # built on the same function, so the extension SET cannot drift
+    # between the two the way it briefly did (P1.8e-2b-1). This calls the
+    # atomic, whole-string-only check, NOT looks_like_media_extension's
+    # two-spelling (whole-cell-or-before-'#') fallback: path_portion has
+    # already had any FRAGMENT-introducing '#' split off by parse() above,
+    # so a '#' still inside it is a literal character in the real
+    # filename (e.g. an escaped '%23' unescaped back), not a possible
+    # fragment marker -- splitting on it here would let a file that
+    # genuinely ends in ".txt" match on the substring before an unrelated
+    # embedded '#' that happens to precede a media extension. Only the
+    # pre-gate, which works on a RAW cell where a '#' might genuinely
+    # introduce a fragment it hasn't parsed, needs that fallback.
+    if not ends_with_media_extension(path_portion):
         return False
 
     # Gate 2: it must look like a location. parse() has already normalised

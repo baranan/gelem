@@ -20,7 +20,7 @@ import json
 import weakref
 import pandas as pd
 
-from media.extensions import MEDIA_EXTENSIONS
+from media.extensions import MEDIA_EXTENSIONS, looks_like_media_extension
 from media.media_address import (
     MediaAddressError,
     absolutise,
@@ -36,6 +36,7 @@ from models.table_schema import (
     TableSchema,
     check_frame,
     infer_schema,
+    infer_type_tag,
     normalise_frame,
     schema_from_dict,
 )
@@ -164,6 +165,36 @@ def _is_blank_cell(cell) -> bool:
     # A non-empty string is never NaN, but keep the guard explicit and
     # parallel with the old _rel_if_inside / _abs_against null check.
     return bool(pd.isna(cell))
+
+
+def _cell_could_be_media_path(cell: str) -> bool:
+    """Cheap pre-gate for _canonicalise_new_media_columns: BOTH gates
+    models.table_schema._looks_like_media_path applies, but string
+    operations only -- no media_address.parse(), no canonicalise_cell.
+
+    Gate 1 (extension): media.extensions.looks_like_media_extension is
+    the one shared implementation, so this cannot drift from
+    _looks_like_media_path's own Gate 1 the way it briefly did --
+    P1.8e-2b-1's Unicode case-folding bug existed only because there
+    were, for one round, two separate copies of this check.
+
+    Gate 2 (a location, not a bare name): the qualifying portion
+    looks_like_media_extension returned must carry a directory
+    separator, OR the cell must carry a '#' anywhere. This is exactly
+    _looks_like_media_path's `has_separator or had_fragment` rule,
+    checked cheaply instead of on a parsed address, so a bare name such
+    as "face.jpg" -- a label, not a location, per that function's own
+    docstring -- is screened out here too. Because both gates match,
+    this screen still cannot exclude a column that would have inferred
+    as media_path: a cell failing either gate here would fail the same
+    gate in the real check.
+    """
+    portion = looks_like_media_extension(cell)
+    if portion is None:
+        return False
+    if "#" in cell:
+        return True
+    return ("/" in portion) or ("\\" in portion)
 
 
 def _rewrite_media_cell(cell, project_root: Path, *, to_stored: bool, working_dir):
@@ -476,6 +507,104 @@ class Dataset:
             if col == "full_path" and col not in _SCHEMA_EXEMPT_COLUMNS
         }
 
+    def _canonicalise_new_media_columns(
+        self,
+        df: pd.DataFrame,
+        new_columns: list[str],
+        hints: dict[str, ColumnHint],
+    ) -> dict[str, pd.Series]:
+        """P1.8e-2b-1. For each brand-new, text-kind column in `new_columns`,
+        canonicalise its cells (media_address.canonicalise_cell) so a value
+        carrying a literal '#' or '%' parses as a media address instead of
+        making infer_type_tag demote the whole column to "text" -- which
+        would cost every row in it its thumbnail. Returns only the columns
+        whose values actually changed; an empty return means the caller can
+        go on using the SAME frame it was given (see _prepare_table).
+
+        `new_columns` already excludes every column the authoritative
+        schema names, so an existing media column's cells are never
+        re-canonicalised here on every accept -- that is P1.8e-2b-2's job.
+
+        A column not of text kind (numeric, bool) is never a candidate --
+        canonicalise_cell only accepts a string. A categorical column is
+        also excluded: pandas reports dtype.kind "O" for it too, but it is
+        a distinct kind here and this item does not reach into its
+        categories. A column whose effective ColumnHint already declares
+        some OTHER explicit type_tag (not "media_path") is also not a
+        candidate -- the caller has already decided what this column is,
+        and this item does not second-guess that.
+
+        Every remaining candidate, hinted "media_path" or not, passes
+        through the SAME test: canonicalise a TRIAL copy, call
+        infer_type_tag on the TRIAL alone, and keep it only when the
+        trial tag comes back "media_path". There is deliberately no
+        shortcut that keeps a hinted column's trial unconditionally,
+        for two reasons:
+
+          * load() unions its media-column hints across every table in
+            the project (see load()'s `load_hints`), so a table missing
+            its own schemas.json entry can inherit a stray "media_path"
+            hint for a same-named column that is really ordinary text.
+            An unconditional keep would let that stray hint REWRITE the
+            column's values, not just mistag it. Requiring the trial to
+            actually look like media caps the damage at what a wrong
+            hint already cost before this item: a wrong display tag,
+            never a rewritten value.
+          * The case the hint exists for is unaffected by dropping the
+            shortcut: 'full_path' on a brand-new, still-empty table has
+            no values to build a trial from, so the trial equals the
+            (empty) original, nothing is kept, and the tag still comes
+            from the hint through infer_schema, exactly as before.
+        """
+        changed: dict[str, pd.Series] = {}
+        for name in new_columns:
+            series = df[name]
+            dtype = series.dtype
+            if isinstance(dtype, pd.CategoricalDtype) or dtype.kind != "O":
+                continue
+
+            hint = hints.get(name)
+            if hint is not None and hint.type_tag not in (None, "media_path"):
+                continue
+
+            # Cheap pre-gate: string operations only, no parse and no
+            # canonicalise_cell. A column with any non-blank cell that
+            # fails either gate _cell_could_be_media_path checks could
+            # never have made infer_type_tag call it "media_path" anyway
+            # (see that function's docstring), so skip the trial entirely
+            # rather than parse/canonicalise every cell only to discard
+            # the result. all() short-circuits on the first non-qualifying
+            # cell, so an ordinary text column costs one cheap check per
+            # cell up to the first failure, not a full parse of the whole
+            # column.
+            if not all(
+                _cell_could_be_media_path(v)
+                for v in series
+                if not _is_blank_cell(v)
+            ):
+                continue
+
+            # canonicalise_cell does not accept None, NaN or a non-string;
+            # _is_blank_cell is the project's one guard for exactly that, so
+            # a blank cell is left exactly as it arrived. Built as a plain
+            # list and constructed straight at the ORIGINAL dtype, not via
+            # Series.map: on pandas >= 3, map() picks its own dtype for the
+            # result (promoting a plain object column of strings to the
+            # new "str" dtype), and that dtype cannot hold a bare Python
+            # None -- it silently becomes float NaN, and casting the
+            # dtype LABEL back with .astype(dtype) does not undo that.
+            # Constructing at `dtype` directly never makes that detour, so
+            # a blank cell's own value, not just its blank-ness, survives.
+            trial_values = [
+                v if _is_blank_cell(v) else canonicalise_cell(v) for v in series
+            ]
+            trial = pd.Series(trial_values, index=series.index, dtype=dtype)
+
+            if infer_type_tag(trial) == "media_path" and not trial.equals(series):
+                changed[name] = trial
+
+        return changed
+
     def _prepare_table(
         self,
         table_name: str,
@@ -493,6 +622,12 @@ class Dataset:
 
         a. row_id (and any other _SCHEMA_EXEMPT_COLUMNS member) is not part of
            any schema.
+        a2. P1.8e-2b-1: before inference sees them, a newly-inferred,
+           text-kind column's cells may be rewritten in place by
+           _canonicalise_new_media_columns, so a value carrying a literal
+           '#' or '%' parses as a media address instead of demoting the
+           whole column to "text". Only a column not already named by the
+           authoritative schema (see (b)) is a candidate.
         b. Build the schema to check against from the FRAME's non-exempt
            columns, in the frame's own order. The ColumnSpec for a column is
            resolved against the AUTHORITATIVE schema -- see below. A column the
@@ -543,8 +678,6 @@ class Dataset:
                 f"duplicate column name(s) {dupes}"
             )
 
-        frame_for_schema = df[schema_columns]
-
         # The authoritative source of already-decided ColumnSpecs -- see the
         # docstring. An explicit `schema` wins; else the stored schema only if
         # the caller allows it; else nothing.
@@ -559,6 +692,13 @@ class Dataset:
         )
         new_columns = [c for c in schema_columns if c not in stored_names]
 
+        # working_df is what schema-checking and storage use from here on.
+        # It stays the SAME object as the caller's df unless a candidate
+        # column's cells actually change below -- _commit_prepared's callers
+        # (apply_row_updates most of all) rely on getting the same frame
+        # object back when nothing changed, to keep their row-id index valid.
+        working_df = df
+
         inferred_by_name: dict[str, object] = {}
         if new_columns:
             # _media_column_hints only ever hints 'full_path' now (P1.8d-2b-1).
@@ -572,18 +712,46 @@ class Dataset:
                 for name, h in effective_hints.items()
                 if name in new_columns
             }
+
+            # P1.8e-2b-1: canonicalise media-address cells in a
+            # newly-inferred, text-kind column before inference sees it, so
+            # a filename carrying a literal '#' does not fail to parse and
+            # demote the whole column to "text" (with it, every thumbnail
+            # in that column). A column the authoritative schema already
+            # names is excluded by `new_columns` above -- but load() does
+            # NOT always give every table an authoritative schema: it
+            # passes `schema=declared`, and `declared` is None both when a
+            # table is absent from schemas.json and when it is present but
+            # empty and the cast to its saved schema fails (see load()'s
+            # `declared = None` fallback). For such a table every column is
+            # "new", so this DOES run during load, against `load_hints` --
+            # the project-wide union of every table's media-tagged columns,
+            # not a per-table hint set. Re-canonicalising an EXISTING media
+            # column's cells on every ordinary (non-load) accept (e.g.
+            # every apply_row_updates tick) is still excluded by
+            # `new_columns` and is P1.8e-2b-2's job, not this one's.
+            canonicalised = self._canonicalise_new_media_columns(
+                df, new_columns, sub_hints
+            )
+            if canonicalised:
+                working_df = df.copy()
+                for name, values in canonicalised.items():
+                    working_df[name] = values
+
             # infer_schema raises ValueError on a dtype it does not support
             # (datetime64, a nullable extension dtype). Surface that as a
             # SchemaRejection, so every "cannot accept this frame" outcome has
             # the one type and names the table and source.
             try:
-                inferred = infer_schema(df[new_columns], hints=sub_hints)
+                inferred = infer_schema(working_df[new_columns], hints=sub_hints)
             except ValueError as exc:
                 raise SchemaRejection(
                     f"Dataset refused table {table_name!r} from {source!r}: "
                     f"{exc}"
                 ) from exc
             inferred_by_name = {s.name: s for s in inferred.columns}
+
+        frame_for_schema = working_df[schema_columns]
 
         specs = []
         for name in schema_columns:
@@ -623,8 +791,8 @@ class Dataset:
 
         if check.adjustments:
             # An adjustment rewrites a column's dtype, so build a fresh frame
-            # and leave the caller's untouched.
-            out = df.copy()
+            # and leave the caller's (and working_df's) untouched.
+            out = working_df.copy()
             normalised = normalise_frame(
                 frame_for_schema, built_schema, check=check
             )
@@ -634,9 +802,11 @@ class Dataset:
             # Nothing to rewrite. Every call site already hands _prepare_table a
             # frame it just built or copied (a fresh DataFrame, a .copy(), or --
             # for apply_row_updates -- the live stored frame it is re-storing
-            # unchanged), so store it as-is. Re-storing the same object on commit
-            # is what keeps apply_row_updates' row-id index stamp valid.
-            out = df
+            # unchanged), so store it as-is. working_df is the SAME object as
+            # the caller's df unless canonicalisation above changed a
+            # column's cells, so this is what keeps apply_row_updates' row-id
+            # index stamp valid when nothing changed.
+            out = working_df
 
         messages = [
             f"Table {table_name!r}: column {adjustment.column!r} arrived as "
