@@ -453,9 +453,15 @@ goes through public seams.
 **`tests/test_dataset.py` runs every test twice** -- it has module-level
 `run_test()` calls as well as pytest collection. Put new tests in their own file.
 
-Run with `python -m pytest`. Environment is a `(gelem)` virtualenv activated via
-`.\setup.ps1`, on Windows PowerShell. The repo sits inside a Google Drive Streaming
-path, so allow a moment after branch checkouts before running tests.
+**`[NOW]`** Run with `python run_tests.py`. It splits the suite into several
+pytest processes -- widget-touching modules each on their own -- because the
+full suite in one process hits an unfixed native crash about one run in six
+(`docs/known_defects.md`, "Native access violation during the full pytest
+run"); the split stops one crash from destroying the rest of the run.
+`python -m pytest` still works for a single module or a quick check.
+Environment is a `(gelem)` virtualenv activated via `.\setup.ps1`, on Windows
+PowerShell. The repo sits inside a Google Drive Streaming path, so allow a
+moment after branch checkouts before running tests.
 
 **The baseline must be green before an item starts.** The per-item green-baseline
 history is in `docs/archive/rule_verification_log.md`.
@@ -529,8 +535,8 @@ completed work item with exactly this block, filled in:
 - three bullets, maximum
 
 **Verify it yourself**
-- the **actual** final lines of the `python -m pytest` run, pasted verbatim
-  (the collected count and the pass/fail summary), not a prediction of them --
+- the **actual** final output of the `python run_tests.py` run, pasted verbatim
+  (the summary table, and each group's pass/fail line), not a prediction of them --
   a reviewer must be able to tell what Claude observed from what it expects
 - the exact commands for Y B to re-run, and what a pass looks like
 - if there is something to check by eye in the app, an exact click list:

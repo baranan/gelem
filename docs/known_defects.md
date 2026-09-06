@@ -285,6 +285,76 @@ to P1.8d, and the two OS-native / non-parsing media-cell entries to P1.8e.
   pandas 2 a bare text column is `object`, not `str`, so a fresh clone can
   behave differently.
 
+## Open -- test-suite instability and process leaks
+
+- **Native access violation during the full pytest run.** *Cause unverified.*
+  Running the whole suite as one `python -m pytest` process on Windows dies,
+  roughly one run in six, with a native access violation (exit code
+  `0xC0000005`, which Python reports as `3221225477` or `-1073741819`) on the
+  main thread. It strikes at the first moment in the run that a Qt widget is
+  shown. The diagnostic record for this lives outside this repository, so
+  everything a second developer needs is here:
+  - **Symptom.** The pytest process exits with the native access-violation
+    code and no Python traceback. Nothing is printed at the point of death; the
+    run simply stops.
+  - **Frequency.** About one full-suite run in six. It is not tied to any one
+    test; a re-run usually passes.
+  - **What five counted diagnostic rounds ruled out.** (1) The background
+    worker threads -- the crash is on the main thread and reproduces with the
+    worker pools quiescent. (2) PIL -- the PIL frames in the first traceback
+    belonged to bystander worker threads, not the crashing main thread; with
+    the worker pools forced to run inline on a single thread the crash still
+    occurred in 10 runs out of 10. (3) Any single culprit module -- no one
+    module, removed, makes the
+    crash go away; it needs a co-occurrence of MediaPipe FaceLandmarker
+    inference (`tests/test_blendshape_operator.py`), several data-layer test
+    modules, and a widget being shown. (4) The loaded library set alone --
+    loading the same libraries without running the tests does not crash. (5)
+    Module imports alone, and QApplication creation timing -- importing every
+    test module without running it does not crash, and moving when the
+    `QApplication` is constructed does not change the rate. No standalone
+    reproducer exists outside pytest, and an application-shaped script does not
+    crash.
+  - **Status.** The cause is UNVERIFIED and the investigation is deliberately
+    closed. This is not being fixed.
+  - **Mitigation.** `run_tests.py` at the repo root. It runs the suite as
+    several independent pytest processes -- the non-widget modules together,
+    each widget-touching module alone -- so a native crash in one process loses
+    only that process's results and the rest of the suite still reports. Its
+    summary table flags a group that hit this code as "NATIVE CRASH -- known
+    defect" rather than "FAILED".
+  - **Trigger for reopening.** The RUNNING APPLICATION (`python main.py`, or a
+    packaged build) dying without a Python traceback. A flaky `run_tests.py`
+    group that reports the native-crash code is the known, contained condition
+    and is not cause to reopen. Only the same failure mode escaping into normal
+    application use is.
+
+- **`tests/test_renderer.py` builds a `QApplication` at module scope with no
+  `QApplication.instance()` guard.** *Consequence unverified.* Because pytest
+  imports every collected module before it runs any test, that module-level
+  line -- not the `qapp` fixture in `tests/conftest.py` -- is what creates the
+  process-wide `QApplication` in a normal full-suite run. Recorded here; not
+  fixed in this item.
+
+- **Nothing ever shuts down a `WorkerPool`.** *Consequence unverified.*
+  `ArtifactStore` has no `shutdown()` method and no test or application code
+  stops the pools it starts, so roughly 30 daemon threads survive to the end of
+  a full test run and are only cleaned up by process exit.
+
+- **`operators/blendshapes.py` never closes its `FaceLandmarker`.**
+  *Consequence unverified.* The MediaPipe `FaceLandmarker` it creates is never
+  `.close()`d. This was proven **not** to be the native crash above, but it is
+  still a resource leak.
+
+- **Two files under `tests/` are named `test_*.py` but are standalone
+  manual-check scripts, not pytest modules.** *Consequence unverified.*
+  `tests/test_renderer.py` and `tests/test_results_panel.py` do their work at
+  import / under `__main__` and expose no `test_` functions, so pytest collects
+  zero tests from them and exits 5. `run_tests.py` has to name them explicitly
+  (`MANUAL_CHECK_MODULES`) to tell that apart from a real "nothing collected"
+  failure such as a mistyped `-k`. The real fix is renaming them out of the
+  `test_` namespace; not done in this item.
+
 ---
 
 ## Fixed
