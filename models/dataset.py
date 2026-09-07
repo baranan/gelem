@@ -400,6 +400,25 @@ class Dataset:
         # too when the suite has flipped the class default.
         self.strict_schema: bool = type(self)._DEFAULT_STRICT_SCHEMA
 
+        # A single monotonically increasing write-ticket counter shared by
+        # EVERY table -- not one counter per table. It starts at 0 and is
+        # never bumped here; _commit_prepared does every bump (P1.12b). The
+        # empty frames table that _accept_table stores at the end of this
+        # constructor therefore lands as version 1, through that one path.
+        #
+        # A version number is a write ticket that no table ever reuses, so a
+        # run holding version 41 for "frames" can never be fooled by a
+        # different project's "frames" that independently reached 41.
+        # _reset_tables therefore clears the version map but must NOT reset
+        # this counter.
+        self._table_version_counter: int = 0
+        # table_name -> its current write-ticket version. A table assigned
+        # straight into _tables by a test has no entry here -- table_version()
+        # raises for it, the same trap as schema_for() returning None.
+        # In-memory only: never written to save() nor read by load(), so a
+        # reloaded project simply gets fresh numbers.
+        self._table_versions: dict[str, int] = {}
+
         self._tables: dict[str, pd.DataFrame] = {}
         self._accept_table(
             "frames",
@@ -476,6 +495,12 @@ class Dataset:
         leave a dead entry sitting in these dicts forever."""
         self._tables = tables
         self._schemas.clear()
+        # Clear the per-table version map -- a table dropped by the reset (one
+        # that existed only in the previous project) must not keep a stale
+        # version. Do NOT reset _table_version_counter: a write ticket is
+        # never reused, so every number minted after this reset is strictly
+        # greater than any seen before it, even for a same-named table.
+        self._table_versions.clear()
         self._row_index.clear()
         self._row_index_stamp.clear()
 
@@ -846,6 +871,22 @@ class Dataset:
         is still schema-validated."""
         self._set_table(prepared.table_name, prepared.frame)
         self._schemas[prepared.table_name] = prepared.schema
+        # Bump this table's write-ticket version (P1.12b). This is the ONLY
+        # place a version is assigned: _commit_prepared is already the single
+        # caller of _set_table, guarded by
+        # tests/test_dataset_schema.py::test_only_commit_prepared_calls_set_table,
+        # so every accepted write -- and only an accepted write -- passes
+        # through here; adding a second guard for the same rule would be
+        # redundant, and a bump anywhere else would be wrong.
+        #
+        # The bump is unconditional. We never diff the new frame against the
+        # old one to decide "did anything really change". The number means
+        # "how many accepted writes this table has had", not "the content
+        # changed" -- a no-op re-accept reads as a change on purpose, because
+        # a false staleness note (P1.12f) is advisory and cheap while a missed
+        # one is a wrong number in a paper.
+        self._table_version_counter += 1
+        self._table_versions[prepared.table_name] = self._table_version_counter
         self._schema_messages.extend(prepared.messages)
         if prepared.provenance_params is not None:
             self.provenance.record(
@@ -1546,6 +1587,34 @@ class Dataset:
         was never accepted through _accept_table (e.g. a test assigned it
         straight into _tables)."""
         return self._schemas.get(table_name)
+
+    def table_version(self, table_name: str) -> int:
+        """The current write-ticket version of a stored table: how many
+        accepted writes it has had since this Dataset instance was created.
+
+        Bumped on every accepted commit (see _commit_prepared), monotonic,
+        never reused by another table or another project, and never persisted
+        -- a reloaded project gets fresh numbers. P1.12b adds it; nothing
+        consumes it yet (P1.12f will, to notice that an operator's inputs
+        moved while it ran).
+
+        Raises:
+            KeyError: If the table has no version -- either it does not exist,
+            or it was assigned straight into _tables by a test and never
+            accepted through the schema path (the same trap as schema_for()
+            returning None for such a table).
+        """
+        if table_name not in self._table_versions:
+            raise KeyError(
+                f"Table '{table_name}' has no version in this project."
+            )
+        return self._table_versions[table_name]
+
+    def table_versions(self) -> dict[str, int]:
+        """A plain dict copy of every current table's write-ticket version,
+        for a caller that wants to record what a run read. Mutating the
+        returned dict does not affect Dataset."""
+        return dict(self._table_versions)
 
     def take_schema_messages(self) -> list[str]:
         """Returns the accumulated plain-English schema-adjustment notes and
