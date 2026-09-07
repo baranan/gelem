@@ -136,6 +136,17 @@ state. This rule carries no violation list of its own -- it points at the three
   (`#f=`, `#t=`, `#r=`, stream selector) is preserved exactly. P0.2c made it
   address-aware. `docs/media_architecture.md` §3.5 is the authority for the
   address-survival rule; tests: `tests/test_dataset_address_paths.py`.
+- **`[NOW]`** A media value is canonicalised as it enters storage: a **column**
+  when it enters the schema, a **value** when it lands in a column already
+  tagged `media_path`. Ordinary text is never silently rewritten, and
+  `_prepare_table` returns the same frame object when no cell changed. Made
+  true by P1.8e; a column already saved with the wrong tag is not retro-fixed
+  (see `docs/known_defects.md`). `docs/media_architecture.md` §3.6 is the
+  authority for the four call sites and why. Tests:
+  `tests/test_media_canonicalise.py`,
+  `tests/test_import_canonicalisation.py::test_load_csv_as_primary_fragment_survives`,
+  `tests/test_accept_canonicalisation.py::test_prepare_table_returns_the_same_object_when_nothing_changed`,
+  `tests/test_accept_canonicalisation.py::test_apply_row_updates_canonicalises_a_hash_value_into_existing_media_column`.
 
 ### Row identity and lineage
 

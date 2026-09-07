@@ -267,6 +267,12 @@ creates a table -- and do not license inference to narrow; a caller that wants a
 narrower storage dtype passes `ColumnHint(dtype=...)`. Tests:
 `tests/test_dataset_schema.py`.
 
+`[NOW]` A media value is canonicalised as it enters storage, so a filename
+containing a literal `#` is not demoted to `text`.
+`docs/media_architecture.md` §3.6 is the authority for where and when. Made
+true by P1.8e. Tests: `tests/test_import_canonicalisation.py`,
+`tests/test_accept_canonicalisation.py`.
+
 `[NOW]` **The three pandas text dtype names -- `object`, `string`, `str` -- are
 one storage kind.** The schema compares text columns by kind, not by name, so a
 text column arriving under one name against a schema declaring another is an

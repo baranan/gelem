@@ -50,9 +50,6 @@ to P1.8d, and the two OS-native / non-parsing media-cell entries to P1.8e.
 - **`_id_counter` assumes `row_id` parses as an int**, and there is no stale-file
   cleanup on re-save. (The parsing half is also the `[MIGRATING]` violation under
   "Row identity and lineage" in `CLAUDE.md`.)
-- **`load_folder()` and `load_csv_as_primary()` write `str(path)`, OS-native**, so
-  a fresh unsaved project's media cells are non-canonical until the first
-  save/load. Belongs with P1.8e, which canonicalises media cells at accept time.
 - **A non-string media cell is silently skipped** and is not counted by
   `_is_blank_cell()`.
 - **A media cell that does not parse as an address shows a permanent grey
@@ -60,8 +57,37 @@ to P1.8d, and the two OS-native / non-parsing media-cell entries to P1.8e.
   and `render_column_value()` cannot key a demand request without a canonical
   address, so a file name with a literal `#` (which `parse()` reads as a
   fragment start) renders a placeholder and never a picture. Before P0.5b-3i
-  the renderer's `Image.open` fallback still displayed it. The real fix is
-  canonicalising cells at accept (P1.8e); detail mode is unaffected.
+  the renderer's `Image.open` fallback still displayed it. **Partly closed by
+  P1.8e:** a cell that enters through the folder scan, CSV import, or a
+  newly-inferred column is now canonicalised at that point (`#` -> `%23`), so
+  it parses and renders. Two gaps remain: a column already saved with a
+  non-`media_path` tag keeps that tag on load (see "Canonicalisation at accept
+  does not retro-fix..." below), and `load_csv_as_primary` still writes a
+  typed fragment straight into `file_name` (next entry). Detail mode is
+  unaffected.
+- **`load_csv_as_primary` keeps an address fragment in `file_name` as literal
+  text.** It builds `file_name` with `Path(str(path_val)).name`, which does not
+  split on `#`, so an image-column cell `clip.mp4#f=1234` yields the file name
+  `clip.mp4#f=1234`. P1.8e canonicalises `full_path` on this path but
+  deliberately leaves `file_name` as the OS-native basename in both import
+  paths (`tests/test_import_canonicalisation.py::test_load_folder_leaves_file_name_as_the_os_native_basename`).
+  P1.8e did not fix this on purpose. Verified against the code 6 Sep 2026;
+  no item assigned.
+- **Canonicalisation at accept does not retro-fix an already-saved mis-tagged
+  media column.** On load, the schema restored from `schemas.json` is
+  authoritative for every column it names (`Dataset._prepare_table`, called
+  with `schema=declared`), so a column saved with the wrong type tag -- an
+  operator that declared a typo'd tag, or an early inference that read a
+  `#`-bearing column as `text` -- keeps that wrong tag forever, and
+  `_rewrite_media_column` runs only on columns already tagged `media_path`.
+  P1.8e canonicalises a column's *values* only when the column is newly
+  inferred at accept or is already `media_path`, so it cannot reach a
+  mis-tagged saved column. This is a **non-goal** of P1.8e, not an oversight.
+  The real fix is a researcher-facing re-tag action -- a way to correct a
+  column's type tag on an open project -- which is not built and is not yet
+  tracked as its own item; `CLAUDE.md`'s rule that an unregistered operator
+  tag "costs a placeholder tile, never a dropped column or a raised exception"
+  is the current accepted behaviour. Verified against the code 6 Sep 2026.
 - **Many module docstrings still assign files to Student A, B, or C.** Remove as
   those files are touched. (Done in `tests/test_renderer.py`, 24 Aug 2026.)
 - **The thumbnail-ready notification is row-grained, not column-grained.**
@@ -359,6 +385,14 @@ to P1.8d, and the two OS-native / non-parsing media-cell entries to P1.8e.
 
 ## Fixed
 
+- **`load_folder()` and `load_csv_as_primary()` wrote `str(path)`, OS-native**,
+  so a fresh unsaved project's media cells were non-canonical (backslashes, an
+  unescaped `#` or `%`) until the first save/load. *(P1.8e-2a: `load_folder`
+  canonicalises every scanned path with `media_address.canonicalise_path` and
+  `load_csv_as_primary` canonicalises each image-column cell with
+  `canonicalise_cell`, so the stored cell is canonical from the first accept.
+  Separators are normalised to forward slashes and `#`/`%` are escaped. Tests:
+  `tests/test_import_canonicalisation.py`.)*
 - **The on-disk artifact cache was append-only, and `load_index()` seeded index
   entries without checking the JPEG was present.** Nothing walked the artifacts
   directory, so a JPEG whose index entry was gone -- from a discarded old-format

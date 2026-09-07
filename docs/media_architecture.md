@@ -464,6 +464,69 @@ addresses that should be identical compare unequal.
 
 ---
 
+**Where and when a media value is canonicalised (P1.8e).** Decision 1 fixes
+the escape scheme; this fixes where it is applied, and it is the single
+authority for that. Two pure functions in `media/media_address.py` do the
+work, and they differ only in what they assume the input already is:
+
+- `canonicalise_path(str)` treats its whole argument as a known filesystem
+  path and escapes every literal `#` and `%` in it (decision 1). It is a
+  one-way encoder, deliberately **not** idempotent -- a caller runs it once,
+  on a raw path, never on another canonicalise call's output.
+- `canonicalise_cell(str)` is for a value that came from user text and may
+  already be an address. It tries `parse()` first, so an existing
+  `#f=`/`#t=`/`#r=`/stream-selector fragment survives, and falls back to
+  `canonicalise_path` on `MediaAddressError` -- treating the whole string
+  as a literal path -- only when the value does not parse as an address.
+
+The rule is: **a column is canonicalised when it enters the schema; a value
+is canonicalised when it enters a column that is already a media column.**
+Four sites apply it:
+
+1. **Folder scan** -- `Dataset.load_folder` calls `canonicalise_path` on
+   each path read off `iterdir()` (real paths, no fragment possible).
+2. **CSV import** -- `Dataset.load_csv_as_primary` calls `canonicalise_cell`
+   on the chosen image column, because a human may have typed a fragment.
+   `file_name` is deliberately left as the OS-native basename in both
+   import paths.
+3. **The newly-inferred-column trial at accept** --
+   `Dataset._prepare_table` -> `_canonicalise_new_media_columns`.
+   Canonicalisation must run *before* `infer_type_tag`, because a cell
+   carrying a literal `#` fails to parse, does not look like a media path,
+   and demotes the whole column to `text` -- with it, every row's
+   thumbnail. But *which* columns hold media is only known *after*
+   inference. The resolution is a trial: canonicalise a copy of the
+   column, run `infer_type_tag` on the copy alone, and keep the copy only
+   if the tag comes back `media_path`; otherwise discard it whole. A column
+   the authoritative schema already names is never a candidate -- its tag
+   is already decided (see §4.3 and `_prepare_table`'s `schema` argument).
+   A column of ordinary text never survives the trial, so ordinary text is
+   never silently rewritten. A stray `media_path` hint -- which `load()`
+   can union across tables -- can still mistag such a column, but requiring
+   the trial to actually look like media caps the damage at a wrong display
+   tag, never a rewritten value.
+4. **The batch in `Dataset.apply_row_updates`** -- `canonicalise_cell` on
+   each non-blank string value written into a column whose *stored* schema
+   tag is already `media_path`, and only those values. The rest of the
+   column is never scanned or rewritten; on a large table, per tick, that
+   would cost seconds.
+
+**Identity constraint.** `_prepare_table` must return the *same* frame
+object when no cell actually changed. `apply_row_updates` mutates the
+stored frame in place, so returning a fresh copy on every accept would
+force the per-table row-id index to rebuild on every timer tick.
+
+**Not retro-active.** A column already saved with the wrong type tag keeps
+that tag on load -- the restored schema is authoritative -- and none of
+these four sites reaches it. See `docs/known_defects.md`.
+
+*Tested by `tests/test_media_canonicalise.py` (the two functions),
+`tests/test_import_canonicalisation.py` (sites 1-2), and
+`tests/test_accept_canonicalisation.py` (sites 3-4 and the identity
+constraint).*
+
+---
+
 ## 4. Display, playback, analysis are three different paths
 
 They have opposite requirements and must not share a mechanism.
