@@ -1,35 +1,52 @@
 # operators_config.yaml
 #
 # Lists all operators available in Gelem and their default settings.
-# To disable an operator, set enabled: false.
-# To add a new operator, add an entry here and create the
-# corresponding .py file in the operators/ folder.
+# This file is the single authority for WHICH operators the application
+# offers. operators/operator_config.py reads it at startup and main.py
+# registers exactly the enabled entries; main.py keeps only the knowledge
+# of HOW to construct each one.
+#
+# The ORDER of the entries below is the order of the Operators menu.
+# Building them top to bottom must reproduce the registration order in
+# main.py, so do not reorder casually.
+#
+# To disable an operator, set enabled: false. It stays listed here (so the
+# drift check still sees it) but is not registered, so it vanishes from
+# the menu.
+# To add a new operator, add an entry here, add a factory for it in
+# operators/operator_config.py, and create the corresponding .py file in
+# the operators/ folder. The entry's key must equal the operator class's
+# `name` attribute.
 
 operators:
   blendshapes:
     enabled: true
-    description: "Extracts blendshape values from face images using mediapipe."
+    description: "Runs MediaPipe FaceLandmarker on each face image and writes the ~52 blendshape (facial-muscle activation) scores as numeric columns; the run aborts unless the face_landmarker model file has been downloaded into operators/models/."
 
   blendshape_avatar:
     enabled: true
-    description: "Renders a face avatar from blendshape column values."
+    description: "NOT IMPLEMENTED: writes a plain grey 256x256 JPEG per row and stores its path in avatar_path. It does not render an avatar and ignores the blendshape values."
 
   mean_face:
     enabled: true
-    description: "Computes a mean face image from a selection of frames."
+    description: "NOT IMPLEMENTED: both the grouped table and the quick-view return grey placeholder JPEGs and all-zero mean blendshape values. No averaging or face rendering is done."
 
   plot:
     enabled: true
-    description: "Generates a blendshape-over-time plot for each item."
-
-  plot_advanced:
-    enabled: true
-    description: "Interactive Plotly plot (scatter/line/bar/box/violin/histogram) for the selected rows."
+    description: "Saves a matplotlib bar chart per row of that row's values for a fixed set of seven blendshape columns (missing values drawn as 0). The dialog to choose which columns to plot is not implemented."
 
   summary_stats:
     enabled: true
-    description: "Computes descriptive statistics over a selection of rows."
+    description: "Computes mean, SD (ddof=1), min, max, median and n for the numeric columns of the selected rows and shows them in the Results panel."
+
+  plot_advanced:
+    enabled: true
+    description: "Builds an interactive Plotly chart (scatter/line/bar/box/violin/histogram, with optional colour, facet and pandas aggregation) from the selected rows and saves it as an HTML file plus a PNG."
+
+  stats:
+    enabled: true
+    description: "NOT IMPLEMENTED: returns hard-coded fake numbers (p = 0.042, effect size 0.61, statistic 2.34). No statistical test is run and the pingouin library its design calls for is not installed."
 
   video_frames:
     enabled: true
-    description: "Extracts frames from videos into a frame-level table."
+    description: "Decodes each video row with OpenCV and writes one JPEG per kept frame (every Nth frame, N chosen in the dialog), producing a frame-level table that carries the source row's columns plus frame_number and video_file."

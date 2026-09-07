@@ -54,14 +54,10 @@ def create_app(fake_data: bool = False):
     from artifacts.artifact_store import ArtifactStore
     from column_types.registry import ColumnTypeRegistry
     from operators.operator_registry import OperatorRegistry
-    from operators.blendshapes import BlendshapeOperator
-    from operators.blendshape_avatar import BlendshapeAvatarOperator
-    from operators.mean_face import MeanFaceOperator
-    from operators.plot_operator import PlotOperator
-    from operators.summary_stats import SummaryStatsOperator
-    from operators.plot_advanced import PlotAdvancedOperator
-    from operators.stats_operator import StatsOperator
-    from operators.video_frames import VideoFramesOperator
+    from operators.operator_config import (
+        OperatorRuntimeDirs,
+        build_enabled_operators,
+    )
     from controller import AppController
     from settings.qsettings_backend import QSettingsBackend
     from settings.settings_store import SettingsStore
@@ -121,14 +117,22 @@ def create_app(fake_data: bool = False):
 
     registry.setup_defaults(artifact_store)
 
-    operator_registry.register(BlendshapeOperator())
-    operator_registry.register(BlendshapeAvatarOperator())
-    operator_registry.register(MeanFaceOperator())
-    operator_registry.register(PlotOperator())
-    operator_registry.register(SummaryStatsOperator())
-    operator_registry.register(PlotAdvancedOperator(output_dir=plots_dir))
-    operator_registry.register(StatsOperator())
-    operator_registry.register(VideoFramesOperator(output_dir=frames_dir))
+    # operators_config.yaml is the single authority for WHICH operators
+    # the application offers, and its entry order is the Operators menu
+    # order. main.py keeps only the knowledge of HOW to construct each one
+    # -- the runtime directories some constructors need are packed into
+    # this one object and handed to every factory (see
+    # operators/operator_config.py). A missing config file, malformed YAML,
+    # or drift between the file and the factory table raises
+    # OperatorConfigError here and stops startup rather than quietly
+    # changing what the researcher can do.
+    operator_dirs = OperatorRuntimeDirs(
+        plots_dir=plots_dir,
+        frames_dir=frames_dir,
+    )
+    operators_config_path = project_root / "operators_config.yaml"
+    for operator in build_enabled_operators(operators_config_path, operator_dirs):
+        operator_registry.register(operator)
 
     controller = AppController(
         dataset=dataset,

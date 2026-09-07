@@ -9,3 +9,4 @@ kaleido
 mediapipe
 pytest
 opencv-python
+PyYAML
