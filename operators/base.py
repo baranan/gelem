@@ -77,8 +77,11 @@ class BaseOperator:
         6. If your operator produces a new visual column type, add a
            renderer in column_types/renderers.py and register it in
            column_types/registry.py setup_defaults().
-        7. Add your operator to operators_config.yaml.
-        8. Register it in main.py create_app().
+        7. Add an entry for your operator to operators_config.yaml
+           (its position there sets the Operators menu order).
+        8. Add a matching factory to OPERATOR_FACTORIES in
+           operators/operator_config.py. A disagreement between the two
+           raises OperatorConfigError at startup.
 
     Example — a simple per-row operator:
 
@@ -292,7 +295,7 @@ class BaseOperator:
                 "operator_name":  str name of this operator.
                 "artifact_path":  str path to a generated image file.
                 "summary":        dict of statistics or other data.
-                "plot_html":      str path to an interactive HTML plot.
+                "html_path":      str path to an interactive HTML plot.
 
         Raises:
             NotImplementedError: If the operator does not implement

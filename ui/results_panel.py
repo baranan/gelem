@@ -110,8 +110,7 @@ class ResultsPanel(QWidget):
                                     (used by StatsOperator).
             'html_path':     str  — path to an interactive HTML file
                                     (PlotAdvanced). A button opens it in
-                                    the system browser. Also accepted as
-                                    'plot_html' for legacy compatibility.
+                                    the system browser.
             'n_rows':        int  — number of rows the operator ran on.
 
         Args:
@@ -178,9 +177,9 @@ class ResultsPanel(QWidget):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(8)
 
-        # PlotAdvanced uses 'html_path'; the ResultsPanel docstring
-        # originally called it 'plot_html' — accept both.
-        html_path = result.get("html_path") or result.get("plot_html", "")
+        # The interactive-plot path is always 'html_path' -- the key
+        # documented in operators/base.py and produced by PlotAdvanced.
+        html_path = result.get("html_path", "")
 
         # ── Header ────────────────────────────────────────────────────
         header_row = QHBoxLayout()

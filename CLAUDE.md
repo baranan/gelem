@@ -147,6 +147,13 @@ state. This rule carries no violation list of its own -- it points at the three
   `tests/test_import_canonicalisation.py::test_load_csv_as_primary_fragment_survives`,
   `tests/test_accept_canonicalisation.py::test_prepare_table_returns_the_same_object_when_nothing_changed`,
   `tests/test_accept_canonicalisation.py::test_apply_row_updates_canonicalises_a_hash_value_into_existing_media_column`.
+- **`[NOW]`** `operators_config.yaml` is the authority for **which** operators the
+  application offers, and its entry order is the menu order. A disagreement
+  between it and `OPERATOR_FACTORIES` in `operators/operator_config.py` --
+  either direction -- or a malformed file raises `OperatorConfigError` at
+  startup rather than silently changing what the researcher can do. Made true
+  by P1.11a. `docs/architecture.md` §7 is the authority. Guarded by
+  `tests/test_operator_config.py::test_yaml_keys_equal_factory_keys`.
 
 ### Row identity and lineage
 

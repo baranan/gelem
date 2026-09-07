@@ -1321,17 +1321,25 @@ sharing the parser and not the decoder.
 
 **P1.14 Demote `VideoFramesOperator`** to "Export frames as files".
 
-**P1.11 Operator registration and output contract.** Make
-`operators_config.yaml` drive registration or delete it -- `main.py` still
-registers every operator by hand and the two lists still disagree
-(`StatsOperator` is registered in code and absent from the YAML). Settle
-`html_path` versus `plot_html` -- `operators/base.py` still documents the
-latter (`docs/known_defects.md`). Promote a real operator as the
-thumbnail-era reference (`operators/thumbnail.py` itself was deleted in
-P0.5b-2i). Two sub-tasks this item used to list are done and dropped: the
-type-tag half (P1.8d-2b-2 -- both operators now declare the registered
-`media_path`, and `media_address` never existed as a tag to map anything to)
-and the `self.output_dir` doc fix (`operators/CLAUDE.md`).
+**P1.11 Operator registration and output contract.** Three sub-tasks:
+
+- **Registration -- done, P1.11a.** `operators_config.yaml` now drives which
+  operators the app offers; `operators/operator_config.py` reads it and
+  `main.py` holds only the factories. Drift or a malformed file raises
+  `OperatorConfigError` at startup. `docs/architecture.md` §7 is the
+  authority.
+- **`html_path` versus `plot_html` -- done, P1.11b.** `operators/base.py`
+  now documents `html_path`, and `ui/results_panel.py` reads that key only;
+  the `plot_html` fallback is gone.
+- **Reference operator -- deferred to P1.12.** Promoting a real operator as
+  the thumbnail-era reference (`operators/thumbnail.py` was deleted in
+  P0.5b-2i) waits on P1.12 settling the operator contract -- see
+  `operators/CLAUDE.md`.
+
+Two sub-tasks this item used to list are done and dropped: the type-tag half
+(P1.8d-2b-2 -- both operators now declare the registered `media_path`, and
+`media_address` never existed as a tag to map anything to) and the
+`self.output_dir` doc fix (`operators/CLAUDE.md`).
 
 **P1.13 Remaining UI boundary cleanup.** Replace the private-attribute access
 listed in `CLAUDE.md` with the public methods that already exist -- `_op_registry`,

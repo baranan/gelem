@@ -17,6 +17,13 @@ implementation:
   - build_enabled_operators raises, naming the offender, for drift in
     either direction between the YAML and OPERATOR_FACTORIES.
 
+WHICH operators are enabled is Y B's decision, made by editing
+operators_config.yaml. No test in this file may assert that roster -- not
+which operators are enabled, and not how many. Disabling an operator must
+never turn a test red. Where a test needs the real file's contents it
+derives them from the file at test time, so the assertions hold whatever
+Y B enables or disables.
+
 This module constructs no operator and imports no Qt binding, so it stays
 in run_tests.py's fast non-widget group.
 """
@@ -40,18 +47,26 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 REAL_CONFIG = REPO_ROOT / "operators_config.yaml"
 
 
-# The registration order main.py must reproduce, per the work item. This
-# is both today's menu order and the order the YAML entries must appear in.
-EXPECTED_MENU_ORDER = [
-    "blendshapes",
-    "blendshape_avatar",
-    "mean_face",
-    "plot",
-    "summary_stats",
-    "plot_advanced",
-    "stats",
-    "video_frames",
-]
+def _real_config_entries() -> list[tuple[str, object]]:
+    """Parse the real operators_config.yaml and return (name, enabled) for
+    every entry, in file order. PyYAML's loader preserves mapping order, so
+    the list order is the file order, which is the Operators menu order."""
+    import yaml
+
+    parsed = yaml.safe_load(REAL_CONFIG.read_text(encoding="utf-8"))
+    return [(name, body.get("enabled")) for name, body in parsed["operators"].items()]
+
+
+# Every entry key in the real config, in file order, enabled or not.
+#
+# The build_enabled_operators drift tests below build throwaway configs
+# from this list rather than a hand-typed roster, so adding a ninth
+# operator (or disabling one) keeps them correct with no edit here. This
+# is deliberately the FULL key set, not the enabled subset: it tracks
+# which operators exist, which is exactly OPERATOR_FACTORIES' key set (the
+# drift guard keeps the two equal), and it is NOT Y B's enabled roster --
+# see the note at the top of this file.
+REAL_CONFIG_NAMES = [name for name, _enabled in _real_config_entries()]
 
 
 # A throwaway OperatorRuntimeDirs for the build_enabled_operators calls.
@@ -101,10 +116,15 @@ def test_yaml_keys_equal_factory_keys():
     )
 
 
-def test_real_config_lists_operators_in_menu_order():
-    # Every real entry is enabled today, so the enabled list is the whole
-    # file in order, and that order is the Operators menu order.
-    assert load_enabled_operator_names(REAL_CONFIG) == EXPECTED_MENU_ORDER
+def test_real_config_lists_enabled_entries_in_file_order():
+    # Derive the expectation from the file itself: the entries whose
+    # `enabled` is true, in the order they appear. This pins that
+    # load_enabled_operator_names preserves file order and neither drops,
+    # adds, nor reorders an entry. It does NOT pin which operators are
+    # enabled -- that is Y B's decision, and this test stays green whatever
+    # he enables or disables.
+    expected = [name for name, enabled in _real_config_entries() if enabled is True]
+    assert load_enabled_operator_names(REAL_CONFIG) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -188,14 +208,15 @@ def test_non_boolean_enabled_value_raises_named_error(tmp_path):
 # offender. Neither case reaches operator construction.
 # ---------------------------------------------------------------------------
 def test_build_raises_for_yaml_name_with_no_factory(tmp_path):
-    # Every expected operator name, all enabled, plus one extra name that
-    # no factory knows about. The YAML names are hard-coded (not taken
-    # from OPERATOR_FACTORIES) on purpose: the extra name must be the one
+    # Every real config name, all enabled, plus one extra name that no
+    # factory knows about. The name list comes from the config FILE, not
+    # from OPERATOR_FACTORIES, on purpose: the extra name must be the one
     # reported, which proves the check walks past the real names and does
-    # not merely raise on the first entry -- and it also means this test
-    # fails, rather than passing vacuously, if OPERATOR_FACTORIES were
-    # emptied.
-    names = EXPECTED_MENU_ORDER + ["phantom_operator"]
+    # not merely raise on the first entry. If OPERATOR_FACTORIES were
+    # emptied, build_enabled_operators would instead raise on the first
+    # real name (blendshapes), so this assertion would fail -- the test
+    # never passes vacuously.
+    names = REAL_CONFIG_NAMES + ["phantom_operator"]
     path = _write_config(tmp_path, _enabled_entries_yaml(names))
 
     with pytest.raises(OperatorConfigError) as excinfo:
@@ -205,13 +226,15 @@ def test_build_raises_for_yaml_name_with_no_factory(tmp_path):
 
 
 def test_build_raises_for_factory_name_absent_from_yaml(tmp_path):
-    # Every expected operator name except the last one. That omitted name
-    # is a real factory the YAML no longer mentions, so it must be the one
-    # reported. Hard-coding the kept names (rather than slicing
-    # OPERATOR_FACTORIES.keys()) makes this test fail if the factory table
-    # were emptied instead of passing on the wrong offender.
-    omitted = EXPECTED_MENU_ORDER[-1]
-    kept = EXPECTED_MENU_ORDER[:-1]
+    # Every real config name except the last one. That omitted name is a
+    # real factory the YAML no longer mentions, so it must be the one
+    # reported. Taking the kept names from the config FILE (rather than
+    # slicing OPERATOR_FACTORIES.keys()) makes this test fail if the
+    # factory table were emptied -- build_enabled_operators would then
+    # raise on the first kept name via the other drift direction, not on
+    # `omitted` -- instead of passing on the wrong offender.
+    omitted = REAL_CONFIG_NAMES[-1]
+    kept = REAL_CONFIG_NAMES[:-1]
     path = _write_config(tmp_path, _enabled_entries_yaml(kept))
 
     with pytest.raises(OperatorConfigError) as excinfo:
@@ -229,7 +252,7 @@ def test_present_but_disabled_is_not_drift(tmp_path):
     # which is a legitimate (if useless) configuration and exactly what
     # exercises "disabled is not drift" without importing mediapipe/Qt.
     lines = ["operators:"]
-    for name in EXPECTED_MENU_ORDER:
+    for name in REAL_CONFIG_NAMES:
         lines.append(f"  {name}:")
         lines.append("    enabled: false")
     path = _write_config(tmp_path, "\n".join(lines) + "\n")

@@ -9,11 +9,15 @@ one or more execution methods. The menu is built from the description.
 **Statuses** follow `CLAUDE.md`: `[NOW]` is true today, `[TARGET -> item]` is not
 yet true and must be by the named item, `[MIGRATING]` has listed exceptions.
 
-`[TARGET -> P1.11]` **There is currently no good reference operator.**
+`[TARGET -> P1.12]` **There is currently no good reference operator.**
 `operators/thumbnail.py` used to be described as one but was dead code -- it
 was deleted in P0.5b-2i (`ArtifactStore` generates thumbnails inline in
-`_run_job`, off a bounded worker pool). P1.11 still owes a real operator
-promoted in its place.
+`_run_job`, off a bounded worker pool). This is deliberately deferred, not an
+oversight: operators differ in what they return -- new columns, a new table,
+a result display, or a combination -- and in whether they need a parameter
+dialog, so no single example can serve as the reference. A set of examples is
+worth writing once a few real operators exist and P1.12 has settled the
+operator contract. There are no students yet, so nothing depends on it now.
 
 ---
 
@@ -172,9 +176,10 @@ shown in the Results panel. Never stored in any table.
 Keys: `operator_name`, `artifact_path` (a PNG), `html_path` (an interactive page),
 `summary` (a nested `{column: {stat: value}}` dict rendered as a table).
 
-Note two traps. `summary` must be wrapped under that key; returning the nested dict
-directly produces no visible output. And the key is `html_path` -- `base.py`
-documents `plot_html`, which `ResultsPanel` only accepts as legacy fallback.
+Note a trap. `summary` must be wrapped under that key; returning the nested dict
+directly produces no visible output. The interactive-plot key is `html_path`
+everywhere -- `base.py` documents it and `ResultsPanel` reads it (P1.11b removed
+the old `plot_html` fallback).
 
 ---
 
@@ -486,10 +491,12 @@ class MyOperator(BaseOperator):
             )}
 ```
 
-`[TARGET -> P1.11]` Registration should be driven by `operators_config.yaml`.
-Today `main.py` registers operators manually and never reads the file, and the two
-lists already disagree -- `StatsOperator` is registered in code and absent from the
-YAML. Until that is fixed, add the operator in both places.
+`[NOW]` Registration is driven by `operators_config.yaml` (P1.11a). Add a new
+operator in **both** places: an entry in `operators_config.yaml` (its position
+sets the menu order) and a factory in `OPERATOR_FACTORIES` in
+`operators/operator_config.py`. A disagreement between the two raises
+`OperatorConfigError` at startup. `docs/architecture.md` §7 is the authority
+for the mechanism.
 
 ---
 

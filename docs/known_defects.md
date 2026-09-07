@@ -42,11 +42,6 @@ to P1.8d, and the two OS-native / non-parsing media-cell entries to P1.8e.
 
 ## Open -- dead or inconsistent
 
-- **`operators_config.yaml` claims to control which operators are enabled.**
-  `main.py` registers them manually and never reads the file. `StatsOperator` is
-  registered in code and absent from the YAML.
-- **`operators/base.py` documents a `plot_html` result key**; `ResultsPanel` and
-  `PlotAdvancedOperator` use `html_path`.
 - **`_id_counter` assumes `row_id` parses as an int**, and there is no stale-file
   cleanup on re-save. (The parsing half is also the `[MIGRATING]` violation under
   "Row identity and lineage" in `CLAUDE.md`.)
@@ -385,6 +380,17 @@ to P1.8d, and the two OS-native / non-parsing media-cell entries to P1.8e.
 
 ## Fixed
 
+- **`operators_config.yaml` claimed to control which operators are enabled but
+  `main.py` registered them by hand and never read the file** (`StatsOperator`
+  was registered in code and absent from the YAML). *(P1.11a:
+  `operators/operator_config.py` reads the file and `main.py` keeps only the
+  factories; drift or a malformed file raises `OperatorConfigError` at startup.
+  `docs/architecture.md` §7 is the authority. Tests:
+  `tests/test_operator_config.py`.)*
+- **`operators/base.py` documented a `plot_html` result key** while `ResultsPanel`
+  and `PlotAdvancedOperator` used `html_path`. *(P1.11b: `base.py` documents
+  `html_path` and `ui/results_panel.py` reads that key only -- the `plot_html`
+  fallback is gone.)*
 - **`load_folder()` and `load_csv_as_primary()` wrote `str(path)`, OS-native**,
   so a fresh unsaved project's media cells were non-canonical (backslashes, an
   unescaped `#` or `%`) until the first save/load. *(P1.8e-2a: `load_folder`
@@ -436,7 +442,8 @@ to P1.8d, and the two OS-native / non-parsing media-cell entries to P1.8e.
 - **`operators/thumbnail.py` was dead code.** *(P0.5b-2i: deleted, together with
   its `main.py` import and registration and its `operators_config.yaml` entry.
   `ArtifactStore._run_job` was always the real path. Promoting a genuine
-  reference operator in its place stays with P1.11.)*
+  reference operator in its place moved to P1.12 (P1.11b) -- it waits on the
+  operator contract settling.)*
 - **The purpose -> resolution mapping was computed in two places.**
   *(P0.5b-1-followups: `ArtifactStore._resolution_for` is now the public
   `ArtifactStore.resolution_for`, `column_types/renderers.py::_cached_thumbnail`

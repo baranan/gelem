@@ -472,9 +472,19 @@ operators_config.yaml
 can run without a real data layer: `python main.py --fake-data`. It must mirror
 every public method of `AppController`.
 
-`[TARGET -> P1.11]` `operators_config.yaml` should either drive registration or be
-deleted. At present `main.py` registers operators manually and never reads it, and
-the two lists already disagree.
+`[NOW]` `operators_config.yaml` is the single authority for **which** operators
+the application offers, and its entry order is the Operators menu order.
+`operators/operator_config.py` reads the file and constructs the enabled
+entries; `main.py` holds only the per-operator factories
+(`OPERATOR_FACTORIES`) -- the knowledge of *how* to build each one -- and
+registers whatever the file enables. Drift in either direction (an enabled
+YAML entry with no factory, or a factory the file never names), a missing
+file, or malformed YAML raises `OperatorConfigError` at startup and stops the
+program rather than silently changing what the researcher can do. Made true
+by P1.11a. Guarded by `tests/test_operator_config.py`
+(`test_yaml_keys_equal_factory_keys`, plus the `build_enabled_operators`
+drift tests). This is the authority for operator registration; other
+documents point here.
 
 ---
 
