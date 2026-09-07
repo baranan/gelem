@@ -24,11 +24,11 @@ operators:
     description: "Runs MediaPipe FaceLandmarker on each face image and writes the ~52 blendshape (facial-muscle activation) scores as numeric columns; the run aborts unless the face_landmarker model file has been downloaded into operators/models/."
 
   blendshape_avatar:
-    enabled: true
+    enabled: false
     description: "NOT IMPLEMENTED: writes a plain grey 256x256 JPEG per row and stores its path in avatar_path. It does not render an avatar and ignores the blendshape values."
 
   mean_face:
-    enabled: true
+    enabled: false
     description: "NOT IMPLEMENTED: both the grouped table and the quick-view return grey placeholder JPEGs and all-zero mean blendshape values. No averaging or face rendering is done."
 
   plot:
@@ -44,7 +44,7 @@ operators:
     description: "Builds an interactive Plotly chart (scatter/line/bar/box/violin/histogram, with optional colour, facet and pandas aggregation) from the selected rows and saves it as an HTML file plus a PNG."
 
   stats:
-    enabled: true
+    enabled: false
     description: "NOT IMPLEMENTED: returns hard-coded fake numbers (p = 0.042, effect size 0.61, statistic 2.34). No statistical test is run and the pingouin library its design calls for is not installed."
 
   video_frames:
