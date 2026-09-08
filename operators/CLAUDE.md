@@ -74,6 +74,7 @@ create_display(df, run)                      -> dict
 | `run.parameters` | this run's parameter values, as declared in `parameters` |
 | `run.cancelled()` | check between units of work; return promptly if true |
 | `run.resolver` | the only way to decode media |
+| `run.model` | `[NOW]` the model the COLUMNS runner built for this run per the mode's `model_lifecycle`; `None` for `NONE`, and `None` in TABLE/DISPLAY modes (no runner builds one there yet). **Never build or cache a model on `self`** -- see "Where a model lives" |
 | `run.paths` | this project's directories; **never store these on `self`** |
 | `run.spec` | the immutable description of the run, including versions |
 | `run.emit()` | the result sink |
@@ -88,40 +89,66 @@ anything else that differs run to run.
 
 ### Where a model lives
 
-`[TARGET -> P1.12]` **Do not put a stateful model on the singleton.** "Load the
+`[NOW]` **Never build or cache a model on the operator singleton.** "Load the
 model once in `__init__`" is the obvious optimisation and it is wrong for exactly
 the models Gelem runs. MediaPipe landmarkers hold internal state, are not
 documented as thread-safe, and in tracking mode carry the previous frame's result
-forward. Two clips processed in parallel through one shared model object would
+forward. Two runs processed in parallel through one shared model object would
 interleave that state, and the symptom is subtly wrong numbers rather than a crash.
+An operator is a singleton, so a model on `self` is shared by every concurrent run
+whatever lifecycle the descriptor names.
 
-Declare the lifecycle in the descriptor and let the runner honour it:
+Declare the lifecycle in the mode descriptor's `model_lifecycle`
+(`operators/descriptor.py` -> `ModelLifecycle`) and provide a **factory**,
+`build_model(self)`. The runner -- `OperatorRegistry`, the one component that
+builds models -- calls the factory and hands the result back as **`run.model`**.
+That is the one channel, for every lifecycle; an operator never builds or caches
+a model itself.
 
-| Lifecycle | For | Lives on |
+**Today only the per-row COLUMNS runner honours this** (`_run_create_columns_worker`).
+`run_create_table` and `run_create_display` build no model and leave `run.model`
+as `None`; no TABLE or DISPLAY operator needs one yet. An operator in those modes
+that comes to need a model extends the same mechanism to its runner rather than
+loading one on `self`.
+
+| `ModelLifecycle` | For | Who builds it, how often |
 |---|---|---|
-| `shared` | immutable, demonstrated thread-safe -- lookup tables, config, pure functions | the singleton, in `__init__` |
-| `per_worker` | stateless-per-call inference that is expensive to load | one instance per worker thread or process |
-| `per_sequence` | anything with tracking state | one isolated instance per clip-run, reset at the sequence boundary |
+| `NONE` | the mode uses no model | nobody; `run.model` is `None` |
+| `SHARED` | immutable, *demonstrated* thread-safe -- lookup tables, config, pure functions | the COLUMNS runner, once per application, cached on `OperatorRegistry` under a `threading.Lock`; reused across every run (the cache is not cleared on a project switch -- fine only while SHARED stays project-independent) |
+| `PER_WORKER` | stateless-per-call inference that is expensive to load | the COLUMNS runner, once per worker, inside the worker before the row loop; the same instance serves every row of that run |
+| `PER_SEQUENCE` | anything that tracks state across frames | nobody yet -- declared but refused, see below |
 
-`shared` requires evidence, not assumption. If you do not know, choose
-`per_worker`; if the model tracks across frames, `per_sequence` is the only correct
+`SHARED` requires evidence, not assumption. If you do not know, choose
+`PER_WORKER`; if the model tracks across frames, `PER_SEQUENCE` is the only correct
 answer and P2.2's per-clip-run cache identity depends on it.
 
-Provide a **factory**, not an instance, so the runner can build models at the right
-granularity:
-
 ```python
-# The runner calls this as many times as the declared lifecycle requires.
-model_lifecycle = "per_sequence"
+# The runner calls this as often as the declared lifecycle requires:
+# once per worker for PER_WORKER, once per application for SHARED, never
+# for NONE. Raise OperatorSetupError here if a prerequisite -- an
+# undownloaded model file -- is missing: the run aborts through
+# on_setup_error before any row is processed.
+model_lifecycle = ModelLifecycle.PER_WORKER   # in the ModeDescriptor
 
 def build_model(self):
     return load_landmarker()
 ```
 
-*(Raised in the fifth review round. It does not block Phase 0 or the measurement
-pass, since no parallel execution exists yet -- but the template is what gets
-copied, so the wrong default would be baked in well before P2.3 decides on
-threads.)*
+`[TARGET -> P2.1]` **`PER_SEQUENCE` is declared but refused today.** The per-row
+COLUMNS runner sees one row at a time and has no sequence boundary to reset a
+tracking model at, so `AppController.run_create_columns` refuses a run whose mode
+declares it -- before any worker starts, in a message naming the operator and the
+lifecycle -- and the worker keeps a defensive guard for one that slips through. An
+operator that needs tracking state waits on the ordered-group runner
+(`iter_column_updates`).
+
+Building the model before the row loop also means a missing prerequisite is
+reported before any work starts. The old lazy load inside `create_columns` only
+raised on the first row whose media happened to decode; a run where every row
+failed to decode reported success having processed zero rows and never mentioned
+the missing model.
+
+Guarded by `tests/test_model_lifecycle.py`.
 
 ### `create_columns(row_id, media, metadata, run) -> dict`
 
@@ -499,9 +526,13 @@ class MyOperator(BaseOperator):
                         OutputColumn(name="my_score", type_tag="numeric"),
                     ),
                 ),
-                # This template uses no model. Anything holding cross-frame
-                # tracking state needs PER_SEQUENCE -- see "Where a model
-                # lives". (The runner does not build models yet.)
+                # This template uses no model, so build_model() is not
+                # overridden and run.model is None. An operator that needs
+                # one declares PER_WORKER or SHARED here and returns it
+                # from build_model(); the runner builds it and hands it in
+                # as run.model. Cross-frame tracking state needs
+                # PER_SEQUENCE, which is declared but refused today -- see
+                # "Where a model lives".
                 model_lifecycle=ModelLifecycle.NONE,
                 # Same inputs + parameters always give the same output, so
                 # a cached result may be reused.

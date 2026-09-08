@@ -97,13 +97,14 @@ def _empty_run_data():
     return RunData(tables={}, projects={})
 
 
-def _run(spec, *, token=None, emit_fn=None):
+def _run(spec, *, token=None, emit_fn=None, model=None):
     return OperatorRun(
         spec=spec,
         data=_empty_run_data(),
         paths=object(),
         _token=token if token is not None else CancellationToken(),
         _emit_fn=emit_fn,
+        model=model,
     )
 
 
@@ -490,6 +491,26 @@ def test_table_snapshot_rejects_empty_name():
 def test_table_snapshot_rejects_version_below_one():
     with pytest.raises(OperatorRunError):
         TableSnapshot(table_name="faces", frame=object(), version=0)
+
+
+# ---------------------------------------------------------------------------
+# OperatorRun.model (P1.12d-2b-2). The runner builds the model per the
+# mode's declared model_lifecycle and hands it in here; it is the one
+# channel by which a model reaches an operator, for every lifecycle.
+# ---------------------------------------------------------------------------
+def test_run_model_defaults_to_none():
+    # An operator whose mode declares ModelLifecycle.NONE, or a run built
+    # before the runner has anything to hand in, sees run.model is None.
+    run = _run(_spec(_columns_mode()))
+    assert run.model is None
+
+
+def test_run_hands_back_the_exact_model_object_it_was_built_with():
+    # The runner builds one instance and passes it straight through --
+    # OperatorRun neither copies nor wraps it.
+    built = object()
+    run = _run(_spec(_columns_mode()), model=built)
+    assert run.model is built
 
 
 # ---------------------------------------------------------------------------

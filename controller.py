@@ -33,7 +33,12 @@ from PySide6.QtCore import QObject, Signal, QTimer
 from models.query_result import QueryResult, ResultLayout, GroupSection
 from models.notifications import RowsUpdated, ThumbnailsReady
 from media.media_address import resolve_source, MediaAddressError
-from operators.descriptor import ExecutionMode, InputKind, MediaRequirement
+from operators.descriptor import (
+    ExecutionMode,
+    InputKind,
+    MediaRequirement,
+    ModelLifecycle,
+)
 from operators.run_context import (
     CancellationToken,
     OperatorRun,
@@ -1251,6 +1256,25 @@ class AppController(QObject):
                     f'Cannot start "{operator.display_label}": it needs '
                     f'{media_requirement.name} media, which the per-row '
                     f'runner cannot supply.'
+                )
+                return
+
+            # The runner builds this operator's model once per worker
+            # (PER_WORKER) or once per application (SHARED), but the
+            # per-row runner has no concept of a sequence, so it cannot
+            # honour PER_SEQUENCE -- one isolated model instance per
+            # clip-run, reset at the sequence boundary. A COLUMNS mode
+            # that declares it is refused here, before any worker starts
+            # and before the run is registered -- the same place a bad
+            # parameter set and a VIDEO_SPAN / AUDIO_SPAN requirement are
+            # refused. The worker keeps a defensive guard in case one
+            # slips through.
+            model_lifecycle = run.spec.mode_descriptor.model_lifecycle
+            if model_lifecycle is ModelLifecycle.PER_SEQUENCE:
+                self.error_occurred.emit(
+                    f'Cannot start "{operator.display_label}": it declares '
+                    f'model_lifecycle {model_lifecycle.name}, which the '
+                    f'per-row runner cannot honour.'
                 )
                 return
 

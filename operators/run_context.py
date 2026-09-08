@@ -589,6 +589,14 @@ class OperatorRun:
     _token: CancellationToken
     # The per-row result sink, injected by the runner. None until wired.
     _emit_fn: Optional[Callable[..., None]] = None
+    # The model instance the runner built for this run according to the
+    # mode's declared ``model_lifecycle`` (operators/descriptor.py ->
+    # ModelLifecycle). It is ``None`` when the mode declares ``NONE``. An
+    # operator reads ``run.model`` and must NEVER build or cache a model
+    # itself: a model kept on the singleton operator would be shared by
+    # every concurrent run regardless of the declared lifecycle. See
+    # operators/CLAUDE.md -> "Where a model lives".
+    model: object = None
 
     @property
     def parameters(self) -> "Mapping[str, object]":

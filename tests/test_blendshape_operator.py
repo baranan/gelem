@@ -50,7 +50,14 @@ def _run(op):
     """A minimal OperatorRun for a direct create_columns() call, built
     from the operator's OWN descriptor so it goes through the same
     OperatorRunSpec validation a real run does (P1.12d-2a). BlendshapeOperator
-    declares no parameters, so parameters is empty."""
+    declares no parameters, so parameters is empty.
+
+    The landmarker is built here via op.build_model() and passed as
+    run.model, exactly as the runner does for the descriptor's PER_WORKER
+    declaration (P1.12d-2b-2) -- the operator no longer loads one itself.
+    This runs only after the module-level guards above have confirmed both
+    mediapipe and the model file are present, so build_model() cannot
+    raise here."""
     mode_descriptor = op.descriptor.mode_for(ExecutionMode.COLUMNS)
     spec = OperatorRunSpec(
         operation_id="test-run",
@@ -65,6 +72,7 @@ def _run(op):
         data=RunData(tables={}, projects={}),
         paths=None,
         _token=CancellationToken(),
+        model=op.build_model(),
     )
 
 

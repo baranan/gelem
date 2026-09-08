@@ -40,11 +40,12 @@ This file is written centrally (not by a student).
 
 from __future__ import annotations
 from pathlib import Path
+import dataclasses
 import threading
 import pandas as pd
 
 from operators.base import BaseOperator, OperatorSetupError
-from operators.descriptor import MediaRequirement
+from operators.descriptor import MediaRequirement, ModelLifecycle
 
 
 class OperatorRegistry:
@@ -92,6 +93,41 @@ class OperatorRegistry:
     def __init__(self):
         # Maps operator name -> BaseOperator instance.
         self._operators: dict[str, BaseOperator] = {}
+
+        # SHARED-lifecycle models: one instance per operator name, built
+        # lazily by the runner on the first run that needs it and reused by
+        # every run after. The lock makes two runs that start at the same
+        # moment build at most one instance between them -- it is held
+        # across the build() call on purpose, so the second run waits for
+        # the first rather than racing it. SHARED models are rare and must
+        # be demonstrably thread-safe, so the coarse lock costs nothing in
+        # practice. NONE / PER_WORKER / PER_SEQUENCE never touch this.
+        #
+        # This cache lives for the process: it is NOT cleared when the
+        # researcher opens a different project. That is correct only while
+        # SHARED means what the descriptor says it means -- an immutable,
+        # project-independent object (a lookup table, config, a pure
+        # function). The first operator that actually declares SHARED must
+        # confirm that, or teach AppController.load_project to clear this.
+        # Nothing declares SHARED today.
+        self._shared_models: dict[str, object] = {}
+        self._shared_models_lock = threading.Lock()
+
+    def _shared_model_for(self, operator: BaseOperator) -> object:
+        """
+        The one application-wide model instance for a SHARED-lifecycle
+        operator, built on first use under ``_shared_models_lock`` so two
+        runs starting at once cannot both build.
+
+        Any ``OperatorSetupError`` raised by ``operator.build_model()``
+        propagates to the caller (the worker), which aborts the run
+        through ``on_setup_error``; nothing is cached, so a later run
+        retries the build.
+        """
+        with self._shared_models_lock:
+            if operator.name not in self._shared_models:
+                self._shared_models[operator.name] = operator.build_model()
+            return self._shared_models[operator.name]
 
     def register(self, operator: BaseOperator) -> None:
         """
@@ -366,6 +402,88 @@ class OperatorRegistry:
 
         # FRAME is the only requirement that makes the runner decode.
         needs_frame = media_requirement is MediaRequirement.FRAME
+
+        # Build this run's model BEFORE the row loop, honouring the mode's
+        # declared model_lifecycle (operators/descriptor.py ->
+        # ModelLifecycle). build_model() is a FACTORY (operators/base.py):
+        #
+        #   NONE         -- no model. run.model stays None.
+        #   PER_WORKER   -- build once here, in this worker, and hand the
+        #                   same instance to every row of this run. This
+        #                   per-row runner starts one worker thread per
+        #                   run, so "per worker" is "per run" today; two
+        #                   concurrent runs get two workers and therefore
+        #                   two isolated instances.
+        #   SHARED       -- one instance for the whole application, built
+        #                   and cached on the registry under a lock so two
+        #                   runs starting at once cannot both build.
+        #   PER_SEQUENCE -- one isolated instance per clip-run, reset at
+        #                   the sequence boundary. This per-row runner has
+        #                   no sequence concept and cannot honour it;
+        #                   AppController.run_create_columns refuses such a
+        #                   run before it starts. The check below is a
+        #                   defensive guard for a run that somehow reaches
+        #                   here anyway -- same shape as the VIDEO_SPAN /
+        #                   AUDIO_SPAN guard above.
+        #
+        # If build_model() raises OperatorSetupError -- e.g. a model file
+        # was never downloaded -- the run aborts through on_setup_error
+        # having processed NO rows. That is stricter than the old lazy
+        # load inside create_columns, which only raised on the first row
+        # whose media happened to decode: a run where every row failed to
+        # decode used to report success having processed zero rows and
+        # never mention the missing model.
+        model_lifecycle = run.spec.mode_descriptor.model_lifecycle
+        if model_lifecycle is ModelLifecycle.PER_SEQUENCE:
+            if on_setup_error is not None:
+                on_setup_error(
+                    operation_id,
+                    operator.display_label,
+                    f"declares model_lifecycle {model_lifecycle.name}, which "
+                    f"the per-row runner cannot honour -- it has no sequence "
+                    f"boundary to reset at. AppController should have refused "
+                    f"this run before it started.",
+                )
+            if on_complete is not None:
+                on_complete(operation_id, operator.name, emitted)
+            return
+
+        try:
+            if model_lifecycle is ModelLifecycle.PER_WORKER:
+                run = dataclasses.replace(run, model=operator.build_model())
+            elif model_lifecycle is ModelLifecycle.SHARED:
+                run = dataclasses.replace(
+                    run, model=self._shared_model_for(operator)
+                )
+            # NONE: leave run.model as it is (None).
+        except Exception as e:
+            # Any failure to build the model aborts the run before the row
+            # loop, through the same on_setup_error path a raised
+            # OperatorSetupError takes: the run cannot proceed without its
+            # model. OperatorSetupError is the expected case (an
+            # undownloaded model file) and gets its exact message; anything
+            # else (a corrupt model file making the library raise
+            # RuntimeError, say) is wrapped so the message still names the
+            # operator and the cause. Either way on_setup_error THEN
+            # on_complete are called and the worker returns, so the run is
+            # torn down and deregistered rather than left live by a dead
+            # worker thread.
+            if isinstance(e, OperatorSetupError):
+                message = str(e)
+            else:
+                message = (
+                    f"could not build its model: "
+                    f"{type(e).__name__}: {e}"
+                )
+            print(
+                f"[OperatorRegistry] Model build failed for "
+                f"'{operator.name}': {type(e).__name__}: {e}"
+            )
+            if on_setup_error is not None:
+                on_setup_error(operation_id, operator.display_label, message)
+            if on_complete is not None:
+                on_complete(operation_id, operator.name, emitted)
+            return
 
         for i, row_id in enumerate(row_ids):
             metadata = snapshot.iloc[i].to_dict()

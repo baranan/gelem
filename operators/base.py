@@ -367,6 +367,35 @@ class BaseOperator:
             f"Operator '{self.name}' does not implement create_display()."
         )
 
+    # ── Model factory ─────────────────────────────────────────────────
+
+    def build_model(self):
+        """
+        FACTORY for this operator's model -- NOT an instance accessor.
+
+        The runner calls this as often as the mode's declared
+        ``model_lifecycle`` requires (operators/descriptor.py ->
+        ``ModelLifecycle``): once per worker for ``PER_WORKER``, once per
+        application for ``SHARED``, and never for ``NONE``. Whatever it
+        returns is handed to the execution method as ``run.model``.
+
+        An operator that keeps the result on ``self`` -- or builds a model
+        anywhere other than here -- has defeated the declaration: an
+        instance is a singleton, so a model on ``self`` is shared by two
+        concurrent runs whatever lifecycle the descriptor names. Read
+        ``run.model`` and nothing else.
+
+        Returns ``None`` by default, which is correct for an operator that
+        needs no model.
+
+        Raise ``OperatorSetupError`` from here if a one-time prerequisite
+        is missing -- typically an undownloaded model file. The runner
+        aborts the run through its ``on_setup_error`` callback and
+        processes no rows. See operators/CLAUDE.md -> "Where a model
+        lives".
+        """
+        return None
+
     # ── Parameter dialog ──────────────────────────────────────────────
 
     def get_parameters_dialog(self, parent=None, columns=None):

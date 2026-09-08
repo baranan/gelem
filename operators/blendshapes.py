@@ -103,25 +103,22 @@ class BlendshapeOperator(BaseOperator):
     output_columns = [(bs_name, "numeric") for bs_name in BLENDSHAPE_NAMES]
 
     # ------------------------------------------------------------------
-    # Descriptor (P1.12d-1). Describes what create_columns() ACTUALLY
-    # does today:
+    # Descriptor (P1.12d-1). Describes what create_columns() does:
     #  - one COLUMNS mode, over the active table;
     #  - no parameters (get_parameters_dialog is not overridden);
     #  - media_requirement FRAME: mediapipe needs the face image, so the
     #    runner decodes one frame and hands it in as `media`;
-    #  - model_lifecycle PER_WORKER: this field states what the runner
-    #    must PROVIDE, not what the code does today. The FaceLandmarker is
-    #    created in IMAGE running mode (no running_mode is passed to
-    #    FaceLandmarkerOptions, and create_columns() calls
-    #    self._landmarker.detect()), so it carries no cross-frame tracking
-    #    state and PER_SEQUENCE is not required; but MediaPipe landmarkers
-    #    are not documented as thread-safe, so we cannot claim SHARED
-    #    either -- PER_WORKER is the fallback operators/CLAUDE.md's "Where
-    #    a model lives" section prescribes when thread-safety is unknown.
-    #    Today the operator holds one landmarker on self and reuses it for
-    #    every row; that is safe ONLY because operator_registry.py runs a
-    #    single worker thread. P1.12d-2 must convert this operator to a
-    #    model factory before any parallel worker path exists.
+    #  - model_lifecycle PER_WORKER (honoured by the runner as of
+    #    P1.12d-2b-2). The FaceLandmarker is created in IMAGE running mode
+    #    (no running_mode is passed to FaceLandmarkerOptions, and
+    #    create_columns() calls run.model.detect()), so it carries no
+    #    cross-frame tracking state and PER_SEQUENCE is not required; but
+    #    MediaPipe landmarkers are not documented as thread-safe, so
+    #    SHARED cannot be claimed either -- PER_WORKER is the fallback
+    #    operators/CLAUDE.md's "Where a model lives" section prescribes
+    #    when thread-safety is unknown. The runner calls build_model()
+    #    once per worker and hands the landmarker in as run.model; this
+    #    class stores nothing on self.
     #  - deterministic: the same image and model give the same scores.
     # ------------------------------------------------------------------
     descriptor = OperatorDescriptor(
@@ -159,12 +156,21 @@ class BlendshapeOperator(BaseOperator):
         ),
     )
 
-    def __init__(self):
-        # Defer loading the mediapipe model until first use, so creating the
-        # operator (and starting the app) does not require the model file.
-        self._landmarker = None
+    def build_model(self):
+        """
+        FACTORY for the MediaPipe FaceLandmarker (see operators/base.py ->
+        build_model and operators/CLAUDE.md -> "Where a model lives").
 
-    def _load_model(self):
+        The runner calls this once per worker -- the descriptor declares
+        model_lifecycle PER_WORKER -- and hands the result to
+        create_columns() as run.model. Nothing is stored on self: a
+        landmarker on this singleton would be shared by every concurrent
+        run, which is exactly what PER_WORKER forbids.
+
+        Raises OperatorSetupError if the model file has not been
+        downloaded yet. The runner aborts the run before any row is
+        processed and surfaces this message to the researcher.
+        """
         if not _MODEL_PATH.exists():
             raise OperatorSetupError(
                 f"The MediaPipe face-landmarker model file is missing.\n"
@@ -176,7 +182,7 @@ class BlendshapeOperator(BaseOperator):
             output_face_blendshapes=True,
             num_faces=1,
         )
-        self._landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(
+        return mp.tasks.vision.FaceLandmarker.create_from_options(
             landmarker_config
         )
 
@@ -198,24 +204,24 @@ class BlendshapeOperator(BaseOperator):
                       the face frame as a numpy array (height, width, 3), RGB.
             metadata: Existing column values for this row (not used here).
             run:      The OperatorRun for this run. This operator declares
-                      no parameters, so run.parameters is empty; the
-                      argument is here for the uniform operator contract.
+                      no parameters, so run.parameters is empty. The
+                      landmarker the runner built once for this run (the
+                      descriptor declares model_lifecycle PER_WORKER) is
+                      run.model; this operator never builds or caches one
+                      itself.
 
         Returns:
             Dict mapping each blendshape name to its score (0.0–1.0).
             If no face is detected, all values are None.
         """
-        if self._landmarker is None:
-            # Lets OperatorSetupError propagate so the worker can abort the
-            # whole run and surface the message to the user.
-            self._load_model()
+        landmarker = run.model
 
         # Unexpected exceptions are intentionally NOT caught here — the
         # worker catches them, marks the row as missing, and reports them
         # in an end-of-run summary so they're distinguishable from the
         # normal "no face detected" case below.
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=media)
-        detection_result = self._landmarker.detect(mp_image)
+        detection_result = landmarker.detect(mp_image)
 
         if not detection_result.face_blendshapes:
             return {name: None for name in BLENDSHAPE_NAMES}
@@ -229,7 +235,7 @@ class BlendshapeOperator(BaseOperator):
             for bs_name in BLENDSHAPE_NAMES
         }
 
-# TODO: until the integration will be completed with the ui, the model can be
-# exercised directly by calling self._landmarker.detect() on a loaded image;
-# create_columns() now needs an OperatorRun, so it is no longer the simplest
-# entry point for a one-off terminal check.
+# TODO: for a one-off terminal check, build a landmarker with build_model()
+# and call landmarker.detect() on a loaded image directly. create_columns()
+# now needs an OperatorRun carrying run.model, so it is no longer the
+# simplest entry point.
