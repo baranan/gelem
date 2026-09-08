@@ -399,104 +399,181 @@ between a development machine and a student's 8 GB laptop. Default low.
 
 ## Template
 
+A complete, runnable **COLUMNS** operator. It constructs today: copy the class,
+change the names, and it will start. Three things look like mistakes and are not:
+
+- **`name`, the menu label and the output columns appear twice** -- once as the
+  legacy class attributes the menu and per-row runner still read, once inside the
+  descriptor. `tests/test_operator_descriptors_match.py` pins the two halves
+  equal, and `[TARGET -> P1.12d-3]` deletes the legacy half once the menu and
+  runner read the descriptor directly.
+- **`media` is `None` unless the mode declares `media_requirement =
+  MediaRequirement.FRAME`.** `METADATA` and `ADDRESS` both hand `create_columns`
+  a `media` of `None`; the per-row runner refuses `VIDEO_SPAN` and `AUDIO_SPAN`
+  before the run starts.
+- **Parameters are never stored on `self`.** An operator instance is a singleton,
+  so a value on `self` is a race -- two concurrent runs would overwrite each
+  other. Every per-run value is read from `run.parameters`.
+
 ```python
 from operators.base import BaseOperator
+from operators.descriptor import (
+    ExecutionMode,
+    InputKind,
+    InputSpec,
+    MediaRequirement,
+    ModeDescriptor,
+    ModelLifecycle,
+    NumberParameter,
+    OperatorDescriptor,
+    OutputColumn,
+    OutputSpec,
+)
 
 
 class MyOperator(BaseOperator):
     """One-line description shown to the researcher."""
 
-    # ---- Identity and self-description --------------------------------
-    # Version is part of the result-cache key. Bump it whenever a change
-    # could alter the numbers this operator produces.
-    name        = "my_operator"
-    version     = "1.0"
-    description = "Computes my score from the face in each image."
-
-    # ---- Menu placement -----------------------------------------------
-    # Setting a label makes that method appear in the Operators menu.
+    # ---- Legacy self-description (still authoritative today) ----------
+    # The Operators menu and the per-row runner still read these three
+    # attributes: `name`, the `*_label`, and `output_columns`. They are
+    # duplicated inside the descriptor below on purpose --
+    # tests/test_operator_descriptors_match.py pins the two halves equal,
+    # so a change to one that misses the other fails a test. P1.12d-3
+    # deletes this legacy half once the menu and runner read the
+    # descriptor directly; until then keep both, and keep them equal.
+    name = "my_operator"
     create_columns_label = "Compute my score"
-    create_table_label   = None
-    create_display_label = None
-
-    # ---- Declared outputs ----------------------------------------------
-    # (column name, type tag). The tag must be registered in
-    # ColumnTypeRegistry or the column will not render.
+    # (column name, type tag). Reuse a registered tag -- numeric,
+    # media_path, text, boolean_flag -- or the column shows a placeholder.
     output_columns = [("my_score", "numeric")]
 
-    # ---- Declared inputs -----------------------------------------------
-    # What this operator needs handed to it is declared as
-    # `media_requirement` on the mode's ModeDescriptor (see "Describing an
-    # operator" above), never as a class attribute and never as a boolean
-    # -- the old `requires_image` was removed in P1.12d-2b-1.
-    # MediaRequirement is one of:
-    #   METADATA    -- no media at all; create_columns gets media = None
-    #   FRAME       -- a single decoded frame
-    #   VIDEO_SPAN  -- an ordered span, for sequential work
-    #   AUDIO_SPAN  -- an audio span
-    #   ADDRESS     -- the raw address; the operator resolves it itself
-    # The per-row create_columns runner accepts METADATA, FRAME and
-    # ADDRESS; it refuses VIDEO_SPAN and AUDIO_SPAN before the run starts,
-    # since it cannot hand a single row a span.
-
-    # ---- Declared parameters -------------------------------------------
-    # The UI builds the dialog from this. No Qt in this file.
-    # 'column' means the value is a column name, so the UI offers a
-    # dropdown of the active table's columns.
-    parameters = [
-        {"name": "window_ms", "type": "number", "default": 500,
-         "label": "Averaging window (ms)"},
-        {"name": "group_by",  "type": "column", "default": None,
-         "label": "Group by", "optional": True},
-    ]
-
-    # ---- Model lifecycle ------------------------------------------------
-    # How often the runner should build a model. 'shared' only if the
-    # object is immutable and demonstrably thread-safe; 'per_sequence' for
-    # anything that tracks across frames. See "Where a model lives".
-    model_lifecycle = "per_worker"
-
-    def build_model(self):
-        # A factory, not an instance. The runner calls it as many times as
-        # the declared lifecycle requires, and hands the result to the
-        # execution methods via `run.model`.
-        return load_landmarker()
-
-    def __init__(self):
-        # Only immutable, genuinely shared resources belong here. No model
-        # unless its lifecycle is 'shared'. No parameter values and no
-        # ProjectPaths -- this object is a singleton and two runs can be in
-        # flight at once.
-        pass
+    # ---- Descriptor (mandatory: the run will not start without it) ----
+    # Since P1.12d-2a AppController builds every run from the mode's
+    # ModeDescriptor and refuses to start an operator that carries no
+    # descriptor (or none for the requested mode).
+    descriptor = OperatorDescriptor(
+        name="my_operator",              # must equal the `name` attribute
+        version="1.0",                   # part of the result-cache key --
+                                         # bump it whenever a change could
+                                         # alter the numbers produced
+        description=(
+            "For each row, computes my score from the face in the frame "
+            "and writes it to the numeric column 'my_score'."
+        ),
+        modes=(
+            ModeDescriptor(
+                mode=ExecutionMode.COLUMNS,
+                # Same string as create_columns_label (pinned by a test).
+                label="Compute my score",
+                # Where the rows come from. ACTIVE_TABLE means "whatever
+                # table is on screen" -- no dialog choice needed.
+                inputs=(
+                    InputSpec(
+                        name="active_table",
+                        label="Active table",
+                        kind=InputKind.ACTIVE_TABLE,
+                    ),
+                ),
+                # What the runner decodes per row before calling
+                # create_columns(). FRAME -> `media` is a decoded frame;
+                # METADATA or ADDRESS -> `media` is None. VIDEO_SPAN and
+                # AUDIO_SPAN are refused for a per-row COLUMNS run.
+                media_requirement=MediaRequirement.FRAME,
+                # Declared parameters. The researcher sets them in the
+                # dialog built by get_parameters_dialog() below; the
+                # operator reads their values from run.parameters.
+                parameters=(
+                    NumberParameter(
+                        name="threshold",
+                        label="Detection threshold",
+                        minimum=0.0,
+                        maximum=1.0,
+                        decimals=2,
+                        default=0.5,
+                    ),
+                ),
+                # One OutputColumn per (name, tag) pair in output_columns.
+                output=OutputSpec(
+                    columns=(
+                        OutputColumn(name="my_score", type_tag="numeric"),
+                    ),
+                ),
+                # This template uses no model. Anything holding cross-frame
+                # tracking state needs PER_SEQUENCE -- see "Where a model
+                # lives". (The runner does not build models yet.)
+                model_lifecycle=ModelLifecycle.NONE,
+                # Same inputs + parameters always give the same output, so
+                # a cached result may be reused.
+                deterministic=True,
+                cacheable=True,
+            ),
+        ),
+    )
 
     def create_columns(self, row_id, media, metadata, run):
-        # Background thread. Everything per-run comes from `run`, including
-        # the model instance built for this run's lifecycle.
-        window = run.parameters["window_ms"]
-        score  = compute_something(media, window, run.model)
+        # Runs once per row, in a background thread.
+        #
+        # `media` is the decoded frame (numpy uint8, HxWx3, RGB) because
+        # this mode declares FRAME; it is None for METADATA or ADDRESS.
+        # `metadata` holds this row's existing column values -- read-only.
+        #
+        # Every per-run value comes from `run`. Read parameters from
+        # run.parameters and NEVER store one on `self`: an operator
+        # instance is a singleton, so two concurrent runs would overwrite
+        # each other's parameter values.
+        threshold = run.parameters["threshold"]
+        score = compute_my_score(media, threshold)   # your analysis here
         return {"my_score": score}
 
-    def create_table(self, df, run):
-        # Same `run` argument, same rule. Grouping is a declared parameter,
-        # not a special-cased method argument.
-        group_by = run.parameters.get("group_by")
-        work     = df.copy()
-        if group_by:
-            return work.groupby(group_by).mean(numeric_only=True).reset_index()
-        return work.mean(numeric_only=True).to_frame().T
+    def get_parameters_dialog(self, parent=None, columns=None):
+        # Nothing generates a dialog from the declared `parameters` yet
+        # (that is later P1.12d/e work). Until then a parameterised
+        # operator builds its own QDialog here and exposes
+        # parameter_values() -> dict, keyed by the descriptor's parameter
+        # names. MainWindow shows this after the scope dialog and passes
+        # the dict to the controller, which validates it against the
+        # descriptor. Store NOTHING on `self`.
+        from PySide6.QtWidgets import (
+            QDialog,
+            QDialogButtonBox,
+            QDoubleSpinBox,
+            QFormLayout,
+        )
 
-    def iter_column_updates(self, rows, run):
-        # Streaming mode: walk the media in order, yield as you go, and
-        # check for cancellation between units of work. With a
-        # 'per_sequence' lifecycle, run.model is isolated to this clip.
-        for row_id, address in rows:
-            if run.cancelled():
-                return
-            frame = run.resolver.resolve_frame(address, purpose="analysis")
-            yield row_id, {"my_score": compute_something(
-                frame, run.parameters["window_ms"], run.model
-            )}
+        dialog = QDialog(parent)
+        dialog.setWindowTitle("Compute my score")
+        form = QFormLayout(dialog)
+
+        threshold_spin = QDoubleSpinBox()
+        threshold_spin.setRange(0.0, 1.0)
+        threshold_spin.setSingleStep(0.05)
+        threshold_spin.setValue(0.5)            # the descriptor's default
+        form.addRow("Detection threshold:", threshold_spin)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+
+        # Hand the chosen values back BY NAME. Every key must be a
+        # parameter the descriptor declares.
+        chosen = {}
+
+        def _store():
+            chosen["threshold"] = threshold_spin.value()
+
+        dialog.accepted.connect(_store)
+        dialog.parameter_values = lambda: dict(chosen)
+        return dialog
 ```
+
+A second execution mode is a second `ModeDescriptor` in `modes=(...)` plus the
+matching `create_table` / `create_display` method and `*_label`; `create_table`
+reads its grouping column from `run.parameters`, not from a special-cased
+argument.
 
 `[NOW]` Registration is driven by `operators_config.yaml` (P1.11a). Add a new
 operator in **both** places: an entry in `operators_config.yaml` (its position
@@ -504,6 +581,11 @@ sets the menu order) and a factory in `OPERATOR_FACTORIES` in
 `operators/operator_config.py`. A disagreement between the two raises
 `OperatorConfigError` at startup. `docs/architecture.md` §7 is the authority
 for the mechanism.
+
+`[NOW]` Then add the operator to `OPERATORS_UNDER_TEST` in
+`tests/test_operator_descriptors_match.py` with its own named test:
+`test_every_factory_operator_is_pinned` asserts that set equals
+`OPERATOR_FACTORIES`, so a new operator without an entry fails the baseline.
 
 ---
 
