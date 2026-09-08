@@ -30,8 +30,49 @@ sys.path.insert(0, str(project_root))
 import pandas as pd
 import pytest
 
+from operators.descriptor import (
+    ExecutionMode,
+    InputKind,
+    InputSpec,
+    ModeDescriptor,
+    OperatorDescriptor,
+    OutputColumn,
+    OutputSpec,
+)
+
 TEST_IMAGES  = project_root / "test_images"
 METADATA_CSV = TEST_IMAGES / "metadata.csv"
+
+
+def _columns_descriptor(name, label, output_columns):
+    """A minimal COLUMNS-mode descriptor for a test double. P1.12d-2a:
+    every operator the controller runs carries a descriptor, and the
+    controller builds the OperatorRunSpec from it."""
+    return OperatorDescriptor(
+        name=name,
+        version="1.0",
+        description=f"Test double: {label}.",
+        modes=(
+            ModeDescriptor(
+                mode=ExecutionMode.COLUMNS,
+                label=label,
+                inputs=(
+                    InputSpec(
+                        name="active_table",
+                        label="Active table",
+                        kind=InputKind.ACTIVE_TABLE,
+                    ),
+                ),
+                parameters=(),
+                output=OutputSpec(
+                    columns=tuple(
+                        OutputColumn(name=col_name, type_tag=col_tag)
+                        for col_name, col_tag in output_columns
+                    )
+                ),
+            ),
+        ),
+    )
 
 NEEDS_CSV = {"add_computed_column", "confirm_merge", "aggregate", "load_csv_as_primary"}
 
@@ -92,8 +133,11 @@ def test_run_create_columns_does_not_copy_table_per_row(monkeypatch, tmp_path):
         create_columns_label  = "Dummy"
         output_columns        = [("dummy_score", "numeric")]
         requires_image        = False
+        descriptor = _columns_descriptor(
+            "dummy_op", "Dummy", [("dummy_score", "numeric")]
+        )
 
-        def create_columns(self, row_id, image, metadata):
+        def create_columns(self, row_id, image, metadata, run):
             return {"dummy_score": 1.0}
 
     store    = ArtifactStore(tmp_path / "artifacts")
@@ -171,8 +215,11 @@ def test_run_create_columns_raises_on_snapshot_length_mismatch():
         create_columns_label  = "No-op"
         output_columns        = [("probe", "numeric")]
         requires_image        = False
+        descriptor = _columns_descriptor(
+            "noop", "No-op", [("probe", "numeric")]
+        )
 
-        def create_columns(self, row_id, image, metadata):
+        def create_columns(self, row_id, image, metadata, run):
             return {"probe": 0}
 
     op_registry = OperatorRegistry()
@@ -181,8 +228,10 @@ def test_run_create_columns_raises_on_snapshot_length_mismatch():
     snapshot = pd.DataFrame({"row_id": ["000001"]})   # 1 row
     row_ids  = ["000001", "000002"]                   # 2 ids -- mismatch
 
+    # run is None here: the length-mismatch guard raises before the worker
+    # (the only thing that would touch run) ever starts.
     with pytest.raises(ValueError):
-        op_registry.run_create_columns("noop", snapshot, row_ids, "frames")
+        op_registry.run_create_columns("noop", snapshot, row_ids, "frames", None)
 
 
 def test_run_create_columns_pairs_snapshot_rows_with_correct_row_id(monkeypatch, tmp_path):
@@ -207,8 +256,11 @@ def test_run_create_columns_pairs_snapshot_rows_with_correct_row_id(monkeypatch,
         create_columns_label  = "Echo row id"
         output_columns        = [("probe", "numeric")]
         requires_image        = False
+        descriptor = _columns_descriptor(
+            "echo_row_id", "Echo row id", [("probe", "numeric")]
+        )
 
-        def create_columns(self, row_id, image, metadata):
+        def create_columns(self, row_id, image, metadata, run):
             # The result is derived purely from row_id, so a shifted
             # pairing shows up as a wrong value at every affected row.
             return {"probe": int(row_id)}

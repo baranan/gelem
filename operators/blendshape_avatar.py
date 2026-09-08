@@ -119,6 +119,7 @@ class BlendshapeAvatarOperator(BaseOperator):
         row_id: str,
         image: np.ndarray | None,
         metadata: dict,
+        run,
     ) -> dict:
         """
         Renders a face avatar for one frame using that frame's
@@ -129,6 +130,9 @@ class BlendshapeAvatarOperator(BaseOperator):
             image:    Not used (requires_image = False).
             metadata: Must contain blendshape columns (bs_jawOpen etc.)
                       for this to produce a meaningful avatar.
+            run:      The OperatorRun for this run. This operator declares
+                      no parameters, so run.parameters is empty; the
+                      argument is here for the uniform operator contract.
 
         Returns:
             Dict with 'avatar_path' key pointing to the rendered image.

@@ -141,6 +141,9 @@ def create_app(fake_data: bool = False):
         registry=registry,
         operator_registry=operator_registry,
         settings_gateway=settings_gateway,
+        # The same directories the operator factories got; the controller
+        # hands them to every OperatorRun as run.paths.
+        runtime_dirs=operator_dirs,
     )
 
     window = MainWindow(controller)

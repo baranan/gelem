@@ -97,22 +97,29 @@ class BaseOperator:
             create_columns_label = "Compute my score"
             output_columns = [("my_score", "numeric")]
 
-            def create_columns(self, row_id, image, metadata):
+            def create_columns(self, row_id, image, metadata, run):
                 score = compute_something(image)
                 return {"my_score": score}
 
-    Example — an operator that supports all three modes:
+    Example — an operator that supports two modes:
 
         class MeanFaceOperator(BaseOperator):
             name = "mean_face"
             create_table_label   = "Mean face table"
             create_display_label = "Mean face (quick view)"
 
-            def create_table(self, df, group_by):
+            def create_table(self, df, run):
                 ...
 
-            def create_display(self, df):
+            def create_display(self, df, run):
                 ...
+
+    Every create_*() method takes a final `run` argument -- an
+    OperatorRun (operators/run_context.py). Per-run values reach the
+    operator through `run.parameters` (a read-only mapping keyed by the
+    operator's declared descriptor parameter names) and NEVER as
+    attributes on `self`: operator instances are singletons, so a value
+    stored on `self` would be shared by two concurrent runs.
     """
 
     name: str = "unnamed"
@@ -226,6 +233,7 @@ class BaseOperator:
         row_id: str,
         image: np.ndarray | None,
         metadata: dict,
+        run,
     ) -> dict:
         """
         Processes one row and returns new column values for that row.
@@ -244,6 +252,18 @@ class BaseOperator:
                       None if requires_image is False.
             metadata: Dict of all existing column values for this row.
                       Read-only — do not modify this dict.
+            run:      The OperatorRun for this run (operators/run_context.py).
+                      Read per-run values from run.parameters (a read-only
+                      mapping keyed by this operator's declared descriptor
+                      parameter names). Never store or read parameters on
+                      self -- operator instances are shared between runs.
+                      run also carries run.data (frozen input snapshots),
+                      run.paths (project directories) and run.cancelled()
+                      (checked between units of work); those are dormant
+                      for a per-row operator today. A run.data table holds
+                      only the rows this run was selected to process, not
+                      the whole stored table -- its name and version just
+                      identify where those rows came from.
 
         Returns:
             A dict mapping column names to new values.
@@ -264,7 +284,7 @@ class BaseOperator:
     def create_table(
         self,
         df: pd.DataFrame,
-        group_by: str | list[str] | None = None,
+        run,
     ) -> pd.DataFrame:
         """
         Processes a DataFrame and returns a new DataFrame representing
@@ -272,15 +292,17 @@ class BaseOperator:
         named table in Dataset.
 
         Called by OperatorRegistry in a background thread with the
-        currently active table as df. The researcher specifies group_by
-        via the parameter dialog.
+        currently active table as df.
 
         Args:
-            df:       The active table as a DataFrame. Read-only —
-                      work on a copy: df = df.copy()
-            group_by: Column name or list of column names to group by,
-                      as chosen by the researcher in the parameter
-                      dialog. None if no grouping is needed.
+            df:   The active table as a DataFrame. Read-only —
+                  work on a copy: df = df.copy()
+            run:  The OperatorRun for this run (operators/run_context.py).
+                  Read every per-run value from run.parameters (a
+                  read-only mapping keyed by this operator's declared
+                  descriptor parameter names) -- e.g. a group-by column
+                  the researcher chose in the dialog. Never read
+                  parameters off self.
 
         Returns:
             A new DataFrame. Must not contain a row_id column —
@@ -306,6 +328,7 @@ class BaseOperator:
     def create_display(
         self,
         df: pd.DataFrame,
+        run,
     ) -> dict:
         """
         Processes a DataFrame and returns a result dict to display
@@ -316,8 +339,13 @@ class BaseOperator:
         scope dialog.
 
         Args:
-            df: The selected rows as a DataFrame. Read-only.
-                May be a single row (one-row DataFrame) or many rows.
+            df:  The selected rows as a DataFrame. Read-only.
+                 May be a single row (one-row DataFrame) or many rows.
+            run: The OperatorRun for this run (operators/run_context.py).
+                 Read every per-run value from run.parameters (a
+                 read-only mapping keyed by this operator's declared
+                 descriptor parameter names). Never read parameters off
+                 self.
 
         Returns:
             A dict describing the result. Common keys:
@@ -341,17 +369,19 @@ class BaseOperator:
         Returns a QDialog for collecting operator-specific parameters,
         or None if this operator needs no parameters.
 
-        If this method returns a dialog, MainWindow will show it after
-        the researcher chooses the run scope, before the operator starts.
-        The dialog should store chosen parameters as instance attributes
-        on self so that create_columns(), create_table(), and
-        create_display() can read them.
+        If this method returns a dialog, MainWindow shows it after the
+        researcher chooses the run scope, before the operator starts.
+        The dialog MUST expose a ``parameter_values() -> dict`` method
+        that returns the chosen values keyed by this operator's declared
+        descriptor parameter names. MainWindow calls it after the dialog
+        is accepted and passes the dict to the controller, which builds
+        the run's OperatorRunSpec from it. The dialog must NOT store
+        anything on the operator instance: instances are shared between
+        runs, so a value on ``self`` would be clobbered by a second
+        concurrent run -- exactly the failure P1.12d-2a removes.
 
-        For create_table() operators, this dialog should ask which
-        column to group by and what to name the new table.
-
-        For plot operators, this dialog should ask which columns to
-        plot, what kind of plot, and whether to group by a column.
+        A dialog returned without a ``parameter_values`` method is a bug:
+        MainWindow raises rather than silently running with no parameters.
 
         Args:
             parent:  The parent widget for the dialog.
@@ -362,7 +392,7 @@ class BaseOperator:
                      None when called outside MainWindow (e.g. tests).
 
         Returns:
-            A QDialog instance, or None.
+            A QDialog instance exposing parameter_values(), or None.
 
         Example (in a subclass):
             def get_parameters_dialog(self, parent=None, columns=None):
@@ -374,19 +404,20 @@ class BaseOperator:
                 dialog.setWindowTitle("Parameters")
                 layout = QVBoxLayout(dialog)
                 layout.addWidget(QLabel("Group by:"))
-                self._group_combo = QComboBox()
-                self._group_combo.addItems(columns or [])
-                layout.addWidget(self._group_combo)
+                group_combo = QComboBox()
+                group_combo.addItems(columns or [])
+                layout.addWidget(group_combo)
                 btn = QPushButton("OK")
                 btn.clicked.connect(dialog.accept)
                 layout.addWidget(btn)
-                # Store the chosen value so create_table() can read it.
-                dialog.accepted.connect(
-                    lambda: setattr(
-                        self, '_group_by',
-                        self._group_combo.currentText()
-                    )
-                )
+                # Hand the chosen values back by NAME through
+                # parameter_values(). Every key must be a parameter this
+                # operator's descriptor declares. Nothing is stored on self.
+                chosen = {}
+                def _store():
+                    chosen["group_by"] = group_combo.currentText()
+                dialog.accepted.connect(_store)
+                dialog.parameter_values = lambda: dict(chosen)
                 return dialog
         """
         return None

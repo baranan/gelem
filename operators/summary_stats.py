@@ -97,12 +97,18 @@ class SummaryStatsOperator(BaseOperator):
     def create_display(
         self,
         df: pd.DataFrame,
+        run,
     ) -> dict:
         """
         Computes summary statistics for the rows in df.
 
         Args:
-            df: The selected rows as a DataFrame. Treated as read-only.
+            df:  The selected rows as a DataFrame. Treated as read-only.
+            run: The OperatorRun for this run. This operator declares no
+                 parameters, so run.parameters is empty; the column
+                 restriction still comes from self._columns (a
+                 construction-time default). The argument is here for the
+                 uniform operator contract.
 
         Returns:
             Dict with keys:

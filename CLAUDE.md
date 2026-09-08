@@ -275,11 +275,13 @@ state. This rule carries no violation list of its own -- it points at the three
   sites are on the closed allowlist in `tests/test_ui_private_access.py`, which
   fails on any other foreign private read under `ui/`.
   *(Re-verified 27 Aug 2026, P0.4.)*
-- **`[MIGRATING]`** No widget reads another component's private state. Known
-  violation, the last site: `ui/main_window.py:448` reads `operator._group_by`
-  back off the operator instance, where `base.py:331-334` stores it with
-  `setattr`. P1.12 removes it when parameters stop being stored on the operator
-  instance. *(Re-verified 27 Aug 2026, P0.4.)*
+- **`[MIGRATING]`** No widget reads another component's private state. The
+  last listed site -- `ui/main_window.py` reading `operator._group_by` back
+  off the operator instance -- was removed by P1.12d-2a: every per-run value
+  now travels in the parameters dict and nothing is read off the operator.
+  No violation sites remain. Guarded by `tests/test_ui_private_access.py`,
+  which fails on any foreign private read under `ui/`.
+  *(Re-verified 8 Sep 2026, P1.12d-2a follow-up.)*
 - **`[NOW]`** Renderers may import PIL and cv2 -- they are not UI files. Renderers
   never import from `ui/`.
 - **`[NOW]`** Shared display components go in `shared_widgets/`, not inside `ui/`.

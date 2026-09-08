@@ -37,6 +37,35 @@ if not MODEL_PATH.exists():
     )
 
 from operators.blendshapes import BlendshapeOperator, BLENDSHAPE_NAMES
+from operators.descriptor import ExecutionMode
+from operators.run_context import (
+    CancellationToken,
+    OperatorRun,
+    OperatorRunSpec,
+    RunData,
+)
+
+
+def _run(op):
+    """A minimal OperatorRun for a direct create_columns() call, built
+    from the operator's OWN descriptor so it goes through the same
+    OperatorRunSpec validation a real run does (P1.12d-2a). BlendshapeOperator
+    declares no parameters, so parameters is empty."""
+    mode_descriptor = op.descriptor.mode_for(ExecutionMode.COLUMNS)
+    spec = OperatorRunSpec(
+        operation_id="test-run",
+        operator_name=op.name,
+        mode=ExecutionMode.COLUMNS,
+        mode_descriptor=mode_descriptor,
+        parameters={},
+        target_table="frames",
+    )
+    return OperatorRun(
+        spec=spec,
+        data=RunData(tables={}, projects={}),
+        paths=None,
+        _token=CancellationToken(),
+    )
 
 
 def test_face_image_returns_scores():
@@ -45,7 +74,7 @@ def test_face_image_returns_scores():
     image = op.load_image(image_path)
     assert image is not None, f"could not load {image_path}"
 
-    scores = op.create_columns("test_face", image, {})
+    scores = op.create_columns("test_face", image, {}, _run(op))
 
     assert set(scores.keys()) == set(BLENDSHAPE_NAMES), \
         "result keys do not match BLENDSHAPE_NAMES"
@@ -70,7 +99,7 @@ def test_no_face_image_returns_all_none():
     op = BlendshapeOperator()
     blank = np.zeros((480, 640, 3), dtype=np.uint8)
 
-    scores = op.create_columns("test_blank", blank, {})
+    scores = op.create_columns("test_blank", blank, {}, _run(op))
 
     assert set(scores.keys()) == set(BLENDSHAPE_NAMES), \
         "result keys do not match BLENDSHAPE_NAMES"

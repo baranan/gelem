@@ -384,16 +384,23 @@ class MainWindow(QMainWindow):
     def _show_scope_and_params_dialog(
         self,
         operator_name: str,
-    ) -> list[str] | None:
+    ) -> tuple[list[str], dict] | None:
         """
         Shows the scope dialog and then the operator's parameter dialog.
-        Returns the chosen row_ids, or None if the researcher cancelled.
+        Returns (row_ids, parameters), or None if the researcher
+        cancelled.
+
+        parameters is the dict the operator's parameter dialog returns
+        from parameter_values() -- keyed by the operator's declared
+        descriptor parameter names -- or {} if the operator has no dialog.
+        The controller validates it against the descriptor and refuses the
+        run on a mismatch, so MainWindow does not check it here.
 
         Args:
             operator_name: Name of the operator being run.
 
         Returns:
-            List of row_ids to run on, or None if cancelled.
+            (row_ids, parameters) to run on, or None if cancelled.
         """
         selected_ids = self._collect_selected_row_ids()
         visible_ids  = self._collect_visible_row_ids()
@@ -415,6 +422,7 @@ class MainWindow(QMainWindow):
             return None
 
         # Step 2: operator parameter dialog (if the operator has one).
+        parameters: dict = {}
         operator = self._controller.get_operator(operator_name)
         if operator is not None:
             df = self._controller._dataset.get_table(
@@ -427,47 +435,72 @@ class MainWindow(QMainWindow):
             if param_dialog is not None:
                 if param_dialog.exec() == 0:
                     return None
+                try:
+                    parameters = self._parameters_from_dialog(
+                        param_dialog, operator_name
+                    )
+                except RuntimeError as e:
+                    # A broken dialog is a developer error, not user input.
+                    # Surface it the same visible way every other run-start
+                    # failure is surfaced and do not start the run -- but
+                    # never fall back to an empty parameter set.
+                    self._on_error(str(e))
+                    return None
 
-        return row_ids
+        return row_ids, parameters
+
+    @staticmethod
+    def _parameters_from_dialog(param_dialog, operator_name: str) -> dict:
+        """The parameter dict an accepted parameter dialog hands back.
+
+        A dialog that does not expose parameter_values() is a bug: running
+        with a silently-empty parameter set is the wrong-number failure
+        P1.12d-2a exists to prevent, so this raises rather than falling
+        back to {}.
+        """
+        if not hasattr(param_dialog, "parameter_values"):
+            raise RuntimeError(
+                f"{operator_name}: get_parameters_dialog() returned a dialog "
+                f"with no parameter_values() method."
+            )
+        return dict(param_dialog.parameter_values())
 
     def _on_run_create_columns(self, operator_name: str) -> None:
         """
         Shows the scope and parameter dialogs, then runs
         create_columns() on the chosen rows.
         """
-        row_ids = self._show_scope_and_params_dialog(operator_name)
-        if row_ids is None:
+        result = self._show_scope_and_params_dialog(operator_name)
+        if result is None:
             return
-        self._controller.run_create_columns(operator_name, row_ids)
+        row_ids, parameters = result
+        self._controller.run_create_columns(operator_name, row_ids, parameters)
 
     def _on_run_create_table(self, operator_name: str) -> None:
         """
         Shows the scope and parameter dialogs, then runs
         create_table() on the chosen rows.
 
-        The group_by parameter is read from the operator instance
-        after the parameter dialog runs — the dialog stores it as
-        operator._group_by.
+        Every per-run value -- a group-by column included -- is in the
+        parameters dict the parameter dialog handed back; there is no
+        separate group_by argument and nothing is read off the operator.
         """
-        row_ids = self._show_scope_and_params_dialog(operator_name)
-        if row_ids is None:
+        result = self._show_scope_and_params_dialog(operator_name)
+        if result is None:
             return
-
-        # Read the group_by parameter set by the parameter dialog.
-        operator = self._controller.get_operator(operator_name)
-        group_by = getattr(operator, "_group_by", None)
-
-        self._controller.run_create_table(operator_name, row_ids, group_by)
+        row_ids, parameters = result
+        self._controller.run_create_table(operator_name, row_ids, parameters)
 
     def _on_run_create_display(self, operator_name: str) -> None:
         """
         Shows the scope and parameter dialogs, then runs
         create_display() on the chosen rows.
         """
-        row_ids = self._show_scope_and_params_dialog(operator_name)
-        if row_ids is None:
+        result = self._show_scope_and_params_dialog(operator_name)
+        if result is None:
             return
-        self._controller.run_create_display(operator_name, row_ids)
+        row_ids, parameters = result
+        self._controller.run_create_display(operator_name, row_ids, parameters)
 
     # ── Signal connections ────────────────────────────────────────────
 

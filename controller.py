@@ -33,6 +33,15 @@ from PySide6.QtCore import QObject, Signal, QTimer
 from models.query_result import QueryResult, ResultLayout, GroupSection
 from models.notifications import RowsUpdated, ThumbnailsReady
 from media.media_address import resolve_source, MediaAddressError
+from operators.descriptor import ExecutionMode, InputKind
+from operators.run_context import (
+    CancellationToken,
+    OperatorRun,
+    OperatorRunError,
+    OperatorRunSpec,
+    RunData,
+    TableSnapshot,
+)
 
 DEFAULT_MEDIA_COLUMN_NAME = "full_path"
 
@@ -92,6 +101,7 @@ class AppController(QObject):
         drain_budget: int = 200,
         *,
         settings_gateway=None,
+        runtime_dirs=None,
     ):
         super().__init__()
 
@@ -100,6 +110,18 @@ class AppController(QObject):
         self._store            = artifact_store
         self._registry         = registry
         self._op_registry      = operator_registry
+
+        # The project directories operator runs may write to
+        # (operators/operator_config.py OperatorRuntimeDirs). Default None
+        # so existing test construction sites need no edit; main.py builds
+        # the real one and passes it in. It is handed to every OperatorRun
+        # as run.paths. Left None, a run still starts and every bundled
+        # operator still works (they write under their own constructor
+        # output_dir, not run.paths) -- but run.paths is then None, so a
+        # future operator that reads run.paths would fail loudly rather
+        # than silently. main.py always passes it, so production is never
+        # in that state.
+        self._runtime_dirs     = runtime_dirs
 
         # The plain-data editing face of the machine-tunable settings
         # (settings/settings_gateway.py). Default None so existing test
@@ -222,6 +244,7 @@ class AppController(QObject):
         label: str,
         table_name: str,
         column_tags: dict[str, str] | None = None,
+        token: CancellationToken | None = None,
     ) -> None:
         """Records a started operator run as live. See _live_runs.
 
@@ -231,6 +254,11 @@ class AppController(QObject):
         run creates is tagged in the table's schema by what the operator
         declared, not by value inference. Empty for create_table /
         create_display runs, which create no per-row columns.
+
+        token is the run's CancellationToken (P1.12d-2a). Nothing cancels
+        yet -- it is kept here because it is the handle P1.12f's Cancel
+        button will call token.cancel() on, and removing a run from
+        _live_runs is already the shape a cancellation takes.
         """
         self._live_runs[operation_id] = {
             "label":       label,
@@ -238,6 +266,7 @@ class AppController(QObject):
             "applied":     0,
             "unplaceable": [],
             "column_tags": dict(column_tags) if column_tags else {},
+            "token":       token,
         }
 
     def _deregister_run(self, operation_id: str) -> None:
@@ -1041,10 +1070,103 @@ class AppController(QObject):
         except Exception as e:
             self.error_occurred.emit(f"Failed to select row: {e}")
 
+    def _build_operator_run(
+        self,
+        operator,
+        mode: ExecutionMode,
+        operation_id: str,
+        table_name: str,
+        parameters: dict,
+        input_frame,
+    ):
+        """Build the OperatorRun for one run, on the main thread, before
+        any worker starts. Returns (run, token).
+
+        The parameters are validated against the operator's descriptor for
+        this mode here: OperatorRunSpec raises OperatorRunError on an
+        undeclared name, a missing required parameter, an out-of-range
+        value or a non-scalar value. The caller catches that and surfaces
+        it through error_occurred without starting the run.
+
+        Raises RuntimeError if the operator carries no descriptor, or no
+        descriptor for this mode. Every real operator has both as of
+        P1.12d-1; an operator that does not is not runnable, and failing
+        here -- rather than falling back to a stale instance value -- is
+        the whole point of P1.12d-2a.
+        """
+        if operator.descriptor is None:
+            raise RuntimeError(
+                f'operator "{operator.name}" has no descriptor and cannot '
+                f"run."
+            )
+        mode_descriptor = operator.descriptor.mode_for(mode)
+        if mode_descriptor is None:
+            raise RuntimeError(
+                f'operator "{operator.name}" descriptor has no '
+                f"{mode.name} mode."
+            )
+
+        # COLUMNS writes new columns into an existing table and needs its
+        # name; TABLE and DISPLAY store nothing into one.
+        target_table = table_name if mode is ExecutionMode.COLUMNS else ""
+
+        spec = OperatorRunSpec(
+            operation_id=operation_id,
+            operator_name=operator.name,
+            mode=mode,
+            mode_descriptor=mode_descriptor,
+            parameters=parameters,
+            target_table=target_table,
+        )
+
+        # One frozen snapshot for the mode's declared ACTIVE_TABLE input,
+        # keyed by the input NAME the descriptor gives it. It wraps the
+        # SAME frame the worker already received -- not a second copy --
+        # plus the table's name and its current write-ticket version.
+        #
+        # Note what that frame is: the rows THIS RUN was selected to
+        # process, not the whole table. An operator author calling
+        # run.data.table("source") gets exactly those selected rows. The
+        # table_name and version do not describe the frame's contents;
+        # they identify the stored table the rows came from, and the
+        # version is what P1.12f compares to detect that the table moved
+        # under the run. Widening a declared input to mean the whole
+        # table -- and the read-set / write-set distinction that lets an
+        # operator ask for more than its selected rows -- is later work.
+        tables: dict = {}
+        active_input = next(
+            (
+                input_spec
+                for input_spec in mode_descriptor.inputs
+                if input_spec.kind is InputKind.ACTIVE_TABLE
+            ),
+            None,
+        )
+        if active_input is not None:
+            tables[active_input.name] = TableSnapshot(
+                table_name=table_name,
+                frame=input_frame,
+                version=self._dataset.table_version(table_name),
+            )
+        run_data = RunData(tables=tables, projects={})
+
+        token = CancellationToken()
+        run = OperatorRun(
+            spec=spec,
+            data=run_data,
+            paths=self._runtime_dirs,
+            _token=token,
+            # The per-row result sink for a COLUMNS run. Wired for the
+            # contract P1.12f consumes; no operator calls run.emit() yet.
+            _emit_fn=self._on_item_complete,
+        )
+        return run, token
+
     def run_create_columns(
         self,
         operator_name: str,
         row_ids: list[str],
+        parameters: dict | None = None,
     ) -> None:
         """
         Runs create_columns() on a list of rows in a background thread.
@@ -1052,7 +1174,12 @@ class AppController(QObject):
         Args:
             operator_name: Name of the operator to run.
             row_ids:       Rows to process.
+            parameters:    The run's parameter values, keyed by the
+                           operator's declared descriptor parameter names
+                           (from the parameter dialog's parameter_values(),
+                           via MainWindow). None means "no parameters".
         """
+        parameters = dict(parameters or {})
         try:
             operator = self._op_registry.get(operator_name)
             if operator is None or operator.create_columns_label is None:
@@ -1088,10 +1215,26 @@ class AppController(QObject):
             table_name   = self._active_table
             # One snapshot of exactly the selected rows, taken once here
             # on the main thread -- not one Dataset.get_row() call (and
-            # one full-table copy) per row.
+            # one full-table copy) per row. The RunData snapshot below
+            # wraps this SAME frame; it is not copied again.
             snapshot = self._dataset.snapshot_rows(table_name, row_ids)
+
+            # Build (and validate) the run before registering it, so a
+            # bad parameter set never leaves a live-run entry behind.
+            try:
+                run, token = self._build_operator_run(
+                    operator, ExecutionMode.COLUMNS, operation_id,
+                    table_name, parameters, snapshot,
+                )
+            except (OperatorRunError, RuntimeError) as e:
+                self.error_occurred.emit(
+                    f'Cannot start "{operator.display_label}": {e}'
+                )
+                return
+
             self._register_run(
-                operation_id, operator.display_label, table_name, column_tags
+                operation_id, operator.display_label, table_name,
+                column_tags, token=token,
             )
             try:
                 started = self._op_registry.run_create_columns(
@@ -1099,6 +1242,7 @@ class AppController(QObject):
                     snapshot,
                     row_ids,
                     table_name,
+                    run=run,
                     operation_id=operation_id,
                     on_item_complete=self._on_item_complete,
                     on_progress=self._on_progress,
@@ -1125,7 +1269,7 @@ class AppController(QObject):
         self,
         operator_name: str,
         row_ids: list[str],
-        group_by: str | list[str] | None = None,
+        parameters: dict | None = None,
     ) -> None:
         """
         Runs create_table() in a background thread.
@@ -1133,8 +1277,12 @@ class AppController(QObject):
         Args:
             operator_name: Name of the operator to run.
             row_ids:       Rows to include in the DataFrame.
-            group_by:      Column or columns to group by.
+            parameters:    The run's parameter values, keyed by the
+                           operator's declared descriptor parameter names.
+                           A group-by column, if the operator declares one,
+                           arrives here -- not as a separate argument.
         """
+        parameters = dict(parameters or {})
         try:
             operator = self._op_registry.get(operator_name)
             if operator is None or operator.create_table_label is None:
@@ -1145,13 +1293,27 @@ class AppController(QObject):
             operation_id = str(uuid.uuid4())
             table_name   = self._active_table
             selected_df  = self._dataset.snapshot_rows(table_name, row_ids)
-            self._register_run(operation_id, operator.display_label, table_name)
+
+            try:
+                run, token = self._build_operator_run(
+                    operator, ExecutionMode.TABLE, operation_id,
+                    table_name, parameters, selected_df,
+                )
+            except (OperatorRunError, RuntimeError) as e:
+                self.error_occurred.emit(
+                    f'Cannot start "{operator.display_label}": {e}'
+                )
+                return
+
+            self._register_run(
+                operation_id, operator.display_label, table_name, token=token
+            )
             try:
                 started = self._op_registry.run_create_table(
                     operator_name,
                     selected_df,
-                    group_by,
                     operation_id=operation_id,
+                    run=run,
                     on_complete=self._on_create_table_complete,
                     on_error=self._on_operator_error,
                 )
@@ -1169,6 +1331,7 @@ class AppController(QObject):
         self,
         operator_name: str,
         row_ids: list[str],
+        parameters: dict | None = None,
     ) -> None:
         """
         Runs create_display() in a background thread.
@@ -1176,7 +1339,10 @@ class AppController(QObject):
         Args:
             operator_name: Name of the operator to run.
             row_ids:       Rows to include in the DataFrame.
+            parameters:    The run's parameter values, keyed by the
+                           operator's declared descriptor parameter names.
         """
+        parameters = dict(parameters or {})
         try:
             operator = self._op_registry.get(operator_name)
             if operator is None or operator.create_display_label is None:
@@ -1187,12 +1353,27 @@ class AppController(QObject):
             operation_id = str(uuid.uuid4())
             table_name   = self._active_table
             selected_df  = self._dataset.snapshot_rows(table_name, row_ids)
-            self._register_run(operation_id, operator.display_label, table_name)
+
+            try:
+                run, token = self._build_operator_run(
+                    operator, ExecutionMode.DISPLAY, operation_id,
+                    table_name, parameters, selected_df,
+                )
+            except (OperatorRunError, RuntimeError) as e:
+                self.error_occurred.emit(
+                    f'Cannot start "{operator.display_label}": {e}'
+                )
+                return
+
+            self._register_run(
+                operation_id, operator.display_label, table_name, token=token
+            )
             try:
                 started = self._op_registry.run_create_display(
                     operator_name,
                     selected_df,
                     operation_id=operation_id,
+                    run=run,
                     on_complete=self._on_create_display_complete,
                     on_error=self._on_operator_error,
                 )

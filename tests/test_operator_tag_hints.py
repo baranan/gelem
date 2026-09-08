@@ -36,9 +36,50 @@ from artifacts.artifact_store import ArtifactStore
 from column_types.registry import ColumnTypeRegistry
 from operators.operator_registry import OperatorRegistry
 from operators.base import BaseOperator
+from operators.descriptor import (
+    ExecutionMode,
+    InputKind,
+    InputSpec,
+    ModeDescriptor,
+    OperatorDescriptor,
+    OutputColumn,
+    OutputSpec,
+)
 from controller import AppController
 
 TEST_IMAGES = project_root / "test_images"
+
+
+def _columns_descriptor(name, label, output_columns):
+    """A minimal COLUMNS-mode descriptor for a test double (P1.12d-2a:
+    every operator the controller runs carries one). output_columns is a
+    list of (column_name, type_tag) pairs, matching the double's
+    output_columns attribute."""
+    return OperatorDescriptor(
+        name=name,
+        version="1.0",
+        description=f"Test double: {label}.",
+        modes=(
+            ModeDescriptor(
+                mode=ExecutionMode.COLUMNS,
+                label=label,
+                inputs=(
+                    InputSpec(
+                        name="active_table",
+                        label="Active table",
+                        kind=InputKind.ACTIVE_TABLE,
+                    ),
+                ),
+                parameters=(),
+                output=OutputSpec(
+                    columns=tuple(
+                        OutputColumn(name=col_name, type_tag=col_tag)
+                        for col_name, col_tag in output_columns
+                    )
+                ),
+            ),
+        ),
+    )
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -104,8 +145,11 @@ class _FlagDeclaringOperator(BaseOperator):
     create_columns_label = "Flag declaring"
     output_columns = [("mood_flag", "boolean_flag")]
     requires_image = False
+    descriptor = _columns_descriptor(
+        "flag_declaring", "Flag declaring", [("mood_flag", "boolean_flag")]
+    )
 
-    def create_columns(self, row_id, image, metadata):
+    def create_columns(self, row_id, image, metadata, run):
         return {"mood_flag": 1}
 
 
@@ -145,8 +189,11 @@ class _UnknownTagOperator(BaseOperator):
     create_columns_label = "Unknown tag"
     output_columns = [("odd_col", "no_such_tag_anywhere")]
     requires_image = False
+    descriptor = _columns_descriptor(
+        "unknown_tag_op", "Unknown tag", [("odd_col", "no_such_tag_anywhere")]
+    )
 
-    def create_columns(self, row_id, image, metadata):
+    def create_columns(self, row_id, image, metadata, run):
         return {"odd_col": "some text"}
 
 
@@ -210,8 +257,11 @@ def test_media_path_declaring_operator_tags_schema_and_warns_nothing(
         create_columns_label = "Chart"
         output_columns = [("chart_path", "media_path")]
         requires_image = False
+        descriptor = _columns_descriptor(
+            "chart_op", "Chart", [("chart_path", "media_path")]
+        )
 
-        def create_columns(self, row_id, image, metadata):
+        def create_columns(self, row_id, image, metadata, run):
             from PIL import Image
             path = out_dir / f"{row_id}_chart.png"
             Image.new("RGB", (16, 16), color=(10, 20, 30)).save(path, "PNG")

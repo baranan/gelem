@@ -137,16 +137,17 @@ class PlotOperator(BaseOperator):
 
     def get_parameters_dialog(self, parent=None, columns=None):
         """
-        Shows a dialog asking the researcher which columns to plot.
-        Stores the chosen columns in self._columns so create_columns()
-        can read them.
+        Would show a dialog asking the researcher which columns to plot.
 
         TODO (Student C): Implement this dialog. It should show a
         list of all numeric columns in the current table and let the
-        researcher select which ones to include in the plot.
+        researcher select which ones to include in the plot, and hand
+        them back through parameter_values() keyed by a "columns"
+        parameter this operator's descriptor would then declare.
         Use the `columns` argument supplied by MainWindow.
 
-        For now returns None (no dialog, uses default columns).
+        For now returns None (no dialog): the column list is a fixed
+        construction-time default (self._columns), not yet a parameter.
         """
         return None
 
@@ -155,6 +156,7 @@ class PlotOperator(BaseOperator):
         row_id: str,
         image: np.ndarray | None,
         metadata: dict,
+        run,
     ) -> dict:
         """
         Generates a bar chart for one row showing the values of
@@ -164,6 +166,11 @@ class PlotOperator(BaseOperator):
             row_id:   The row being processed.
             image:    Not used (requires_image = False).
             metadata: Contains column values for this row.
+            run:      The OperatorRun for this run. This operator declares
+                      no parameters yet, so run.parameters is empty and
+                      the column list still comes from self._columns (a
+                      construction-time default); the argument is here for
+                      the uniform operator contract.
 
         Returns:
             Dict with 'plot_path' pointing to the saved PNG.

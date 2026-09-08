@@ -55,19 +55,22 @@ class OperatorRegistry:
         registry.register(BlendshapeOperator())
 
         # Run create_columns on a list of rows. snapshot holds exactly
-        # these rows, in this order -- AppController builds it with one
-        # Dataset.snapshot_rows() call before calling this method.
+        # these rows, in this order -- AppController builds it, and the
+        # OperatorRun (run), with one Dataset.snapshot_rows() call before
+        # calling this method.
         registry.run_create_columns(
-            "blendshapes", snapshot, row_ids, table_name,
+            "blendshapes", snapshot, row_ids, table_name, run,
             on_item_complete=callback,
             on_progress=progress_callback,
             on_complete=done_callback,
         )
 
-        # Run create_table on the active DataFrame:
+        # Run create_table on the active DataFrame. Any group-by column is
+        # in run.parameters, not a separate argument:
         registry.run_create_table(
-            "mean_face", df, group_by="condition",
+            "mean_face", df,
             operation_id=operation_id,
+            run=run,
             on_complete=done_callback,
         )
 
@@ -75,8 +78,14 @@ class OperatorRegistry:
         registry.run_create_display(
             "summary_stats", df,
             operation_id=operation_id,
+            run=run,
             on_complete=done_callback,
         )
+
+    Every mode is handed one OperatorRun (operators/run_context.py),
+    which the registry passes straight through as the final argument to
+    the operator's execution method. Per-run parameter values live in
+    run.parameters; the registry does not read them.
     """
 
     def __init__(self):
@@ -164,6 +173,7 @@ class OperatorRegistry:
         snapshot: pd.DataFrame,
         row_ids: list[str],
         table_name: str,
+        run,
         operation_id: str = "",
         on_item_complete=None,
         on_progress=None,
@@ -196,6 +206,11 @@ class OperatorRegistry:
                            in the same order. Read-only.
             row_ids:       Ordered row_ids matching snapshot's rows.
             table_name:    Table the rows belong to.
+            run:           The OperatorRun for this run
+                           (operators/run_context.py), built and validated
+                           by AppController. Passed straight through as the
+                           final argument to operator.create_columns();
+                           the registry does not read run.parameters.
             operation_id:  Unique ID for this run. Travels through every
                            callback below so AppController can reject a
                            result from a run that is no longer live.
@@ -267,7 +282,7 @@ class OperatorRegistry:
         thread = threading.Thread(
             target=self._run_create_columns_worker,
             args=(
-                operator, snapshot, row_ids, table_name, operation_id,
+                operator, snapshot, row_ids, table_name, run, operation_id,
                 on_item_complete, on_progress, on_complete,
                 on_setup_error, on_row_errors,
             ),
@@ -282,6 +297,7 @@ class OperatorRegistry:
         snapshot: pd.DataFrame,
         row_ids: list[str],
         table_name: str,
+        run,
         operation_id: str,
         on_item_complete,
         on_progress,
@@ -320,7 +336,7 @@ class OperatorRegistry:
                 else:
                     image = None
 
-                result = operator.create_columns(row_id, image, metadata)
+                result = operator.create_columns(row_id, image, metadata, run)
 
                 if on_item_complete is not None:
                     on_item_complete(operation_id, table_name, row_id, result)
@@ -374,26 +390,30 @@ class OperatorRegistry:
         self,
         operator_name: str,
         df: pd.DataFrame,
-        group_by: str | list[str] | None,
         operation_id: str,
+        run,
         on_complete=None,
         on_error=None,
     ) -> bool:
         """
         Runs create_table() in a background thread.
 
-        The operator receives the full DataFrame and returns a new
-        DataFrame. AppController stores it as a new named table via
-        Dataset.create_table_from_df().
+        The operator receives the full DataFrame and the OperatorRun and
+        returns a new DataFrame. AppController stores it as a new named
+        table via Dataset.create_table_from_df().
 
         Args:
             operator_name: Name of the operator to run.
             df:            The active table as a DataFrame.
-            group_by:      Column or columns to group by, as chosen
-                           by the researcher in the parameter dialog.
             operation_id:  Unique ID for this run, echoed back through
                            on_complete / on_error so AppController can
                            reject a result whose run is no longer live.
+            run:           The OperatorRun for this run
+                           (operators/run_context.py). Passed straight
+                           through as the final argument to
+                           operator.create_table(). A group-by column, if
+                           the operator declares one, is in run.parameters
+                           -- there is no separate group_by argument.
             on_complete:   Called when done.
                            Signature: (operation_id: str,
                                        operator_name: str,
@@ -421,7 +441,7 @@ class OperatorRegistry:
 
         thread = threading.Thread(
             target=self._run_create_table_worker,
-            args=(operator, df, group_by, operation_id, on_complete, on_error),
+            args=(operator, df, operation_id, run, on_complete, on_error),
             daemon=True,
         )
         thread.start()
@@ -431,14 +451,14 @@ class OperatorRegistry:
         self,
         operator: BaseOperator,
         df: pd.DataFrame,
-        group_by,
         operation_id,
+        run,
         on_complete,
         on_error,
     ) -> None:
         """Worker that runs create_table() in the background thread."""
         try:
-            result_df = operator.create_table(df, group_by)
+            result_df = operator.create_table(df, run)
             if on_complete is not None:
                 on_complete(operation_id, operator.name, result_df)
         except NotImplementedError:
@@ -470,15 +490,16 @@ class OperatorRegistry:
         operator_name: str,
         df: pd.DataFrame,
         operation_id: str,
+        run,
         on_complete=None,
         on_error=None,
     ) -> bool:
         """
         Runs create_display() in a background thread.
 
-        The operator receives the selected rows as a DataFrame and
-        returns a result dict. AppController passes this to
-        ResultsPanel for display.
+        The operator receives the selected rows as a DataFrame and the
+        OperatorRun and returns a result dict. AppController passes this
+        to ResultsPanel for display.
 
         Args:
             operator_name: Name of the operator to run.
@@ -486,6 +507,10 @@ class OperatorRegistry:
             operation_id:  Unique ID for this run, echoed back through
                            on_complete / on_error so AppController can
                            reject a result whose run is no longer live.
+            run:           The OperatorRun for this run
+                           (operators/run_context.py). Passed straight
+                           through as the final argument to
+                           operator.create_display().
             on_complete:   Called when done.
                            Signature: (operation_id: str,
                                        operator_name: str,
@@ -512,7 +537,7 @@ class OperatorRegistry:
 
         thread = threading.Thread(
             target=self._run_create_display_worker,
-            args=(operator, df, operation_id, on_complete, on_error),
+            args=(operator, df, operation_id, run, on_complete, on_error),
             daemon=True,
         )
         thread.start()
@@ -523,12 +548,13 @@ class OperatorRegistry:
         operator: BaseOperator,
         df: pd.DataFrame,
         operation_id,
+        run,
         on_complete,
         on_error,
     ) -> None:
         """Worker that runs create_display() in the background thread."""
         try:
-            result = operator.create_display(df)
+            result = operator.create_display(df, run)
             if on_complete is not None:
                 on_complete(operation_id, operator.name, result)
         except NotImplementedError:

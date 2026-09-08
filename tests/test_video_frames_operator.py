@@ -33,6 +33,37 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from operators.video_frames import VideoFramesOperator
+from operators.descriptor import ExecutionMode
+from operators.run_context import (
+    CancellationToken,
+    OperatorRun,
+    OperatorRunSpec,
+    RunData,
+)
+
+
+def _run(op, *, video_column, frame_step):
+    """A minimal OperatorRun for a direct create_table() call. The
+    parameters are built from and validated against the operator's OWN
+    descriptor (P1.12d-2a) -- so this also proves video_column / frame_step
+    reach the operator through run.parameters, which is the behaviour this
+    item introduces. Replaces the old `op._video_column = ...` /
+    `op._frame_step = ...` instance-attribute setup."""
+    mode_descriptor = op.descriptor.mode_for(ExecutionMode.TABLE)
+    spec = OperatorRunSpec(
+        operation_id="test-run",
+        operator_name=op.name,
+        mode=ExecutionMode.TABLE,
+        mode_descriptor=mode_descriptor,
+        parameters={"video_column": video_column, "frame_step": frame_step},
+        target_table="",
+    )
+    return OperatorRun(
+        spec=spec,
+        data=RunData(tables={}, projects={}),
+        paths=None,
+        _token=CancellationToken(),
+    )
 
 
 def _write_test_video(path: Path, n_frames: int, color_seed: int) -> None:
@@ -72,10 +103,10 @@ def test_step_1_keeps_every_frame():
         td = Path(td)
         df = _make_df(td)
         op = VideoFramesOperator(output_dir=td / "out")
-        op._video_column = "full_path"
-        op._frame_step = 1
 
-        result = op.create_table(df)
+        result = op.create_table(
+            df, _run(op, video_column="full_path", frame_step=1)
+        )
 
         assert len(result) == 12 + 8, \
             f"expected 20 frame rows, got {len(result)}"
@@ -104,10 +135,10 @@ def test_step_n_downsamples():
         td = Path(td)
         df = _make_df(td)
         op = VideoFramesOperator(output_dir=td / "out")
-        op._video_column = "full_path"
-        op._frame_step = 4
 
-        result = op.create_table(df)
+        result = op.create_table(
+            df, _run(op, video_column="full_path", frame_step=4)
+        )
 
         v1_rows = result[result["video_file"] == "participant_01.mp4"]
         v2_rows = result[result["video_file"] == "participant_02.mp4"]
@@ -120,10 +151,10 @@ def test_frames_from_different_videos_do_not_collide():
         td = Path(td)
         df = _make_df(td)
         op = VideoFramesOperator(output_dir=td / "out")
-        op._video_column = "full_path"
-        op._frame_step = 1
 
-        result = op.create_table(df)
+        result = op.create_table(
+            df, _run(op, video_column="full_path", frame_step=1)
+        )
         paths = result["full_path"].tolist()
         assert len(paths) == len(set(paths)), \
             "frame paths must be unique across videos"
@@ -135,9 +166,9 @@ def test_input_dataframe_not_mutated():
         df = _make_df(td)
         snapshot = df.copy()
         op = VideoFramesOperator(output_dir=td / "out")
-        op._video_column = "full_path"
-        op._frame_step = 1
-        op.create_table(df)
+        op.create_table(
+            df, _run(op, video_column="full_path", frame_step=1)
+        )
         pd.testing.assert_frame_equal(df, snapshot)
 
 
@@ -146,9 +177,9 @@ def test_missing_column_returns_empty():
         td = Path(td)
         df = _make_df(td)
         op = VideoFramesOperator(output_dir=td / "out")
-        op._video_column = "does_not_exist"
-        op._frame_step = 1
-        result = op.create_table(df)
+        result = op.create_table(
+            df, _run(op, video_column="does_not_exist", frame_step=1)
+        )
         assert len(result) == 0
 
 
@@ -173,10 +204,10 @@ def test_non_video_extensions_are_skipped():
         )
 
         op = VideoFramesOperator(output_dir=td / "out")
-        op._video_column = "full_path"
-        op._frame_step = 1
 
-        result = op.create_table(df)
+        result = op.create_table(
+            df, _run(op, video_column="full_path", frame_step=1)
+        )
 
         assert "P03" not in set(result["participant_id"]), \
             "rows with non-video paths must be skipped"
@@ -197,11 +228,11 @@ def test_zero_videos_raises():
         }])
 
         op = VideoFramesOperator(output_dir=td / "out")
-        op._video_column = "full_path"
-        op._frame_step = 1
 
         try:
-            op.create_table(df)
+            op.create_table(
+                df, _run(op, video_column="full_path", frame_step=1)
+            )
         except ValueError as e:
             msg = str(e)
             assert "only supports videos" in msg

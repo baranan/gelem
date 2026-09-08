@@ -70,15 +70,13 @@ class PlotAdvancedOperator(BaseOperator):
     # Descriptor (P1.12d-1). What create_display() ACTUALLY does today:
     #  - one DISPLAY mode, over the active table's selected rows,
     #    storing nothing;
-    #  - SEVEN parameters, all genuinely read by create_display() via
-    #    the instance attributes get_parameters_dialog() stores:
-    #      title       -> self._title      (line ~267 / used line ~353)
-    #      chart_type  -> self._chart_type (used line ~293)
-    #      x, y        -> self._x, self._y (used lines ~288-289)
-    #      color, facet-> self._color, self._facet (optional; ~290-291)
-    #      aggregate   -> self._aggregate  (used line ~293)
+    #  - SEVEN parameters -- title, chart_type, x, y, color, facet,
+    #    aggregate -- all genuinely read by create_display(). As of
+    #    P1.12d-2a they arrive in run.parameters (the dialog returns them
+    #    from parameter_values(), the run spec validates them against this
+    #    descriptor), never off the operator instance.
     #    The dialog is a real QDialog (not None), so these ARE the
-    #    operator's parameters today.
+    #    operator's parameters.
     #  - media_requirement METADATA: works purely from the DataFrame;
     #  - deterministic FALSE / cacheable FALSE: the returned artifact_path
     #    and html_path embed a wall-clock timestamp --
@@ -169,29 +167,31 @@ class PlotAdvancedOperator(BaseOperator):
         # directory (same pattern as VideoFramesOperator). main.py can
         # pass an explicit output_dir once Dataset.save()/load() define
         # a real project folder.
+        #
+        # output_dir is a genuine construction-time value and stays here.
+        # The seven run parameters (title, chart_type, x, y, color, facet,
+        # aggregate) used to be stored on self by get_parameters_dialog;
+        # as of P1.12d-2a they travel in run.parameters and nothing about
+        # them lives on the instance -- two concurrent runs must not share
+        # one set of values.
         self._output_dir = output_dir or (
             Path.cwd() / "gelem_project" / "plots"
         )
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
-        self._chart_type: str        = "scatter"
-        self._x:          str | None = None
-        self._y:          str | None = None
-        self._color:      str | None = None
-        self._facet:      str | None = None
-        self._aggregate:  str        = "none"
-        self._title:      str | None = None  # None -> auto ("{y} by {x}")
-
     def get_parameters_dialog(self, parent=None, columns=None):
-        """Show a dialog and store the researcher's choices as instance attributes.
+        """Show a dialog and hand the researcher's choices back through
+        parameter_values(). It stores NOTHING on the operator instance.
 
-        Collect:
-            self._chart_type  -- one of: scatter | line | bar | box | violin | histogram
-            self._x           -- column name for the horizontal axis
-            self._y           -- column name for the vertical axis
-            self._color       -- (optional) column to colour marks by group; None if not chosen
-            self._facet       -- (optional) column to split into a grid of small plots; None if not chosen
-            self._aggregate   -- one of: none | count | sum | mean | median
+        parameter_values() returns a dict keyed by the descriptor's
+        parameter names:
+            chart_type  -- one of: scatter | line | bar | box | violin | histogram
+            x           -- column name for the horizontal axis
+            y           -- column name for the vertical axis
+            color       -- (optional) column to colour marks by group; None if not chosen
+            facet       -- (optional) column to split into a grid of small plots; None if not chosen
+            aggregate   -- one of: none | count | sum | mean | median
+            title       -- free text; "" means "use the auto title {y} by {x}"
 
         Notes for the dialog:
         - Populate the x/y/color/facet dropdowns from the `columns` argument
@@ -237,15 +237,13 @@ class PlotAdvancedOperator(BaseOperator):
         # Plot title -- free text. Leave blank for the auto title
         # "{y} by {x}" computed in create_display().
         title_edit = QLineEdit()
-        if self._title:
-            title_edit.setText(self._title)
         title_edit.setPlaceholderText("Auto: \"{y} by {x}\"")
         _add_row("Title:", title_edit)
 
-        # Chart-type dropdown.
+        # Chart-type dropdown. Starts at the descriptor's default ("scatter").
         chart_combo = QComboBox()
         chart_combo.addItems(CHART_TYPES)
-        chart_combo.setCurrentText(self._chart_type)
+        chart_combo.setCurrentText("scatter")
         _add_row("Chart type:", chart_combo)
 
         # Column dropdowns for x/y/color/facet. Colour and facet accept
@@ -261,10 +259,10 @@ class PlotAdvancedOperator(BaseOperator):
                 cb.setCurrentText("(none)")
             return cb
 
-        x_combo     = _make_col_combo(self._x)
-        y_combo     = _make_col_combo(self._y)
-        color_combo = _make_col_combo(self._color, allow_none=True)
-        facet_combo = _make_col_combo(self._facet, allow_none=True)
+        x_combo     = _make_col_combo(None)
+        y_combo     = _make_col_combo(None)
+        color_combo = _make_col_combo(None, allow_none=True)
+        facet_combo = _make_col_combo(None, allow_none=True)
         _add_row("X axis:",            x_combo)
         _add_row("Y axis:",            y_combo)
         _add_row("Colour (optional):", color_combo)
@@ -274,7 +272,7 @@ class PlotAdvancedOperator(BaseOperator):
         # the chart type (see _apply_chart_rules below).
         agg_combo = QComboBox()
         agg_combo.addItems(AGGREGATES)
-        agg_combo.setCurrentText(self._aggregate)
+        agg_combo.setCurrentText("none")
         _add_row("Aggregate:", agg_combo)
 
         # One label reused for both warnings (bar+none and histogram+count
@@ -366,21 +364,35 @@ class PlotAdvancedOperator(BaseOperator):
         y_combo.currentTextChanged.connect(lambda _: _refresh_ok_enabled())
         _refresh_ok_enabled()
 
+        # The dialog hands its answers back through parameter_values(),
+        # keyed by the descriptor's parameter names. It stores nothing on
+        # the operator instance -- two concurrent runs must not share one
+        # set of values. x and y are always real column names here (the OK
+        # button stays disabled until both are chosen); color and facet
+        # are None when left as "(none)".
+        chosen: dict = {}
+
         def _store():
-            self._chart_type = chart_combo.currentText()
-            self._x          = x_combo.currentText() or None
-            self._y          = y_combo.currentText() or None
-            color            = color_combo.currentText()
-            self._color      = None if color in ("", "(none)") else color
-            facet            = facet_combo.currentText()
-            self._facet      = None if facet in ("", "(none)") else facet
-            self._aggregate  = agg_combo.currentText()
-            self._title      = title_edit.text().strip() or None
+            color = color_combo.currentText()
+            facet = facet_combo.currentText()
+            chosen.clear()
+            chosen.update(
+                {
+                    "title":      title_edit.text().strip(),
+                    "chart_type": chart_combo.currentText(),
+                    "x":          x_combo.currentText(),
+                    "y":          y_combo.currentText(),
+                    "color":      None if color in ("", "(none)") else color,
+                    "facet":      None if facet in ("", "(none)") else facet,
+                    "aggregate":  agg_combo.currentText(),
+                }
+            )
 
         dialog.accepted.connect(_store)
+        dialog.parameter_values = lambda: dict(chosen)
         return dialog
 
-    def create_display(self, df):
+    def create_display(self, df, run):
         """Build one interactive Plotly figure for the selected rows.
 
         Parameters
@@ -388,6 +400,10 @@ class PlotAdvancedOperator(BaseOperator):
         df : pd.DataFrame
             The selected rows, passed in by AppController.
             Do not modify it -- work on a copy.
+        run : OperatorRun
+            The run object. Every parameter is read from run.parameters
+            (validated against this operator's descriptor before the run
+            started); nothing is read off self.
 
         Returns
         -------
@@ -396,12 +412,13 @@ class PlotAdvancedOperator(BaseOperator):
         """
         data = df.copy()  # never modify the DataFrame received from AppController
 
-        x         = self._x
-        y         = self._y
-        color     = self._color or None   # None is fine -- px ignores it
-        facet     = self._facet or None   # None is fine -- px ignores it
-        chart     = self._chart_type
-        aggregate = self._aggregate
+        params    = run.parameters
+        x         = params["x"]
+        y         = params["y"]
+        color     = params.get("color") or None   # None is fine -- px ignores it
+        facet     = params.get("facet") or None   # None is fine -- px ignores it
+        chart     = params["chart_type"]
+        aggregate = params.get("aggregate", "none")
 
         # ------------------------------------------------------------------
         # Step 1: decide whether to summarise the data before plotting
@@ -461,7 +478,7 @@ class PlotAdvancedOperator(BaseOperator):
 
         # Title: researcher's text if provided, otherwise "{y} by {x}".
         # x=0.5 + xanchor="center" centres the title above the plot area.
-        title = self._title or f"{y} by {x}"
+        title = params.get("title") or f"{y} by {x}"
         fig.update_layout(title=dict(text=title, x=0.5, xanchor="center"))
 
         # ------------------------------------------------------------------

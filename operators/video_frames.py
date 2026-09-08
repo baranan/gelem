@@ -13,9 +13,10 @@ overwritten to point at the saved frame JPEG, and two new columns are
 added: frame_number (0-indexed within the video) and video_file
 (the source video's filename).
 
-The researcher chooses two parameters via the dialog:
-    self._video_column  -- which column holds the video path
-    self._frame_step    -- keep every Nth frame (1 keeps everything)
+The researcher chooses two parameters via the dialog; both travel in
+run.parameters, never on the operator instance:
+    video_column  -- which column holds the video path
+    frame_step    -- keep every Nth frame (1 keeps everything)
 
 Frame JPEGs are saved under self._output_dir, one fresh subfolder per
 create_table() call (named run_YYYY.MM.DD_HH.MM.SS.cs) so re-runs never
@@ -60,11 +61,12 @@ class VideoFramesOperator(BaseOperator):
     # Descriptor (P1.12d-1). What create_table() ACTUALLY does today:
     #  - one TABLE mode: it builds a brand-new frame-level table
     #    (creates_table), one row per kept frame;
-    #  - TWO parameters, both read by create_table():
-    #      video_column -> self._video_column (a column of the active
-    #                      table holding the video path; used line ~114)
-    #      frame_step   -> self._frame_step   (keep every Nth frame;
-    #                      dialog min 1, max 10_000, default 1)
+    #  - TWO parameters, both read by create_table() from run.parameters
+    #    (P1.12d-2a -- they no longer touch the operator instance):
+    #      video_column -- a column of the active table holding the video
+    #                      path
+    #      frame_step   -- keep every Nth frame; dialog min 1, max 10_000,
+    #                      default 1
     #  - media_requirement ADDRESS: create_table() opens the video files
     #    itself --
     #        cap = cv2.VideoCapture(str(video_path))
@@ -129,12 +131,16 @@ class VideoFramesOperator(BaseOperator):
         # directory. Temp wasn't durable (Disk Cleanup / Storage Sense
         # could wipe saved frame paths) and accumulated leftovers
         # across runs. main.py passes an explicit output_dir.
+        #
+        # output_dir is a genuine construction-time value and stays here.
+        # The two run parameters (video_column, frame_step) used to be
+        # stored on self by get_parameters_dialog; as of P1.12d-2a they
+        # travel in run.parameters and nothing about them lives on the
+        # instance.
         self._output_dir = output_dir or (
             Path.cwd() / "gelem_project" / "frames"
         )
         self._output_dir.mkdir(parents=True, exist_ok=True)
-        self._video_column: str = "full_path"
-        self._frame_step: int = 1
 
     def get_parameters_dialog(self, parent=None, columns=None):
         from PySide6.QtWidgets import (
@@ -163,7 +169,7 @@ class VideoFramesOperator(BaseOperator):
         step_spin = QSpinBox()
         step_spin.setMinimum(1)
         step_spin.setMaximum(10_000)
-        step_spin.setValue(self._frame_step)
+        step_spin.setValue(1)
         form.addRow("Frame step (keep every Nth):", step_spin)
 
         layout.addLayout(form)
@@ -175,26 +181,38 @@ class VideoFramesOperator(BaseOperator):
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
 
+        # The dialog hands its answers back through parameter_values(),
+        # keyed by the descriptor's parameter names. It stores nothing on
+        # the operator instance -- two concurrent runs must not share one
+        # set of values.
+        chosen: dict = {}
+
         def _store():
-            self._video_column = column_combo.currentText()
-            self._frame_step = step_spin.value()
+            chosen["video_column"] = column_combo.currentText()
+            chosen["frame_step"] = int(step_spin.value())
 
         dialog.accepted.connect(_store)
+        dialog.parameter_values = lambda: dict(chosen)
         return dialog
 
     def create_table(
         self,
         df: pd.DataFrame,
-        group_by: str | list[str] | None = None,
+        run,
     ) -> pd.DataFrame:
         import cv2
         from datetime import datetime
 
+        # Parameters arrive in run.parameters, validated against this
+        # operator's descriptor before the run started -- never off self.
+        video_column: str = run.parameters["video_column"]
+        frame_step: int = int(run.parameters["frame_step"])
+
         work = df.copy()
-        if self._video_column not in work.columns:
+        if video_column not in work.columns:
             print(
                 f"[VideoFramesOperator] Column "
-                f"'{self._video_column}' not in input table. "
+                f"'{video_column}' not in input table. "
                 f"Available: {list(work.columns)}"
             )
             return pd.DataFrame()
@@ -217,7 +235,7 @@ class VideoFramesOperator(BaseOperator):
         non_videos_skipped = 0
 
         for _, src_row in work.iterrows():
-            video_path_raw = src_row[self._video_column]
+            video_path_raw = src_row[video_column]
             if not video_path_raw:
                 videos_skipped += 1
                 continue
@@ -256,7 +274,7 @@ class VideoFramesOperator(BaseOperator):
                     ok, frame_bgr = cap.read()
                     if not ok:
                         break
-                    if frame_idx % self._frame_step == 0:
+                    if frame_idx % frame_step == 0:
                         frame_rgb = cv2.cvtColor(
                             frame_bgr, cv2.COLOR_BGR2RGB
                         )
@@ -279,14 +297,14 @@ class VideoFramesOperator(BaseOperator):
 
             print(
                 f"[VideoFramesOperator] {video_filename}: "
-                f"{kept} frames kept (step={self._frame_step})"
+                f"{kept} frames kept (step={frame_step})"
             )
 
         if videos_seen == 0:
             raise ValueError(
                 f"VideoFramesOperator only supports videos "
                 f"({', '.join(sorted(VIDEO_EXTENSIONS))}). "
-                f"Found 0 video files in column '{self._video_column}'."
+                f"Found 0 video files in column '{video_column}'."
             )
 
         print(

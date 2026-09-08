@@ -34,6 +34,15 @@ from PySide6.QtWidgets import QApplication
 from models.dataset import Dataset
 from models.query_engine import QueryEngine, Filter
 from operators.base import BaseOperator
+from operators.descriptor import (
+    ExecutionMode,
+    InputKind,
+    InputSpec,
+    ModeDescriptor,
+    OperatorDescriptor,
+    OutputColumn,
+    OutputSpec,
+)
 from models.query_result import ResultLayout, GroupSection
 
 # The controller factory lives in tests/conftest.py (make_controller
@@ -54,11 +63,35 @@ class _RecordingOperator(BaseOperator):
     output_columns       = [("probe", "numeric")]
     requires_image       = False
 
+    # P1.12d-2a: every operator the controller runs carries a descriptor.
+    descriptor = OperatorDescriptor(
+        name="record_order",
+        version="1.0",
+        description="Records the row_id order create_columns() is given.",
+        modes=(
+            ModeDescriptor(
+                mode=ExecutionMode.COLUMNS,
+                label="Record order",
+                inputs=(
+                    InputSpec(
+                        name="active_table",
+                        label="Active table",
+                        kind=InputKind.ACTIVE_TABLE,
+                    ),
+                ),
+                parameters=(),
+                output=OutputSpec(
+                    columns=(OutputColumn(name="probe", type_tag="numeric"),)
+                ),
+            ),
+        ),
+    )
+
     def __init__(self):
         super().__init__()
         self.seen: list[str] = []
 
-    def create_columns(self, row_id, image, metadata):
+    def create_columns(self, row_id, image, metadata, run):
         self.seen.append(str(row_id))
         return {"probe": 1.0}
 

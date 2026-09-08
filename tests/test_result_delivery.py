@@ -36,7 +36,71 @@ from models.notifications import RowsUpdated, ThumbnailsReady
 from artifacts.artifact_store import ArtifactStore
 from column_types.registry import ColumnTypeRegistry
 from operators.operator_registry import OperatorRegistry
+from operators.descriptor import (
+    ExecutionMode,
+    InputKind,
+    InputSpec,
+    ModeDescriptor,
+    OperatorDescriptor,
+    OutputColumn,
+    OutputSpec,
+)
 from controller import AppController
+
+
+def _active_table_input():
+    return (
+        InputSpec(
+            name="active_table",
+            label="Active table",
+            kind=InputKind.ACTIVE_TABLE,
+        ),
+    )
+
+
+def _columns_descriptor(name, label, output_columns):
+    """A minimal COLUMNS-mode descriptor for a test double (P1.12d-2a:
+    every operator the controller runs carries one)."""
+    return OperatorDescriptor(
+        name=name,
+        version="1.0",
+        description=f"Test double: {label}.",
+        modes=(
+            ModeDescriptor(
+                mode=ExecutionMode.COLUMNS,
+                label=label,
+                inputs=_active_table_input(),
+                parameters=(),
+                output=OutputSpec(
+                    columns=tuple(
+                        OutputColumn(name=col_name, type_tag=col_tag)
+                        for col_name, col_tag in output_columns
+                    )
+                ),
+            ),
+        ),
+    )
+
+
+def _table_descriptor(name, label):
+    """A minimal TABLE-mode descriptor for a test double. The double may
+    still not implement create_table() -- the descriptor only declares the
+    mode; BaseOperator.create_table() then raises NotImplementedError,
+    which is exactly the path the 'unimplemented mode' test exercises."""
+    return OperatorDescriptor(
+        name=name,
+        version="1.0",
+        description=f"Test double: {label}.",
+        modes=(
+            ModeDescriptor(
+                mode=ExecutionMode.TABLE,
+                label=label,
+                inputs=_active_table_input(),
+                parameters=(),
+                output=OutputSpec(creates_table=True),
+            ),
+        ),
+    )
 
 TEST_IMAGES = project_root / "test_images"
 CONTROLLER_FILE = project_root / "controller.py"
@@ -305,8 +369,9 @@ def test_failed_operator_start_leaves_no_live_run(tmp_path, monkeypatch):
         create_columns_label = "Probe"
         output_columns       = [("probe", "numeric")]
         requires_image       = False
+        descriptor = _columns_descriptor("probe", "Probe", [("probe", "numeric")])
 
-        def create_columns(self, row_id, image, metadata):
+        def create_columns(self, row_id, image, metadata, run):
             return {"probe": 1.0}
 
     controller, dataset, op_registry = _make_controller(tmp_path)
@@ -344,11 +409,13 @@ def test_unimplemented_mode_run_leaves_no_live_run(tmp_path, monkeypatch):
     from operators.base import BaseOperator
 
     class _NoTable(BaseOperator):
-        # A label is set, so the controller's guard lets the run start;
-        # create_table() is BaseOperator's default, which raises
-        # NotImplementedError inside the worker.
+        # A label AND a TABLE-mode descriptor are set, so the controller
+        # builds the run and starts the worker; create_table() is still
+        # BaseOperator's default, which raises NotImplementedError inside
+        # the worker -- the path this test exercises.
         name               = "no_table"
         create_table_label = "No table"
+        descriptor         = _table_descriptor("no_table", "No table")
 
     controller, dataset, op_registry = _make_controller(tmp_path)
     op_registry.register(_NoTable())

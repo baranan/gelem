@@ -357,6 +357,62 @@ def _iter_all_snapshots(
             yield snapshot
 
 
+# The parameter values a run spec accepts, once lists have been flattened
+# to tuples. bool is listed before int because bool is a subclass of int
+# in Python and the two are called out separately in the error messages.
+_ALLOWED_SCALAR_TYPES = (str, bool, int, float)
+
+
+def _describe_type(value: object) -> str:
+    """The type name to name in an error message. ``None`` reads better as
+    ``NoneType`` spelled out than as ``type(None).__name__`` would suggest
+    to a reader who never sees the call."""
+    return type(value).__name__
+
+
+def _normalise_parameter_value(name: str, value: object) -> object:
+    """Return the value a run spec should store for parameter ``name``.
+
+    The rules, and why:
+
+      * A list or a tuple becomes a tuple, so the stored value cannot be
+        mutated in place after the spec is frozen. Every element must
+        itself be an allowed scalar -- a nested list or a dict inside the
+        sequence would just move the mutable-state problem one level
+        deeper, so it is refused here.
+      * An allowed scalar -- ``str``, ``bool``, ``int``, ``float`` or
+        ``None`` -- is returned unchanged. (``bool`` is a subclass of
+        ``int``; both are allowed, so the order of the check does not
+        matter for acceptance, only for the wording of the errors above.)
+      * Anything else -- a ``dict``, a ``set``, a DataFrame, an arbitrary
+        object -- is refused, naming the parameter and the offending type.
+
+    Raises ``OperatorRunError`` on any refusal.
+    """
+    # A sequence: copy to a tuple and check each element is a plain scalar.
+    if isinstance(value, (list, tuple)):
+        for element in value:
+            if element is None:
+                continue
+            if not isinstance(element, _ALLOWED_SCALAR_TYPES):
+                raise OperatorRunError(
+                    f"parameter {name!r}: list/tuple element {element!r} has "
+                    f"type {_describe_type(element)}; only str, bool, int, "
+                    f"float and None are allowed inside a parameter sequence."
+                )
+        return tuple(value)
+
+    # A bare scalar: str / bool / int / float / None pass; nothing else.
+    if value is None or isinstance(value, _ALLOWED_SCALAR_TYPES):
+        return value
+
+    raise OperatorRunError(
+        f"parameter {name!r}: value of type {_describe_type(value)} is not "
+        f"allowed; a parameter must be a str, bool, int, float, None, or a "
+        f"list/tuple of those."
+    )
+
+
 # ---------------------------------------------------------------------------
 # OperatorRunSpec -- everything about one run that cannot change while it
 # runs.
@@ -422,9 +478,30 @@ class OperatorRunSpec:
                     f"{self.mode.name} of {self.operator_name!r}."
                 )
 
+        # -- Normalise and lock down every parameter VALUE. --
+        #
+        # MappingProxyType (applied at the freeze step below) stops the
+        # mapping being rebound, but it does NOT stop a mutable value
+        # inside it -- a list, say -- being mutated after the fact. A
+        # parameter holding a list is therefore still shared mutable state,
+        # exactly one level down from the defect this object removes. So:
+        #
+        #   * a list or a tuple is copied to a tuple, and every element
+        #     must itself be an allowed scalar;
+        #   * an allowed scalar (str, bool, int, float, None) is kept as-is;
+        #   * anything else -- a dict, a set, a DataFrame, an arbitrary
+        #     object -- is refused, naming the parameter and the type.
+        #
+        # The result is `normalised`, which is what the per-type checks
+        # below run against and what the freeze step stores.
+        normalised: dict[str, object] = {
+            name: _normalise_parameter_value(name, value)
+            for name, value in self.parameters.items()
+        }
+
         # Per-type value checks, for whichever declared parameters are
         # actually present in this run.
-        for name, value in self.parameters.items():
+        for name, value in normalised.items():
             spec = declared[name]
             if isinstance(spec, ChoiceParameter):
                 allowed = tuple(choice_value for choice_value, _ in spec.choices)
@@ -479,9 +556,12 @@ class OperatorRunSpec:
 
         # -- Freeze the parameter mapping. A frozen dataclass forbids
         # ordinary assignment in __post_init__, so object.__setattr__ is the
-        # documented way to replace the field with a read-only view. --
+        # documented way to replace the field with a read-only view. The
+        # value stored is `normalised` (lists already copied to tuples), so
+        # nothing a caller still holds a reference to can reach inside the
+        # spec. --
         object.__setattr__(
-            self, "parameters", MappingProxyType(dict(self.parameters))
+            self, "parameters", MappingProxyType(normalised)
         )
 
 

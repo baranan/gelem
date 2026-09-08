@@ -51,10 +51,7 @@ EXCLUDED_FILES = {"fake_controller.py"}
 #   _op_registry, _dataset, _active_table -- ui/main_window.py reaching
 #       into AppController, tracked under CLAUDE.md's "UI never touches
 #       private controller attributes" rule.
-#   _group_by -- ui/main_window.py reading the group-by parameter back
-#       off an operator instance, where operators/base.py stores it with
-#       setattr.
-ALLOWLIST = {"_op_registry", "_dataset", "_active_table", "_group_by"}
+ALLOWLIST = {"_op_registry", "_dataset", "_active_table"}
 
 _GETATTR_BUILTINS = {"getattr", "setattr", "hasattr"}
 

@@ -60,10 +60,11 @@ class MeanFaceOperator(BaseOperator):
     #  - DISPLAY mode (create_display): shows one mean face for the
     #    whole selection, storing nothing;
     #  - NO parameters for either mode. get_parameters_dialog() is NOT
-    #    overridden, so it returns None. create_table() reads a
-    #    `group_by` argument, but MainWindow sources that from
-    #    getattr(operator, "_group_by", None) and nothing ever sets
-    #    _group_by on this operator -- so grouping is unreachable today.
+    #    overridden, so it returns None. create_table() looks for a
+    #    "group_by" value in run.parameters, but the descriptor declares
+    #    none, so it is always absent and grouping is unreachable today
+    #    (before P1.12d-2a MainWindow read a "_group_by" attribute that
+    #    nothing ever set -- same result). P1.12e adds the dialog.
     #    See the P1.12d-1 report, "should have a parameter but does not".
     #  - media_requirement METADATA for both: they work purely from the
     #    DataFrame;
@@ -138,7 +139,7 @@ class MeanFaceOperator(BaseOperator):
     def create_table(
         self,
         df: pd.DataFrame,
-        group_by: str | list[str] | None = None,
+        run,
     ) -> pd.DataFrame:
         """
         Computes a mean face per group and returns a new DataFrame.
@@ -146,9 +147,13 @@ class MeanFaceOperator(BaseOperator):
         path to the rendered mean face image.
 
         Args:
-            df:       The active table as a DataFrame.
-            group_by: Column or columns to group by, chosen by the
-                      researcher in the parameter dialog.
+            df:  The active table as a DataFrame.
+            run: The OperatorRun for this run. A grouping column would
+                 arrive as run.parameters["group_by"]; this operator's
+                 descriptor declares no parameters yet (P1.12e adds the
+                 dialog), so run.parameters is empty and grouping is
+                 unreachable -- exactly as it was before P1.12d-2a, when
+                 MainWindow read a "_group_by" attribute nothing ever set.
 
         Returns:
             A new DataFrame with one row per group. Columns include
@@ -169,6 +174,10 @@ class MeanFaceOperator(BaseOperator):
         """
         # PLACEHOLDER: returns one row per group with gray images.
         from PIL import Image
+
+        # A grouping column would come from run.parameters; the descriptor
+        # declares none yet, so this is None and every row is one group.
+        group_by = run.parameters.get("group_by")
 
         if group_by is None:
             groups = [("all", df)]
@@ -202,13 +211,17 @@ class MeanFaceOperator(BaseOperator):
     def create_display(
         self,
         df: pd.DataFrame,
+        run,
     ) -> dict:
         """
         Computes a single mean face from all rows in df and returns
         a result dict for display in the Results panel.
 
         Args:
-            df: The selected rows as a DataFrame.
+            df:  The selected rows as a DataFrame.
+            run: The OperatorRun for this run. This mode declares no
+                 parameters, so run.parameters is empty; the argument is
+                 here for the uniform operator contract.
 
         Returns:
             Dict with keys:

@@ -362,7 +362,8 @@ class FakeController(QObject):
         metadata = self._metadata.get(row_id, {"row_id": row_id})
         self.row_selected.emit(metadata)
 
-    def run_create_columns(self, operator_name: str, row_ids: list[str]) -> None:
+    def run_create_columns(self, operator_name: str, row_ids: list[str],
+                           parameters: dict | None = None) -> None:
         print(f"[FakeController] run_create_columns({operator_name}, {len(row_ids)} rows)")
         total = len(row_ids)
         for i, row_id in enumerate(row_ids):
@@ -374,14 +375,15 @@ class FakeController(QObject):
         )
 
     def run_create_table(self, operator_name: str, row_ids: list[str],
-                         group_by=None) -> None:
-        print(f"[FakeController] run_create_table({operator_name}, group_by={group_by})")
+                         parameters: dict | None = None) -> None:
+        print(f"[FakeController] run_create_table({operator_name}, parameters={parameters})")
         table_name = f"{operator_name}_result"
         QTimer.singleShot(300, lambda: self.tables_updated.emit(["frames", table_name]))
         QTimer.singleShot(350, lambda: self.table_created.emit(table_name))
         QTimer.singleShot(400, lambda: self.operator_complete.emit(operator_name))
 
-    def run_create_display(self, operator_name: str, row_ids: list[str]) -> None:
+    def run_create_display(self, operator_name: str, row_ids: list[str],
+                           parameters: dict | None = None) -> None:
         print(f"[FakeController] run_create_display({operator_name})")
         import numpy as np
         from PIL import Image

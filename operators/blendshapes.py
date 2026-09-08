@@ -186,6 +186,7 @@ class BlendshapeOperator(BaseOperator):
         row_id: str,
         image: np.ndarray,
         metadata: dict,
+        run,
     ) -> dict:
         """
         Runs mediapipe face detection on one image and returns blendshape scores.
@@ -194,6 +195,9 @@ class BlendshapeOperator(BaseOperator):
             row_id:   Unique ID of the row being processed.
             image:    The face image as a numpy array (height, width, 3), RGB.
             metadata: Existing column values for this row (not used here).
+            run:      The OperatorRun for this run. This operator declares
+                      no parameters, so run.parameters is empty; the
+                      argument is here for the uniform operator contract.
 
         Returns:
             Dict mapping each blendshape name to its score (0.0–1.0).
@@ -223,14 +227,7 @@ class BlendshapeOperator(BaseOperator):
             for bs_name in BLENDSHAPE_NAMES
         }
 
-# TODO: until the integration will be completed with the ui, we can print the result for a single picture by running this in the terminal:
-# (only change to the correct picture name from this folder)
-
-# python -c "
-# from operators.blendshapes import BlendshapeOperator
-# op = BlendshapeOperator()
-# image = op.load_image('test_images/001_08.jpg')
-# scores = op.create_columns('test_001', image, {})
-# for name, value in scores.items():
-#     print(f'{name}: {value}')
-# "
+# TODO: until the integration will be completed with the ui, the model can be
+# exercised directly by calling self._landmarker.detect() on a loaded image;
+# create_columns() now needs an OperatorRun, so it is no longer the simplest
+# entry point for a one-off terminal check.

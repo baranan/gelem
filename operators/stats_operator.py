@@ -124,33 +124,41 @@ class StatsOperator(BaseOperator):
 
     def get_parameters_dialog(self, parent=None, columns=None):
         """
-        Shows a dialog asking the researcher to choose:
+        Would show a dialog asking the researcher to choose:
             - Test type
             - Dependent variable column
             - Grouping column (for t-test, ANOVA)
             - Subject ID column (for paired/repeated measures tests)
 
-        Stores the chosen values as instance attributes.
-
         TODO (Student C): Implement this dialog.
         Show dropdowns for test type and column selection populated
         from the `columns` argument supplied by MainWindow.
         Grey out irrelevant fields based on the chosen test type
-        (e.g. subject column is only needed for paired tests).
+        (e.g. subject column is only needed for paired tests). Hand the
+        choices back through parameter_values() keyed by parameters this
+        operator's descriptor would then declare.
 
-        For now returns None (no dialog — uses default values).
+        For now returns None (no dialog): the values keep their
+        construction-time defaults (self._test_type etc.).
         """
         return None
 
     def create_display(
         self,
         df: pd.DataFrame,
+        run,
     ) -> dict:
         """
         Runs the chosen statistical test on df and returns results.
 
         Args:
-            df: The selected rows as a DataFrame. Read-only.
+            df:  The selected rows as a DataFrame. Read-only.
+            run: The OperatorRun for this run. This operator declares no
+                 parameters yet, so run.parameters is empty and the test
+                 configuration still comes from self._test_type /
+                 self._dv_column / self._group_column (construction-time
+                 defaults). The argument is here for the uniform operator
+                 contract.
 
         Returns:
             Dict with keys:

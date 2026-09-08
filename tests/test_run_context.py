@@ -243,6 +243,70 @@ def test_parameters_mapping_is_read_only():
 
 
 # ---------------------------------------------------------------------------
+# OperatorRunSpec normalises and locks down parameter VALUES (P1.12d-2a
+# STEP 2). A MappingProxyType stops the mapping being rebound but not a
+# mutable value inside it, so a list parameter is flattened to a tuple and
+# non-scalar values are refused outright.
+# ---------------------------------------------------------------------------
+def test_list_parameter_value_becomes_a_tuple():
+    mode = _columns_mode(
+        parameters=(TextParameter(name="cols", label="Columns", required=False),)
+    )
+    spec = _spec(mode, parameters={"cols": ["a", "b", "c"]})
+    assert spec.parameters["cols"] == ("a", "b", "c")
+    assert isinstance(spec.parameters["cols"], tuple)
+
+
+def test_nested_list_parameter_value_is_refused():
+    mode = _columns_mode(
+        parameters=(TextParameter(name="cols", label="Columns", required=False),)
+    )
+    with pytest.raises(OperatorRunError):
+        _spec(mode, parameters={"cols": ["a", ["b", "c"]]})
+
+
+def test_dict_parameter_value_is_refused():
+    mode = _columns_mode(
+        parameters=(TextParameter(name="cfg", label="Config", required=False),)
+    )
+    with pytest.raises(OperatorRunError):
+        _spec(mode, parameters={"cfg": {"k": "v"}})
+
+
+def test_the_allowed_scalar_types_are_accepted():
+    # str, bool, int, float and None all pass through unchanged.
+    mode = _columns_mode(
+        parameters=(
+            TextParameter(name="s", label="S", required=False),
+            BooleanParameter(name="b", label="B", required=False),
+            NumberParameter(name="i", label="I", required=False),
+            NumberParameter(name="f", label="F", required=False, decimals=2),
+            TextParameter(name="n", label="N", required=False),
+        )
+    )
+    spec = _spec(
+        mode,
+        parameters={"s": "text", "b": True, "i": 3, "f": 1.5, "n": None},
+    )
+    assert spec.parameters["s"] == "text"
+    assert spec.parameters["b"] is True
+    assert spec.parameters["i"] == 3
+    assert spec.parameters["f"] == 1.5
+    assert spec.parameters["n"] is None
+
+
+def test_mutating_the_passed_in_list_does_not_change_the_spec():
+    mode = _columns_mode(
+        parameters=(TextParameter(name="cols", label="Columns", required=False),)
+    )
+    original = ["a", "b"]
+    spec = _spec(mode, parameters={"cols": original})
+    original.append("c")
+    # The spec kept its own tuple copy, so the later mutation cannot reach it.
+    assert spec.parameters["cols"] == ("a", "b")
+
+
+# ---------------------------------------------------------------------------
 # RunData.
 # ---------------------------------------------------------------------------
 def test_table_returns_the_identical_object_it_was_handed():

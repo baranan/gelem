@@ -29,6 +29,35 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from operators.summary_stats import SummaryStatsOperator
+from operators.descriptor import ExecutionMode
+from operators.run_context import (
+    CancellationToken,
+    OperatorRun,
+    OperatorRunSpec,
+    RunData,
+)
+
+
+def _run(op):
+    """A minimal OperatorRun for a direct create_display() call, built
+    from the operator's OWN descriptor so it goes through the same
+    OperatorRunSpec validation a real run does (P1.12d-2a).
+    SummaryStatsOperator declares no parameters."""
+    mode_descriptor = op.descriptor.mode_for(ExecutionMode.DISPLAY)
+    spec = OperatorRunSpec(
+        operation_id="test-run",
+        operator_name=op.name,
+        mode=ExecutionMode.DISPLAY,
+        mode_descriptor=mode_descriptor,
+        parameters={},
+        target_table="",
+    )
+    return OperatorRun(
+        spec=spec,
+        data=RunData(tables={}, projects={}),
+        paths=None,
+        _token=CancellationToken(),
+    )
 
 
 def _make_df():
@@ -42,7 +71,7 @@ def _make_df():
 
 def test_default_includes_all_numeric_except_row_id():
     op = SummaryStatsOperator()
-    result = op.create_display(_make_df())
+    result = op.create_display(_make_df(), _run(op))
 
     assert result["operator_name"] == "summary_stats"
     assert result["n_rows"] == 5
@@ -65,7 +94,7 @@ def test_default_includes_all_numeric_except_row_id():
 
 def test_columns_override():
     op = SummaryStatsOperator(columns=["score"])
-    result = op.create_display(_make_df())
+    result = op.create_display(_make_df(), _run(op))
 
     assert set(result["summary"].keys()) == {"score"}, \
         "self._columns should restrict the result"
@@ -75,7 +104,7 @@ def test_input_dataframe_not_mutated():
     df = _make_df()
     snapshot = df.copy()
     op = SummaryStatsOperator()
-    op.create_display(df)
+    op.create_display(df, _run(op))
     pd.testing.assert_frame_equal(df, snapshot)
 
 
@@ -85,7 +114,8 @@ def test_all_nan_column_is_skipped():
         "valid":  [1.0, 2.0, 3.0],
         "empty":  [float("nan"), float("nan"), float("nan")],
     })
-    result = SummaryStatsOperator().create_display(df)
+    op = SummaryStatsOperator()
+    result = op.create_display(df, _run(op))
     assert set(result["summary"].keys()) == {"valid"}
 
 
@@ -97,7 +127,7 @@ if __name__ == "__main__":
 
     # Print a sample for human inspection.
     op = SummaryStatsOperator()
-    sample = op.create_display(_make_df())
+    sample = op.create_display(_make_df(), _run(op))
     print("\nSample result:")
     for col, stats in sample["summary"].items():
         print(f"  {col}: {stats}")
