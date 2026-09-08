@@ -19,8 +19,9 @@ rule it guards and each asserting the raise. On top of that:
   * a happy-path test that builds a realistic three-mode descriptor and
     reads it back through mode_for().
 
-This module imports no Qt and no pandas, so run_tests.py keeps it in the
-combined non-widget group.
+This module imports no Qt and no pandas, but the source-scan test names the
+Qt binding as a forbidden string, so it carries a "# run-tests: combined"
+token that keeps it in the combined non-widget group.
 """
 
 from __future__ import annotations
@@ -532,11 +533,12 @@ def test_descriptor_is_immutable_and_uses_tuples():
 # Source scan -- stdlib only, nothing from this repo
 # ===========================================================================
 
+# run-tests: combined -- names the Qt binding in a source-scan assertion but never imports it
 def test_descriptor_module_imports_only_stdlib_and_nothing_from_repo():
-    # Assemble the Qt binding name from parts so this test file's own text
-    # does not contain the literal marker run_tests.py scans for when it
-    # decides which test modules touch a widget.
-    qt_binding = "PySide" + "6"
+    # The Qt binding name is written plainly here; the declaration comment
+    # above keeps this module out of run_tests.py's isolated group even though
+    # its text now contains the literal marker.
+    qt_binding = "PySide6"
 
     module_path = (
         Path(__file__).resolve().parent.parent / "operators" / "descriptor.py"

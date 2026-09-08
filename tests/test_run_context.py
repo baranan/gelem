@@ -496,13 +496,13 @@ def _module_path():
     )
 
 
+# run-tests: combined -- names the Qt binding in a source-scan assertion but never imports it
 def test_module_source_has_no_qt_binding_import():
     source = _module_path().read_text(encoding="utf-8")
-    # The Qt binding names are assembled rather than written as literals so
-    # that this test module is not itself swept into run_tests.py's isolated
-    # widget group by tests/test_run_tests_grouping.py, whose marker set
-    # includes the literal binding name.
-    qt_bindings = ("PySide" + "6", "Py" + "Qt5", "Py" + "Qt6")
+    # The binding names are written plainly; the declaration comment above
+    # keeps this module out of run_tests.py's isolated group even though its
+    # text now contains the literal marker.
+    qt_bindings = ("PySide6", "PyQt5", "PyQt6")
     for binding in qt_bindings:
         assert binding not in source, f"run_context.py must not import {binding}"
 
