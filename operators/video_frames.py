@@ -55,7 +55,6 @@ class VideoFramesOperator(BaseOperator):
     name = "video_frames"
     create_table_label = "Extract frames from videos"
     output_columns = []
-    requires_image = False
 
     # ------------------------------------------------------------------
     # Descriptor (P1.12d-1). What create_table() ACTUALLY does today:

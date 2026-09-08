@@ -101,15 +101,14 @@ class BlendshapeOperator(BaseOperator):
     name = "blendshapes"
     create_columns_label = "Extract blendshapes"
     output_columns = [(bs_name, "numeric") for bs_name in BLENDSHAPE_NAMES]
-    requires_image = True  # Needs the face image to run mediapipe.
 
     # ------------------------------------------------------------------
     # Descriptor (P1.12d-1). Describes what create_columns() ACTUALLY
     # does today:
     #  - one COLUMNS mode, over the active table;
     #  - no parameters (get_parameters_dialog is not overridden);
-    #  - media_requirement FRAME: requires_image is True, so the runner
-    #    decodes one frame and hands it in as `image`;
+    #  - media_requirement FRAME: mediapipe needs the face image, so the
+    #    runner decodes one frame and hands it in as `image`;
     #  - model_lifecycle PER_WORKER: this field states what the runner
     #    must PROVIDE, not what the code does today. The FaceLandmarker is
     #    created in IMAGE running mode (no running_mode is passed to

@@ -202,9 +202,11 @@ class MediaRequirement(Enum):
                   real example -- a TABLE-mode operator that walks the
                   address on its own).
 
-    This enum is what replaces the current boolean ``requires_image`` when
-    P1.12d migrates the runner: ``requires_image`` is only the narrow
-    "FRAME or not" version of the same decision.
+    This enum replaced the boolean ``requires_image`` when P1.12d-2b-1
+    migrated the ``create_columns`` runner. ``requires_image`` was only
+    the narrow "FRAME or not" version of the same decision and no longer
+    exists: the runner now reads ``media_requirement`` off the mode
+    descriptor and decodes a frame only for ``FRAME``.
     """
 
     METADATA = "metadata"

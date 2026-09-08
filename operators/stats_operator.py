@@ -68,7 +68,6 @@ class StatsOperator(BaseOperator):
     name = "stats"
     create_display_label = "Statistical test (pingouin)"
     output_columns       = []
-    requires_image       = False
 
     # ------------------------------------------------------------------
     # Descriptor (P1.12d-1). What create_display() ACTUALLY does today:

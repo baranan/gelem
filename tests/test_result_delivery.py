@@ -368,7 +368,6 @@ def test_failed_operator_start_leaves_no_live_run(tmp_path, monkeypatch):
         name                 = "probe"
         create_columns_label = "Probe"
         output_columns       = [("probe", "numeric")]
-        requires_image       = False
         descriptor = _columns_descriptor("probe", "Probe", [("probe", "numeric")])
 
         def create_columns(self, row_id, image, metadata, run):

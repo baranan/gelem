@@ -61,7 +61,6 @@ class _RecordingOperator(BaseOperator):
     name                 = "record_order"
     create_columns_label = "Record order"
     output_columns       = [("probe", "numeric")]
-    requires_image       = False
 
     # P1.12d-2a: every operator the controller runs carries a descriptor.
     descriptor = OperatorDescriptor(

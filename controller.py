@@ -33,7 +33,7 @@ from PySide6.QtCore import QObject, Signal, QTimer
 from models.query_result import QueryResult, ResultLayout, GroupSection
 from models.notifications import RowsUpdated, ThumbnailsReady
 from media.media_address import resolve_source, MediaAddressError
-from operators.descriptor import ExecutionMode, InputKind
+from operators.descriptor import ExecutionMode, InputKind, MediaRequirement
 from operators.run_context import (
     CancellationToken,
     OperatorRun,
@@ -1229,6 +1229,28 @@ class AppController(QObject):
             except (OperatorRunError, RuntimeError) as e:
                 self.error_occurred.emit(
                     f'Cannot start "{operator.display_label}": {e}'
+                )
+                return
+
+            # The per-row runner can hand the operator one decoded frame
+            # (media_requirement FRAME) or nothing (METADATA, or ADDRESS --
+            # where the operator resolves the media itself from its
+            # metadata). It cannot produce an ordered span of video or
+            # audio, so a COLUMNS mode that declares VIDEO_SPAN or
+            # AUDIO_SPAN is refused here -- before any worker starts and
+            # before the run is registered, the same place a bad parameter
+            # set is refused. Handing such an operator a single frame, or
+            # None, would be the wrong-number failure P1.12d exists to
+            # remove.
+            media_requirement = run.spec.mode_descriptor.media_requirement
+            if media_requirement in (
+                MediaRequirement.VIDEO_SPAN,
+                MediaRequirement.AUDIO_SPAN,
+            ):
+                self.error_occurred.emit(
+                    f'Cannot start "{operator.display_label}": it needs '
+                    f'{media_requirement.name} media, which the per-row '
+                    f'runner cannot supply.'
                 )
                 return
 

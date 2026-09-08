@@ -192,9 +192,11 @@ decode_video_span(address, purpose)  -> iterator of FramePayload
 decode_audio_span(address, purpose)  -> AudioPayload
 ```
 
-Input requirements on operators become declarative in the same spirit: `metadata
-only`, `image frame`, `video span`, `audio span`, `arbitrary media address` --
-rather than the current boolean `requires_image`.
+Input requirements on operators are declarative in the same spirit: each mode
+declares a `media_requirement` (`operators/descriptor.py` -> `MediaRequirement`)
+of `METADATA`, `FRAME`, `VIDEO_SPAN`, `AUDIO_SPAN` or `ADDRESS`. The old boolean
+`requires_image` was removed in P1.12d-2b-1, when the `create_columns` runner
+started reading `media_requirement` off the descriptor.
 
 **Nothing else in Gelem decodes media.** Today three places do, and all three must
 route through the resolver:

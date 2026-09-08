@@ -53,7 +53,6 @@ class PlotOperator(BaseOperator):
     # the column's TableSchema spec; 'plot_image' was never a registered
     # type and left the column rendering as an "Unknown column" placeholder.
     output_columns = [("plot_path", "media_path")]
-    requires_image = False  # Reads column values from metadata.
 
     # ------------------------------------------------------------------
     # Descriptor (P1.12d-1). What create_columns() ACTUALLY does today:
@@ -63,8 +62,8 @@ class PlotOperator(BaseOperator):
     #    "which columns to plot" choice is NOT a parameter today: the
     #    column list is fixed in __init__ (self._columns default). See
     #    the P1.12d-1 report, "should have a parameter but does not".
-    #  - media_requirement METADATA: requires_image is False and
-    #    create_columns() reads only metadata values, decoding nothing;
+    #  - media_requirement METADATA: create_columns() reads only metadata
+    #    values, decoding nothing, so the runner hands it image=None;
     #  - despite the "# PLACEHOLDER" comment, create_columns() does real
     #    work -- it builds a real matplotlib bar chart from the row's
     #    real metadata values and writes a real PNG -- so the
@@ -164,7 +163,8 @@ class PlotOperator(BaseOperator):
 
         Args:
             row_id:   The row being processed.
-            image:    Not used (requires_image = False).
+            image:    Not used -- this operator's descriptor declares
+                      media_requirement = METADATA, so it is always None.
             metadata: Contains column values for this row.
             run:      The OperatorRun for this run. This operator declares
                       no parameters yet, so run.parameters is empty and

@@ -46,11 +46,12 @@ allowed values, whether they name a column, default. The UI generates the dialog
 `QComboBox` directly. That puts UI code in the analysis layer and makes an
 operator impossible to run from a test, a script, or a future terminal.
 
-**Parameter values never live on `self`.** They arrive as an immutable
-`OperatorRunSpec` for one run. Storing them as attributes on the operator instance
-is a live correctness bug: operators are singletons, so two concurrent runs of the
-same operator overwrite each other's parameters, and `MainWindow` currently reads
-`operator._group_by` back off the instance.
+**Parameter values never live on `self`.** They arrive for one run in
+`run.parameters` -- a read-only mapping backed by an immutable `OperatorRunSpec`.
+Read every per-run value from there, and never store one as an attribute on the
+operator instance or read one back off it. Operators are singletons, so a value
+on `self` is a race: two concurrent runs of the same operator would overwrite
+each other's parameters.
 
 ---
 
@@ -130,9 +131,10 @@ tile repaints immediately.
 
 Use for per-item work where rows are independent. `media` is a typed payload, not
 necessarily a still image, so the same method serves video spans and audio later.
-Declare what you need in the descriptor's input requirements; `media` is `None` for
-metadata-only operators. (The current boolean `requires_image` is the narrow
-version of this.)
+Declare what you need as the mode descriptor's `media_requirement`
+(`operators/descriptor.py` -> `MediaRequirement`): `FRAME` gets a decoded frame,
+`METADATA` and `ADDRESS` get `media = None`. There is no `requires_image` boolean
+-- it was removed in P1.12d-2b-1.
 
 Inside this method, use **only** the arguments given. Never touch `Dataset`, the
 controller, or any Qt object. Never modify `metadata`.
@@ -423,14 +425,19 @@ class MyOperator(BaseOperator):
     output_columns = [("my_score", "numeric")]
 
     # ---- Declared inputs -----------------------------------------------
-    # What this operator needs handed to it. One of:
-    #   'metadata'   -- no media at all
-    #   'frame'      -- a single decoded frame
-    #   'video_span' -- an ordered span, for sequential work
-    #   'audio_span' -- an audio span
-    #   'address'    -- the raw address, resolve it yourself
-    # (The current boolean `requires_image` is the narrow version of this.)
-    input_requirement = "frame"
+    # What this operator needs handed to it is declared as
+    # `media_requirement` on the mode's ModeDescriptor (see "Describing an
+    # operator" above), never as a class attribute and never as a boolean
+    # -- the old `requires_image` was removed in P1.12d-2b-1.
+    # MediaRequirement is one of:
+    #   METADATA    -- no media at all; create_columns gets media = None
+    #   FRAME       -- a single decoded frame
+    #   VIDEO_SPAN  -- an ordered span, for sequential work
+    #   AUDIO_SPAN  -- an audio span
+    #   ADDRESS     -- the raw address; the operator resolves it itself
+    # The per-row create_columns runner accepts METADATA, FRAME and
+    # ADDRESS; it refuses VIDEO_SPAN and AUDIO_SPAN before the run starts,
+    # since it cannot hand a single row a span.
 
     # ---- Declared parameters -------------------------------------------
     # The UI builds the dialog from this. No Qt in this file.

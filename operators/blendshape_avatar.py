@@ -50,15 +50,15 @@ class BlendshapeAvatarOperator(BaseOperator):
     # the column's TableSchema spec; 'avatar_path' was never a registered
     # type and left the column rendering as an "Unknown column" placeholder.
     output_columns = [("avatar_path", "media_path")]
-    requires_image = False  # Reads blendshape values from metadata.
 
     # ------------------------------------------------------------------
     # Descriptor (P1.12d-1). What create_columns() ACTUALLY does today:
     #  - one COLUMNS mode, over the active table, producing one
     #    media_path column "avatar_path" -- matches output_columns;
     #  - NO parameters (get_parameters_dialog is not overridden);
-    #  - media_requirement METADATA: requires_image is False and the
-    #    method body decodes nothing;
+    #  - media_requirement METADATA: the method reads blendshape values
+    #    from metadata and decodes nothing, so the runner hands it
+    #    image=None;
     #  - PLACEHOLDER output: the method ignores the blendshape values
     #    entirely and writes a flat 256x256 grey JPEG per row. The
     #    description says so.
@@ -127,7 +127,8 @@ class BlendshapeAvatarOperator(BaseOperator):
 
         Args:
             row_id:   The row being processed.
-            image:    Not used (requires_image = False).
+            image:    Not used -- this operator's descriptor declares
+                      media_requirement = METADATA, so it is always None.
             metadata: Must contain blendshape columns (bs_jawOpen etc.)
                       for this to produce a meaningful avatar.
             run:      The OperatorRun for this run. This operator declares

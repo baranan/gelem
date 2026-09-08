@@ -144,7 +144,6 @@ class _FlagDeclaringOperator(BaseOperator):
     name = "flag_declaring"
     create_columns_label = "Flag declaring"
     output_columns = [("mood_flag", "boolean_flag")]
-    requires_image = False
     descriptor = _columns_descriptor(
         "flag_declaring", "Flag declaring", [("mood_flag", "boolean_flag")]
     )
@@ -188,7 +187,6 @@ class _UnknownTagOperator(BaseOperator):
     name = "unknown_tag_op"
     create_columns_label = "Unknown tag"
     output_columns = [("odd_col", "no_such_tag_anywhere")]
-    requires_image = False
     descriptor = _columns_descriptor(
         "unknown_tag_op", "Unknown tag", [("odd_col", "no_such_tag_anywhere")]
     )
@@ -256,7 +254,6 @@ def test_media_path_declaring_operator_tags_schema_and_warns_nothing(
         name = "chart_op"
         create_columns_label = "Chart"
         output_columns = [("chart_path", "media_path")]
-        requires_image = False
         descriptor = _columns_descriptor(
             "chart_op", "Chart", [("chart_path", "media_path")]
         )

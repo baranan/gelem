@@ -132,7 +132,6 @@ def test_run_create_columns_does_not_copy_table_per_row(monkeypatch, tmp_path):
         name                  = "dummy_op"
         create_columns_label  = "Dummy"
         output_columns        = [("dummy_score", "numeric")]
-        requires_image        = False
         descriptor = _columns_descriptor(
             "dummy_op", "Dummy", [("dummy_score", "numeric")]
         )
@@ -214,7 +213,6 @@ def test_run_create_columns_raises_on_snapshot_length_mismatch():
         name                  = "noop"
         create_columns_label  = "No-op"
         output_columns        = [("probe", "numeric")]
-        requires_image        = False
         descriptor = _columns_descriptor(
             "noop", "No-op", [("probe", "numeric")]
         )
@@ -255,7 +253,6 @@ def test_run_create_columns_pairs_snapshot_rows_with_correct_row_id(monkeypatch,
         name                  = "echo_row_id"
         create_columns_label  = "Echo row id"
         output_columns        = [("probe", "numeric")]
-        requires_image        = False
         descriptor = _columns_descriptor(
             "echo_row_id", "Echo row id", [("probe", "numeric")]
         )

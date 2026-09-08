@@ -146,10 +146,12 @@ class BaseOperator:
     As of P1.12d-1 every concrete operator sets this, and a consistency
     test (tests/test_operator_descriptors_match.py) pins each descriptor
     against the operator's existing name / *_label / output_columns
-    attributes. Nothing CONSUMES the descriptor yet: P1.12d-2 makes the
-    Operators menu build from it and P1.12d-3 makes the runner read it.
-    Until then the legacy attributes above remain authoritative at run
-    time and the descriptor is a parallel, test-checked description.
+    attributes. As of P1.12d-2a AppController consumes the descriptor at
+    run time: every run looks up the mode's ModeDescriptor to build the
+    OperatorRun, and a run will not start for an operator that carries no
+    descriptor (or none for the requested mode). The Operators menu and
+    parameter dialog still build from the legacy *_label / parameters
+    attributes; wiring those to the descriptor is later P1.12d work.
     """
 
     # ── Menu labels ───────────────────────────────────────────────────
@@ -193,17 +195,18 @@ class BaseOperator:
         ]
     """
 
-    requires_image: bool = True
-    """
-    Whether create_columns() needs a full-resolution image to run.
-    Set to False for operators that work purely from metadata columns.
-    Only relevant for create_columns() — create_table() and
-    create_display() receive a DataFrame and never load images.
-
-    Example: BlendshapeAvatarOperator reads blendshape values from
-    metadata and renders an avatar without needing the original image,
-    so it sets requires_image = False.
-    """
+    # ── What media a create_columns run is handed ─────────────────────
+    #
+    # Whether create_columns() is handed a decoded frame is declared on
+    # the operator's descriptor, not by a boolean here. The COLUMNS
+    # ModeDescriptor carries a `media_requirement` (operators/descriptor.py
+    # -> MediaRequirement): FRAME means the runner decodes one frame and
+    # passes it as `image`; METADATA and ADDRESS mean the runner decodes
+    # nothing and passes `image=None` (ADDRESS is for an operator that
+    # resolves the media itself from its metadata). VIDEO_SPAN and
+    # AUDIO_SPAN are refused before the run starts -- the per-row runner
+    # cannot supply a span. See operators/operator_registry.py
+    # (_run_create_columns_worker) and AppController.run_create_columns.
 
     # ── Identity ──────────────────────────────────────────────────────
 
@@ -249,7 +252,8 @@ class BaseOperator:
             row_id:   The unique identifier of the row being processed.
             image:    The full-resolution image as a numpy array of
                       shape (height, width, 3), dtype uint8, RGB order.
-                      None if requires_image is False.
+                      None unless this operator's COLUMNS ModeDescriptor
+                      declares media_requirement = FRAME.
             metadata: Dict of all existing column values for this row.
                       Read-only — do not modify this dict.
             run:      The OperatorRun for this run (operators/run_context.py).

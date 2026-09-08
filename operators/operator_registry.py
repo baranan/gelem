@@ -44,6 +44,7 @@ import threading
 import pandas as pd
 
 from operators.base import BaseOperator, OperatorSetupError
+from operators.descriptor import MediaRequirement
 
 
 class OperatorRegistry:
@@ -319,13 +320,61 @@ class OperatorRegistry:
         # last results into the bounded main-thread drain.
         emitted = 0
 
+        # What the runner decodes for each row is decided by this run's
+        # declared media_requirement (operators/descriptor.py ->
+        # MediaRequirement), read off the run's mode descriptor -- not by a
+        # boolean flag on the operator. The five declared values and what
+        # each one means for this per-row COLUMNS runner:
+        #
+        #   FRAME    -- the operator needs one decoded frame. The runner
+        #               decodes the row's image below, exactly as before,
+        #               and skips the row if it cannot be loaded.
+        #   METADATA -- the operator works purely from the row's ordinary
+        #               columns. The runner decodes nothing and hands it
+        #               image=None.
+        #   ADDRESS  -- the operator resolves the media itself from its
+        #               metadata (the video frame-extraction operator is
+        #               the real case). The runner decodes nothing here
+        #               either and hands it image=None.
+        #   VIDEO_SPAN / AUDIO_SPAN -- an ordered span of video or audio.
+        #               This per-row runner cannot produce one: it sees a
+        #               single row at a time and has no decoder. A run that
+        #               declares either is REFUSED BEFORE IT STARTS, in
+        #               AppController.run_create_columns, naming the
+        #               operator and the requirement -- it must never reach
+        #               this worker. Approximating a span with one frame,
+        #               or silently handing None, is exactly the
+        #               wrong-number failure P1.12d exists to remove, so if
+        #               one somehow reaches here we surface it as a setup
+        #               error and process no rows rather than guess.
+        media_requirement = run.spec.mode_descriptor.media_requirement
+        if media_requirement in (
+            MediaRequirement.VIDEO_SPAN,
+            MediaRequirement.AUDIO_SPAN,
+        ):
+            if on_setup_error is not None:
+                on_setup_error(
+                    operation_id,
+                    operator.display_label,
+                    f"needs {media_requirement.name} media, which the "
+                    f"per-row runner cannot supply. AppController should "
+                    f"have refused this run before it started.",
+                )
+            if on_complete is not None:
+                on_complete(operation_id, operator.name, emitted)
+            return
+
+        # FRAME is the only requirement that makes the runner decode.
+        needs_frame = media_requirement is MediaRequirement.FRAME
+
         for i, row_id in enumerate(row_ids):
             metadata = snapshot.iloc[i].to_dict()
             try:
                 full_path = metadata.get("full_path", "")
 
-                # Load image only if the operator requires it.
-                if operator.requires_image:
+                # FRAME: decode one frame and skip the row if it will not
+                # load. METADATA / ADDRESS: hand the operator None.
+                if needs_frame:
                     image = operator.load_image(full_path)
                     if image is None:
                         print(

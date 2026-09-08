@@ -130,7 +130,6 @@ class _FactorOperator(BaseOperator):
     name = "factor_op"
     create_columns_label = "Write factor"
     output_columns = [("out", "numeric")]
-    requires_image = False
     descriptor = OperatorDescriptor(
         name="factor_op",
         version="1.0",
@@ -159,7 +158,6 @@ class _NoParamOperator(BaseOperator):
     name = "no_param_op"
     create_columns_label = "No params"
     output_columns = [("out", "numeric")]
-    requires_image = False
     descriptor = OperatorDescriptor(
         name="no_param_op",
         version="1.0",
@@ -183,7 +181,6 @@ class _NoDescriptorOperator(BaseOperator):
     name = "no_descriptor_op"
     create_columns_label = "No descriptor"
     output_columns = [("out", "numeric")]
-    requires_image = False
     # descriptor deliberately left as BaseOperator's None.
 
     def create_columns(self, row_id, image, metadata, run):
