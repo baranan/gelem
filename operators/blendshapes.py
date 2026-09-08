@@ -30,6 +30,17 @@ import numpy as np
 import mediapipe as mp
 
 from operators.base import BaseOperator, OperatorSetupError
+from operators.descriptor import (
+    ExecutionMode,
+    InputKind,
+    InputSpec,
+    MediaRequirement,
+    ModelLifecycle,
+    ModeDescriptor,
+    OperatorDescriptor,
+    OutputColumn,
+    OutputSpec,
+)
 
 # Where the model file lives, and where to download it from. Kept in one
 # place so the missing-model error message and the docstring above stay
@@ -91,6 +102,63 @@ class BlendshapeOperator(BaseOperator):
     create_columns_label = "Extract blendshapes"
     output_columns = [(bs_name, "numeric") for bs_name in BLENDSHAPE_NAMES]
     requires_image = True  # Needs the face image to run mediapipe.
+
+    # ------------------------------------------------------------------
+    # Descriptor (P1.12d-1). Describes what create_columns() ACTUALLY
+    # does today:
+    #  - one COLUMNS mode, over the active table;
+    #  - no parameters (get_parameters_dialog is not overridden);
+    #  - media_requirement FRAME: requires_image is True, so the runner
+    #    decodes one frame and hands it in as `image`;
+    #  - model_lifecycle PER_WORKER: this field states what the runner
+    #    must PROVIDE, not what the code does today. The FaceLandmarker is
+    #    created in IMAGE running mode (no running_mode is passed to
+    #    FaceLandmarkerOptions, and create_columns() calls
+    #    self._landmarker.detect()), so it carries no cross-frame tracking
+    #    state and PER_SEQUENCE is not required; but MediaPipe landmarkers
+    #    are not documented as thread-safe, so we cannot claim SHARED
+    #    either -- PER_WORKER is the fallback operators/CLAUDE.md's "Where
+    #    a model lives" section prescribes when thread-safety is unknown.
+    #    Today the operator holds one landmarker on self and reuses it for
+    #    every row; that is safe ONLY because operator_registry.py runs a
+    #    single worker thread. P1.12d-2 must convert this operator to a
+    #    model factory before any parallel worker path exists.
+    #  - deterministic: the same image and model give the same scores.
+    # ------------------------------------------------------------------
+    descriptor = OperatorDescriptor(
+        name="blendshapes",
+        version="1.0",
+        description=(
+            "Runs MediaPipe's FaceLandmarker on each row's face image and "
+            "writes the 52 ARKit blendshape activation scores (0.0-1.0) as "
+            "numeric columns. Rows with no detected face get None for every "
+            "blendshape column."
+        ),
+        modes=(
+            ModeDescriptor(
+                mode=ExecutionMode.COLUMNS,
+                label="Extract blendshapes",
+                inputs=(
+                    InputSpec(
+                        name="active_table",
+                        label="Active table",
+                        kind=InputKind.ACTIVE_TABLE,
+                    ),
+                ),
+                media_requirement=MediaRequirement.FRAME,
+                parameters=(),
+                output=OutputSpec(
+                    columns=tuple(
+                        OutputColumn(name=bs_name, type_tag="numeric")
+                        for bs_name in BLENDSHAPE_NAMES
+                    ),
+                ),
+                model_lifecycle=ModelLifecycle.PER_WORKER,
+                deterministic=True,
+                cacheable=True,
+            ),
+        ),
+    )
 
     def __init__(self):
         # Defer loading the mediapipe model until first use, so creating the

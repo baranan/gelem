@@ -21,6 +21,19 @@ import pandas as pd
 import plotly.express as px
 
 from operators.base import BaseOperator
+from operators.descriptor import (
+    ChoiceParameter,
+    ColumnParameter,
+    ExecutionMode,
+    InputKind,
+    InputSpec,
+    MediaRequirement,
+    ModelLifecycle,
+    ModeDescriptor,
+    OperatorDescriptor,
+    OutputSpec,
+    TextParameter,
+)
 
 
 CHART_TYPES = ["scatter", "line", "bar", "box", "violin", "histogram"]
@@ -52,6 +65,104 @@ class PlotAdvancedOperator(BaseOperator):
     # Setting create_display_label makes this operator appear in the
     # Operators menu under "Display results for selection".
     create_display_label = "Plot (interactive, Plotly)"
+
+    # ------------------------------------------------------------------
+    # Descriptor (P1.12d-1). What create_display() ACTUALLY does today:
+    #  - one DISPLAY mode, over the active table's selected rows,
+    #    storing nothing;
+    #  - SEVEN parameters, all genuinely read by create_display() via
+    #    the instance attributes get_parameters_dialog() stores:
+    #      title       -> self._title      (line ~267 / used line ~353)
+    #      chart_type  -> self._chart_type (used line ~293)
+    #      x, y        -> self._x, self._y (used lines ~288-289)
+    #      color, facet-> self._color, self._facet (optional; ~290-291)
+    #      aggregate   -> self._aggregate  (used line ~293)
+    #    The dialog is a real QDialog (not None), so these ARE the
+    #    operator's parameters today.
+    #  - media_requirement METADATA: works purely from the DataFrame;
+    #  - deterministic FALSE / cacheable FALSE: the returned artifact_path
+    #    and html_path embed a wall-clock timestamp --
+    #        now = datetime.now()
+    #        run_id = (now.strftime("%Y.%m.%d_%H.%M.%S") + ...)
+    #    so two runs with identical inputs return different paths.
+    # ------------------------------------------------------------------
+    descriptor = OperatorDescriptor(
+        name="plot_advanced",
+        version="1.0",
+        description=(
+            "Builds one interactive Plotly Express figure (scatter, line, "
+            "bar, box, violin or histogram) for the selected rows, "
+            "optionally colouring and facetting by a column and aggregating "
+            "groups first. Writes a static PNG and an interactive HTML file "
+            "and shows them in the Results panel; stores nothing."
+        ),
+        modes=(
+            ModeDescriptor(
+                mode=ExecutionMode.DISPLAY,
+                label="Plot (interactive, Plotly)",
+                inputs=(
+                    InputSpec(
+                        name="active_table",
+                        label="Active table",
+                        kind=InputKind.ACTIVE_TABLE,
+                    ),
+                ),
+                media_requirement=MediaRequirement.METADATA,
+                parameters=(
+                    TextParameter(
+                        name="title",
+                        label="Title",
+                        help_text="Blank uses the auto title \"{y} by {x}\".",
+                        required=False,
+                        default="",
+                    ),
+                    ChoiceParameter(
+                        name="chart_type",
+                        label="Chart type",
+                        choices=tuple(
+                            (chart_type, chart_type)
+                            for chart_type in CHART_TYPES
+                        ),
+                        default="scatter",
+                    ),
+                    ColumnParameter(
+                        name="x",
+                        label="X axis",
+                        from_input="active_table",
+                    ),
+                    ColumnParameter(
+                        name="y",
+                        label="Y axis",
+                        from_input="active_table",
+                    ),
+                    ColumnParameter(
+                        name="color",
+                        label="Colour (optional)",
+                        from_input="active_table",
+                        required=False,
+                    ),
+                    ColumnParameter(
+                        name="facet",
+                        label="Facet (optional)",
+                        from_input="active_table",
+                        required=False,
+                    ),
+                    ChoiceParameter(
+                        name="aggregate",
+                        label="Aggregate",
+                        choices=tuple(
+                            (aggregate, aggregate) for aggregate in AGGREGATES
+                        ),
+                        default="none",
+                    ),
+                ),
+                output=OutputSpec(is_display_only=True),
+                model_lifecycle=ModelLifecycle.NONE,
+                deterministic=False,
+                cacheable=False,
+            ),
+        ),
+    )
 
     def __init__(self, output_dir: Path | None = None):
         # Default to a project-relative folder, not the system Temp

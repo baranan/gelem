@@ -20,6 +20,17 @@ import numpy as np
 
 from operators.base import BaseOperator
 from operators.blendshapes import BLENDSHAPE_NAMES
+from operators.descriptor import (
+    ExecutionMode,
+    InputKind,
+    InputSpec,
+    MediaRequirement,
+    ModelLifecycle,
+    ModeDescriptor,
+    OperatorDescriptor,
+    OutputColumn,
+    OutputSpec,
+)
 
 
 class BlendshapeAvatarOperator(BaseOperator):
@@ -40,6 +51,52 @@ class BlendshapeAvatarOperator(BaseOperator):
     # type and left the column rendering as an "Unknown column" placeholder.
     output_columns = [("avatar_path", "media_path")]
     requires_image = False  # Reads blendshape values from metadata.
+
+    # ------------------------------------------------------------------
+    # Descriptor (P1.12d-1). What create_columns() ACTUALLY does today:
+    #  - one COLUMNS mode, over the active table, producing one
+    #    media_path column "avatar_path" -- matches output_columns;
+    #  - NO parameters (get_parameters_dialog is not overridden);
+    #  - media_requirement METADATA: requires_image is False and the
+    #    method body decodes nothing;
+    #  - PLACEHOLDER output: the method ignores the blendshape values
+    #    entirely and writes a flat 256x256 grey JPEG per row. The
+    #    description says so.
+    #  - deterministic: fixed filename, constant grey image.
+    # ------------------------------------------------------------------
+    descriptor = OperatorDescriptor(
+        name="blendshape_avatar",
+        version="1.0",
+        description=(
+            "PLACEHOLDER operator: for each row it writes a flat grey "
+            "256x256 JPEG and stores its path in the 'avatar_path' media "
+            "column. It does not yet read the row's blendshape values or "
+            "render a real deformed face."
+        ),
+        modes=(
+            ModeDescriptor(
+                mode=ExecutionMode.COLUMNS,
+                label="Render blendshape avatar",
+                inputs=(
+                    InputSpec(
+                        name="active_table",
+                        label="Active table",
+                        kind=InputKind.ACTIVE_TABLE,
+                    ),
+                ),
+                media_requirement=MediaRequirement.METADATA,
+                parameters=(),
+                output=OutputSpec(
+                    columns=(
+                        OutputColumn(name="avatar_path", type_tag="media_path"),
+                    ),
+                ),
+                model_lifecycle=ModelLifecycle.NONE,
+                deterministic=True,
+                cacheable=True,
+            ),
+        ),
+    )
 
     def __init__(self, output_dir: Path | None = None):
         """

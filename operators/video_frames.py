@@ -31,6 +31,18 @@ from pathlib import Path
 import pandas as pd
 
 from operators.base import BaseOperator
+from operators.descriptor import (
+    ColumnParameter,
+    ExecutionMode,
+    InputKind,
+    InputSpec,
+    MediaRequirement,
+    ModelLifecycle,
+    ModeDescriptor,
+    NumberParameter,
+    OperatorDescriptor,
+    OutputSpec,
+)
 from column_types.renderers import VIDEO_EXTENSIONS
 
 
@@ -43,6 +55,74 @@ class VideoFramesOperator(BaseOperator):
     create_table_label = "Extract frames from videos"
     output_columns = []
     requires_image = False
+
+    # ------------------------------------------------------------------
+    # Descriptor (P1.12d-1). What create_table() ACTUALLY does today:
+    #  - one TABLE mode: it builds a brand-new frame-level table
+    #    (creates_table), one row per kept frame;
+    #  - TWO parameters, both read by create_table():
+    #      video_column -> self._video_column (a column of the active
+    #                      table holding the video path; used line ~114)
+    #      frame_step   -> self._frame_step   (keep every Nth frame;
+    #                      dialog min 1, max 10_000, default 1)
+    #  - media_requirement ADDRESS: create_table() opens the video files
+    #    itself --
+    #        cap = cv2.VideoCapture(str(video_path))
+    #    -- rather than being handed decoded media by the runner. This is
+    #    the ADDRESS case the descriptor enum calls out by name.
+    #  - model_lifecycle NONE;
+    #  - deterministic FALSE / cacheable FALSE: every run writes into a
+    #    fresh timestamped subfolder --
+    #        now = datetime.now()
+    #        stamp = now.strftime("%Y.%m.%d_%H.%M.%S") + ...
+    #        run_dir = self._output_dir / f"run_{stamp}"
+    #    -- and the output table's overwritten full_path values carry
+    #    that timestamp, so identical inputs give different output.
+    # ------------------------------------------------------------------
+    descriptor = OperatorDescriptor(
+        name="video_frames",
+        version="1.0",
+        description=(
+            "Reads a video-path column of the active table, decodes each "
+            "video with OpenCV, and builds a new frame-level table with one "
+            "row per kept frame (every Nth frame). Each frame row copies the "
+            "source video row's columns, repoints full_path at the saved "
+            "frame JPEG, and adds frame_number and video_file."
+        ),
+        modes=(
+            ModeDescriptor(
+                mode=ExecutionMode.TABLE,
+                label="Extract frames from videos",
+                inputs=(
+                    InputSpec(
+                        name="active_table",
+                        label="Active table",
+                        kind=InputKind.ACTIVE_TABLE,
+                    ),
+                ),
+                media_requirement=MediaRequirement.ADDRESS,
+                parameters=(
+                    ColumnParameter(
+                        name="video_column",
+                        label="Video path column",
+                        from_input="active_table",
+                    ),
+                    NumberParameter(
+                        name="frame_step",
+                        label="Frame step (keep every Nth)",
+                        minimum=1,
+                        maximum=10_000,
+                        decimals=0,
+                        default=1,
+                    ),
+                ),
+                output=OutputSpec(creates_table=True),
+                model_lifecycle=ModelLifecycle.NONE,
+                deterministic=False,
+                cacheable=False,
+            ),
+        ),
+    )
 
     def __init__(self, output_dir: Path | None = None):
         # Default to a project-relative folder, not the system Temp

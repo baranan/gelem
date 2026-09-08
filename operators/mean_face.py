@@ -28,6 +28,16 @@ import pandas as pd
 
 from operators.base import BaseOperator
 from operators.blendshapes import BLENDSHAPE_NAMES
+from operators.descriptor import (
+    ExecutionMode,
+    InputKind,
+    InputSpec,
+    MediaRequirement,
+    ModelLifecycle,
+    ModeDescriptor,
+    OperatorDescriptor,
+    OutputSpec,
+)
 
 
 class MeanFaceOperator(BaseOperator):
@@ -41,6 +51,76 @@ class MeanFaceOperator(BaseOperator):
     create_display_label = "Mean face (quick view)"
     output_columns       = []
     requires_image       = False
+
+    # ------------------------------------------------------------------
+    # Descriptor (P1.12d-1). What the two methods ACTUALLY do today:
+    #  - TABLE mode (create_table): builds a new table, one row per
+    #    group, with n_frames, the group-by column, and a
+    #    "<bs>_mean" column per blendshape;
+    #  - DISPLAY mode (create_display): shows one mean face for the
+    #    whole selection, storing nothing;
+    #  - NO parameters for either mode. get_parameters_dialog() is NOT
+    #    overridden, so it returns None. create_table() reads a
+    #    `group_by` argument, but MainWindow sources that from
+    #    getattr(operator, "_group_by", None) and nothing ever sets
+    #    _group_by on this operator -- so grouping is unreachable today.
+    #    See the P1.12d-1 report, "should have a parameter but does not".
+    #  - media_requirement METADATA for both: they work purely from the
+    #    DataFrame;
+    #  - PLACEHOLDER output: both modes write flat grey JPEGs and report
+    #    every blendshape mean as 0.0. The group counting / grouping
+    #    itself is real. The description says which parts are placeholder.
+    #  - deterministic: fixed filenames, constant grey images, constant
+    #    0.0 means.
+    # ------------------------------------------------------------------
+    descriptor = OperatorDescriptor(
+        name="mean_face",
+        version="1.0",
+        description=(
+            "Groups the selected rows (TABLE mode groups by a column, "
+            "DISPLAY mode takes the whole selection as one group) and is "
+            "meant to average their blendshapes and render a mean face. "
+            "PLACEHOLDER today: the grouping and row counts are real, but "
+            "every rendered face is a flat grey JPEG and every reported "
+            "blendshape mean is 0.0."
+        ),
+        modes=(
+            ModeDescriptor(
+                mode=ExecutionMode.TABLE,
+                label="Mean face table",
+                inputs=(
+                    InputSpec(
+                        name="active_table",
+                        label="Active table",
+                        kind=InputKind.ACTIVE_TABLE,
+                    ),
+                ),
+                media_requirement=MediaRequirement.METADATA,
+                parameters=(),
+                output=OutputSpec(creates_table=True),
+                model_lifecycle=ModelLifecycle.NONE,
+                deterministic=True,
+                cacheable=True,
+            ),
+            ModeDescriptor(
+                mode=ExecutionMode.DISPLAY,
+                label="Mean face (quick view)",
+                inputs=(
+                    InputSpec(
+                        name="active_table",
+                        label="Active table",
+                        kind=InputKind.ACTIVE_TABLE,
+                    ),
+                ),
+                media_requirement=MediaRequirement.METADATA,
+                parameters=(),
+                output=OutputSpec(is_display_only=True),
+                model_lifecycle=ModelLifecycle.NONE,
+                deterministic=True,
+                cacheable=True,
+            ),
+        ),
+    )
 
     def __init__(self, output_dir: Path | None = None):
         """

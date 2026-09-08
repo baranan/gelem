@@ -30,6 +30,16 @@ from __future__ import annotations
 import pandas as pd
 
 from operators.base import BaseOperator
+from operators.descriptor import (
+    ExecutionMode,
+    InputKind,
+    InputSpec,
+    MediaRequirement,
+    ModelLifecycle,
+    ModeDescriptor,
+    OperatorDescriptor,
+    OutputSpec,
+)
 
 
 # Statistical tests the researcher can choose from.
@@ -59,6 +69,51 @@ class StatsOperator(BaseOperator):
     create_display_label = "Statistical test (pingouin)"
     output_columns       = []
     requires_image       = False
+
+    # ------------------------------------------------------------------
+    # Descriptor (P1.12d-1). What create_display() ACTUALLY does today:
+    #  - one DISPLAY mode, over the active table's selected rows,
+    #    storing nothing;
+    #  - NO parameters. get_parameters_dialog() returns None, so the
+    #    test type / dependent variable / grouping column that __init__
+    #    sets up (self._test_type etc.) are never chosen by the
+    #    researcher -- they keep their constructor defaults. See the
+    #    P1.12d-1 report, "should have a parameter but does not".
+    #  - media_requirement METADATA: works purely from the DataFrame;
+    #  - PLACEHOLDER output: returns a hard-coded fake result
+    #    (p_value 0.042, effect_size 0.61, statistic 2.34) regardless of
+    #    the data. The description says so.
+    #  - deterministic: the same constant dict every call.
+    # ------------------------------------------------------------------
+    descriptor = OperatorDescriptor(
+        name="stats",
+        version="1.0",
+        description=(
+            "PLACEHOLDER operator: meant to run a pingouin statistical test "
+            "(t-test, ANOVA, correlation, chi-square) on the selected rows "
+            "and show an APA-style result table. Today it ignores the data "
+            "and returns a fixed fake result (p = 0.042, effect size 0.61)."
+        ),
+        modes=(
+            ModeDescriptor(
+                mode=ExecutionMode.DISPLAY,
+                label="Statistical test (pingouin)",
+                inputs=(
+                    InputSpec(
+                        name="active_table",
+                        label="Active table",
+                        kind=InputKind.ACTIVE_TABLE,
+                    ),
+                ),
+                media_requirement=MediaRequirement.METADATA,
+                parameters=(),
+                output=OutputSpec(is_display_only=True),
+                model_lifecycle=ModelLifecycle.NONE,
+                deterministic=True,
+                cacheable=True,
+            ),
+        ),
+    )
 
     def __init__(self):
         """Creates the operator with default parameter values."""

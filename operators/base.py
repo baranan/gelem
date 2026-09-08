@@ -54,6 +54,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+# operators/descriptor.py is standard-library only and imports nothing from
+# this package, so a plain runtime import here is not circular. We import it
+# at runtime (not merely under TYPE_CHECKING) so the annotation below stays
+# resolvable and every operator module can build its descriptor from the
+# shared vocabulary.
+from operators.descriptor import OperatorDescriptor
+
 
 class OperatorSetupError(Exception):
     """
@@ -114,6 +121,28 @@ class BaseOperator:
     operators. Used as the key in operators_config.yaml and as the
     internal identifier in OperatorRegistry.
     Example: "blendshapes", "mean_face", "plot"
+    """
+
+    descriptor: OperatorDescriptor | None = None
+    """
+    The operator's pure-data self-description: its modes, the inputs and
+    parameters each mode takes, and what each mode produces (see
+    operators/descriptor.py for the vocabulary).
+
+    Some fields DESCRIBE the operator as it already behaves (the labels,
+    the output columns) and must match what the code does today; others
+    state a REQUIREMENT the runner must satisfy for the operator to be
+    correct (model_lifecycle, media_requirement) and may declare a
+    stricter contract than the current single-worker code happens to
+    need.
+
+    As of P1.12d-1 every concrete operator sets this, and a consistency
+    test (tests/test_operator_descriptors_match.py) pins each descriptor
+    against the operator's existing name / *_label / output_columns
+    attributes. Nothing CONSUMES the descriptor yet: P1.12d-2 makes the
+    Operators menu build from it and P1.12d-3 makes the runner read it.
+    Until then the legacy attributes above remain authoritative at run
+    time and the descriptor is a parallel, test-checked description.
     """
 
     # ── Menu labels ───────────────────────────────────────────────────

@@ -23,6 +23,17 @@ from pathlib import Path
 import numpy as np
 
 from operators.base import BaseOperator
+from operators.descriptor import (
+    ExecutionMode,
+    InputKind,
+    InputSpec,
+    MediaRequirement,
+    ModelLifecycle,
+    ModeDescriptor,
+    OperatorDescriptor,
+    OutputColumn,
+    OutputSpec,
+)
 
 
 class PlotOperator(BaseOperator):
@@ -43,6 +54,57 @@ class PlotOperator(BaseOperator):
     # type and left the column rendering as an "Unknown column" placeholder.
     output_columns = [("plot_path", "media_path")]
     requires_image = False  # Reads column values from metadata.
+
+    # ------------------------------------------------------------------
+    # Descriptor (P1.12d-1). What create_columns() ACTUALLY does today:
+    #  - one COLUMNS mode, over the active table, producing one
+    #    media_path column "plot_path" -- matches output_columns;
+    #  - NO parameters. get_parameters_dialog() returns None, so the
+    #    "which columns to plot" choice is NOT a parameter today: the
+    #    column list is fixed in __init__ (self._columns default). See
+    #    the P1.12d-1 report, "should have a parameter but does not".
+    #  - media_requirement METADATA: requires_image is False and
+    #    create_columns() reads only metadata values, decoding nothing;
+    #  - despite the "# PLACEHOLDER" comment, create_columns() does real
+    #    work -- it builds a real matplotlib bar chart from the row's
+    #    real metadata values and writes a real PNG -- so the
+    #    description does not call it a placeholder;
+    #  - deterministic: fixed output filename, chart built from the
+    #    row's values.
+    # ------------------------------------------------------------------
+    descriptor = OperatorDescriptor(
+        name="plot",
+        version="1.0",
+        description=(
+            "For each row, draws a horizontal matplotlib bar chart of a "
+            "fixed set of numeric columns' values and writes it as a PNG, "
+            "storing the file path in the 'plot_path' media column. Missing "
+            "values are treated as 0.0."
+        ),
+        modes=(
+            ModeDescriptor(
+                mode=ExecutionMode.COLUMNS,
+                label="Plot columns (bar chart)",
+                inputs=(
+                    InputSpec(
+                        name="active_table",
+                        label="Active table",
+                        kind=InputKind.ACTIVE_TABLE,
+                    ),
+                ),
+                media_requirement=MediaRequirement.METADATA,
+                parameters=(),
+                output=OutputSpec(
+                    columns=(
+                        OutputColumn(name="plot_path", type_tag="media_path"),
+                    ),
+                ),
+                model_lifecycle=ModelLifecycle.NONE,
+                deterministic=True,
+                cacheable=True,
+            ),
+        ),
+    )
 
     def __init__(
         self,

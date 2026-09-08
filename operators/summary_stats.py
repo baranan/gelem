@@ -15,6 +15,16 @@ from __future__ import annotations
 import pandas as pd
 
 from operators.base import BaseOperator
+from operators.descriptor import (
+    ExecutionMode,
+    InputKind,
+    InputSpec,
+    MediaRequirement,
+    ModelLifecycle,
+    ModeDescriptor,
+    OperatorDescriptor,
+    OutputSpec,
+)
 
 
 class SummaryStatsOperator(BaseOperator):
@@ -29,6 +39,50 @@ class SummaryStatsOperator(BaseOperator):
     create_display_label = "Summary statistics"
     output_columns       = []
     requires_image       = False
+
+    # ------------------------------------------------------------------
+    # Descriptor (P1.12d-1). What create_display() ACTUALLY does today:
+    #  - one DISPLAY mode, over the active table's selected rows,
+    #    storing nothing (is_display_only);
+    #  - NO parameters. get_parameters_dialog() is not overridden, so it
+    #    returns None. The __init__ `columns` argument is never wired to
+    #    a dialog; with it left as None the operator computes stats for
+    #    every numeric column. So there is no column-selection parameter
+    #    today (a milder case than plot -- there is no hardcoded list,
+    #    just "all numeric").
+    #  - media_requirement METADATA: works purely from the DataFrame;
+    #  - real work: computes mean / SD (ddof=1) / min / max / median / n;
+    #  - deterministic.
+    # ------------------------------------------------------------------
+    descriptor = OperatorDescriptor(
+        name="summary_stats",
+        version="1.0",
+        description=(
+            "Computes descriptive statistics -- mean, sample SD (ddof=1), "
+            "min, max, median and n -- for every numeric column across the "
+            "selected rows and shows them in the Results panel. Nothing is "
+            "stored in any table."
+        ),
+        modes=(
+            ModeDescriptor(
+                mode=ExecutionMode.DISPLAY,
+                label="Summary statistics",
+                inputs=(
+                    InputSpec(
+                        name="active_table",
+                        label="Active table",
+                        kind=InputKind.ACTIVE_TABLE,
+                    ),
+                ),
+                media_requirement=MediaRequirement.METADATA,
+                parameters=(),
+                output=OutputSpec(is_display_only=True),
+                model_lifecycle=ModelLifecycle.NONE,
+                deterministic=True,
+                cacheable=True,
+            ),
+        ),
+    )
 
     def __init__(self, columns: list[str] | None = None):
         """
