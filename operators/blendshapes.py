@@ -108,7 +108,7 @@ class BlendshapeOperator(BaseOperator):
     #  - one COLUMNS mode, over the active table;
     #  - no parameters (get_parameters_dialog is not overridden);
     #  - media_requirement FRAME: mediapipe needs the face image, so the
-    #    runner decodes one frame and hands it in as `image`;
+    #    runner decodes one frame and hands it in as `media`;
     #  - model_lifecycle PER_WORKER: this field states what the runner
     #    must PROVIDE, not what the code does today. The FaceLandmarker is
     #    created in IMAGE running mode (no running_mode is passed to
@@ -183,7 +183,7 @@ class BlendshapeOperator(BaseOperator):
     def create_columns(
         self,
         row_id: str,
-        image: np.ndarray,
+        media: np.ndarray,
         metadata: dict,
         run,
     ) -> dict:
@@ -192,7 +192,10 @@ class BlendshapeOperator(BaseOperator):
 
         Args:
             row_id:   Unique ID of the row being processed.
-            image:    The face image as a numpy array (height, width, 3), RGB.
+            media:    The payload the runner decoded for this row, decided
+                      by the mode's media_requirement (None for METADATA
+                      and ADDRESS). This operator declares FRAME, so it is
+                      the face frame as a numpy array (height, width, 3), RGB.
             metadata: Existing column values for this row (not used here).
             run:      The OperatorRun for this run. This operator declares
                       no parameters, so run.parameters is empty; the
@@ -211,7 +214,7 @@ class BlendshapeOperator(BaseOperator):
         # worker catches them, marks the row as missing, and reports them
         # in an end-of-run summary so they're distinguishable from the
         # normal "no face detected" case below.
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=media)
         detection_result = self._landmarker.detect(mp_image)
 
         if not detection_result.face_blendshapes:

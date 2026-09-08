@@ -147,7 +147,7 @@ class _FactorOperator(BaseOperator):
         super().__init__()
         self.runs_seen: list = []
 
-    def create_columns(self, row_id, image, metadata, run):
+    def create_columns(self, row_id, media, metadata, run):
         self.runs_seen.append(run)
         return {"out": float(run.parameters["factor"])}
 
@@ -169,7 +169,7 @@ class _NoParamOperator(BaseOperator):
         super().__init__()
         self.seen_empty: list[bool] = []
 
-    def create_columns(self, row_id, image, metadata, run):
+    def create_columns(self, row_id, media, metadata, run):
         self.seen_empty.append(dict(run.parameters) == {})
         return {"out": 1.0}
 
@@ -183,7 +183,7 @@ class _NoDescriptorOperator(BaseOperator):
     output_columns = [("out", "numeric")]
     # descriptor deliberately left as BaseOperator's None.
 
-    def create_columns(self, row_id, image, metadata, run):
+    def create_columns(self, row_id, media, metadata, run):
         return {"out": 1.0}
 
 

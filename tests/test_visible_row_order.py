@@ -90,7 +90,7 @@ class _RecordingOperator(BaseOperator):
         super().__init__()
         self.seen: list[str] = []
 
-    def create_columns(self, row_id, image, metadata, run):
+    def create_columns(self, row_id, media, metadata, run):
         self.seen.append(str(row_id))
         return {"probe": 1.0}
 

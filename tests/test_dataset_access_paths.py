@@ -136,7 +136,7 @@ def test_run_create_columns_does_not_copy_table_per_row(monkeypatch, tmp_path):
             "dummy_op", "Dummy", [("dummy_score", "numeric")]
         )
 
-        def create_columns(self, row_id, image, metadata, run):
+        def create_columns(self, row_id, media, metadata, run):
             return {"dummy_score": 1.0}
 
     store    = ArtifactStore(tmp_path / "artifacts")
@@ -217,7 +217,7 @@ def test_run_create_columns_raises_on_snapshot_length_mismatch():
             "noop", "No-op", [("probe", "numeric")]
         )
 
-        def create_columns(self, row_id, image, metadata, run):
+        def create_columns(self, row_id, media, metadata, run):
             return {"probe": 0}
 
     op_registry = OperatorRegistry()
@@ -257,7 +257,7 @@ def test_run_create_columns_pairs_snapshot_rows_with_correct_row_id(monkeypatch,
             "echo_row_id", "Echo row id", [("probe", "numeric")]
         )
 
-        def create_columns(self, row_id, image, metadata, run):
+        def create_columns(self, row_id, media, metadata, run):
             # The result is derived purely from row_id, so a shifted
             # pairing shows up as a wrong value at every affected row.
             return {"probe": int(row_id)}

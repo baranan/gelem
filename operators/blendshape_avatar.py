@@ -58,7 +58,7 @@ class BlendshapeAvatarOperator(BaseOperator):
     #  - NO parameters (get_parameters_dialog is not overridden);
     #  - media_requirement METADATA: the method reads blendshape values
     #    from metadata and decodes nothing, so the runner hands it
-    #    image=None;
+    #    media=None;
     #  - PLACEHOLDER output: the method ignores the blendshape values
     #    entirely and writes a flat 256x256 grey JPEG per row. The
     #    description says so.
@@ -117,7 +117,7 @@ class BlendshapeAvatarOperator(BaseOperator):
     def create_columns(
         self,
         row_id: str,
-        image: np.ndarray | None,
+        media: np.ndarray | None,
         metadata: dict,
         run,
     ) -> dict:
@@ -127,8 +127,9 @@ class BlendshapeAvatarOperator(BaseOperator):
 
         Args:
             row_id:   The row being processed.
-            image:    Not used -- this operator's descriptor declares
-                      media_requirement = METADATA, so it is always None.
+            media:    The payload the runner decoded for this row, decided
+                      by the mode's media_requirement. This operator
+                      declares METADATA, so it is None.
             metadata: Must contain blendshape columns (bs_jawOpen etc.)
                       for this to produce a meaningful avatar.
             run:      The OperatorRun for this run. This operator declares

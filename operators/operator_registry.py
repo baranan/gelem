@@ -331,11 +331,11 @@ class OperatorRegistry:
         #               and skips the row if it cannot be loaded.
         #   METADATA -- the operator works purely from the row's ordinary
         #               columns. The runner decodes nothing and hands it
-        #               image=None.
+        #               media=None.
         #   ADDRESS  -- the operator resolves the media itself from its
         #               metadata (the video frame-extraction operator is
         #               the real case). The runner decodes nothing here
-        #               either and hands it image=None.
+        #               either and hands it media=None.
         #   VIDEO_SPAN / AUDIO_SPAN -- an ordered span of video or audio.
         #               This per-row runner cannot produce one: it sees a
         #               single row at a time and has no decoder. A run that
@@ -375,17 +375,17 @@ class OperatorRegistry:
                 # FRAME: decode one frame and skip the row if it will not
                 # load. METADATA / ADDRESS: hand the operator None.
                 if needs_frame:
-                    image = operator.load_image(full_path)
-                    if image is None:
+                    media = operator.load_image(full_path)
+                    if media is None:
                         print(
                             f"[OperatorRegistry] Could not load image "
                             f"for {row_id}: {full_path}"
                         )
                         continue
                 else:
-                    image = None
+                    media = None
 
-                result = operator.create_columns(row_id, image, metadata, run)
+                result = operator.create_columns(row_id, media, metadata, run)
 
                 if on_item_complete is not None:
                     on_item_complete(operation_id, table_name, row_id, result)

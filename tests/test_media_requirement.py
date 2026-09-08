@@ -108,7 +108,7 @@ def _columns_descriptor(name, label, media_requirement):
 
 
 class _RecordingOperator(BaseOperator):
-    """A COLUMNS operator that records the ``image`` argument it is handed
+    """A COLUMNS operator that records the ``media`` argument it is handed
     for every row. The descriptor -- and therefore the declared
     media_requirement -- is supplied per instance so one class covers the
     FRAME, METADATA and ADDRESS cases."""
@@ -126,8 +126,8 @@ class _RecordingOperator(BaseOperator):
         )
         self.images_seen: list = []
 
-    def create_columns(self, row_id, image, metadata, run):
-        self.images_seen.append(image)
+    def create_columns(self, row_id, media, metadata, run):
+        self.images_seen.append(media)
         return {"out": 1.0}
 
 

@@ -370,7 +370,7 @@ def test_failed_operator_start_leaves_no_live_run(tmp_path, monkeypatch):
         output_columns       = [("probe", "numeric")]
         descriptor = _columns_descriptor("probe", "Probe", [("probe", "numeric")])
 
-        def create_columns(self, row_id, image, metadata, run):
+        def create_columns(self, row_id, media, metadata, run):
             return {"probe": 1.0}
 
     controller, dataset, op_registry = _make_controller(tmp_path)

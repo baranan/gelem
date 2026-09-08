@@ -148,7 +148,7 @@ class _FlagDeclaringOperator(BaseOperator):
         "flag_declaring", "Flag declaring", [("mood_flag", "boolean_flag")]
     )
 
-    def create_columns(self, row_id, image, metadata, run):
+    def create_columns(self, row_id, media, metadata, run):
         return {"mood_flag": 1}
 
 
@@ -191,7 +191,7 @@ class _UnknownTagOperator(BaseOperator):
         "unknown_tag_op", "Unknown tag", [("odd_col", "no_such_tag_anywhere")]
     )
 
-    def create_columns(self, row_id, image, metadata, run):
+    def create_columns(self, row_id, media, metadata, run):
         return {"odd_col": "some text"}
 
 
@@ -258,7 +258,7 @@ def test_media_path_declaring_operator_tags_schema_and_warns_nothing(
             "chart_op", "Chart", [("chart_path", "media_path")]
         )
 
-        def create_columns(self, row_id, image, metadata, run):
+        def create_columns(self, row_id, media, metadata, run):
             from PIL import Image
             path = out_dir / f"{row_id}_chart.png"
             Image.new("RGB", (16, 16), color=(10, 20, 30)).save(path, "PNG")

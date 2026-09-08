@@ -63,7 +63,7 @@ class PlotOperator(BaseOperator):
     #    column list is fixed in __init__ (self._columns default). See
     #    the P1.12d-1 report, "should have a parameter but does not".
     #  - media_requirement METADATA: create_columns() reads only metadata
-    #    values, decoding nothing, so the runner hands it image=None;
+    #    values, decoding nothing, so the runner hands it media=None;
     #  - despite the "# PLACEHOLDER" comment, create_columns() does real
     #    work -- it builds a real matplotlib bar chart from the row's
     #    real metadata values and writes a real PNG -- so the
@@ -153,7 +153,7 @@ class PlotOperator(BaseOperator):
     def create_columns(
         self,
         row_id: str,
-        image: np.ndarray | None,
+        media: np.ndarray | None,
         metadata: dict,
         run,
     ) -> dict:
@@ -163,8 +163,9 @@ class PlotOperator(BaseOperator):
 
         Args:
             row_id:   The row being processed.
-            image:    Not used -- this operator's descriptor declares
-                      media_requirement = METADATA, so it is always None.
+            media:    The payload the runner decoded for this row, decided
+                      by the mode's media_requirement. This operator
+                      declares METADATA, so it is None.
             metadata: Contains column values for this row.
             run:      The OperatorRun for this run. This operator declares
                       no parameters yet, so run.parameters is empty and

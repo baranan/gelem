@@ -97,8 +97,8 @@ class BaseOperator:
             create_columns_label = "Compute my score"
             output_columns = [("my_score", "numeric")]
 
-            def create_columns(self, row_id, image, metadata, run):
-                score = compute_something(image)
+            def create_columns(self, row_id, media, metadata, run):
+                score = compute_something(media)
                 return {"my_score": score}
 
     Example — an operator that supports two modes:
@@ -201,8 +201,8 @@ class BaseOperator:
     # the operator's descriptor, not by a boolean here. The COLUMNS
     # ModeDescriptor carries a `media_requirement` (operators/descriptor.py
     # -> MediaRequirement): FRAME means the runner decodes one frame and
-    # passes it as `image`; METADATA and ADDRESS mean the runner decodes
-    # nothing and passes `image=None` (ADDRESS is for an operator that
+    # passes it as `media`; METADATA and ADDRESS mean the runner decodes
+    # nothing and passes `media=None` (ADDRESS is for an operator that
     # resolves the media itself from its metadata). VIDEO_SPAN and
     # AUDIO_SPAN are refused before the run starts -- the per-row runner
     # cannot supply a span. See operators/operator_registry.py
@@ -234,7 +234,7 @@ class BaseOperator:
     def create_columns(
         self,
         row_id: str,
-        image: np.ndarray | None,
+        media: np.ndarray | None,
         metadata: dict,
         run,
     ) -> dict:
@@ -250,10 +250,11 @@ class BaseOperator:
 
         Args:
             row_id:   The unique identifier of the row being processed.
-            image:    The full-resolution image as a numpy array of
-                      shape (height, width, 3), dtype uint8, RGB order.
-                      None unless this operator's COLUMNS ModeDescriptor
-                      declares media_requirement = FRAME.
+            media:    The payload the runner decoded for this row, decided
+                      by the mode's media_requirement. It is None for
+                      METADATA and ADDRESS. For FRAME it is the
+                      full-resolution frame as a numpy array of shape
+                      (height, width, 3), dtype uint8, RGB order.
             metadata: Dict of all existing column values for this row.
                       Read-only — do not modify this dict.
             run:      The OperatorRun for this run (operators/run_context.py).
