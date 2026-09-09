@@ -243,6 +243,16 @@ def build_field_specs(mode_descriptor, columns_by_input) -> tuple[FieldSpec, ...
                 # Empty required_tags means "any column of this input".
                 offered = tuple(column_name for column_name, _tag in available)
 
+            # A single-selection ColumnParameter may name a column to
+            # preselect. A default that names a column this input does not
+            # offer falls back to no preselection, rather than the form
+            # showing a column that is not there. (allow_multiple together
+            # with a default is refused at descriptor construction, so this
+            # only ever matters for the single-selection case.)
+            default_column = parameter.default
+            if default_column is not None and default_column not in offered:
+                default_column = None
+
             specs.append(
                 FieldSpec(
                     name=parameter.name,
@@ -250,7 +260,7 @@ def build_field_specs(mode_descriptor, columns_by_input) -> tuple[FieldSpec, ...
                     label=parameter.label,
                     help_text=parameter.help_text,
                     required=parameter.required,
-                    default=None,
+                    default=default_column,
                     column_names=offered,
                     allow_multiple=parameter.allow_multiple,
                 )
@@ -418,8 +428,10 @@ class ParameterDialog(QDialog):
       * boolean        -- QCheckBox;
       * choice         -- QComboBox, item data = the choice value (a blank
                           first entry unless a default pre-selects one);
-      * column, single -- QComboBox of column names (always a blank first
-                          entry, so the field starts unselected);
+      * column, single -- QComboBox of column names (a blank first entry is
+                          always present; the field starts on its default
+                          column when the default names one this input
+                          offers, otherwise on the blank entry);
       * column, multi  -- QListWidget in multi-selection mode.
     """
 
@@ -521,13 +533,21 @@ class ParameterDialog(QDialog):
                 return listing
 
             combo = QComboBox()
-            # Always start unselected: a blank first entry (data None). An
-            # optional field needs it to say "none"; a required one needs it
-            # so collect_parameters' required check is reachable rather than
+            # A blank first entry (data None) is always present. An optional
+            # field needs it to say "none"; a required one needs it so
+            # collect_parameters' required check is reachable rather than
             # the researcher silently getting the first column.
             combo.addItem("", None)
             for column_name in spec.column_names:
                 combo.addItem(column_name, column_name)
+            # A single-selection column field may name a column to start on.
+            # build_field_specs has already dropped a default that names a
+            # column this input does not offer, so findData either hits a
+            # real entry or the field stays on the blank one.
+            if spec.default is not None:
+                index = combo.findData(spec.default)
+                if index >= 0:
+                    combo.setCurrentIndex(index)
             return combo
 
         # build_field_specs never produces another kind.

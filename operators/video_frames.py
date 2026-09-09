@@ -105,6 +105,12 @@ class VideoFramesOperator(BaseOperator):
                         name="video_column",
                         label="Video path column",
                         from_input="active_table",
+                        # full_path is Gelem's conventional media-path
+                        # column, so preselect it when the table offers it.
+                        # If the default names a column the input does not
+                        # offer, the field falls back to blank rather than
+                        # showing a column that is not there.
+                        default="full_path",
                     ),
                     NumberParameter(
                         name="frame_step",
@@ -142,12 +148,10 @@ class VideoFramesOperator(BaseOperator):
     # (ui/parameter_dialog.py) and passes the collected values to the
     # controller in run.parameters. This module contains no Qt.
     #
-    # One behaviour change: the hand-drawn dialog pre-selected the
-    # "full_path" column for video_column. ColumnParameter has no "default"
-    # field, so the generated form starts that dropdown unselected and, the
-    # parameter being required, asks the researcher to pick the column
-    # explicitly. Giving ColumnParameter a default is descriptor work,
-    # outside this item.
+    # video_column carries default="full_path", so the generated form
+    # arrives with that column preselected -- matching the hand-drawn
+    # dialog it replaced. When the active table has no full_path column the
+    # field falls back to blank and the researcher picks one explicitly.
 
     def create_table(
         self,

@@ -217,6 +217,39 @@ def test_required_tags_filters_the_offered_columns():
     assert field.column_names == ("age", "score")
 
 
+def test_single_column_default_is_carried_onto_the_field_spec():
+    # A single-selection ColumnParameter naming a default column that the
+    # input offers puts that name on the FieldSpec.
+    parameter = ColumnParameter(
+        name="video_column", label="Video path column", from_input="src",
+        default="full_path",
+    )
+    field = _one_field(
+        parameter,
+        inputs=[_SOURCE_INPUT],
+        columns_by_input={
+            "src": [("full_path", "media_path"), ("participant", "text")]
+        },
+    )
+    assert field.default == "full_path"
+
+
+def test_default_naming_an_unoffered_column_comes_through_as_no_preselection():
+    # If the default names a column the input does not offer, the field
+    # falls back to no preselection rather than pointing at a column that
+    # is not there.
+    parameter = ColumnParameter(
+        name="video_column", label="Video path column", from_input="src",
+        default="full_path",
+    )
+    field = _one_field(
+        parameter,
+        inputs=[_SOURCE_INPUT],
+        columns_by_input={"src": [("clip", "media_path"), ("name", "text")]},
+    )
+    assert field.default is None
+
+
 def test_empty_required_tags_offers_every_column_of_the_input():
     parameter = ColumnParameter(
         name="col", label="Any column", from_input="src", required_tags=()

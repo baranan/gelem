@@ -404,12 +404,30 @@ class ColumnParameter(ParameterSpec):
     allow_multiple: bool = False
     # Column type tags the chosen column must carry; empty means "any".
     required_tags: tuple[str, ...] = ()
+    # A column name to preselect in the generated form, or None for "no
+    # preference". Applies only to a SINGLE-selection parameter: one column
+    # name cannot stand for a multiple selection, so a default together
+    # with allow_multiple=True is refused below rather than guessing a
+    # meaning. If the default names a column the input does not offer, the
+    # form falls back to no preselection -- that check is the dialog's, not
+    # the descriptor's.
+    default: Optional[str] = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
         _require_tuple(
             self.required_tags, f"ColumnParameter {self.name!r} required_tags"
         )
+        # A default is a single column name. It cannot describe a multiple
+        # selection, so refuse the combination at construction rather than
+        # inventing a meaning for it later.
+        if self.allow_multiple and self.default is not None:
+            raise OperatorDescriptorError(
+                f"ColumnParameter {self.name!r}: a default column name "
+                f"({self.default!r}) cannot be combined with "
+                "allow_multiple=True -- one column name cannot stand for a "
+                "multiple selection."
+            )
 
 
 @dataclass(frozen=True, kw_only=True)

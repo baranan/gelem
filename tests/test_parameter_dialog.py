@@ -220,6 +220,54 @@ def test_untouched_optional_fields_are_omitted_like_layer_a(qapp):
 
 
 # ===========================================================================
+# A single-column field's default preselects the widget (P1.12e-3)
+# ===========================================================================
+
+def _column_default_mode(*, default):
+    """A one-parameter DISPLAY mode: a single-selection column field whose
+    ColumnParameter names ``default`` as its preselected column."""
+    return ModeDescriptor(
+        mode=ExecutionMode.DISPLAY,
+        label="Column default test",
+        inputs=(_SOURCE_INPUT,),
+        parameters=(
+            ColumnParameter(
+                name="video_column",
+                label="Video path column",
+                from_input="src",
+                default=default,
+            ),
+        ),
+        output=OutputSpec(is_display_only=True),
+    )
+
+
+def test_single_column_widget_starts_on_the_defaulted_column(qapp):
+    # "clip" is one of the offered columns, so the combo opens on it rather
+    # than on the blank first entry.
+    dialog = ParameterDialog(
+        _column_default_mode(default="clip"), _COLUMNS_BY_INPUT
+    )
+    combo = dialog._widgets["video_column"]
+    assert combo.currentData() == "clip"
+    # parameter_values() therefore already carries it with no interaction.
+    assert dialog.parameter_values() == {"video_column": "clip"}
+
+
+def test_single_column_widget_starts_blank_when_the_default_is_absent(qapp):
+    # _COLUMNS_BY_INPUT offers age/name/clip but not full_path, so the
+    # default is dropped and the field opens on the blank entry.
+    dialog = ParameterDialog(
+        _column_default_mode(default="full_path"), _COLUMNS_BY_INPUT
+    )
+    combo = dialog._widgets["video_column"]
+    assert combo.currentData() is None
+    # Required and unset -> parameter_values() refuses through Layer A.
+    with pytest.raises(ParameterFormError):
+        dialog.parameter_values()
+
+
+# ===========================================================================
 # The two MainWindow-side rules P1.12e-2 adds (STEP 5 deletion check):
 #   - a mode that declares no parameters shows NO dialog at all and
 #     proceeds with {} -- exactly what a None get_parameters_dialog()

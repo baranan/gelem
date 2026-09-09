@@ -191,6 +191,44 @@ def test_choice_parameter_rejects_choice_entry_that_is_not_a_pair():
 
 
 # ===========================================================================
+# ColumnParameter.default
+# ===========================================================================
+
+def test_column_parameter_rejects_default_with_allow_multiple():
+    # A default is a single column name; it cannot describe a multiple
+    # selection, so the combination is refused at construction.
+    with pytest.raises(OperatorDescriptorError):
+        ColumnParameter(
+            name="cols",
+            label="Columns",
+            from_input="rows",
+            allow_multiple=True,
+            default="full_path",
+        )
+
+
+def test_column_parameter_accepts_default_on_single_selection():
+    # A single-selection ColumnParameter with a default constructs cleanly
+    # and reads the default back.
+    parameter = ColumnParameter(
+        name="video_column",
+        label="Video path column",
+        from_input="rows",
+        default="full_path",
+    )
+    assert parameter.default == "full_path"
+    assert parameter.allow_multiple is False
+
+
+def test_column_parameter_default_is_optional_and_defaults_to_none():
+    # Omitting it is the existing behaviour -- no preselection.
+    parameter = ColumnParameter(
+        name="col", label="Column", from_input="rows"
+    )
+    assert parameter.default is None
+
+
+# ===========================================================================
 # OutputColumn
 # ===========================================================================
 
