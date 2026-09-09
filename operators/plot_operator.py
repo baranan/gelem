@@ -54,8 +54,8 @@ class PlotOperator(BaseOperator):
     #    PNG file this operator writes to disk (see create_columns), so
     #    it is a media path -- the same tag a folder of images gets, and
     #    the tag the column's TableSchema spec is built from;
-    #  - NO parameters. get_parameters_dialog() returns None, so the
-    #    "which columns to plot" choice is NOT a parameter today: the
+    #  - NO parameters (parameters=() below), so MainWindow shows no form.
+    #    The "which columns to plot" choice is NOT a parameter today: the
     #    column list is fixed in __init__ (self._columns default). See
     #    the P1.12d-1 report, "should have a parameter but does not".
     #  - media_requirement METADATA: create_columns() reads only metadata
@@ -130,21 +130,12 @@ class PlotOperator(BaseOperator):
         )
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
-    def get_parameters_dialog(self, parent=None, columns=None):
-        """
-        Would show a dialog asking the researcher which columns to plot.
-
-        TODO (Student C): Implement this dialog. It should show a
-        list of all numeric columns in the current table and let the
-        researcher select which ones to include in the plot, and hand
-        them back through parameter_values() keyed by a "columns"
-        parameter this operator's descriptor would then declare.
-        Use the `columns` argument supplied by MainWindow.
-
-        For now returns None (no dialog): the column list is a fixed
-        construction-time default (self._columns), not yet a parameter.
-        """
-        return None
+    # No get_parameters_dialog(). This mode declares no parameters
+    # (parameters=() on the descriptor), so MainWindow shows no form and
+    # runs with an empty parameters dict. The "which columns to plot"
+    # choice is still a fixed construction-time default (self._columns),
+    # not yet a declared parameter -- see the P1.12d-1 report, "should
+    # have a parameter but does not". This module contains no Qt.
 
     def create_columns(
         self,

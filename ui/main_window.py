@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction
 
-from operators.descriptor import ExecutionMode
+from operators.descriptor import ExecutionMode, InputKind
 from shared_widgets.checkable_combo_box import CheckableComboBox
 from ui.gallery_widget import GalleryWidget
 from ui.filter_panel import FilterPanel
@@ -33,6 +33,16 @@ from ui.save_table_dialog import SaveTableDialog
 from ui.csv_image_column_dialog import CsvImageColumnDialog
 from ui.merge_report_dialog import MergeReportDialog
 from ui.settings_dialog import SettingsDialog
+from ui.parameter_dialog import ParameterDialog, ParameterFormError
+
+
+class _UnresolvableInputKind(Exception):
+    """A mode declares a data input whose kind the generated parameter form
+    cannot resolve without a choice it does not yet offer (NAMED_TABLE,
+    WHOLE_PROJECT). MainWindow catches this and refuses the run before
+    showing anything, the same visible way any other run-start failure is
+    surfaced. No operator declares such a kind today.
+    """
 
 
 class MainWindow(QMainWindow):
@@ -393,23 +403,32 @@ class MainWindow(QMainWindow):
     def _show_scope_and_params_dialog(
         self,
         operator_name: str,
+        mode: ExecutionMode,
     ) -> tuple[list[str], dict] | None:
         """
-        Shows the scope dialog and then the operator's parameter dialog.
-        Returns (row_ids, parameters), or None if the researcher
-        cancelled.
+        Shows the scope dialog and then, when this mode declares any
+        parameters, the parameter dialog generated from its descriptor.
+        Returns (row_ids, parameters), or None if the researcher cancelled
+        or the run was refused before it could start.
 
-        parameters is the dict the operator's parameter dialog returns
-        from parameter_values() -- keyed by the operator's declared
-        descriptor parameter names -- or {} if the operator has no dialog.
+        parameters is the dict ParameterDialog.parameter_values() hands
+        back -- keyed by the mode's declared descriptor parameter names --
+        or {} when the mode declares no parameters. That empty dict is
+        exactly what a None get_parameters_dialog() return used to mean.
         The controller validates it against the descriptor and refuses the
         run on a mismatch, so MainWindow does not check it here.
 
+        No operator is asked to build a dialog: MainWindow builds the form
+        itself from the declared parameters, so no operator module
+        contains Qt.
+
         Args:
             operator_name: Name of the operator being run.
+            mode:          The ExecutionMode this run uses; picks which
+                           ModeDescriptor the form is built from.
 
         Returns:
-            (row_ids, parameters) to run on, or None if cancelled.
+            (row_ids, parameters) to run on, or None if cancelled/refused.
         """
         selected_ids = self._collect_selected_row_ids()
         visible_ids  = self._collect_visible_row_ids()
@@ -430,56 +449,93 @@ class MainWindow(QMainWindow):
         if not row_ids:
             return None
 
-        # Step 2: operator parameter dialog (if the operator has one).
+        # Step 2: the generated parameter form, built from the mode's
+        # declared parameters.
         parameters: dict = {}
         operator = self._controller.get_operator(operator_name)
-        if operator is not None:
-            df = self._controller._dataset.get_table(
-                self._controller._active_table
-            )
-            param_dialog = operator.get_parameters_dialog(
-                parent=self,
-                columns=list(df.columns),
-            )
-            if param_dialog is not None:
-                if param_dialog.exec() == 0:
-                    return None
-                try:
-                    parameters = self._parameters_from_dialog(
-                        param_dialog, operator_name
-                    )
-                except RuntimeError as e:
-                    # A broken dialog is a developer error, not user input.
-                    # Surface it the same visible way every other run-start
-                    # failure is surfaced and do not start the run -- but
-                    # never fall back to an empty parameter set.
-                    self._on_error(str(e))
-                    return None
+        descriptor = (
+            getattr(operator, "descriptor", None) if operator is not None else None
+        )
+        mode_descriptor = (
+            descriptor.mode_for(mode) if descriptor is not None else None
+        )
+
+        # A mode that declares no parameters shows NO dialog at all and
+        # runs with {} -- exactly what a None get_parameters_dialog()
+        # return used to mean. ParameterDialog builds one field per
+        # declared parameter, so "parameters declared" and "the form has
+        # fields" are the same condition.
+        if mode_descriptor is not None and mode_descriptor.parameters:
+            # Build the form before showing anything. Two things can make a
+            # form impossible to build, and both refuse the run the same
+            # visible way any other run-start failure is surfaced, rather
+            # than raising out of this menu-action slot:
+            #   * an input kind the form cannot resolve
+            #     (_UnresolvableInputKind, from _columns_by_input);
+            #   * a declared parameter of a kind the form has no widget for
+            #     (ParameterFormError, from build_field_specs inside
+            #     ParameterDialog). No operator hits either today.
+            try:
+                columns_by_input = self._columns_by_input(
+                    operator_name, mode_descriptor
+                )
+                param_dialog = ParameterDialog(
+                    mode_descriptor, columns_by_input, parent=self
+                )
+            except (_UnresolvableInputKind, ParameterFormError) as refusal:
+                self._on_error(str(refusal))
+                return None
+
+            if param_dialog.exec() == 0:
+                return None
+            parameters = dict(param_dialog.parameter_values())
 
         return row_ids, parameters
 
-    @staticmethod
-    def _parameters_from_dialog(param_dialog, operator_name: str) -> dict:
-        """The parameter dict an accepted parameter dialog hands back.
+    def _columns_by_input(self, operator_name: str, mode_descriptor) -> dict:
+        """The mapping build_field_specs expects: each declared input's
+        NAME -> a tuple of (column_name, type_tag) for that input's table.
 
-        A dialog that does not expose parameter_values() is a bug: running
-        with a silently-empty parameter set is the wrong-number failure
-        P1.12d-2a exists to prevent, so this raises rather than falling
-        back to {}.
+        Only ACTIVE_TABLE resolves without a dialog choice. NAMED_TABLE and
+        WHOLE_PROJECT need a choice the generated form does not offer yet,
+        so this raises _UnresolvableInputKind -- naming the operator and
+        the kind -- rather than silently building a form with an empty
+        dropdown. No operator declares those kinds today.
         """
-        if not hasattr(param_dialog, "parameter_values"):
-            raise RuntimeError(
-                f"{operator_name}: get_parameters_dialog() returned a dialog "
-                f"with no parameter_values() method."
-            )
-        return dict(param_dialog.parameter_values())
+        columns_by_input: dict = {}
+        for input_spec in mode_descriptor.inputs:
+            if input_spec.kind is InputKind.ACTIVE_TABLE:
+                table_name = self._controller.get_active_table()
+            else:
+                raise _UnresolvableInputKind(
+                    f'Cannot run "{operator_name}": its input '
+                    f'"{input_spec.name}" is a {input_spec.kind.name} input, '
+                    f"which the parameter form cannot resolve yet."
+                )
+
+            # Pair each column with its schema type tag, both read through
+            # public controller accessors. An unregistered column yields a
+            # None ColumnType; "" then means "no known tag", which
+            # build_field_specs simply will not match against required_tags.
+            pairs: list[tuple[str, str]] = []
+            for column_name in self._controller.get_column_names(table_name):
+                column_type = self._controller.get_column_type(
+                    column_name, table_name
+                )
+                tag = column_type.tag if column_type is not None else ""
+                pairs.append((column_name, tag))
+            columns_by_input[input_spec.name] = tuple(pairs)
+
+        return columns_by_input
 
     def _on_run_create_columns(self, operator_name: str) -> None:
         """
         Shows the scope and parameter dialogs, then runs
         create_columns() on the chosen rows.
         """
-        result = self._show_scope_and_params_dialog(operator_name)
+        result = self._show_scope_and_params_dialog(
+            operator_name, ExecutionMode.COLUMNS
+        )
         if result is None:
             return
         row_ids, parameters = result
@@ -494,7 +550,9 @@ class MainWindow(QMainWindow):
         parameters dict the parameter dialog handed back; there is no
         separate group_by argument and nothing is read off the operator.
         """
-        result = self._show_scope_and_params_dialog(operator_name)
+        result = self._show_scope_and_params_dialog(
+            operator_name, ExecutionMode.TABLE
+        )
         if result is None:
             return
         row_ids, parameters = result
@@ -505,7 +563,9 @@ class MainWindow(QMainWindow):
         Shows the scope and parameter dialogs, then runs
         create_display() on the chosen rows.
         """
-        result = self._show_scope_and_params_dialog(operator_name)
+        result = self._show_scope_and_params_dialog(
+            operator_name, ExecutionMode.DISPLAY
+        )
         if result is None:
             return
         row_ids, parameters = result

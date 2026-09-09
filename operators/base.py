@@ -339,64 +339,14 @@ class BaseOperator:
         return None
 
     # ── Parameter dialog ──────────────────────────────────────────────
-
-    def get_parameters_dialog(self, parent=None, columns=None):
-        """
-        Returns a QDialog for collecting operator-specific parameters,
-        or None if this operator needs no parameters.
-
-        If this method returns a dialog, MainWindow shows it after the
-        researcher chooses the run scope, before the operator starts.
-        The dialog MUST expose a ``parameter_values() -> dict`` method
-        that returns the chosen values keyed by this operator's declared
-        descriptor parameter names. MainWindow calls it after the dialog
-        is accepted and passes the dict to the controller, which builds
-        the run's OperatorRunSpec from it. The dialog must NOT store
-        anything on the operator instance: instances are shared between
-        runs, so a value on ``self`` would be clobbered by a second
-        concurrent run -- exactly the failure P1.12d-2a removes.
-
-        A dialog returned without a ``parameter_values`` method is a bug:
-        MainWindow raises rather than silently running with no parameters.
-
-        Args:
-            parent:  The parent widget for the dialog.
-            columns: List of column names in the active table, supplied
-                     by MainWindow. Operators that need to populate
-                     column dropdowns should read from this list rather
-                     than reaching into the controller themselves.
-                     None when called outside MainWindow (e.g. tests).
-
-        Returns:
-            A QDialog instance exposing parameter_values(), or None.
-
-        Example (in a subclass):
-            def get_parameters_dialog(self, parent=None, columns=None):
-                from PySide6.QtWidgets import (
-                    QDialog, QVBoxLayout, QComboBox,
-                    QLabel, QPushButton
-                )
-                dialog = QDialog(parent)
-                dialog.setWindowTitle("Parameters")
-                layout = QVBoxLayout(dialog)
-                layout.addWidget(QLabel("Group by:"))
-                group_combo = QComboBox()
-                group_combo.addItems(columns or [])
-                layout.addWidget(group_combo)
-                btn = QPushButton("OK")
-                btn.clicked.connect(dialog.accept)
-                layout.addWidget(btn)
-                # Hand the chosen values back by NAME through
-                # parameter_values(). Every key must be a parameter this
-                # operator's descriptor declares. Nothing is stored on self.
-                chosen = {}
-                def _store():
-                    chosen["group_by"] = group_combo.currentText()
-                dialog.accepted.connect(_store)
-                dialog.parameter_values = lambda: dict(chosen)
-                return dialog
-        """
-        return None
+    #
+    # There is no get_parameters_dialog(). An operator declares its
+    # parameters as ParameterSpec entries on its ModeDescriptor (see
+    # operators/descriptor.py); MainWindow builds the form from those
+    # declarations (ui/parameter_dialog.py) and passes the collected
+    # values to the controller in run.parameters. An operator module
+    # contains no Qt -- that is guarded by
+    # tests/test_operators_are_qt_free.py.
 
     # ── Convenience methods ───────────────────────────────────────────
 

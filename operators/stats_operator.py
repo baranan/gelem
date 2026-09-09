@@ -71,8 +71,8 @@ class StatsOperator(BaseOperator):
     # Descriptor (P1.12d-1). What create_display() ACTUALLY does today:
     #  - one DISPLAY mode, over the active table's selected rows,
     #    storing nothing;
-    #  - NO parameters. get_parameters_dialog() returns None, so the
-    #    test type / dependent variable / grouping column that __init__
+    #  - NO parameters (parameters=() below), so MainWindow shows no form.
+    #    The test type / dependent variable / grouping column that __init__
     #    sets up (self._test_type etc.) are never chosen by the
     #    researcher -- they keep their constructor defaults. See the
     #    P1.12d-1 report, "should have a parameter but does not".
@@ -119,26 +119,13 @@ class StatsOperator(BaseOperator):
         self._group_column: str | None = None  # Grouping variable
         self._subject_col:  str | None = None  # Subject ID (for repeated measures)
 
-    def get_parameters_dialog(self, parent=None, columns=None):
-        """
-        Would show a dialog asking the researcher to choose:
-            - Test type
-            - Dependent variable column
-            - Grouping column (for t-test, ANOVA)
-            - Subject ID column (for paired/repeated measures tests)
-
-        TODO (Student C): Implement this dialog.
-        Show dropdowns for test type and column selection populated
-        from the `columns` argument supplied by MainWindow.
-        Grey out irrelevant fields based on the chosen test type
-        (e.g. subject column is only needed for paired tests). Hand the
-        choices back through parameter_values() keyed by parameters this
-        operator's descriptor would then declare.
-
-        For now returns None (no dialog): the values keep their
-        construction-time defaults (self._test_type etc.).
-        """
-        return None
+    # No get_parameters_dialog(). This mode declares no parameters
+    # (parameters=() on the descriptor), so MainWindow shows no form and
+    # runs with an empty parameters dict. The test type / dependent
+    # variable / grouping column that __init__ sets up keep their
+    # construction-time defaults -- they are not yet declared parameters
+    # (see the P1.12d-1 report, "should have a parameter but does not").
+    # This module contains no Qt.
 
     def create_display(
         self,

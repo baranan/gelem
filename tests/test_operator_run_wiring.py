@@ -27,8 +27,6 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-import pytest
-
 from models.dataset import Dataset
 from models.query_engine import QueryEngine
 from artifacts.artifact_store import ArtifactStore
@@ -46,7 +44,6 @@ from operators.descriptor import (
     OutputSpec,
 )
 from controller import AppController
-from ui.main_window import MainWindow
 
 TEST_IMAGES = project_root / "test_images"
 
@@ -410,29 +407,9 @@ def test_operator_without_a_descriptor_does_not_start_and_says_so(
     assert "descriptor" in errors[-1].lower()
     assert controller._live_runs == {}
 
-
-# ---------------------------------------------------------------------------
-# MainWindow refuses a parameter dialog that does not hand its values back
-# by name (STEP 3 / STEP 7 deletion check). Tested through the extracted
-# MainWindow._parameters_from_dialog staticmethod so no widget is realised.
-# ---------------------------------------------------------------------------
-
-def test_mainwindow_rejects_a_dialog_with_no_parameter_values():
-    class _BadDialog:
-        pass  # no parameter_values() method
-
-    # Would still pass if broken? No. Without the raise, MainWindow would
-    # fall back to an empty parameter set and the run would start with no
-    # parameters -- the wrong-number failure this item removes.
-    with pytest.raises(RuntimeError):
-        MainWindow._parameters_from_dialog(_BadDialog(), "some_op")
-
-
-def test_mainwindow_reads_parameter_values_from_a_conforming_dialog():
-    class _GoodDialog:
-        def parameter_values(self):
-            return {"factor": 5}
-
-    assert MainWindow._parameters_from_dialog(
-        _GoodDialog(), "some_op"
-    ) == {"factor": 5}
+# NOTE: the two tests that exercised MainWindow._parameters_from_dialog --
+# the parameter_values() contract check -- were removed in P1.12e-2. That
+# check is gone: MainWindow now builds the ParameterDialog itself, and a
+# ParameterDialog always exposes parameter_values(), so there is no dialog
+# object without the method to reject. The generated form is covered by
+# tests/test_parameter_dialog.py.

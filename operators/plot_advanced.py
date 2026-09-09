@@ -70,12 +70,11 @@ class PlotAdvancedOperator(BaseOperator):
     #  - one DISPLAY mode, over the active table's selected rows,
     #    storing nothing;
     #  - SEVEN parameters -- title, chart_type, x, y, color, facet,
-    #    aggregate -- all genuinely read by create_display(). As of
-    #    P1.12d-2a they arrive in run.parameters (the dialog returns them
-    #    from parameter_values(), the run spec validates them against this
-    #    descriptor), never off the operator instance.
-    #    The dialog is a real QDialog (not None), so these ARE the
-    #    operator's parameters.
+    #    aggregate -- all genuinely read by create_display(). They arrive
+    #    in run.parameters: MainWindow builds the form from these
+    #    declarations (ui/parameter_dialog.py), the run spec validates the
+    #    collected values against this descriptor, and nothing is read off
+    #    the operator instance.
     #  - media_requirement METADATA: works purely from the DataFrame;
     #  - deterministic FALSE / cacheable FALSE: the returned artifact_path
     #    and html_path embed a wall-clock timestamp --
@@ -169,227 +168,25 @@ class PlotAdvancedOperator(BaseOperator):
         #
         # output_dir is a genuine construction-time value and stays here.
         # The seven run parameters (title, chart_type, x, y, color, facet,
-        # aggregate) used to be stored on self by get_parameters_dialog;
-        # as of P1.12d-2a they travel in run.parameters and nothing about
-        # them lives on the instance -- two concurrent runs must not share
-        # one set of values.
+        # aggregate) travel in run.parameters and nothing about them lives
+        # on the instance -- two concurrent runs must not share one set of
+        # values.
         self._output_dir = output_dir or (
             Path.cwd() / "gelem_project" / "plots"
         )
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
-    def get_parameters_dialog(self, parent=None, columns=None):
-        """Show a dialog and hand the researcher's choices back through
-        parameter_values(). It stores NOTHING on the operator instance.
-
-        parameter_values() returns a dict keyed by the descriptor's
-        parameter names:
-            chart_type  -- one of: scatter | line | bar | box | violin | histogram
-            x           -- column name for the horizontal axis
-            y           -- column name for the vertical axis
-            color       -- (optional) column to colour marks by group; None if not chosen
-            facet       -- (optional) column to split into a grid of small plots; None if not chosen
-            aggregate   -- one of: none | count | sum | mean | median
-            title       -- free text; "" means "use the auto title {y} by {x}"
-
-        Notes for the dialog:
-        - Populate the x/y/color/facet dropdowns from the `columns` argument
-          supplied by MainWindow.
-        - Disable the aggregate control when chart_type is "box" or "violin"
-          (those chart types always use every row).
-        - Offer count / sum / mean for histogram (no median -- Plotly does not
-          support median histfunc).
-        """
-        from PySide6.QtCore import Qt
-        from PySide6.QtWidgets import (
-            QComboBox,
-            QDialog,
-            QDialogButtonBox,
-            QGridLayout,
-            QLabel,
-            QLineEdit,
-            QVBoxLayout,
-        )
-
-        available = list(columns) if columns else []
-
-        dialog = QDialog(parent)
-        dialog.setWindowTitle("Plot (interactive, Plotly)")
-        dialog.setMinimumWidth(420)
-
-        layout = QVBoxLayout(dialog)
-        # Equal column stretch keeps the label/field split at the middle.
-        grid = QGridLayout()
-        grid.setColumnStretch(0, 1)
-        grid.setColumnStretch(1, 1)
-
-        row = 0
-
-        def _add_row(text: str, widget) -> None:
-            nonlocal row
-            lbl = QLabel(text)
-            lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            grid.addWidget(lbl, row, 0)
-            grid.addWidget(widget, row, 1)
-            row += 1
-
-        # Plot title -- free text. Leave blank for the auto title
-        # "{y} by {x}" computed in create_display().
-        title_edit = QLineEdit()
-        title_edit.setPlaceholderText("Auto: \"{y} by {x}\"")
-        _add_row("Title:", title_edit)
-
-        # Chart-type dropdown. Starts at the descriptor's default ("scatter").
-        chart_combo = QComboBox()
-        chart_combo.addItems(CHART_TYPES)
-        chart_combo.setCurrentText("scatter")
-        _add_row("Chart type:", chart_combo)
-
-        # Column dropdowns for x/y/color/facet. Colour and facet accept
-        # "(none)" as an explicit "no column" choice.
-        def _make_col_combo(current: str | None, allow_none: bool = False) -> QComboBox:
-            cb = QComboBox()
-            if allow_none:
-                cb.addItem("(none)")
-            cb.addItems(available)
-            if current and current in available:
-                cb.setCurrentText(current)
-            elif allow_none:
-                cb.setCurrentText("(none)")
-            return cb
-
-        x_combo     = _make_col_combo(None)
-        y_combo     = _make_col_combo(None)
-        color_combo = _make_col_combo(None, allow_none=True)
-        facet_combo = _make_col_combo(None, allow_none=True)
-        _add_row("X axis:",            x_combo)
-        _add_row("Y axis:",            y_combo)
-        _add_row("Colour (optional):", color_combo)
-        _add_row("Facet (optional):",  facet_combo)
-
-        # Aggregate dropdown -- its enabled state and options change with
-        # the chart type (see _apply_chart_rules below).
-        agg_combo = QComboBox()
-        agg_combo.addItems(AGGREGATES)
-        agg_combo.setCurrentText("none")
-        _add_row("Aggregate:", agg_combo)
-
-        # One label reused for both warnings (bar+none and histogram+count
-        # never overlap). retainSizeWhenHidden keeps the row so the dialog
-        # does not jump when the text toggles.
-        warning = QLabel()
-        warning.setWordWrap(True)
-        warning.setStyleSheet("color: #B36B00; font-size: 11px;")
-        warning.setMinimumHeight(45)
-        policy = warning.sizePolicy()
-        policy.setRetainSizeWhenHidden(True)
-        warning.setSizePolicy(policy)
-        warning.setVisible(False)
-        grid.addWidget(warning, row, 1)
-        row += 1
-
-        def _apply_chart_rules(chart: str) -> None:
-            """
-            Enforce the plan-doc rules on the aggregate control:
-                box / violin   -> disabled (always uses every row)
-                histogram      -> only count/sum/mean (no median)
-                scatter/line/bar -> all five options
-            Also shows/hides the warning line.
-            """
-            if chart in ("box", "violin"):
-                agg_combo.setCurrentText("none")
-                agg_combo.setEnabled(False)
-            elif chart == "histogram":
-                current = agg_combo.currentText()
-                agg_combo.clear()
-                agg_combo.addItems(["count", "sum", "mean"])
-                if current in ("count", "sum", "mean"):
-                    agg_combo.setCurrentText(current)
-                else:
-                    agg_combo.setCurrentText("count")
-                agg_combo.setEnabled(True)
-            else:
-                current = agg_combo.currentText()
-                agg_combo.clear()
-                agg_combo.addItems(AGGREGATES)
-                if current in AGGREGATES:
-                    agg_combo.setCurrentText(current)
-                else:
-                    agg_combo.setCurrentText("none")
-                agg_combo.setEnabled(True)
-            _refresh_warnings()
-
-        def _refresh_warnings() -> None:
-            chart = chart_combo.currentText()
-            agg   = agg_combo.currentText()
-            if chart == "bar" and agg == "none":
-                warning.setText(
-                    "Bar with aggregate=none sums rows sharing X. "
-                    "Pick mean or sum for one bar per group."
-                )
-                warning.setVisible(True)
-            elif chart == "histogram" and agg == "count":
-                warning.setText(
-                    "Histogram with aggregate=count ignores the Y column. "
-                    "Pick sum or mean to use Y."
-                )
-                warning.setVisible(True)
-            else:
-                warning.setVisible(False)
-
-        chart_combo.currentTextChanged.connect(_apply_chart_rules)
-        agg_combo.currentTextChanged.connect(lambda _: _refresh_warnings())
-        _apply_chart_rules(chart_combo.currentText())
-
-        layout.addLayout(grid)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
-        )
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-
-        # OK stays disabled until both x and y are chosen -- otherwise
-        # create_display would hand None to Plotly and crash.
-        ok_button = buttons.button(QDialogButtonBox.Ok)
-
-        def _refresh_ok_enabled() -> None:
-            ok_button.setEnabled(
-                bool(x_combo.currentText()) and bool(y_combo.currentText())
-            )
-
-        x_combo.currentTextChanged.connect(lambda _: _refresh_ok_enabled())
-        y_combo.currentTextChanged.connect(lambda _: _refresh_ok_enabled())
-        _refresh_ok_enabled()
-
-        # The dialog hands its answers back through parameter_values(),
-        # keyed by the descriptor's parameter names. It stores nothing on
-        # the operator instance -- two concurrent runs must not share one
-        # set of values. x and y are always real column names here (the OK
-        # button stays disabled until both are chosen); color and facet
-        # are None when left as "(none)".
-        chosen: dict = {}
-
-        def _store():
-            color = color_combo.currentText()
-            facet = facet_combo.currentText()
-            chosen.clear()
-            chosen.update(
-                {
-                    "title":      title_edit.text().strip(),
-                    "chart_type": chart_combo.currentText(),
-                    "x":          x_combo.currentText(),
-                    "y":          y_combo.currentText(),
-                    "color":      None if color in ("", "(none)") else color,
-                    "facet":      None if facet in ("", "(none)") else facet,
-                    "aggregate":  agg_combo.currentText(),
-                }
-            )
-
-        dialog.accepted.connect(_store)
-        dialog.parameter_values = lambda: dict(chosen)
-        return dialog
+    # No get_parameters_dialog(). The seven parameters above are declared
+    # on the descriptor; MainWindow builds the form from them
+    # (ui/parameter_dialog.py) and passes the collected values to the
+    # controller in run.parameters. This module contains no Qt.
+    #
+    # The generated form is plainer than the hand-drawn one it replaced:
+    # it has no live coupling between chart_type and the aggregate control
+    # and no inline warnings. create_display() already tolerates every
+    # combination -- box/violin ignore aggregate, and histogram falls back
+    # to "count" for an unsupported histfunc -- so nothing breaks; the
+    # researcher just loses the guidance the old dialog showed while open.
 
     def create_display(self, df, run):
         """Build one interactive Plotly figure for the selected rows.

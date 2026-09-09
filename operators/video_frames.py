@@ -62,8 +62,8 @@ class VideoFramesOperator(BaseOperator):
     #    (P1.12d-2a -- they no longer touch the operator instance):
     #      video_column -- a column of the active table holding the video
     #                      path
-    #      frame_step   -- keep every Nth frame; dialog min 1, max 10_000,
-    #                      default 1
+    #      frame_step   -- keep every Nth frame; declared min 1,
+    #                      max 10_000, default 1
     #  - media_requirement ADDRESS: create_table() opens the video files
     #    itself --
     #        cap = cv2.VideoCapture(str(video_path))
@@ -130,67 +130,24 @@ class VideoFramesOperator(BaseOperator):
         # across runs. main.py passes an explicit output_dir.
         #
         # output_dir is a genuine construction-time value and stays here.
-        # The two run parameters (video_column, frame_step) used to be
-        # stored on self by get_parameters_dialog; as of P1.12d-2a they
-        # travel in run.parameters and nothing about them lives on the
-        # instance.
+        # The two run parameters (video_column, frame_step) travel in
+        # run.parameters and nothing about them lives on the instance.
         self._output_dir = output_dir or (
             Path.cwd() / "gelem_project" / "frames"
         )
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
-    def get_parameters_dialog(self, parent=None, columns=None):
-        from PySide6.QtWidgets import (
-            QComboBox,
-            QDialog,
-            QDialogButtonBox,
-            QFormLayout,
-            QSpinBox,
-            QVBoxLayout,
-        )
-
-        available = list(columns) if columns else ["full_path"]
-
-        dialog = QDialog(parent)
-        dialog.setWindowTitle("Extract frames from videos")
-
-        layout = QVBoxLayout(dialog)
-        form = QFormLayout()
-
-        column_combo = QComboBox()
-        column_combo.addItems(available)
-        if "full_path" in available:
-            column_combo.setCurrentText("full_path")
-        form.addRow("Video path column:", column_combo)
-
-        step_spin = QSpinBox()
-        step_spin.setMinimum(1)
-        step_spin.setMaximum(10_000)
-        step_spin.setValue(1)
-        form.addRow("Frame step (keep every Nth):", step_spin)
-
-        layout.addLayout(form)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
-        )
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-
-        # The dialog hands its answers back through parameter_values(),
-        # keyed by the descriptor's parameter names. It stores nothing on
-        # the operator instance -- two concurrent runs must not share one
-        # set of values.
-        chosen: dict = {}
-
-        def _store():
-            chosen["video_column"] = column_combo.currentText()
-            chosen["frame_step"] = int(step_spin.value())
-
-        dialog.accepted.connect(_store)
-        dialog.parameter_values = lambda: dict(chosen)
-        return dialog
+    # No get_parameters_dialog(). video_column and frame_step are declared
+    # on the descriptor above; MainWindow builds the form from them
+    # (ui/parameter_dialog.py) and passes the collected values to the
+    # controller in run.parameters. This module contains no Qt.
+    #
+    # One behaviour change: the hand-drawn dialog pre-selected the
+    # "full_path" column for video_column. ColumnParameter has no "default"
+    # field, so the generated form starts that dropdown unselected and, the
+    # parameter being required, asks the researcher to pick the column
+    # explicitly. Giving ColumnParameter a default is descriptor work,
+    # outside this item.
 
     def create_table(
         self,
