@@ -45,11 +45,15 @@ from operators.descriptor import (
     TextParameter,
 )
 
+from operators.form_advice import FormAdvice, FormMessage
+
 from ui.parameter_dialog import (
     FieldSpec,
     ParameterFormError,
+    ResolvedForm,
     build_field_specs,
     collect_parameters,
+    resolve_form,
 )
 
 
@@ -433,3 +437,145 @@ def test_a_supplied_optional_parameter_is_kept():
         {},
     )
     assert collect_parameters(specs, {"note": " hello "}) == {"note": "hello"}
+
+
+# ===========================================================================
+# resolve_form -- applying operator FormAdvice against the current values
+# ===========================================================================
+
+def _agg_specs():
+    """A one-field form: a required choice 'agg' offering four values."""
+    return build_field_specs(
+        _mode(
+            [
+                ChoiceParameter(
+                    name="agg",
+                    label="Aggregation",
+                    choices=(
+                        ("count", "Count"),
+                        ("sum", "Sum"),
+                        ("mean", "Mean"),
+                        ("median", "Median"),
+                    ),
+                )
+            ]
+        ),
+        {},
+    )
+
+
+def _two_field_specs():
+    """A two-field form: a text 'title' and a number 'bins'."""
+    return build_field_specs(
+        _mode(
+            [
+                TextParameter(name="title", label="Chart title", required=False),
+                NumberParameter(name="bins", label="Bin count", default=10),
+            ]
+        ),
+        {},
+    )
+
+
+def test_inapplicable_field_comes_back_disabled_with_value_intact():
+    specs = _two_field_specs()
+    raw_values = {"title": "My chart", "bins": 30}
+    advice = FormAdvice(inapplicable=("bins",))
+
+    resolved = resolve_form(specs, advice, raw_values)
+
+    assert isinstance(resolved, ResolvedForm)
+    # 'bins' is disabled, 'title' is not.
+    assert resolved.disabled_fields == ("bins",)
+    # The researcher's typed values are untouched -- resolve_form never
+    # writes a value back.
+    assert raw_values == {"title": "My chart", "bins": 30}
+    # A disabled field on its own does not block.
+    assert resolved.blocked is False
+
+
+def test_applicable_field_value_outside_the_allowed_set_blocks_and_names_it():
+    specs = _agg_specs()
+    advice = FormAdvice(allowed_choices={"agg": ("count", "sum", "mean")})
+
+    resolved = resolve_form(specs, advice, {"agg": "median"})
+
+    assert resolved.blocked is True
+    # A generated message names the offending field.
+    agg_messages = [m for m in resolved.messages if m.field == "agg"]
+    assert len(agg_messages) == 1
+    assert agg_messages[0].severity == "error"
+    assert "Aggregation" in agg_messages[0].text
+
+
+def test_the_same_violation_on_an_inapplicable_field_does_not_block():
+    specs = _agg_specs()
+    advice = FormAdvice(
+        inapplicable=("agg",),
+        allowed_choices={"agg": ("count", "sum", "mean")},
+    )
+
+    resolved = resolve_form(specs, advice, {"agg": "median"})
+
+    # The value is out of range, but the field is disabled -- blocking on
+    # it would trap the researcher.
+    assert resolved.blocked is False
+    assert all(m.field != "agg" for m in resolved.messages)
+
+
+def test_an_operator_error_message_blocks():
+    specs = _agg_specs()
+    advice = FormAdvice(
+        messages=(
+            FormMessage(text="these settings conflict", severity="error"),
+        )
+    )
+
+    resolved = resolve_form(specs, advice, {"agg": "count"})
+
+    assert resolved.blocked is True
+    assert resolved.messages[0].text == "these settings conflict"
+
+
+def test_an_operator_warning_message_does_not_block():
+    specs = _agg_specs()
+    advice = FormAdvice(
+        messages=(
+            FormMessage(text="this is unusual but fine", severity="warning"),
+        )
+    )
+
+    resolved = resolve_form(specs, advice, {"agg": "count"})
+
+    assert resolved.blocked is False
+    assert resolved.messages[0].severity == "warning"
+
+
+def test_no_advice_at_all_leaves_every_field_as_it_was():
+    specs = _two_field_specs()
+    raw_values = {"title": "Keep me", "bins": 12}
+
+    resolved = resolve_form(specs, FormAdvice(), raw_values)
+
+    assert resolved.disabled_fields == ()
+    assert resolved.allowed_values == {}
+    assert resolved.messages == ()
+    assert resolved.blocked is False
+    assert raw_values == {"title": "Keep me", "bins": 12}
+
+
+def test_a_second_call_is_recomputed_from_the_declarations_not_accumulated():
+    specs = _agg_specs()
+    advice = FormAdvice(allowed_choices={"agg": ("count", "sum", "mean")})
+
+    # First call: an out-of-range value blocks and produces a message.
+    first = resolve_form(specs, advice, {"agg": "median"})
+    assert first.blocked is True
+    assert any(m.field == "agg" for m in first.messages)
+
+    # Second call, a valid value: the answer is computed fresh. If state
+    # accumulated, the earlier block or the earlier message would leak
+    # into this result.
+    second = resolve_form(specs, advice, {"agg": "sum"})
+    assert second.blocked is False
+    assert second.messages == ()

@@ -38,7 +38,7 @@ standard-library only and pulls in no data library.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from PySide6.QtWidgets import (
@@ -64,6 +64,7 @@ from operators.descriptor import (
     NumberParameter,
     TextParameter,
 )
+from operators.form_advice import FormAdvice, FormMessage
 
 
 # ---------------------------------------------------------------------------
@@ -399,6 +400,154 @@ def collect_parameters(field_specs, raw_values) -> dict:
         )
 
     return collected
+
+
+# ---------------------------------------------------------------------------
+# Layer A -- applying a piece of operator FormAdvice against the current
+# values. Still Qt-free: this decides what the widget layer must show and
+# whether acceptance is blocked, but touches no widget.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ResolvedForm:
+    """Everything the widget layer needs to reflect one ``FormAdvice``
+    against the current values.
+
+      * ``disabled_fields`` -- parameter names whose widget is disabled,
+        because the operator called them inapplicable. Their values are
+        PRESERVED, never cleared.
+      * ``allowed_values``  -- parameter name -> the tuple of values still
+        allowed, for every field the operator restricted, passed through
+        as the operator declared it. A field absent here is unrestricted.
+        An entry MAY name a field that is also in ``disabled_fields`` --
+        the operator restricted it and called it inapplicable in the same
+        answer. The widget layer (P1.12e-4b) must apply ``disabled_fields``
+        first and never prune a disabled widget's items, so its preserved
+        value survives.
+      * ``messages``        -- every ``FormMessage`` to display: the ones
+        the operator returned, plus any this layer generated for an
+        applicable field whose current value is not among its allowed
+        values.
+      * ``blocked``         -- whether acceptance is blocked. See
+        ``resolve_form`` for the two things that block.
+    """
+
+    disabled_fields: tuple[str, ...] = ()
+    allowed_values: dict = field(default_factory=dict)
+    messages: tuple[FormMessage, ...] = ()
+    blocked: bool = False
+
+
+def _violates_restriction(current_value, allowed_values, spec: FieldSpec) -> bool:
+    """Whether this field's current raw value falls outside the values the
+    operator still allows.
+
+    A blank / unset field is NOT a violation here -- ``collect_parameters``
+    is what refuses a required field left empty, and blocking twice for
+    one problem only confuses. For a multi-column picker every picked
+    column must be allowed; an empty pick counts as blank.
+    """
+    # A multi-column selection is a list of column names; each one must be
+    # allowed.
+    if spec.kind == "column" and spec.allow_multiple:
+        picked = tuple(current_value or ())
+        if not picked:
+            return False
+        return any(column not in allowed_values for column in picked)
+
+    # Every other kind holds a single scalar value.
+    if _is_blank(current_value):
+        return False
+    return current_value not in allowed_values
+
+
+def _restriction_message(spec: FieldSpec, allowed_values) -> FormMessage:
+    """The message this layer generates for an applicable field whose
+    value is not allowed.
+
+    The operator states the restriction ("a histogram allows only count,
+    sum and mean"); naming the field and listing the valid choices is the
+    form's own job, so the operator does not also have to say "and your
+    current value is wrong".
+    """
+    choices = ", ".join(str(value) for value in allowed_values)
+    return FormMessage(
+        text=(
+            f"{spec.label}: the current value is not allowed here. "
+            f"Choose one of: {choices}."
+        ),
+        severity="error",
+        field=spec.name,
+    )
+
+
+def resolve_form(field_specs, advice, raw_values) -> ResolvedForm:
+    """Fold one ``FormAdvice`` together with the current values into the
+    concrete state the widget layer renders.
+
+    ``field_specs`` -- the fields, from ``build_field_specs``.
+    ``advice``      -- what the operator's ``refine_form`` returned
+                       (``FormAdvice()`` when it has no guidance, or the
+                       operator declares none).
+    ``raw_values``  -- parameter name -> the widget's current raw value,
+                       the same shape ``collect_parameters`` reads.
+
+    Blocking is decided HERE, from two sources:
+
+      * any operator ``FormMessage`` of severity "error";
+      * any APPLICABLE field whose current value is not among its allowed
+        values -- this layer generates that message itself.
+
+    A field the operator listed as inapplicable is disabled and its value
+    is left untouched, and a restriction on an inapplicable field never
+    blocks: the researcher cannot edit a disabled field, so blocking on
+    one would trap them with no way out.
+
+    Pure: it reads its three arguments, mutates none of them, and holds no
+    state between calls. Called again with different values, the result is
+    computed entirely from those values and that advice -- never
+    accumulated onto the previous answer.
+    """
+    inapplicable = set(advice.inapplicable)
+
+    # Disabled fields, in form order.
+    disabled_fields = tuple(
+        spec.name for spec in field_specs if spec.name in inapplicable
+    )
+
+    # The operator's restrictions, copied so the caller cannot reach back
+    # into the advice through the result.
+    allowed_values = dict(advice.allowed_choices)
+
+    # Start from the operator's own messages; generated ones are appended.
+    messages = list(advice.messages)
+
+    # An operator error message blocks on its own.
+    blocked = any(
+        message.severity == "error" for message in advice.messages
+    )
+
+    # A restriction bites only on an APPLICABLE field. Walk the fields in
+    # form order so any generated messages read top-to-bottom.
+    for spec in field_specs:
+        if spec.name not in allowed_values:
+            continue
+        if spec.name in inapplicable:
+            # A restriction on a disabled field never blocks.
+            continue
+        current_value = raw_values.get(spec.name)
+        allowed = allowed_values[spec.name]
+        if _violates_restriction(current_value, allowed, spec):
+            blocked = True
+            messages.append(_restriction_message(spec, allowed))
+
+    return ResolvedForm(
+        disabled_fields=disabled_fields,
+        allowed_values=allowed_values,
+        messages=tuple(messages),
+        blocked=blocked,
+    )
 
 
 # ---------------------------------------------------------------------------

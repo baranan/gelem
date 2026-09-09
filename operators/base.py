@@ -61,6 +61,7 @@ import pandas as pd
 # resolvable and every operator module can build its descriptor from the
 # shared vocabulary.
 from operators.descriptor import OperatorDescriptor
+from operators.form_advice import FormAdvice
 
 
 class OperatorSetupError(Exception):
@@ -337,6 +338,35 @@ class BaseOperator:
         lives".
         """
         return None
+
+    # ── Form guidance ─────────────────────────────────────────────────
+
+    def refine_form(self, values) -> FormAdvice:
+        """
+        Look at the parameter values the researcher has entered so far and
+        return guidance for the generated parameter form: which fields do
+        not apply, which choices are still allowed, and what to say about
+        the current combination (see operators/form_advice.py ->
+        FormAdvice).
+
+        This is a PURE function. It is called on the UI thread on every
+        change to the form -- every keystroke, every selection -- so:
+
+          * It must be cheap. It runs on every change.
+          * It is given ONLY ``values`` (a mapping of declared parameter
+            name -> the current raw value) and NEVER a data table. It
+            cannot look at the rows.
+          * It must tolerate an incomplete form. ``values`` is raw and a
+            required parameter may still be blank or absent entirely. Do
+            not assume a value is present or well-typed.
+          * It returns the COMPLETE state every time, recomputed from the
+            declarations -- it never accumulates onto a previous answer,
+            and it never writes a value back into ``values``.
+
+        The default is ``FormAdvice()`` -- no guidance. Nothing calls this
+        yet; P1.12e-4b wires it into the dialog.
+        """
+        return FormAdvice()
 
     # ── Parameter dialog ──────────────────────────────────────────────
     #
