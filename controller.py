@@ -253,8 +253,8 @@ class AppController(QObject):
     ) -> None:
         """Records a started operator run as live. See _live_runs.
 
-        column_tags is the operator's declared output_columns as a
-        {column_name: type_tag} mapping (P1.8d-2b-2). The item drain reads
+        column_tags is the run's COLUMNS mode descriptor OutputSpec
+        columns as a {column_name: type_tag} mapping (P1.12d-3). The item drain reads
         it back and hands it to Dataset.apply_row_updates() so a column the
         run creates is tagged in the table's schema by what the operator
         declared, not by value inference. Empty for create_table /
@@ -460,9 +460,9 @@ class AppController(QObject):
         label: str,
         message: str,
     ) -> None:
-        # The label is computed by the operator itself
-        # (BaseOperator.display_label) and passed in, so this callback
-        # reads no component state from the worker thread.
+        # The label is the run's mode-descriptor label, computed by the
+        # worker and passed in, so this callback reads no component state
+        # from the worker thread.
         self._complete_queue.put(
             ("setup_error", (operation_id, label, message))
         )
@@ -1187,23 +1187,49 @@ class AppController(QObject):
         parameters = dict(parameters or {})
         try:
             operator = self._op_registry.get(operator_name)
-            if operator is None or operator.create_columns_label is None:
+            if operator is None:
                 self.error_occurred.emit(
                     f'Operator "{operator_name}" cannot add columns.'
                 )
                 return
-            # P1.8d-2b-2: the operator's declared output-column tags no
-            # longer go into ColumnTypeRegistry's column-name map. They
-            # travel to the target table's TableSchema as ColumnHints on
-            # the accept path -- carried on the live run (see
+            operation_id = str(uuid.uuid4())
+            table_name   = self._active_table
+            # One snapshot of exactly the selected rows, taken once here
+            # on the main thread -- not one Dataset.get_row() call (and
+            # one full-table copy) per row. The RunData snapshot below
+            # wraps this SAME frame; it is not copied again.
+            snapshot = self._dataset.snapshot_rows(table_name, row_ids)
+
+            # Build (and validate) the run before registering it, so a
+            # bad parameter set never leaves a live-run entry behind.
+            # _build_operator_run also raises (RuntimeError) if the
+            # operator carries no descriptor, or none for COLUMNS mode --
+            # that is now the only "operator cannot add columns" check.
+            try:
+                run, token = self._build_operator_run(
+                    operator, ExecutionMode.COLUMNS, operation_id,
+                    table_name, parameters, snapshot,
+                )
+            except (OperatorRunError, RuntimeError) as e:
+                self.error_occurred.emit(
+                    f'Cannot start "{operator.name}": {e}'
+                )
+                return
+
+            mode_label = run.spec.mode_descriptor.label
+
+            # P1.8d-2b-2 / P1.12d-3: the COLUMNS mode's declared output
+            # columns (descriptor OutputSpec) are the per-row column tags.
+            # They travel to the target table's TableSchema as ColumnHints
+            # on the accept path -- carried on the live run (see
             # _register_run) and handed to Dataset.apply_row_updates() by
             # the item drain. The schema does not police tags, so an
             # unknown tag still reaches it; but such a column renders as a
             # placeholder, so warn once per run about any tag the registry
             # has no renderer for.
             column_tags = {
-                col_name: col_tag
-                for col_name, col_tag in operator.output_columns
+                column.name: column.type_tag
+                for column in run.spec.mode_descriptor.output.columns
             }
             unknown_tags = sorted(
                 tag for tag in set(column_tags.values())
@@ -1216,26 +1242,6 @@ class AppController(QObject):
                     f"ColumnTypeRegistry has no renderer for; those columns "
                     f"will show a placeholder."
                 )
-            operation_id = str(uuid.uuid4())
-            table_name   = self._active_table
-            # One snapshot of exactly the selected rows, taken once here
-            # on the main thread -- not one Dataset.get_row() call (and
-            # one full-table copy) per row. The RunData snapshot below
-            # wraps this SAME frame; it is not copied again.
-            snapshot = self._dataset.snapshot_rows(table_name, row_ids)
-
-            # Build (and validate) the run before registering it, so a
-            # bad parameter set never leaves a live-run entry behind.
-            try:
-                run, token = self._build_operator_run(
-                    operator, ExecutionMode.COLUMNS, operation_id,
-                    table_name, parameters, snapshot,
-                )
-            except (OperatorRunError, RuntimeError) as e:
-                self.error_occurred.emit(
-                    f'Cannot start "{operator.display_label}": {e}'
-                )
-                return
 
             # The per-row runner can hand the operator one decoded frame
             # (media_requirement FRAME) or nothing (METADATA, or ADDRESS --
@@ -1253,7 +1259,7 @@ class AppController(QObject):
                 MediaRequirement.AUDIO_SPAN,
             ):
                 self.error_occurred.emit(
-                    f'Cannot start "{operator.display_label}": it needs '
+                    f'Cannot start "{mode_label}": it needs '
                     f'{media_requirement.name} media, which the per-row '
                     f'runner cannot supply.'
                 )
@@ -1272,14 +1278,14 @@ class AppController(QObject):
             model_lifecycle = run.spec.mode_descriptor.model_lifecycle
             if model_lifecycle is ModelLifecycle.PER_SEQUENCE:
                 self.error_occurred.emit(
-                    f'Cannot start "{operator.display_label}": it declares '
+                    f'Cannot start "{mode_label}": it declares '
                     f'model_lifecycle {model_lifecycle.name}, which the '
                     f'per-row runner cannot honour.'
                 )
                 return
 
             self._register_run(
-                operation_id, operator.display_label, table_name,
+                operation_id, mode_label, table_name,
                 column_tags, token=token,
             )
             try:
@@ -1331,7 +1337,7 @@ class AppController(QObject):
         parameters = dict(parameters or {})
         try:
             operator = self._op_registry.get(operator_name)
-            if operator is None or operator.create_table_label is None:
+            if operator is None:
                 self.error_occurred.emit(
                     f'Operator "{operator_name}" cannot create a table.'
                 )
@@ -1340,6 +1346,9 @@ class AppController(QObject):
             table_name   = self._active_table
             selected_df  = self._dataset.snapshot_rows(table_name, row_ids)
 
+            # _build_operator_run raises (RuntimeError) if the operator
+            # carries no descriptor, or none for TABLE mode -- that is now
+            # the only "operator cannot create a table" check.
             try:
                 run, token = self._build_operator_run(
                     operator, ExecutionMode.TABLE, operation_id,
@@ -1347,12 +1356,13 @@ class AppController(QObject):
                 )
             except (OperatorRunError, RuntimeError) as e:
                 self.error_occurred.emit(
-                    f'Cannot start "{operator.display_label}": {e}'
+                    f'Cannot start "{operator.name}": {e}'
                 )
                 return
 
             self._register_run(
-                operation_id, operator.display_label, table_name, token=token
+                operation_id, run.spec.mode_descriptor.label, table_name,
+                token=token,
             )
             try:
                 started = self._op_registry.run_create_table(
@@ -1391,7 +1401,7 @@ class AppController(QObject):
         parameters = dict(parameters or {})
         try:
             operator = self._op_registry.get(operator_name)
-            if operator is None or operator.create_display_label is None:
+            if operator is None:
                 self.error_occurred.emit(
                     f'Operator "{operator_name}" cannot show a result.'
                 )
@@ -1400,6 +1410,9 @@ class AppController(QObject):
             table_name   = self._active_table
             selected_df  = self._dataset.snapshot_rows(table_name, row_ids)
 
+            # _build_operator_run raises (RuntimeError) if the operator
+            # carries no descriptor, or none for DISPLAY mode -- that is
+            # now the only "operator cannot show a result" check.
             try:
                 run, token = self._build_operator_run(
                     operator, ExecutionMode.DISPLAY, operation_id,
@@ -1407,12 +1420,13 @@ class AppController(QObject):
                 )
             except (OperatorRunError, RuntimeError) as e:
                 self.error_occurred.emit(
-                    f'Cannot start "{operator.display_label}": {e}'
+                    f'Cannot start "{operator.name}": {e}'
                 )
                 return
 
             self._register_run(
-                operation_id, operator.display_label, table_name, token=token
+                operation_id, run.spec.mode_descriptor.label, table_name,
+                token=token,
             )
             try:
                 started = self._op_registry.run_create_display(

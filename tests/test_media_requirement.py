@@ -254,8 +254,11 @@ def _assert_span_run_is_refused(tmp_path, monkeypatch, requirement):
     assert op.images_seen == [], "create_columns() ran for a span run"
     assert errors, f"no error surfaced for the {requirement.name} run"
     message = errors[-1]
-    # The message names the operator...
-    assert op.display_label in message, message
+    # The message names the run -- by its COLUMNS mode descriptor label
+    # (P1.12d-3 removed BaseOperator.display_label; the controller reads
+    # the label off the run's mode descriptor now)...
+    columns_label = op.descriptor.mode_for(ExecutionMode.COLUMNS).label
+    assert columns_label in message, message
     # ...and the requirement that cannot be supplied.
     assert requirement.name in message, message
     # The run left no live-run entry behind.

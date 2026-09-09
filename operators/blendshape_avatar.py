@@ -43,18 +43,14 @@ class BlendshapeAvatarOperator(BaseOperator):
     """
 
     name = "blendshape_avatar"
-    create_columns_label = "Render blendshape avatar"
-    # 'avatar_path' holds the path to a JPEG this operator writes to disk
-    # (see create_columns), so it is a media path -- the same tag a folder
-    # of images gets. P1.8d-2b-2 makes this declared tag authoritative for
-    # the column's TableSchema spec; 'avatar_path' was never a registered
-    # type and left the column rendering as an "Unknown column" placeholder.
-    output_columns = [("avatar_path", "media_path")]
 
     # ------------------------------------------------------------------
     # Descriptor (P1.12d-1). What create_columns() ACTUALLY does today:
     #  - one COLUMNS mode, over the active table, producing one
-    #    media_path column "avatar_path" -- matches output_columns;
+    #    media_path column "avatar_path". 'avatar_path' holds the path to
+    #    a JPEG this operator writes to disk (see create_columns), so it
+    #    is a media path -- the same tag a folder of images gets, and the
+    #    tag the column's TableSchema spec is built from;
     #  - NO parameters (get_parameters_dialog is not overridden);
     #  - media_requirement METADATA: the method reads blendshape values
     #    from metadata and decodes nothing, so the runner hands it

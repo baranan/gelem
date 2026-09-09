@@ -53,8 +53,9 @@ TEST_IMAGES = project_root / "test_images"
 def _columns_descriptor(name, label, output_columns):
     """A minimal COLUMNS-mode descriptor for a test double (P1.12d-2a:
     every operator the controller runs carries one). output_columns is a
-    list of (column_name, type_tag) pairs, matching the double's
-    output_columns attribute."""
+    list of (column_name, type_tag) pairs that become the mode's
+    OutputSpec columns -- the single source of the run's column tags
+    since P1.12d-3."""
     return OperatorDescriptor(
         name=name,
         version="1.0",
@@ -292,6 +293,83 @@ def test_media_path_declaring_operator_tags_schema_and_warns_nothing(
     # paths here -- so the discriminating half of this test is the warning
     # assertion: declaring an unregistered tag (the pre-fix state) prints a
     # line, declaring 'media_path' must not.
+
+
+# ---------------------------------------------------------------------------
+# P1.12d-3 -- the run's column tags come from the COLUMNS mode descriptor's
+# OutputSpec, not from any operator attribute.
+# ---------------------------------------------------------------------------
+
+def test_run_column_tags_come_from_the_descriptor_output_spec(
+    tmp_path, monkeypatch
+):
+    """AppController.run_create_columns builds the live run's column_tags
+    from run.spec.mode_descriptor.output.columns -- the descriptor is the
+    single source since P1.12d-3.
+
+    Would still pass if the controller read a legacy ``output_columns``
+    attribute instead? No: the double below carries an ``output_columns``
+    with deliberately DIFFERENT names and tags, and the assertion would
+    then see ``{"wrong": "numeric"}`` rather than the descriptor's pairs.
+    """
+    controller, dataset, op_registry = _make_controller(tmp_path)
+
+    class _TwoColumnOperator(BaseOperator):
+        name = "two_col_op"
+        # A stray legacy-style attribute with the WRONG facts. Nothing
+        # in the run path may consult it.
+        output_columns = [("wrong", "numeric")]
+        descriptor = OperatorDescriptor(
+            name="two_col_op",
+            version="1.0",
+            description="Declares two output columns in its descriptor.",
+            modes=(
+                ModeDescriptor(
+                    mode=ExecutionMode.COLUMNS,
+                    label="Two columns",
+                    inputs=(
+                        InputSpec(
+                            name="active_table",
+                            label="Active table",
+                            kind=InputKind.ACTIVE_TABLE,
+                        ),
+                    ),
+                    parameters=(),
+                    output=OutputSpec(
+                        columns=(
+                            OutputColumn(name="mood", type_tag="boolean_flag"),
+                            OutputColumn(name="face", type_tag="media_path"),
+                        )
+                    ),
+                ),
+            ),
+        )
+
+        def create_columns(self, row_id, media, metadata, run):
+            return {"mood": None, "face": None}
+
+    op_registry.register(_TwoColumnOperator())
+
+    # Spy on _register_run to capture the column_tags the controller
+    # derived, without changing its behaviour.
+    captured: dict = {}
+    real_register_run = controller._register_run
+
+    def _spy(operation_id, label, table_name, column_tags=None, token=None):
+        captured["column_tags"] = dict(column_tags or {})
+        return real_register_run(
+            operation_id, label, table_name, column_tags, token=token
+        )
+
+    monkeypatch.setattr(controller, "_register_run", _spy)
+
+    row_ids = controller.get_visible_row_ids()[:3]
+    _run_operator_to_completion(controller, "two_col_op", row_ids)
+
+    assert captured["column_tags"] == {
+        "mood": "boolean_flag",
+        "face": "media_path",
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -481,8 +481,10 @@ to P1.8d, and the two OS-native / non-parsing media-cell entries to P1.8e.
 - **Worker-bound callbacks read component state**
   (`_on_operator_setup_error`, `_on_operator_row_errors` called
   `self._op_registry.get()` from the worker thread to build a display label).
-  *(P0.2b: `BaseOperator.display_label` owns that fallback chain and
-  `OperatorRegistry` passes the ready label into the callbacks. Guarded by
+  *(P0.2b: `OperatorRegistry` passes the ready label into the callbacks. Since
+  P1.12d-3 the worker computes that label once from
+  `run.spec.mode_descriptor.label` -- the `BaseOperator.display_label` property
+  that used to own the fallback chain is deleted. Guarded by
   `tests/test_controller_async_contracts.py::test_worker_callbacks_touch_no_component_state`.)*
 - **Operator result columns declared unregistered types.**
   `BlendshapeAvatarOperator` declared tag `avatar_path` and `PlotOperator`

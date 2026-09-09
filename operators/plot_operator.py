@@ -46,18 +46,14 @@ class PlotOperator(BaseOperator):
     """
 
     name = "plot"
-    create_columns_label = "Plot columns (bar chart)"
-    # 'plot_path' holds the path to a PNG file this operator writes to disk
-    # (see create_columns), so it is a media path -- the same tag a folder
-    # of images gets. P1.8d-2b-2 makes this declared tag authoritative for
-    # the column's TableSchema spec; 'plot_image' was never a registered
-    # type and left the column rendering as an "Unknown column" placeholder.
-    output_columns = [("plot_path", "media_path")]
 
     # ------------------------------------------------------------------
     # Descriptor (P1.12d-1). What create_columns() ACTUALLY does today:
     #  - one COLUMNS mode, over the active table, producing one
-    #    media_path column "plot_path" -- matches output_columns;
+    #    media_path column "plot_path". 'plot_path' holds the path to a
+    #    PNG file this operator writes to disk (see create_columns), so
+    #    it is a media path -- the same tag a folder of images gets, and
+    #    the tag the column's TableSchema spec is built from;
     #  - NO parameters. get_parameters_dialog() returns None, so the
     #    "which columns to plot" choice is NOT a parameter today: the
     #    column list is fixed in __init__ (self._columns default). See

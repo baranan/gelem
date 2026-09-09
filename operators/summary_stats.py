@@ -36,8 +36,6 @@ class SummaryStatsOperator(BaseOperator):
     """
 
     name = "summary_stats"
-    create_display_label = "Summary statistics"
-    output_columns       = []
 
     # ------------------------------------------------------------------
     # Descriptor (P1.12d-1). What create_display() ACTUALLY does today:

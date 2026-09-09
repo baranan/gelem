@@ -1176,7 +1176,10 @@ the signals were renamed to the plural `rows_updated` / `thumbnails_ready`.
 `MainWindow` is the single place that checks a payload's table against
 `AppController.get_active_table()` before repainting; each gallery makes one pass
 over its mounted tiles per batch. The two `[MIGRATING]` worker-thread label
-lookups are gone -- `BaseOperator.display_label` owns that chain. Supersession
+lookups are gone -- the worker computes the run's user-facing label once from
+`run.spec.mode_descriptor.label` (P1.12d-3; the earlier
+`BaseOperator.display_label` property that owned that chain is deleted).
+Supersession
 of one run by another is deliberately not detected (that is P1.12). Tests:
 `tests/test_result_delivery.py`, rewritten
 `tests/test_controller_async_contracts.py`, and a signal-signature check added

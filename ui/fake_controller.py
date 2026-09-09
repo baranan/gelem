@@ -658,21 +658,32 @@ class FakeController(QObject):
 
     @property
     def _op_registry(self):
+        from operators.descriptor import ExecutionMode
+
         class FakeOpRegistry:
-            def list_create_columns_operators(self):
-                return [
+            # Mirrors OperatorRegistry.list_operators_for_mode(mode):
+            # (operator_name, mode label) for every operator declaring
+            # that mode, in registration order. Canned here so the
+            # Operators menu renders in --fake-data mode.
+            _BY_MODE = {
+                ExecutionMode.COLUMNS: [
                     ("blendshapes",       "Extract blendshapes"),
                     ("blendshape_avatar", "Render blendshape avatar"),
                     ("plot",              "Plot columns"),
-                ]
-            def list_create_table_operators(self):
-                return [("mean_face", "Mean face table")]
-            def list_create_display_operators(self):
-                return [
+                ],
+                ExecutionMode.TABLE: [
+                    ("mean_face", "Mean face table"),
+                ],
+                ExecutionMode.DISPLAY: [
                     ("mean_face",     "Mean face (quick view)"),
                     ("summary_stats", "Summary statistics"),
                     ("plot_advanced", "Plot (interactive)"),
-                ]
+                ],
+            }
+
+            def list_operators_for_mode(self, mode):
+                return list(self._BY_MODE.get(mode, []))
+
             def get(self, name):
                 return None
         return FakeOpRegistry()

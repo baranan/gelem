@@ -62,9 +62,8 @@ _AGG_TO_HISTFUNC = {
 class PlotAdvancedOperator(BaseOperator):
 
     name = "plot_advanced"
-    # Setting create_display_label makes this operator appear in the
-    # Operators menu under "Display results for selection".
-    create_display_label = "Plot (interactive, Plotly)"
+    # The descriptor's DISPLAY ModeDescriptor (below) is what makes this
+    # operator appear in the Operators menu's "Show result" section.
 
     # ------------------------------------------------------------------
     # Descriptor (P1.12d-1). What create_display() ACTUALLY does today:

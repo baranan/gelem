@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction
 
+from operators.descriptor import ExecutionMode
 from shared_widgets.checkable_combo_box import CheckableComboBox
 from ui.gallery_widget import GalleryWidget
 from ui.filter_panel import FilterPanel
@@ -288,18 +289,26 @@ class MainWindow(QMainWindow):
     def _refresh_operators_menu(self) -> None:
         """
         Rebuilds the Operators menu just before it is shown.
-        Builds three sections from the operator labels registered
-        in OperatorRegistry — no hardcoded operator names here.
+        Builds three sections from the operators' descriptors, via
+        OperatorRegistry.list_operators_for_mode() — no hardcoded
+        operator names here. Each list is in registration order, which
+        is operators_config.yaml's order.
 
-        Section 1: "Add columns" — operators with create_columns_label
-        Section 2: "Create table" — operators with create_table_label
-        Section 3: "Show result" — operators with create_display_label
+        Section 1: "Add columns" — operators declaring an ExecutionMode.COLUMNS mode
+        Section 2: "Create table" — operators declaring an ExecutionMode.TABLE mode
+        Section 3: "Show result" — operators declaring an ExecutionMode.DISPLAY mode
         """
         self._operators_menu.clear()
 
-        columns_ops = self._controller._op_registry.list_create_columns_operators()
-        table_ops   = self._controller._op_registry.list_create_table_operators()
-        display_ops = self._controller._op_registry.list_create_display_operators()
+        columns_ops = self._controller._op_registry.list_operators_for_mode(
+            ExecutionMode.COLUMNS
+        )
+        table_ops = self._controller._op_registry.list_operators_for_mode(
+            ExecutionMode.TABLE
+        )
+        display_ops = self._controller._op_registry.list_operators_for_mode(
+            ExecutionMode.DISPLAY
+        )
 
         # ── Section 1: Add columns (per-row operators) ────────────────
         if columns_ops:

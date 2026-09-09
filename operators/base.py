@@ -34,8 +34,9 @@ produces one of three kinds of output:
         selected rows and returns a dict shown in the Results panel.
 
 An operator may implement one, two, or all three of these methods.
-The Operators menu is built automatically from whichever labels are
-set — if a label is None, that method is not shown in the menu.
+The Operators menu is built automatically from the operator's
+`descriptor` (operators/descriptor.py): one menu entry per declared
+execution mode, carrying that mode's `label`.
 
 THREADING RULES:
     - create_columns() runs in a background thread.
@@ -75,11 +76,14 @@ class BaseOperator:
     """
     Abstract base class for all Gelem operators.
 
-    To create a new operator:
+    To create a new operator (see operators/CLAUDE.md for the full
+    guide, which is the authority):
         1. Create a new .py file in the operators/ folder.
         2. Define a class that inherits from BaseOperator.
         3. Set the name attribute.
-        4. Set one or more label attributes for the methods you implement.
+        4. Build the `descriptor` (operators/descriptor.py): one
+           ModeDescriptor per method you implement, each carrying the
+           menu label and, for a COLUMNS mode, its output columns.
         5. Implement the corresponding create_*() methods.
         6. If your operator produces a new visual column type, add a
            renderer in column_types/renderers.py and register it in
@@ -90,29 +94,29 @@ class BaseOperator:
            operators/operator_config.py. A disagreement between the two
            raises OperatorConfigError at startup.
 
-    Example — a simple per-row operator:
+    Example -- a simple per-row operator:
 
         class MyOperator(BaseOperator):
             name = "my_operator"
-            create_columns_label = "Compute my score"
-            output_columns = [("my_score", "numeric")]
+            descriptor = OperatorDescriptor(
+                name="my_operator",
+                version="1.0",
+                description="...",
+                modes=(
+                    ModeDescriptor(
+                        mode=ExecutionMode.COLUMNS,
+                        label="Compute my score",
+                        inputs=(...),
+                        output=OutputSpec(columns=(
+                            OutputColumn(name="my_score", type_tag="numeric"),
+                        )),
+                    ),
+                ),
+            )
 
             def create_columns(self, row_id, media, metadata, run):
                 score = compute_something(media)
                 return {"my_score": score}
-
-    Example — an operator that supports two modes:
-
-        class MeanFaceOperator(BaseOperator):
-            name = "mean_face"
-            create_table_label   = "Mean face table"
-            create_display_label = "Mean face (quick view)"
-
-            def create_table(self, df, run):
-                ...
-
-            def create_display(self, df, run):
-                ...
 
     Every create_*() method takes a final `run` argument -- an
     OperatorRun (operators/run_context.py). Per-run values reach the
@@ -136,63 +140,21 @@ class BaseOperator:
     parameters each mode takes, and what each mode produces (see
     operators/descriptor.py for the vocabulary).
 
-    Some fields DESCRIBE the operator as it already behaves (the labels,
-    the output columns) and must match what the code does today; others
-    state a REQUIREMENT the runner must satisfy for the operator to be
-    correct (model_lifecycle, media_requirement) and may declare a
+    Some fields DESCRIBE the operator as it already behaves (the mode
+    labels, the output columns) and must match what the code does today;
+    others state a REQUIREMENT the runner must satisfy for the operator
+    to be correct (model_lifecycle, media_requirement) and may declare a
     stricter contract than the current single-worker code happens to
     need.
 
-    As of P1.12d-1 every concrete operator sets this, and a consistency
-    test (tests/test_operator_descriptors_match.py) pins each descriptor
-    against the operator's existing name / *_label / output_columns
-    attributes. As of P1.12d-2a AppController consumes the descriptor at
-    run time: every run looks up the mode's ModeDescriptor to build the
-    OperatorRun, and a run will not start for an operator that carries no
-    descriptor (or none for the requested mode). The Operators menu and
-    parameter dialog still build from the legacy *_label / parameters
-    attributes; wiring those to the descriptor is later P1.12d work.
-    """
-
-    # ── Menu labels ───────────────────────────────────────────────────
-    # Set these to a non-None string to make the corresponding method
-    # appear in the Operators menu. Leave as None to hide it.
-
-    create_columns_label: str | None = None
-    """
-    Label shown in the Operators menu for the create_columns() action.
-    Example: "Extract blendshapes"
-    None means this operator does not implement create_columns().
-    """
-
-    create_table_label: str | None = None
-    """
-    Label shown in the Operators menu for the create_table() action.
-    Example: "Mean face table"
-    None means this operator does not implement create_table().
-    """
-
-    create_display_label: str | None = None
-    """
-    Label shown in the Operators menu for the create_display() action.
-    Example: "Mean face (quick view)"
-    None means this operator does not implement create_display().
-    """
-
-    # ── Output columns (for create_columns only) ──────────────────────
-
-    output_columns: list = []
-    """
-    List of (column_name, column_type_tag) pairs describing what
-    this operator adds to the table when create_columns() is used.
-    Not used by create_table() or create_display().
-
-    Example:
-        output_columns = [
-            ("bs_jawOpen",      "numeric"),
-            ("bs_mouthSmile_L", "numeric"),
-            ("avatar_path",     "media_path"),
-        ]
+    As of P1.12d-3 the descriptor is the SINGLE source of these facts.
+    The Operators menu builds from it (one entry per declared mode,
+    carrying that mode's `label`), AppController builds each run's
+    OperatorRun from the mode's ModeDescriptor and its per-row column
+    tags from the mode's OutputSpec, and a run will not start for an
+    operator that carries no descriptor (or none for the requested
+    mode). The legacy `*_label` / `output_columns` / `display_label`
+    attributes that used to hold these facts in parallel are gone.
     """
 
     # ── What media a create_columns run is handed ─────────────────────
@@ -207,27 +169,6 @@ class BaseOperator:
     # AUDIO_SPAN are refused before the run starts -- the per-row runner
     # cannot supply a span. See operators/operator_registry.py
     # (_run_create_columns_worker) and AppController.run_create_columns.
-
-    # ── Identity ──────────────────────────────────────────────────────
-
-    @property
-    def display_label(self) -> str:
-        """
-        The operator's user-facing name for dialogs and error messages.
-
-        One operator can expose up to three menu actions with three
-        labels; this picks whichever is set, falling back to the
-        internal name. It lives here so that OperatorRegistry can pass a
-        ready label into its error callbacks and the controller never
-        rebuilds this chain on a worker thread just to phrase an error
-        (a CLAUDE.md threading rule).
-        """
-        return (
-            self.create_columns_label
-            or self.create_table_label
-            or self.create_display_label
-            or self.name
-        )
 
     # ── Core methods ──────────────────────────────────────────────────
 
@@ -272,7 +213,8 @@ class BaseOperator:
 
         Returns:
             A dict mapping column names to new values.
-            Keys must match the column names in output_columns.
+            Keys must match the column names the COLUMNS mode declares
+            in its descriptor's OutputSpec.
             Example: {"bs_jawOpen": 0.42, "bs_mouthSmile_L": 0.18}
 
             For visual columns, the value should be a string file path
@@ -506,15 +448,19 @@ class BaseOperator:
         return output_path
 
     def __repr__(self) -> str:
-        labels = []
-        if self.create_columns_label:
-            labels.append(f"columns='{self.create_columns_label}'")
-        if self.create_table_label:
-            labels.append(f"table='{self.create_table_label}'")
-        if self.create_display_label:
-            labels.append(f"display='{self.create_display_label}'")
+        # Describe the operator by the modes its descriptor declares --
+        # e.g. "columns='Extract blendshapes'". An operator with no
+        # descriptor is not runnable, but repr() must still not raise.
+        if self.descriptor is not None:
+            modes = ", ".join(
+                f"{mode_descriptor.mode.name.lower()}="
+                f"{mode_descriptor.label!r}"
+                for mode_descriptor in self.descriptor.modes
+            )
+        else:
+            modes = "no descriptor"
         return (
             f"{self.__class__.__name__}("
             f"name={self.name!r}, "
-            f"{', '.join(labels)})"
+            f"{modes})"
         )

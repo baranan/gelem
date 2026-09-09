@@ -99,8 +99,6 @@ class BlendshapeOperator(BaseOperator):
     """
 
     name = "blendshapes"
-    create_columns_label = "Extract blendshapes"
-    output_columns = [(bs_name, "numeric") for bs_name in BLENDSHAPE_NAMES]
 
     # ------------------------------------------------------------------
     # Descriptor (P1.12d-1). Describes what create_columns() does:

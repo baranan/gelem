@@ -427,13 +427,8 @@ between a development machine and a student's 8 GB laptop. Default low.
 ## Template
 
 A complete, runnable **COLUMNS** operator. It constructs today: copy the class,
-change the names, and it will start. Three things look like mistakes and are not:
+change the names, and it will start. Two things look like mistakes and are not:
 
-- **`name`, the menu label and the output columns appear twice** -- once as the
-  legacy class attributes the menu and per-row runner still read, once inside the
-  descriptor. `tests/test_operator_descriptors_match.py` pins the two halves
-  equal, and `[TARGET -> P1.12d-3]` deletes the legacy half once the menu and
-  runner read the descriptor directly.
 - **`media` is `None` unless the mode declares `media_requirement =
   MediaRequirement.FRAME`.** `METADATA` and `ADDRESS` both hand `create_columns`
   a `media` of `None`; the per-row runner refuses `VIDEO_SPAN` and `AUDIO_SPAN`
@@ -461,24 +456,20 @@ from operators.descriptor import (
 class MyOperator(BaseOperator):
     """One-line description shown to the researcher."""
 
-    # ---- Legacy self-description (still authoritative today) ----------
-    # The Operators menu and the per-row runner still read these three
-    # attributes: `name`, the `*_label`, and `output_columns`. They are
-    # duplicated inside the descriptor below on purpose --
-    # tests/test_operator_descriptors_match.py pins the two halves equal,
-    # so a change to one that misses the other fails a test. P1.12d-3
-    # deletes this legacy half once the menu and runner read the
-    # descriptor directly; until then keep both, and keep them equal.
+    # ---- Identifier ---------------------------------------------------
+    # The one non-descriptor attribute. `name` is the operator's unique
+    # key -- in operators_config.yaml, in OPERATOR_FACTORIES, and in
+    # OperatorRegistry. It must equal `descriptor.name` (checked when the
+    # descriptor is built). Everything else the menu and the runner need
+    # -- the menu label, the declared output columns -- lives only in the
+    # descriptor below.
     name = "my_operator"
-    create_columns_label = "Compute my score"
-    # (column name, type tag). Reuse a registered tag -- numeric,
-    # media_path, text, boolean_flag -- or the column shows a placeholder.
-    output_columns = [("my_score", "numeric")]
 
     # ---- Descriptor (mandatory: the run will not start without it) ----
-    # Since P1.12d-2a AppController builds every run from the mode's
-    # ModeDescriptor and refuses to start an operator that carries no
-    # descriptor (or none for the requested mode).
+    # AppController builds every run from the mode's ModeDescriptor and
+    # refuses to start an operator that carries no descriptor (or none for
+    # the requested mode). Since P1.12d-3 the descriptor is also the only
+    # source of the menu label and the output columns.
     descriptor = OperatorDescriptor(
         name="my_operator",              # must equal the `name` attribute
         version="1.0",                   # part of the result-cache key --
@@ -491,7 +482,8 @@ class MyOperator(BaseOperator):
         modes=(
             ModeDescriptor(
                 mode=ExecutionMode.COLUMNS,
-                # Same string as create_columns_label (pinned by a test).
+                # The Operators-menu entry for this mode. Your wording --
+                # no test pins it.
                 label="Compute my score",
                 # Where the rows come from. ACTIVE_TABLE means "whatever
                 # table is on screen" -- no dialog choice needed.
@@ -520,7 +512,11 @@ class MyOperator(BaseOperator):
                         default=0.5,
                     ),
                 ),
-                # One OutputColumn per (name, tag) pair in output_columns.
+                # The columns this mode writes, one OutputColumn each.
+                # Reuse a registered tag -- numeric, media_path, text,
+                # boolean_flag -- or the column shows a placeholder.
+                # tests/test_operator_descriptors_match.py pins each real
+                # operator's (name, tag) pairs.
                 output=OutputSpec(
                     columns=(
                         OutputColumn(name="my_score", type_tag="numeric"),
@@ -601,10 +597,10 @@ class MyOperator(BaseOperator):
         return dialog
 ```
 
-A second execution mode is a second `ModeDescriptor` in `modes=(...)` plus the
-matching `create_table` / `create_display` method and `*_label`; `create_table`
-reads its grouping column from `run.parameters`, not from a special-cased
-argument.
+A second execution mode is a second `ModeDescriptor` in `modes=(...)` -- with its
+own `label` and `output` -- plus the matching `create_table` / `create_display`
+method; `create_table` reads its grouping column from `run.parameters`, not from
+a special-cased argument.
 
 `[NOW]` Registration is driven by `operators_config.yaml` (P1.11a). Add a new
 operator in **both** places: an entry in `operators_config.yaml` (its position
@@ -613,8 +609,9 @@ sets the menu order) and a factory in `OPERATOR_FACTORIES` in
 `OperatorConfigError` at startup. `docs/architecture.md` §7 is the authority
 for the mechanism.
 
-`[NOW]` Then add the operator to `OPERATORS_UNDER_TEST` in
-`tests/test_operator_descriptors_match.py` with its own named test:
+`[NOW]` Then add the operator to `OPERATORS_UNDER_TEST` **and** `EXPECTED` in
+`tests/test_operator_descriptors_match.py` -- the modes it declares and, for a
+COLUMNS mode, its `(name, tag)` output columns -- with its own named test.
 `test_every_factory_operator_is_pinned` asserts that set equals
 `OPERATOR_FACTORIES`, so a new operator without an entry fails the baseline.
 

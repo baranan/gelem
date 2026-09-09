@@ -45,7 +45,7 @@ import threading
 import pandas as pd
 
 from operators.base import BaseOperator, OperatorSetupError
-from operators.descriptor import MediaRequirement, ModelLifecycle
+from operators.descriptor import ExecutionMode, MediaRequirement, ModelLifecycle
 
 
 class OperatorRegistry:
@@ -160,47 +160,31 @@ class OperatorRegistry:
         """
         return self._operators.get(operator_name, None)
 
-    def list_create_columns_operators(self) -> list[tuple[str, str]]:
+    def list_operators_for_mode(
+        self, mode: ExecutionMode
+    ) -> list[tuple[str, str]]:
         """
-        Returns all operators that implement create_columns().
+        Returns the operators whose descriptor declares ``mode``, in
+        registration order (which is operators_config.yaml's order, so
+        this is the Operators-menu order for that section).
+
+        Args:
+            mode: The ExecutionMode to list -- COLUMNS, TABLE or DISPLAY.
 
         Returns:
-            List of (operator_name, label) tuples for operators
-            whose create_columns_label is not None.
+            List of (operator_name, label) tuples, where ``label`` is the
+            ModeDescriptor's label for that mode. An operator that
+            declares two modes appears in the list for each, once.
+            An operator with no descriptor contributes nothing.
         """
-        return [
-            (op.name, op.create_columns_label)
-            for op in self._operators.values()
-            if op.create_columns_label is not None
-        ]
-
-    def list_create_table_operators(self) -> list[tuple[str, str]]:
-        """
-        Returns all operators that implement create_table().
-
-        Returns:
-            List of (operator_name, label) tuples for operators
-            whose create_table_label is not None.
-        """
-        return [
-            (op.name, op.create_table_label)
-            for op in self._operators.values()
-            if op.create_table_label is not None
-        ]
-
-    def list_create_display_operators(self) -> list[tuple[str, str]]:
-        """
-        Returns all operators that implement create_display().
-
-        Returns:
-            List of (operator_name, label) tuples for operators
-            whose create_display_label is not None.
-        """
-        return [
-            (op.name, op.create_display_label)
-            for op in self._operators.values()
-            if op.create_display_label is not None
-        ]
+        listed: list[tuple[str, str]] = []
+        for op in self._operators.values():
+            if op.descriptor is None:
+                continue
+            mode_descriptor = op.descriptor.mode_for(mode)
+            if mode_descriptor is not None:
+                listed.append((op.name, mode_descriptor.label))
+        return listed
 
     # ── run_create_columns ────────────────────────────────────────────
 
@@ -266,7 +250,9 @@ class OperatorRegistry:
                               OperatorSetupError on any row. The run is
                               aborted and remaining rows are skipped.
                               Signature: (operation_id: str,
-                                          display_label: str, message: str)
+                                          label: str, message: str)
+                              `label` is the COLUMNS mode's descriptor
+                              label, computed by the worker.
             on_row_errors:    Called once at the end of the run if any rows
                               raised an unexpected exception. Lets the
                               controller surface a single end-of-run
@@ -274,7 +260,7 @@ class OperatorRegistry:
                               are visibly distinct from the normal "no
                               face detected" case.
                               Signature: (operation_id: str,
-                                          display_label: str,
+                                          label: str,
                                           errors: list[tuple[str, str, str]])
                               Each tuple is (row_id, exc_type_name, message).
 
@@ -302,7 +288,10 @@ class OperatorRegistry:
             print(f"[OperatorRegistry] Unknown operator: {operator_name}")
             return False
 
-        if operator.create_columns_label is None:
+        if (
+            operator.descriptor is None
+            or operator.descriptor.mode_for(ExecutionMode.COLUMNS) is None
+        ):
             print(
                 f"[OperatorRegistry] Operator '{operator_name}' "
                 f"does not implement create_columns()."
@@ -350,6 +339,14 @@ class OperatorRegistry:
         """
         total = len(row_ids)
         row_errors: list[tuple[str, str, str]] = []
+        # The user-facing label for this run's error callbacks. It is the
+        # COLUMNS mode's descriptor label -- computed here, on the worker,
+        # from the run object it was handed, so the controller never
+        # rebuilds it on this thread just to phrase an error (a CLAUDE.md
+        # threading rule). run.spec.mode_descriptor is the COLUMNS
+        # ModeDescriptor: AppController.run_create_columns built the run
+        # for ExecutionMode.COLUMNS.
+        label = run.spec.mode_descriptor.label
         # How many per-row results we hand to on_item_complete. The
         # controller holds this run's completion back until it has
         # applied this many, so the completion never races ahead of the
@@ -391,7 +388,7 @@ class OperatorRegistry:
             if on_setup_error is not None:
                 on_setup_error(
                     operation_id,
-                    operator.display_label,
+                    label,
                     f"needs {media_requirement.name} media, which the "
                     f"per-row runner cannot supply. AppController should "
                     f"have refused this run before it started.",
@@ -438,7 +435,7 @@ class OperatorRegistry:
             if on_setup_error is not None:
                 on_setup_error(
                     operation_id,
-                    operator.display_label,
+                    label,
                     f"declares model_lifecycle {model_lifecycle.name}, which "
                     f"the per-row runner cannot honour -- it has no sequence "
                     f"boundary to reset at. AppController should have refused "
@@ -480,7 +477,7 @@ class OperatorRegistry:
                 f"'{operator.name}': {type(e).__name__}: {e}"
             )
             if on_setup_error is not None:
-                on_setup_error(operation_id, operator.display_label, message)
+                on_setup_error(operation_id, label, message)
             if on_complete is not None:
                 on_complete(operation_id, operator.name, emitted)
             return
@@ -524,7 +521,7 @@ class OperatorRegistry:
                 if on_setup_error is not None:
                     # Pass the operator's own display label so the
                     # controller never rebuilds it from a worker thread.
-                    on_setup_error(operation_id, operator.display_label, str(e))
+                    on_setup_error(operation_id, label, str(e))
                 break
             except Exception as e:
                 # Unexpected per-row failure (mediapipe crash, bug, malformed
@@ -537,7 +534,11 @@ class OperatorRegistry:
                 )
                 row_errors.append((row_id, type(e).__name__, str(e)))
                 if on_item_complete is not None:
-                    all_none = {name: None for name, _ in operator.output_columns}
+                    all_none = {
+                        column.name: None
+                        for column
+                        in run.spec.mode_descriptor.output.columns
+                    }
                     on_item_complete(operation_id, table_name, row_id, all_none)
                     emitted += 1
 
@@ -546,7 +547,7 @@ class OperatorRegistry:
                 on_progress(percent)
 
         if row_errors and on_row_errors is not None:
-            on_row_errors(operation_id, operator.display_label, row_errors)
+            on_row_errors(operation_id, label, row_errors)
 
         if on_complete is not None:
             on_complete(operation_id, operator.name, emitted)
@@ -599,7 +600,10 @@ class OperatorRegistry:
             print(f"[OperatorRegistry] Unknown operator: {operator_name}")
             return False
 
-        if operator.create_table_label is None:
+        if (
+            operator.descriptor is None
+            or operator.descriptor.mode_for(ExecutionMode.TABLE) is None
+        ):
             print(
                 f"[OperatorRegistry] Operator '{operator_name}' "
                 f"does not implement create_table()."
@@ -695,7 +699,10 @@ class OperatorRegistry:
             print(f"[OperatorRegistry] Unknown operator: {operator_name}")
             return False
 
-        if operator.create_display_label is None:
+        if (
+            operator.descriptor is None
+            or operator.descriptor.mode_for(ExecutionMode.DISPLAY) is None
+        ):
             print(
                 f"[OperatorRegistry] Operator '{operator_name}' "
                 f"does not implement create_display()."

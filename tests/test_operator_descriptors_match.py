@@ -1,33 +1,52 @@
 """
 tests/test_operator_descriptors_match.py
 
-P1.12d-1 consistency check: every operator now carries a `descriptor`
-(an operators/descriptor.py OperatorDescriptor), and this module pins
-each one against the operator's LEGACY attributes -- `name`, the three
-`*_label` strings and `output_columns` -- which stay authoritative at
-run time until P1.12d-2/d-3 wire the menu and runner to the descriptor.
+Every configured operator's ``descriptor`` (an operators/descriptor.py
+OperatorDescriptor) is pinned here against an EXPLICIT table of the
+facts it must carry: which execution modes it offers, and -- for a
+COLUMNS mode -- the (name, tag) output columns.
 
-If these ever disagree, one of the two descriptions is wrong. The test
-does not judge which; it just refuses the drift.
+HISTORY. Until P1.12d-3 this module pinned each descriptor against the
+operator's LEGACY attributes -- the three ``*_label`` strings and
+``output_columns`` -- which held the same facts in parallel with the
+descriptor. P1.12d-3 deleted those attributes: the descriptor is now the
+SINGLE source (the Operators menu reads ``list_operators_for_mode`` off
+the descriptors, and AppController builds every run and its column tags
+from the mode descriptor). With no second copy left there is nothing to
+cross-check, so this module now checks the descriptor against a
+hand-written expected table instead -- a real regression guard: a
+regression of ``avatar_path``'s tag away from ``media_path`` fails a
+named test here.
+
+WHY MENU LABELS ARE NOT PINNED HERE (P1.12d-3 follow-up). This module
+used to also pin each mode's exact menu label string. It no longer does,
+and must not be made to again. A menu label is Y B's wording and he may
+change it whenever he likes; a test in another file that goes red
+because he renamed a menu entry is a test pinning a decision that is not
+the test's to make. An output column's name and type tag are different
+in kind: an unregistered tag renders a placeholder tile in the gallery,
+which is a defect, not a preference, so those stay pinned. That a mode
+label is present and non-empty at all is enforced where it belongs --
+``ModeDescriptor.__post_init__`` rejects an empty or missing ``label``
+at construction (operators/descriptor.py), and every operator builds its
+descriptor at import time.
 
 There is deliberately ONE named test per operator (not a loop over a
-list of classes) so a failure names the operator directly. A final
+list of classes) so a failure names the operator directly. The final
 coverage test checks that the set of operators pinned here equals the
-set of factory keys in operators/operator_config.py, so a ninth
-operator cannot be added later without a descriptor and a test noticing.
+set of factory keys in operators/operator_config.py, so a ninth operator
+cannot be added later without a descriptor and a test noticing.
 
 Grouping: this module imports the operator modules but creates no Qt
-widget, so it belongs in run_tests.py's combined group. The substring
-heuristic already puts it there (the file names none of the widget
-markers), so it carries no `# run-tests:` declaration.
+widget, so it belongs in run_tests.py's combined group.
 """
 
 from __future__ import annotations
 
-from operators.descriptor import ExecutionMode
+from operators.descriptor import ExecutionMode, OperatorDescriptor
 from operators.operator_config import OPERATOR_FACTORIES
 
-from operators.blendshapes import BlendshapeOperator
+from operators.blendshapes import BLENDSHAPE_NAMES, BlendshapeOperator
 from operators.blendshape_avatar import BlendshapeAvatarOperator
 from operators.mean_face import MeanFaceOperator
 from operators.plot_operator import PlotOperator
@@ -54,76 +73,89 @@ OPERATORS_UNDER_TEST = {
 }
 
 
+# The expected facts, written out by hand. `modes` is the exact set of
+# ExecutionModes the operator must declare (the label each carries is
+# deliberately NOT pinned -- see the module docstring). `columns` (only
+# meaningful for a COLUMNS mode) is the expected list of (name, type_tag)
+# output columns, in order.
+EXPECTED = {
+    "blendshapes": {
+        "modes": {ExecutionMode.COLUMNS},
+        "columns": [(bs_name, "numeric") for bs_name in BLENDSHAPE_NAMES],
+    },
+    "blendshape_avatar": {
+        "modes": {ExecutionMode.COLUMNS},
+        "columns": [("avatar_path", "media_path")],
+    },
+    "mean_face": {
+        "modes": {ExecutionMode.TABLE, ExecutionMode.DISPLAY},
+        "columns": None,
+    },
+    "plot": {
+        "modes": {ExecutionMode.COLUMNS},
+        "columns": [("plot_path", "media_path")],
+    },
+    "plot_advanced": {
+        "modes": {ExecutionMode.DISPLAY},
+        "columns": None,
+    },
+    "stats": {
+        "modes": {ExecutionMode.DISPLAY},
+        "columns": None,
+    },
+    "summary_stats": {
+        "modes": {ExecutionMode.DISPLAY},
+        "columns": None,
+    },
+    "video_frames": {
+        "modes": {ExecutionMode.TABLE},
+        "columns": None,
+    },
+}
+
+
 # ---------------------------------------------------------------------------
-# Shared assertions. Called by each named test with one operator class --
+# Shared assertion. Called by each named test with one operator name --
 # this is not a loop over a list, so a failure still points at one operator.
 # ---------------------------------------------------------------------------
 
-def _assert_mode_matches_label(descriptor, mode: ExecutionMode, label):
-    """A mode of `mode` must exist in the descriptor exactly when the
-    matching legacy `*_label` is set, and carry that same label string.
-    """
-    mode_descriptor = descriptor.mode_for(mode)
-    if label is None:
-        # No legacy label -> the operator does not implement this mode ->
-        # the descriptor must not claim it.
-        assert mode_descriptor is None, (
-            f"descriptor declares a {mode.name} mode but the operator's "
-            f"legacy label for it is None"
-        )
-    else:
-        assert mode_descriptor is not None, (
-            f"operator has a {mode.name} label ({label!r}) but the "
-            f"descriptor declares no {mode.name} mode"
-        )
-        assert mode_descriptor.label == label, (
-            f"{mode.name} mode label {mode_descriptor.label!r} does not "
-            f"match the legacy label {label!r}"
-        )
-
-
-def _assert_descriptor_matches(operator_class):
-    """Pin one operator's descriptor against its legacy attributes."""
+def _assert_descriptor_matches_expected(name):
+    operator_class = OPERATORS_UNDER_TEST[name]
+    expected = EXPECTED[name]
     descriptor = operator_class.descriptor
 
-    # It exists, and its name is the operator's name.
-    assert descriptor is not None, (
-        f"{operator_class.__name__} has no descriptor"
+    assert isinstance(descriptor, OperatorDescriptor), (
+        f"{operator_class.__name__} has no OperatorDescriptor"
     )
-    assert descriptor.name == operator_class.name, (
-        f"descriptor.name {descriptor.name!r} != operator name "
-        f"{operator_class.name!r}"
-    )
-
-    # Each of the three modes: present iff the legacy label is set, and
-    # the label string matches.
-    _assert_mode_matches_label(
-        descriptor, ExecutionMode.COLUMNS,
-        operator_class.create_columns_label,
-    )
-    _assert_mode_matches_label(
-        descriptor, ExecutionMode.TABLE,
-        operator_class.create_table_label,
-    )
-    _assert_mode_matches_label(
-        descriptor, ExecutionMode.DISPLAY,
-        operator_class.create_display_label,
+    assert descriptor.name == operator_class.name == name, (
+        f"descriptor.name {descriptor.name!r} / operator name "
+        f"{operator_class.name!r} / expected {name!r} disagree"
     )
 
-    # For a COLUMNS mode, the descriptor's output columns must equal
-    # output_columns as (name, tag) pairs, in the same order.
+    # The set of declared modes is exactly the expected set. The label
+    # each mode carries is not checked here -- see the module docstring.
+    declared = {md.mode for md in descriptor.modes}
+    assert declared == expected["modes"], (
+        f"{name}: descriptor modes {declared} != expected "
+        f"{expected['modes']}"
+    )
+
+    # For a COLUMNS mode, the OutputSpec columns must be exactly the
+    # expected (name, tag) pairs, in order.
     columns_mode = descriptor.mode_for(ExecutionMode.COLUMNS)
-    if columns_mode is not None:
-        descriptor_pairs = [
+    if expected["columns"] is not None:
+        assert columns_mode is not None, f"{name}: expected a COLUMNS mode"
+        actual_pairs = [
             (column.name, column.type_tag)
             for column in columns_mode.output.columns
         ]
-        legacy_pairs = [
-            (name, tag) for name, tag in operator_class.output_columns
-        ]
-        assert descriptor_pairs == legacy_pairs, (
-            f"descriptor output columns {descriptor_pairs} != "
-            f"output_columns {legacy_pairs}"
+        assert actual_pairs == expected["columns"], (
+            f"{name}: descriptor output columns {actual_pairs} != expected "
+            f"{expected['columns']}"
+        )
+    else:
+        assert columns_mode is None, (
+            f"{name}: descriptor declares a COLUMNS mode but none is expected"
         )
 
 
@@ -131,36 +163,36 @@ def _assert_descriptor_matches(operator_class):
 # One named test per operator.
 # ---------------------------------------------------------------------------
 
-def test_blendshapes_descriptor_matches_legacy_attributes():
-    _assert_descriptor_matches(OPERATORS_UNDER_TEST["blendshapes"])
+def test_blendshapes_descriptor_matches_expected():
+    _assert_descriptor_matches_expected("blendshapes")
 
 
-def test_blendshape_avatar_descriptor_matches_legacy_attributes():
-    _assert_descriptor_matches(OPERATORS_UNDER_TEST["blendshape_avatar"])
+def test_blendshape_avatar_descriptor_matches_expected():
+    _assert_descriptor_matches_expected("blendshape_avatar")
 
 
-def test_mean_face_descriptor_matches_legacy_attributes():
-    _assert_descriptor_matches(OPERATORS_UNDER_TEST["mean_face"])
+def test_mean_face_descriptor_matches_expected():
+    _assert_descriptor_matches_expected("mean_face")
 
 
-def test_plot_descriptor_matches_legacy_attributes():
-    _assert_descriptor_matches(OPERATORS_UNDER_TEST["plot"])
+def test_plot_descriptor_matches_expected():
+    _assert_descriptor_matches_expected("plot")
 
 
-def test_plot_advanced_descriptor_matches_legacy_attributes():
-    _assert_descriptor_matches(OPERATORS_UNDER_TEST["plot_advanced"])
+def test_plot_advanced_descriptor_matches_expected():
+    _assert_descriptor_matches_expected("plot_advanced")
 
 
-def test_stats_descriptor_matches_legacy_attributes():
-    _assert_descriptor_matches(OPERATORS_UNDER_TEST["stats"])
+def test_stats_descriptor_matches_expected():
+    _assert_descriptor_matches_expected("stats")
 
 
-def test_summary_stats_descriptor_matches_legacy_attributes():
-    _assert_descriptor_matches(OPERATORS_UNDER_TEST["summary_stats"])
+def test_summary_stats_descriptor_matches_expected():
+    _assert_descriptor_matches_expected("summary_stats")
 
 
-def test_video_frames_descriptor_matches_legacy_attributes():
-    _assert_descriptor_matches(OPERATORS_UNDER_TEST["video_frames"])
+def test_video_frames_descriptor_matches_expected():
+    _assert_descriptor_matches_expected("video_frames")
 
 
 # ---------------------------------------------------------------------------
@@ -171,11 +203,19 @@ def test_every_factory_operator_is_pinned():
     """The operators pinned by the named tests above must be exactly the
     operators the application offers. Adding a ninth operator to
     OPERATOR_FACTORIES without a descriptor and a named test here then
-    fails this test.
+    fails this test (the set mismatch), and the named test it forces the
+    author to add then fails until the descriptor exists and matches.
     """
     pinned = set(OPERATORS_UNDER_TEST)
     configured = set(OPERATOR_FACTORIES)
     assert pinned == configured, (
         f"operators pinned here {sorted(pinned)} != configured operators "
         f"{sorted(configured)}"
+    )
+    # And EXPECTED covers the same set -- so a new operator cannot be
+    # added to OPERATORS_UNDER_TEST without also stating its expected
+    # facts.
+    assert set(EXPECTED) == pinned, (
+        f"EXPECTED keys {sorted(EXPECTED)} != pinned operators "
+        f"{sorted(pinned)}"
     )

@@ -320,7 +320,10 @@ def test_per_sequence_run_does_not_start_and_message_names_operator_and_lifecycl
     assert op.events == [], "build_model() or create_columns() ran for a refused run"
     assert errors, "no error surfaced for the PER_SEQUENCE run"
     message = errors[-1]
-    assert op.display_label in message, message
+    # The message names the run by its COLUMNS mode descriptor label
+    # (P1.12d-3 removed BaseOperator.display_label).
+    columns_label = op.descriptor.mode_for(ExecutionMode.COLUMNS).label
+    assert columns_label in message, message
     assert ModelLifecycle.PER_SEQUENCE.name in message, message
     # The run left no live-run entry behind.
     assert controller._live_runs == {}

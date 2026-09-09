@@ -47,9 +47,6 @@ class MeanFaceOperator(BaseOperator):
     """
 
     name = "mean_face"
-    create_table_label   = "Mean face table"
-    create_display_label = "Mean face (quick view)"
-    output_columns       = []
 
     # ------------------------------------------------------------------
     # Descriptor (P1.12d-1). What the two methods ACTUALLY do today:
