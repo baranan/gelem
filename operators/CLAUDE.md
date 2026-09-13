@@ -53,6 +53,59 @@ operator instance or read one back off it. Operators are singletons, so a value
 on `self` is a race: two concurrent runs of the same operator would overwrite
 each other's parameters.
 
+### Guiding the form as the researcher fills it -- `refine_form`
+
+`[TARGET -> P1.12]` An operator may override `refine_form(self, values)` to make
+the generated parameter form react as the researcher types -- the live coupling
+a hand-drawn `QDialog` used to give (disable a field that no longer applies,
+narrow a dropdown, show a warning). It returns a `FormAdvice`
+(`operators/form_advice.py`); the default returns the empty `FormAdvice()` and
+the form behaves as a plain form.
+
+**What it receives.** One argument, `values` -- a plain mapping of declared
+parameter name to the widget's current raw value. A number is a number, a
+checkbox a bool, a dropdown its selected value or `None`, a multi-column picker a
+list. Nothing else.
+
+**What it may say**, all optional, all on the returned `FormAdvice`:
+
+- `inapplicable` -- a tuple of parameter names that do not apply to this
+  combination. The form disables each and **preserves its value**.
+- `allowed_choices` -- `{parameter name: tuple of values still allowed}`. The
+  form disables the items outside that tuple; it never removes them, so the
+  researcher's current selection is always kept and OK just stays blocked until
+  they pick an allowed value. **Never name a multi-select column field here**
+  (a `ColumnParameter` with `allow_multiple=True`) -- narrowing one would mean
+  un-picking a column the researcher already chose, which is a value written
+  back; the form refuses that combination rather than doing it. Mark a
+  multi-select field `inapplicable` instead. An **empty** tuple is refused at
+  construction -- a field nothing can satisfy is an inapplicable field, so
+  list it in `inapplicable` instead.
+- `messages` -- a tuple of `FormMessage`, each `severity="warning"` (the
+  researcher may proceed) or `severity="error"` (acceptance is blocked). Give a
+  message a `field` when it belongs beside one parameter.
+
+**The rules `refine_form` must obey:**
+
+- **Pure.** It reads `values`, returns a `FormAdvice`, and does nothing else. No
+  attribute on `self`, no I/O.
+- **Cheap.** It runs on the UI thread on every keystroke and every selection.
+- **No tables.** It is never handed the rows and cannot look at them. Guidance is
+  a function of the parameter values alone.
+- **Tolerates an incomplete form.** `values` is raw: a required parameter may be
+  blank, absent, or the wrong type. Do not assume a value is present or valid --
+  return `FormAdvice()` for a combination you cannot judge yet.
+- **Describes the complete state every time.** Recompute the whole answer from
+  the declarations and `values` on each call. Never accumulate onto a previous
+  answer -- a field only stops being inapplicable if the fresh answer omits it.
+- **Never writes a value back.** It may say "this does not apply" or "only these
+  are valid"; it never substitutes what the researcher typed. The form disables
+  an inapplicable field and keeps its value.
+
+`operators/plot_advanced.py` is the worked example: box and violin make
+`aggregate` inapplicable, histogram narrows it to count/sum/mean, and bar-with-none
+and histogram-with-count each raise a warning.
+
 ---
 
 ## The execution methods

@@ -39,8 +39,10 @@ standard-library only and pulls in no data library.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from html import escape as _html_escape
 from typing import Optional
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -64,7 +66,7 @@ from operators.descriptor import (
     NumberParameter,
     TextParameter,
 )
-from operators.form_advice import FormAdvice, FormMessage
+from operators.form_advice import FormAdvice, FormAdviceError, FormMessage
 
 
 # ---------------------------------------------------------------------------
@@ -504,11 +506,41 @@ def resolve_form(field_specs, advice, raw_values) -> ResolvedForm:
     blocks: the researcher cannot edit a disabled field, so blocking on
     one would trap them with no way out.
 
+    RAISES ``FormAdviceError`` if ``allowed_choices`` names a multi-select
+    column field (a ``ColumnParameter`` with ``allow_multiple=True``).
+    Narrowing one would mean un-picking a column the researcher already
+    chose to keep the selection consistent with the restriction, and
+    advice must never write a value back (see ``operators/form_advice.py``).
+    The check lives here rather than on ``FormAdvice`` itself: a
+    ``FormAdvice`` is a bare mapping of parameter names to tuples with no
+    field-kind information, so it cannot tell a multi-select column field
+    from any other by name alone. This function is the one place advice
+    and the field declarations meet, so it is the one place that can
+    refuse the combination -- and it raises rather than degrading,
+    because an operator that does this has a bug to fix, not a case the
+    form should silently paper over. An operator that needs to react to a
+    multi-select field marks it inapplicable instead.
+
     Pure: it reads its three arguments, mutates none of them, and holds no
     state between calls. Called again with different values, the result is
     computed entirely from those values and that advice -- never
     accumulated onto the previous answer.
     """
+    for spec in field_specs:
+        if (
+            spec.kind == "column"
+            and spec.allow_multiple
+            and spec.name in advice.allowed_choices
+        ):
+            raise FormAdviceError(
+                f"FormAdvice.allowed_choices names {spec.name!r}, a "
+                f"multi-select column field. A multi-select field cannot "
+                f"be narrowed -- narrowing it would have to un-pick a "
+                f"column the researcher already chose, and advice must "
+                f"never write a value back. Mark {spec.name!r} "
+                f"inapplicable instead."
+            )
+
     inapplicable = set(advice.inapplicable)
 
     # Disabled fields, in form order.
@@ -567,8 +599,9 @@ class ParameterDialog(QDialog):
     """A parameter form generated from a mode descriptor.
 
     Construct with the mode descriptor, the ``columns_by_input`` mapping
-    (see ``build_field_specs``), and an optional parent. Call ``exec()``;
-    on accept, read the values back with ``parameter_values()``.
+    (see ``build_field_specs``), an optional parent, and an optional
+    ``advice_provider``. Call ``exec()``; on accept, read the values back
+    with ``parameter_values()``.
 
     The widget chosen per kind:
       * number         -- QSpinBox (decimals 0) or QDoubleSpinBox;
@@ -582,9 +615,40 @@ class ParameterDialog(QDialog):
                           column when the default names one this input
                           offers, otherwise on the blank entry);
       * column, multi  -- QListWidget in multi-selection mode.
+
+    ``advice_provider`` (P1.12e-4b) is a callable ``raw_values -> FormAdvice``
+    -- an operator's ``refine_form`` bound method. The dialog depends on
+    the FUNCTION, never on the operator object. It is called once before
+    the dialog is first shown and again on every field change; its answer
+    is folded through ``resolve_form`` and rendered:
+
+      * a field the operator calls inapplicable is DISABLED, its value
+        left untouched;
+      * a field the operator restricted has its now-disallowed items
+        DISABLED, never removed -- rebuilding the list on every change is
+        the accumulating state the design forbids. The current selection is
+        always kept: a disabled current item is fine, and OK just stays
+        blocked. Only single-value fields (``choice``, single ``column``)
+        can be narrowed this way -- ``resolve_form`` REFUSES advice that
+        narrows a multi-select column field, because there the only way to
+        keep it consistent would be to un-pick a column the researcher
+        already chose, and advice must never write a value back;
+      * every ``FormMessage`` is shown, warnings and errors in different
+        colours;
+      * OK is disabled while ``resolve_form`` reports the form blocked.
+
+    When no ``advice_provider`` is given (or the operator's ``refine_form``
+    returns the default empty ``FormAdvice()``), the form behaves exactly
+    as it did before P1.12e-4b.
     """
 
-    def __init__(self, mode_descriptor, columns_by_input, parent=None):
+    def __init__(
+        self,
+        mode_descriptor,
+        columns_by_input,
+        parent=None,
+        advice_provider=None,
+    ):
         super().__init__(parent)
         self.setWindowTitle(f"{mode_descriptor.label} -- parameters")
 
@@ -593,6 +657,27 @@ class ParameterDialog(QDialog):
 
         # name -> the widget built for that field.
         self._widgets: dict = {}
+
+        # A callable raw_values -> FormAdvice. The default gives no
+        # guidance, so a form with no provider behaves as it did before
+        # this item.
+        self._advice_provider = advice_provider or (
+            lambda raw_values: FormAdvice()
+        )
+
+        # Re-entrancy guard. Applying advice changes widgets, which fires
+        # their change signals, which would ask for advice again. While
+        # this flag is set, _on_field_changed returns immediately.
+        self._applying_advice = False
+
+        # The dropdown fields the last advice narrowed. Only these need
+        # re-widening when a later advice lifts the restriction -- a field
+        # that was never narrowed is already in its full state.
+        self._narrowed_fields: set[str] = set()
+
+        # Filled in by _build().
+        self._message_label: Optional[QLabel] = None
+        self._ok_button = None
 
         self._build()
 
@@ -614,13 +699,29 @@ class ParameterDialog(QDialog):
                 help_label.setWordWrap(True)
                 layout.addWidget(help_label)
 
+        # The one place operator FormMessages are shown. Rich text so a
+        # warning and an error read in different colours; hidden until
+        # there is something to say.
+        self._message_label = QLabel()
+        self._message_label.setWordWrap(True)
+        self._message_label.setTextFormat(Qt.TextFormat.RichText)
+        self._message_label.setVisible(False)
+        layout.addWidget(self._message_label)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.accepted.connect(self._on_ok)
         buttons.rejected.connect(self.reject)
+        self._ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
         layout.addWidget(buttons)
+
+        # Wire every widget's change signal to a single handler, then run
+        # the advice once so the form opens in its resolved state -- before
+        # it is ever shown.
+        self._connect_change_signals()
+        self._apply_advice()
 
     def _widget_for(self, spec: FieldSpec):
         """The one widget this field's kind calls for."""
@@ -757,6 +858,196 @@ class ParameterDialog(QDialog):
         accepted. It delegates every rule to ``collect_parameters``.
         """
         return collect_parameters(self._field_specs, self._raw_values())
+
+    # -- form guidance ----------------------------------------------
+
+    def _connect_change_signals(self) -> None:
+        """Route every widget's "the researcher changed me" signal to
+        ``_on_field_changed``.
+
+        One signal per kind -- the one that fires on a user edit and
+        carries no argument we need.
+        """
+        for spec in self._field_specs:
+            widget = self._widgets[spec.name]
+            if spec.kind == "number":
+                widget.valueChanged.connect(self._on_field_changed)
+            elif spec.kind == "boolean":
+                widget.toggled.connect(self._on_field_changed)
+            elif spec.kind == "choice":
+                widget.currentIndexChanged.connect(self._on_field_changed)
+            elif spec.kind in ("text", "new_table_name"):
+                widget.textChanged.connect(self._on_field_changed)
+            elif spec.kind == "column":
+                if spec.allow_multiple:
+                    widget.itemSelectionChanged.connect(self._on_field_changed)
+                else:
+                    widget.currentIndexChanged.connect(self._on_field_changed)
+
+    def _on_field_changed(self, *_args) -> None:
+        """A field changed. Recompute and re-apply the whole advice --
+        unless we are the ones changing it right now."""
+        if self._applying_advice:
+            return
+        self._apply_advice()
+
+    def _apply_advice(self) -> None:
+        """Ask the provider for advice on the current values, fold it
+        through ``resolve_form``, and render the result.
+
+        The re-entrancy guard is held across the render: applying advice
+        changes widgets, which can fire a field's change signal back into
+        ``_on_field_changed`` mid-render -- without the guard that would
+        call straight back in here. (Narrowing used to be the concrete
+        case that triggered this, by un-picking a multi-select column's
+        now-disallowed entry; ``resolve_form`` now refuses that advice
+        outright, so the guard is defence in depth rather than a path a
+        test can currently force.)
+
+        ``resolve_form`` can itself raise -- see its docstring for when --
+        and that is left to propagate rather than caught here: the
+        provider-call try/except below is only for a broken *operator*;
+        a ``resolve_form`` refusal means the FormAdvice it returned is
+        malformed, which is the same kind of bug ``build_field_specs``
+        raising ``ParameterFormError`` is for an unrenderable parameter --
+        loud, at the point the bad advice was produced.
+
+        A broken refine_form must not take down the Operators menu (this
+        runs during dialog construction) or freeze all further guidance
+        (it runs again on every change, in a Qt slot). Its contract is to
+        be pure, to return a FormAdvice, and to tolerate an incomplete
+        form; a raise, a None (forgotten return) or a wrong type all
+        degrade this cycle to a plain form, and the bug surfaces in the
+        operator's own tests rather than here.
+        """
+        raw_values = self._raw_values()
+        try:
+            advice = self._advice_provider(raw_values)
+            if not isinstance(advice, FormAdvice):
+                advice = FormAdvice()
+        except Exception:
+            advice = FormAdvice()
+
+        resolved = resolve_form(self._field_specs, advice, raw_values)
+
+        self._applying_advice = True
+        try:
+            self._render_resolved(resolved)
+        finally:
+            self._applying_advice = False
+
+    def _render_resolved(self, resolved: ResolvedForm) -> None:
+        """Reflect one ``ResolvedForm`` onto the widgets.
+
+        Order matters and follows the P1.12e-4a note: disable the
+        inapplicable fields FIRST, then narrow allowed values -- an
+        inapplicable field is skipped by the narrowing pass so its items
+        are never pruned. Narrowing disables the now-disallowed items
+        without removing them, so the field's current selection is always
+        kept and OK just stays blocked (via ``resolved.blocked``) until the
+        researcher picks an allowed value. This only ever reaches a
+        single-value field (``choice``, single ``column``): ``resolve_form``
+        refuses advice that narrows a multi-select column field before this
+        method is ever called.
+        """
+        disabled = set(resolved.disabled_fields)
+
+        # 1. Disabled fields first. A disabled widget keeps its value; we
+        #    never touch its items.
+        for spec in self._field_specs:
+            self._widgets[spec.name].setEnabled(spec.name not in disabled)
+
+        # 2. Narrow the still-editable dropdowns. A field that is also
+        #    disabled is skipped -- its items must not be pruned. Widening
+        #    only touches a field a PREVIOUS advice actually narrowed;
+        #    every other field is already in its full state, so re-walking
+        #    its rows on every keystroke would be pure overhead.
+        now_narrowed: set[str] = set()
+        for spec in self._field_specs:
+            if spec.name in disabled:
+                # Left untouched this pass; its items keep whatever state
+                # they had, so remember a still-standing narrowing.
+                if spec.name in self._narrowed_fields:
+                    now_narrowed.add(spec.name)
+                continue
+            allowed = resolved.allowed_values.get(spec.name)
+            if allowed is None:
+                if spec.name in self._narrowed_fields:
+                    self._widen_widget(spec)
+            else:
+                self._narrow_widget(spec, allowed)
+                now_narrowed.add(spec.name)
+        self._narrowed_fields = now_narrowed
+
+        # 3. The messages, warnings and errors visually distinct.
+        self._render_messages(resolved.messages)
+
+        # 4. OK follows `blocked` exactly.
+        if self._ok_button is not None:
+            self._ok_button.setEnabled(not resolved.blocked)
+
+    def _widen_widget(self, spec: FieldSpec) -> None:
+        """Re-enable every item of a dropdown field -- the state a field
+        with no restriction must be in.
+
+        Only ever called for ``choice`` or a single-selection ``column``:
+        ``resolve_form`` refuses advice that narrows a multi-select column
+        field, so ``_narrowed_fields`` (see ``_render_resolved``) never
+        contains one, and this is never asked to widen one either.
+        """
+        widget = self._widgets[spec.name]
+        model = widget.model()
+        for row in range(widget.count()):
+            item = model.item(row)
+            if item is not None:
+                item.setEnabled(True)
+
+    def _narrow_widget(self, spec: FieldSpec, allowed) -> None:
+        """Disable the items of this field that are no longer allowed.
+
+        Never removes an item: removing loses the current selection and
+        forces the original list to be restored on the next change. The
+        blank "unset" entry (data ``None``) is always left enabled.
+
+        Only ever called for ``choice`` or a single-selection ``column``:
+        ``resolve_form`` refuses advice that narrows a multi-select column
+        field before ``allowed`` can reach here (see its docstring for why
+        -- narrowing one would mean un-picking a column the researcher
+        already chose, and advice must never write a value back).
+        """
+        allowed_set = set(allowed)
+        widget = self._widgets[spec.name]
+        model = widget.model()
+        for row in range(widget.count()):
+            data = widget.itemData(row)
+            item = model.item(row)
+            if item is None:
+                continue
+            item.setEnabled(data is None or data in allowed_set)
+
+    def _render_messages(self, messages) -> None:
+        """Show the ``FormMessage`` list, each line coloured by severity.
+
+        The wording is the operator's / Layer A's; this only decides the
+        colour and the "Warning" / "Error" prefix.
+        """
+        if not messages:
+            self._message_label.clear()
+            self._message_label.setVisible(False)
+            return
+
+        blocks = []
+        for message in messages:
+            if message.severity == "error":
+                colour, prefix = "#B00020", "Error"
+            else:
+                colour, prefix = "#B36B00", "Warning"
+            blocks.append(
+                f'<div style="color: {colour}; margin-bottom: 4px;">'
+                f"<b>{prefix}:</b> {_html_escape(message.text)}</div>"
+            )
+        self._message_label.setText("".join(blocks))
+        self._message_label.setVisible(True)
 
     # -- OK -----------------------------------------------------------
 

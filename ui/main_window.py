@@ -33,7 +33,7 @@ from ui.save_table_dialog import SaveTableDialog
 from ui.csv_image_column_dialog import CsvImageColumnDialog
 from ui.merge_report_dialog import MergeReportDialog
 from ui.settings_dialog import SettingsDialog
-from ui.parameter_dialog import ParameterDialog, ParameterFormError
+from ui.parameter_dialog import FormAdviceError, ParameterDialog, ParameterFormError
 
 
 class _UnresolvableInputKind(Exception):
@@ -466,24 +466,49 @@ class MainWindow(QMainWindow):
         # declared parameter, so "parameters declared" and "the form has
         # fields" are the same condition.
         if mode_descriptor is not None and mode_descriptor.parameters:
-            # Build the form before showing anything. Two things can make a
-            # form impossible to build, and both refuse the run the same
-            # visible way any other run-start failure is surfaced, rather
-            # than raising out of this menu-action slot:
+            # Build the form before showing anything. Three things can make
+            # a form impossible to build, and all three refuse the run the
+            # same visible way any other run-start failure is surfaced,
+            # rather than raising out of this menu-action slot:
             #   * an input kind the form cannot resolve
             #     (_UnresolvableInputKind, from _columns_by_input);
             #   * a declared parameter of a kind the form has no widget for
             #     (ParameterFormError, from build_field_specs inside
-            #     ParameterDialog). No operator hits either today.
+            #     ParameterDialog);
+            #   * an operator's refine_form returning FormAdvice that
+            #     resolve_form refuses -- e.g. it tries to narrow a
+            #     multi-select column field (FormAdviceError; see
+            #     ui/parameter_dialog.py -> resolve_form). This is a bug in
+            #     the operator's form guidance, not something the
+            #     researcher did, so the message names the operator rather
+            #     than repeating the internals-facing exception text alone.
+            # No operator hits any of the three today.
             try:
                 columns_by_input = self._columns_by_input(
                     operator_name, mode_descriptor
                 )
+                # The dialog gets the operator's refine_form as a plain
+                # callable -- it depends on a function, never on the
+                # operator object. An operator that overrides nothing hands
+                # over BaseOperator.refine_form, which returns the empty
+                # FormAdvice(), so the form behaves as it did before.
                 param_dialog = ParameterDialog(
-                    mode_descriptor, columns_by_input, parent=self
+                    mode_descriptor,
+                    columns_by_input,
+                    parent=self,
+                    advice_provider=getattr(operator, "refine_form", None),
                 )
-            except (_UnresolvableInputKind, ParameterFormError) as refusal:
-                self._on_error(str(refusal))
+            except (
+                _UnresolvableInputKind, ParameterFormError, FormAdviceError
+            ) as refusal:
+                if isinstance(refusal, FormAdviceError):
+                    self._on_error(
+                        f'Cannot open the parameter form for '
+                        f'"{operator_name}": its form guidance is faulty. '
+                        f"{refusal}"
+                    )
+                else:
+                    self._on_error(str(refusal))
                 return None
 
             if param_dialog.exec() == 0:

@@ -54,7 +54,10 @@ from ui.parameter_dialog import (
     ParameterFormError,
     build_field_specs,
     collect_parameters,
+    resolve_form,
 )
+
+from operators.form_advice import FormAdvice, FormAdviceError
 
 import ui.main_window as main_window_module
 from ui.main_window import MainWindow, _UnresolvableInputKind
@@ -297,9 +300,12 @@ class _ParameterDialogSpy:
 
     instances: list = []
 
-    def __init__(self, mode_descriptor, columns_by_input, parent=None):
+    def __init__(
+        self, mode_descriptor, columns_by_input, parent=None, advice_provider=None
+    ):
         self.mode_descriptor = mode_descriptor
         self.columns_by_input = columns_by_input
+        self.advice_provider = advice_provider
         _ParameterDialogSpy.instances.append(self)
 
     def exec(self):
@@ -433,7 +439,9 @@ class _RealSpecsParameterDialog:
     widget. It lets the seam test drive that failure path.
     """
 
-    def __init__(self, mode_descriptor, columns_by_input, parent=None):
+    def __init__(
+        self, mode_descriptor, columns_by_input, parent=None, advice_provider=None
+    ):
         build_field_specs(mode_descriptor, columns_by_input)
 
 
@@ -475,6 +483,87 @@ def test_an_unrenderable_parameter_kind_refuses_instead_of_crashing(qapp, monkey
     assert "odd" in errors[0]
 
 
+class _RealAdviceParameterDialog:
+    """A ParameterDialog stand-in that runs build_field_specs and the REAL
+    resolve_form in its constructor -- exactly the call that raises
+    FormAdviceError when advice narrows a multi-select column field --
+    without needing a QApplication or a real parent widget. It lets the
+    seam test drive that failure path the same way
+    _RealSpecsParameterDialog does for ParameterFormError above.
+    """
+
+    def __init__(
+        self, mode_descriptor, columns_by_input, parent=None, advice_provider=None
+    ):
+        specs = build_field_specs(mode_descriptor, columns_by_input)
+        # The advice a buggy or mistaken refine_form might return: it
+        # narrows "extra", a multi-select column field. resolve_form
+        # refuses this (see ui/parameter_dialog.py).
+        bad_advice = FormAdvice(allowed_choices={"extra": ("age",)})
+        resolve_form(specs, bad_advice, {"extra": []})
+
+
+def test_a_form_advice_error_is_routed_to_the_error_path_not_raised(
+    qapp, monkeypatch
+):
+    from operators.descriptor import OperatorDescriptor
+
+    descriptor = OperatorDescriptor(
+        name="demo_op",
+        version="1.0",
+        description="an operator whose refine_form gives bad advice",
+        modes=(
+            _display_mode(
+                parameters=(
+                    ColumnParameter(
+                        name="extra",
+                        label="Extra columns",
+                        from_input="src",
+                        allow_multiple=True,
+                        required=False,
+                    ),
+                ),
+                inputs=(_SOURCE_INPUT,),
+            ),
+        ),
+    )
+
+    # First: the real resolve_form really does refuse this advice.
+    specs = build_field_specs(
+        descriptor.modes[0], {"src": (("age", "numeric"),)}
+    )
+    with pytest.raises(FormAdviceError):
+        resolve_form(
+            specs,
+            FormAdvice(allowed_choices={"extra": ("age",)}),
+            {"extra": []},
+        )
+
+    monkeypatch.setattr(main_window_module, "RunOperatorDialog", _FakeScopeDialog)
+    monkeypatch.setattr(
+        main_window_module, "ParameterDialog", _RealAdviceParameterDialog
+    )
+    window = MainWindow.__new__(MainWindow)
+    window._controller = _FakeController(_Operator(descriptor))
+    monkeypatch.setattr(window, "_collect_selected_row_ids", lambda: [], raising=False)
+    monkeypatch.setattr(window, "_collect_visible_row_ids", lambda: [], raising=False)
+    errors: list = []
+    monkeypatch.setattr(window, "_on_error", errors.append, raising=False)
+
+    result = window._show_scope_and_params_dialog("demo_op", ExecutionMode.DISPLAY)
+
+    # Refused through _on_error -- the FormAdviceError does not unwind out
+    # of this menu-action slot -- and the researcher is told plainly, by
+    # operator name, that the form guidance is faulty, not shown a
+    # traceback.
+    assert result is None
+    assert len(errors) == 1
+    message = errors[0]
+    assert "demo_op" in message
+    assert "form guidance" in message
+    assert "faulty" in message
+
+
 def test_columns_by_input_raises_for_a_whole_project_input(qapp):
     whole_project = InputSpec(
         name="everything", label="Everything", kind=InputKind.WHOLE_PROJECT
@@ -490,3 +579,302 @@ def test_columns_by_input_raises_for_a_whole_project_input(qapp):
         window._columns_by_input("demo_op", mode)
     assert "WHOLE_PROJECT" in str(excinfo.value)
     assert "demo_op" in str(excinfo.value)
+
+
+# ===========================================================================
+# P1.12e-4b: the dialog uses an operator's refine_form -- disable, narrow,
+# message, block OK -- and never re-enters itself while applying advice.
+#
+# The advice provider under test is PlotAdvancedOperator.refine_form itself
+# (it reads nothing off the instance, so a bare __new__ instance is fine),
+# driven through a mode whose two parameters carry plot_advanced's exact
+# names and choices.
+# ===========================================================================
+
+from operators.plot_advanced import PlotAdvancedOperator
+
+
+def _plot_advice_provider():
+    operator = PlotAdvancedOperator.__new__(PlotAdvancedOperator)
+    return operator.refine_form
+
+
+def _guided_mode(*, default_chart="scatter"):
+    """A DISPLAY mode with chart_type + aggregate, the pair plot_advanced's
+    refine_form couples."""
+    return ModeDescriptor(
+        mode=ExecutionMode.DISPLAY,
+        label="Guided",
+        inputs=(_SOURCE_INPUT,),
+        parameters=(
+            ChoiceParameter(
+                name="chart_type",
+                label="Chart type",
+                choices=(
+                    ("scatter", "scatter"),
+                    ("bar", "bar"),
+                    ("box", "box"),
+                    ("histogram", "histogram"),
+                ),
+                default=default_chart,
+            ),
+            ChoiceParameter(
+                name="aggregate",
+                label="Aggregate",
+                choices=tuple(
+                    (value, value)
+                    for value in ("none", "count", "sum", "mean", "median")
+                ),
+                default="none",
+            ),
+        ),
+        output=OutputSpec(is_display_only=True),
+    )
+
+
+def _combo_row_for(combo, value):
+    return combo.findData(value)
+
+
+def test_advice_is_applied_before_the_dialog_is_first_shown(qapp):
+    # chart_type starts on "box", which makes aggregate inapplicable. The
+    # aggregate widget must already be disabled at construction -- exec()
+    # is never called.
+    dialog = ParameterDialog(
+        _guided_mode(default_chart="box"),
+        _COLUMNS_BY_INPUT,
+        advice_provider=_plot_advice_provider(),
+    )
+    assert dialog._widgets["aggregate"].isEnabled() is False
+
+
+def test_a_disabled_field_greys_out_and_keeps_its_value(qapp):
+    dialog = ParameterDialog(
+        _guided_mode(default_chart="scatter"),
+        _COLUMNS_BY_INPUT,
+        advice_provider=_plot_advice_provider(),
+    )
+    aggregate = dialog._widgets["aggregate"]
+    # Put a real value in, then move to a chart that disables the field.
+    aggregate.setCurrentIndex(_combo_row_for(aggregate, "mean"))
+    dialog._widgets["chart_type"].setCurrentIndex(
+        _combo_row_for(dialog._widgets["chart_type"], "box")
+    )
+    assert aggregate.isEnabled() is False
+    # The value the researcher chose is untouched.
+    assert aggregate.currentData() == "mean"
+
+
+def test_a_narrowed_dropdown_keeps_a_now_disallowed_selection_and_blocks_ok(qapp):
+    dialog = ParameterDialog(
+        _guided_mode(default_chart="scatter"),
+        _COLUMNS_BY_INPUT,
+        advice_provider=_plot_advice_provider(),
+    )
+    aggregate = dialog._widgets["aggregate"]
+    chart_type = dialog._widgets["chart_type"]
+
+    # Choose median, then switch to histogram, which allows only
+    # count/sum/mean.
+    aggregate.setCurrentIndex(_combo_row_for(aggregate, "median"))
+    chart_type.setCurrentIndex(_combo_row_for(chart_type, "histogram"))
+
+    # The selection is preserved even though it is now disallowed...
+    assert aggregate.currentData() == "median"
+    # ...the median item is disabled (not removed)...
+    median_item = aggregate.model().item(_combo_row_for(aggregate, "median"))
+    assert median_item.isEnabled() is False
+    # ...count/sum/mean stay enabled...
+    for allowed in ("count", "sum", "mean"):
+        assert aggregate.model().item(_combo_row_for(aggregate, allowed)).isEnabled()
+    # ...and OK is blocked while the disallowed value stands.
+    assert dialog._ok_button.isEnabled() is False
+    # The blocking message is rendered as an error, distinct from a warning.
+    label_html = dialog._message_label.text()
+    assert "Error" in label_html
+    assert "#B00020" in label_html  # the error colour, not the warning amber
+
+
+def test_ok_re_enables_when_an_allowed_value_is_picked(qapp):
+    dialog = ParameterDialog(
+        _guided_mode(default_chart="scatter"),
+        _COLUMNS_BY_INPUT,
+        advice_provider=_plot_advice_provider(),
+    )
+    aggregate = dialog._widgets["aggregate"]
+    chart_type = dialog._widgets["chart_type"]
+
+    aggregate.setCurrentIndex(_combo_row_for(aggregate, "median"))
+    chart_type.setCurrentIndex(_combo_row_for(chart_type, "histogram"))
+    assert dialog._ok_button.isEnabled() is False
+
+    # Pick an allowed value: OK comes back. histogram+count still warns,
+    # but a warning does not block.
+    aggregate.setCurrentIndex(_combo_row_for(aggregate, "count"))
+    assert dialog._ok_button.isEnabled() is True
+    # The warning is shown (the dialog itself is never exec()'d, so check
+    # the label was populated and un-hidden rather than isVisible()).
+    assert dialog._message_label.isHidden() is False
+    assert "Warning" in dialog._message_label.text()
+    assert "Y column" in dialog._message_label.text()
+
+
+class _CountingProvider:
+    """Wraps a real provider and counts how many times the dialog asks."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.calls = 0
+
+    def __call__(self, raw_values):
+        self.calls += 1
+        return self._inner(raw_values)
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        pytest.param(lambda raw_values: (_ for _ in ()).throw(RuntimeError("bug")),
+                     id="raises"),
+        pytest.param(lambda raw_values: None, id="forgets-return"),
+        pytest.param(lambda raw_values: {"inapplicable": ("aggregate",)},
+                     id="wrong-type"),
+    ],
+)
+def test_a_broken_advice_provider_degrades_to_a_plain_form(qapp, broken):
+    # refine_form is operator code called during construction and on every
+    # keystroke. A raise, a forgotten return (None), or a wrong return type
+    # must all leave the dialog building and working -- as a plain form --
+    # not crash the Operators menu.
+    dialog = ParameterDialog(
+        _guided_mode(default_chart="box"),
+        _COLUMNS_BY_INPUT,
+        advice_provider=broken,
+    )
+    # No guidance applied: aggregate is not disabled, OK is not blocked.
+    assert dialog._widgets["aggregate"].isEnabled() is True
+    assert dialog._ok_button.isEnabled() is True
+    # A later change also does not raise out of the slot.
+    dialog._widgets["chart_type"].setCurrentIndex(
+        _combo_row_for(dialog._widgets["chart_type"], "histogram")
+    )
+    assert dialog._widgets["aggregate"].isEnabled() is True
+
+
+def test_advice_is_asked_once_per_field_change(qapp):
+    # The construction-time apply is one call; each later field change is
+    # exactly one more.
+    provider = _CountingProvider(_plot_advice_provider())
+    dialog = ParameterDialog(
+        _guided_mode(default_chart="scatter"),
+        _COLUMNS_BY_INPUT,
+        advice_provider=provider,
+    )
+    assert provider.calls == 1
+
+    aggregate = dialog._widgets["aggregate"]
+    aggregate.setCurrentIndex(_combo_row_for(aggregate, "median"))
+    calls_before = provider.calls
+    dialog._widgets["chart_type"].setCurrentIndex(
+        _combo_row_for(dialog._widgets["chart_type"], "histogram")
+    )
+    assert provider.calls == calls_before + 1
+
+
+def test_widening_re_enables_items_a_previous_advice_disabled(qapp):
+    dialog = ParameterDialog(
+        _guided_mode(default_chart="scatter"),
+        _COLUMNS_BY_INPUT,
+        advice_provider=_plot_advice_provider(),
+    )
+    aggregate = dialog._widgets["aggregate"]
+    chart_type = dialog._widgets["chart_type"]
+
+    # histogram disables median...
+    chart_type.setCurrentIndex(_combo_row_for(chart_type, "histogram"))
+    assert aggregate.model().item(_combo_row_for(aggregate, "median")).isEnabled() is False
+
+    # ...back to scatter, which restricts nothing: every item enabled again.
+    chart_type.setCurrentIndex(_combo_row_for(chart_type, "scatter"))
+    for value in ("none", "count", "sum", "mean", "median"):
+        assert aggregate.model().item(_combo_row_for(aggregate, value)).isEnabled()
+    assert aggregate.isEnabled() is True
+    assert dialog._ok_button.isEnabled() is True
+
+
+def _both_provider(raw_values):
+    """`aggregate` is BOTH inapplicable AND narrowed -- the case the
+    disable-before-narrow ordering is about."""
+    return FormAdvice(
+        inapplicable=("aggregate",),
+        allowed_choices={"aggregate": ("count",)},
+    )
+
+
+def test_a_disabled_field_is_not_also_narrowed(qapp):
+    # STEP 7 (P1.12e-4b) -- disable-before-narrow ordering. When a field is
+    # inapplicable the narrowing pass skips it entirely: its dropdown items
+    # are left exactly as they were, so nothing about its preserved value
+    # is pruned.
+    dialog = ParameterDialog(
+        _guided_mode(default_chart="scatter"),
+        _COLUMNS_BY_INPUT,
+        advice_provider=_both_provider,
+    )
+    aggregate = dialog._widgets["aggregate"]
+
+    assert aggregate.isEnabled() is False
+    # `count` is the only allowed value, but because the field is disabled
+    # the narrowing never runs -- `median` and `none` stay enabled.
+    for value in ("none", "count", "sum", "mean", "median"):
+        assert aggregate.model().item(_combo_row_for(aggregate, value)).isEnabled()
+
+
+# ---------------------------------------------------------------------------
+# P1.12e-4b follow-up -- resolve_form refuses to narrow a multi-select
+# column field. Narrowing one used to un-pick a now-disallowed column mid-
+# render (a value written back, forbidden by operators/form_advice.py) and
+# left a stale "not allowed" error showing for one render afterwards. Both
+# are gone: the combination is refused outright, at the one place (Layer A)
+# that has both the advice and the field declarations. `_mode()` (top of
+# this file) already declares a multi-select field, `extra`.
+# ---------------------------------------------------------------------------
+
+def test_resolve_form_refuses_to_narrow_a_multi_select_field():
+    # Layer A only -- resolve_form touches no Qt, so no qapp is needed.
+    specs = build_field_specs(_mode(), _COLUMNS_BY_INPUT)
+    advice = FormAdvice(allowed_choices={"extra": ("age", "name")})
+
+    with pytest.raises(FormAdviceError) as excinfo:
+        resolve_form(specs, advice, {"extra": ["age"]})
+
+    assert "extra" in str(excinfo.value)
+
+
+def test_resolve_form_still_narrows_a_single_select_field():
+    # The refusal is specific to a multi-select column; an ordinary
+    # single-select field (a ChoiceParameter, or a ColumnParameter with
+    # allow_multiple=False) is narrowed exactly as before.
+    specs = build_field_specs(_mode(), _COLUMNS_BY_INPUT)
+    advice = FormAdvice(allowed_choices={"chart_type": ("bar",)})
+
+    resolved = resolve_form(specs, advice, {"chart_type": "scatter"})
+
+    assert resolved.allowed_values == {"chart_type": ("bar",)}
+    assert resolved.blocked is True
+
+
+def test_narrowing_a_multi_select_field_raises_out_of_the_dialog(qapp):
+    # The widget layer, not just Layer A: an operator whose refine_form
+    # narrows a multi-select column field gets a loud failure -- not the
+    # old silent un-pick-and-stale-error. The provider narrows `extra` as
+    # soon as it is asked, so this raises at construction, before the
+    # dialog is ever shown.
+    def _narrows_a_multi_select_field(raw_values):
+        return FormAdvice(allowed_choices={"extra": ("age",)})
+
+    with pytest.raises(FormAdviceError):
+        ParameterDialog(
+            _mode(), _COLUMNS_BY_INPUT,
+            advice_provider=_narrows_a_multi_select_field,
+        )

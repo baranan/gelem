@@ -141,7 +141,19 @@ class FormAdvice:
                            and PRESERVES its value.
     ``allowed_choices`` -- parameter name -> the tuple of values still
                            allowed for it. A field absent from this
-                           mapping is unrestricted.
+                           mapping is unrestricted. NEVER name a
+                           multi-select column field (a ``ColumnParameter``
+                           with ``allow_multiple=True``) here -- narrowing
+                           one would mean un-picking a column the
+                           researcher already chose, which is a value
+                           written back. Mark it ``inapplicable`` instead.
+                           This class cannot enforce that itself -- it is a
+                           bare mapping of names to tuples with no
+                           field-kind information -- so
+                           ``ui/parameter_dialog.py``'s ``resolve_form``
+                           raises ``FormAdviceError`` for it instead, at
+                           the one place advice and the field declarations
+                           meet.
     ``messages``        -- the ``FormMessage`` objects to display.
 
     ``allowed_choices`` is a plain dict rather than a tuple of pairs: this
@@ -176,6 +188,18 @@ class FormAdvice:
         for name, values in self.allowed_choices.items():
             _require_non_empty_name(name, "FormAdvice.allowed_choices key")
             _require_tuple(values, f"FormAdvice.allowed_choices[{name!r}]")
+            # An empty allowed set is not "narrow this field to nothing" --
+            # a field nothing can satisfy is really an INAPPLICABLE field.
+            # Refuse it here, because the alternative is a blocked form
+            # whose only message ("choose one of: ") is meaningless. The
+            # operator should list the field in `inapplicable` instead.
+            if len(values) == 0:
+                raise FormAdviceError(
+                    f"FormAdvice.allowed_choices[{name!r}] is empty. A "
+                    f"field that nothing can satisfy is an inapplicable "
+                    f"field -- put its name in `inapplicable` instead of "
+                    f"giving it an empty allowed set."
+                )
 
         # messages: a tuple of FormMessage. Each one validated itself at
         # construction; here we only insist the container is a tuple and

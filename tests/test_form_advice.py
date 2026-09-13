@@ -93,6 +93,15 @@ def test_a_list_of_allowed_values_is_rejected():
         FormAdvice(allowed_choices={"agg": ["count", "sum"]})
 
 
+def test_an_empty_allowed_set_for_a_field_is_rejected():
+    # A field nothing can satisfy is an inapplicable field, not a field
+    # narrowed to zero choices. The message must point the author at
+    # `inapplicable`.
+    with pytest.raises(FormAdviceError) as excinfo:
+        FormAdvice(allowed_choices={"aggregate": ()})
+    assert "inapplicable" in str(excinfo.value)
+
+
 def test_a_list_for_the_allowed_choices_mapping_is_rejected():
     with pytest.raises(FormAdviceError):
         FormAdvice(allowed_choices=[("agg", ("count",))])

@@ -34,6 +34,7 @@ from operators.descriptor import (
     OutputSpec,
     TextParameter,
 )
+from operators.form_advice import FormAdvice, FormMessage
 
 
 CHART_TYPES = ["scatter", "line", "bar", "box", "violin", "histogram"]
@@ -181,12 +182,76 @@ class PlotAdvancedOperator(BaseOperator):
     # (ui/parameter_dialog.py) and passes the collected values to the
     # controller in run.parameters. This module contains no Qt.
     #
-    # The generated form is plainer than the hand-drawn one it replaced:
-    # it has no live coupling between chart_type and the aggregate control
-    # and no inline warnings. create_display() already tolerates every
-    # combination -- box/violin ignore aggregate, and histogram falls back
-    # to "count" for an unsupported histfunc -- so nothing breaks; the
-    # researcher just loses the guidance the old dialog showed while open.
+    # refine_form() below restores the live coupling the hand-drawn dialog
+    # had between chart_type and the aggregate control -- the guidance the
+    # generated form lost in P1.12e-2.
+
+    def refine_form(self, values):
+        """Guide the generated parameter form as the researcher fills it.
+
+        Pure: it reads ``values`` (raw parameter name -> current value),
+        touches no table and nothing on ``self``, and returns the COMPLETE
+        guidance for this combination every time -- never accumulated onto
+        a previous answer, never a value written back.
+
+        The rules are exactly the ones the deleted ``_apply_chart_rules``
+        / ``_refresh_warnings`` enforced in the old QDialog:
+
+          * box / violin  -- Aggregate does not apply; those charts always
+                             plot every raw row. The field is inapplicable.
+          * histogram     -- Plotly's ``histfunc`` supports only count, sum
+                             and avg (mean): no median, and "none" is not a
+                             histfunc. Narrow Aggregate to count / sum /
+                             mean. With count, warn that the Y column is
+                             ignored.
+          * bar           -- with Aggregate "none", warn that rows sharing
+                             an X value are summed rather than giving one
+                             bar per group.
+          * scatter / line, or an unset chart type -- no guidance.
+        """
+        chart = values.get("chart_type")
+        aggregate = values.get("aggregate")
+
+        inapplicable: tuple[str, ...] = ()
+        allowed_choices: dict = {}
+        messages: list[FormMessage] = []
+
+        if chart in ("box", "violin"):
+            # These chart types are the raw-row distribution; there is
+            # nothing for an aggregate to mean.
+            inapplicable = ("aggregate",)
+        elif chart == "histogram":
+            # median has no histfunc, and "none" is not one either.
+            allowed_choices = {"aggregate": ("count", "sum", "mean")}
+            if aggregate == "count":
+                messages.append(
+                    FormMessage(
+                        text=(
+                            "Histogram with aggregate=count ignores the Y "
+                            "column. Pick sum or mean to use Y."
+                        ),
+                        severity="warning",
+                        field="aggregate",
+                    )
+                )
+        elif chart == "bar":
+            if aggregate == "none":
+                messages.append(
+                    FormMessage(
+                        text=(
+                            "Bar with aggregate=none sums rows sharing X. "
+                            "Pick mean or sum for one bar per group."
+                        ),
+                        severity="warning",
+                        field="aggregate",
+                    )
+                )
+
+        return FormAdvice(
+            inapplicable=inapplicable,
+            allowed_choices=allowed_choices,
+            messages=tuple(messages),
+        )
 
     def create_display(self, df, run):
         """Build one interactive Plotly figure for the selected rows.
