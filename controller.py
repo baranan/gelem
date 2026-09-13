@@ -250,6 +250,13 @@ class AppController(QObject):
         table_name: str,
         column_tags: dict[str, str] | None = None,
         token: CancellationToken | None = None,
+        *,
+        operator_name: str = "",
+        mode_name: str = "",
+        target_table: str = "",
+        parameters: dict | None = None,
+        rows_requested: int = 0,
+        inputs: dict[str, dict] | None = None,
     ) -> None:
         """Records a started operator run as live. See _live_runs.
 
@@ -264,19 +271,231 @@ class AppController(QObject):
         yet -- it is kept here because it is the handle P1.12f's Cancel
         button will call token.cancel() on, and removing a run from
         _live_runs is already the shape a cancellation takes.
+
+        The keyword-only arguments (P1.12f-1) carry everything
+        Dataset.record_operator_run() needs at arrival that is not
+        already on the run: the operator and mode identity, the
+        declared target table, the parameter values, how many rows were
+        requested, and the input table(s) read with their start
+        versions. They default to empty/zero so a caller that only wants
+        the pre-existing tracking (several tests construct a run this
+        way) still works; such a run is simply recorded with blank
+        provenance fields.
+
+        "own_versions" starts empty and is filled in by
+        _drain_item_results as this run's own per-row results are
+        applied -- the last table_version() a table reached because of
+        THIS run's writes, so that a COLUMNS run does not read its own
+        writes back as if some other run had superseded it (see
+        _superseded_input_tables).
+
+        "superseded_latched" (P1.12f-1-fix) starts empty and is a SET of
+        table names, filled in by _drain_item_results right BEFORE it
+        applies this run's own results to a table: if that table's
+        current version already disagrees with the version this run
+        itself last caused there, something foreign landed in between
+        two of this run's own drain ticks. Once a table name is added it
+        is never removed -- a comparison only at arrival would miss
+        exactly this case, because this run's own later write becomes
+        the new "last thing that happened" and erases the evidence.
+
+        "had_setup_error" / "had_row_errors" start False and are flipped
+        by _on_operator_complete's "setup_error" / "row_errors" branches,
+        which arrive before this run's own completion and do not
+        deregister it.
         """
         self._live_runs[operation_id] = {
-            "label":       label,
-            "table_name":  table_name,
-            "applied":     0,
-            "unplaceable": [],
-            "column_tags": dict(column_tags) if column_tags else {},
-            "token":       token,
+            "label":              label,
+            "table_name":         table_name,
+            "applied":            0,
+            "unplaceable":        [],
+            "column_tags":        dict(column_tags) if column_tags else {},
+            "token":              token,
+            "operator_name":      operator_name,
+            "mode_name":          mode_name,
+            "target_table":       target_table,
+            "parameters":         dict(parameters) if parameters else {},
+            "rows_requested":     rows_requested,
+            "inputs":             dict(inputs) if inputs else {},
+            "own_versions":       {},
+            "superseded_latched": set(),
+            "had_setup_error":    False,
+            "had_row_errors":     False,
         }
 
     def _deregister_run(self, operation_id: str) -> None:
         """Drops a run from the live set. Idempotent."""
         self._live_runs.pop(operation_id, None)
+
+    def _attach_run_provenance(
+        self,
+        operation_id: str,
+        *,
+        operator_name: str,
+        mode_name: str,
+        target_table: str,
+        parameters: dict,
+        rows_requested: int,
+        inputs: dict[str, dict],
+    ) -> None:
+        """Fills in the provenance fields _register_run defaults to empty
+        (P1.12f-1), as a step separate from _register_run itself.
+
+        Kept separate rather than folded into _register_run's own
+        argument list: tests/test_operator_tag_hints.py monkeypatches
+        _register_run with a spy that forwards only its original five
+        arguments, so widening that call's signature at the
+        run_create_columns call site would break a test outside this
+        item's permitted files. Called immediately after _register_run,
+        before the worker starts, so there is no window where a live run
+        carries the empty defaults while it could actually complete.
+        """
+        run = self._live_runs.get(operation_id)
+        if run is None:
+            return
+        run["operator_name"]  = operator_name
+        run["mode_name"]      = mode_name
+        run["target_table"]   = target_table
+        run["parameters"]     = dict(parameters)
+        run["rows_requested"] = rows_requested
+        run["inputs"]         = dict(inputs)
+
+    def _run_inputs_snapshot(self, run: OperatorRun) -> dict[str, dict]:
+        """{declared input name: {"table": name, "version": n}} for every
+        single-table input this run reads (P1.12f-1).
+
+        A whole-project input (RunData.tables() rather than .table()) is
+        skipped: run.data.snapshot() raises OperatorRunError for one, and
+        nothing builds a project input today (_build_operator_run only
+        ever populates RunData.projects as {}), so there is nothing yet
+        to record for that case.
+        """
+        snapshot: dict[str, dict] = {}
+        for input_name in run.data.input_names():
+            try:
+                table_snapshot = run.data.snapshot(input_name)
+            except OperatorRunError:
+                continue
+            snapshot[input_name] = {
+                "table":   table_snapshot.table_name,
+                "version": table_snapshot.version,
+            }
+        return snapshot
+
+    def _run_outcome(self, mode: str, run: dict) -> str:
+        """One of "complete", "partial" or "failed" for a run ending at
+        this _on_operator_complete branch (P1.12f-1).
+
+        "failed" is exactly the "error" mode -- the run never finished.
+        Otherwise "partial" if a setup_error or row_errors landed for
+        this run, or it left rows unplaceable; this is also the shape a
+        cancelled run will use once cancellation exists (CLAUDE.md says
+        so explicitly; not built here). Everything else is "complete".
+        """
+        if mode == "error":
+            return "failed"
+        if run["had_setup_error"] or run["had_row_errors"] or run["unplaceable"]:
+            return "partial"
+        return "complete"
+
+    def _run_input_start_version(self, run: dict, table_name: str) -> int | None:
+        """The write-ticket version run["inputs"] recorded for table_name
+        (P1.12f-1-fix), or None if table_name is not one of this run's
+        declared inputs.
+
+        Used by _drain_item_results' pre-apply latch check, which needs
+        this run's ORIGINAL start version for a table it may not have
+        written to yet -- run["own_versions"] only gains an entry for a
+        table after this run's first write there.
+        """
+        for info in run["inputs"].values():
+            if info["table"] == table_name:
+                return info["version"]
+        return None
+
+    def _superseded_input_tables(self, run: dict) -> list[str]:
+        """Input table names whose data has moved out from under this run
+        (P1.12f-1, latch added by P1.12f-1-fix).
+
+        A table counts as superseded by either of two independent checks,
+        because each catches a different moment a foreign write can land:
+
+          1. ARRIVAL: its CURRENT write-ticket version differs from the
+             version THIS RUN itself last caused there -- read off
+             run["own_versions"], updated by _drain_item_results every
+             time it applies this run's own results to that table -- or,
+             for a table this run never wrote to (TABLE/DISPLAY mode, or
+             a COLUMNS run that produced no results for it), from the
+             version recorded at run start (run["inputs"]). This is the
+             false-positive guard: a COLUMNS run reads and writes the
+             SAME table, and its own apply_row_updates() call bumps that
+             table's version before this run's completion is processed.
+             Comparing against the start version alone would mark almost
+             every successful COLUMNS run as superseded by itself.
+
+          2. LATCHED: run["superseded_latched"] already names the table.
+             _drain_item_results sets this BEFORE each of this run's own
+             applies, by the same comparison as (1) but made at that
+             earlier moment. This is what catches a foreign write that
+             lands BETWEEN two of this run's own drain ticks: by arrival
+             time this run's own later write is the last thing that
+             happened to the table, so check (1) alone would see nothing
+             wrong -- the foreign write is masked by this run's own
+             next commit. The latch is taken at the one moment the
+             foreign write is still the last thing that happened, and
+             never cleared once set.
+
+        A false staleness note is advisory and cheap; a missed one is a
+        wrong number in a paper, so this errs toward over-reporting: OR,
+        not AND.
+        """
+        superseded: list[str] = []
+        seen_tables: set[str] = set()
+        for info in run["inputs"].values():
+            table_name = info["table"]
+            if table_name in seen_tables:
+                continue
+            seen_tables.add(table_name)
+            baseline = run["own_versions"].get(table_name, info["version"])
+            arrival_moved = self._dataset.table_version(table_name) != baseline
+            latched_moved = table_name in run["superseded_latched"]
+            if arrival_moved or latched_moved:
+                superseded.append(table_name)
+        return superseded
+
+    def _finish_run_provenance(self, mode: str, run: dict) -> None:
+        """Records this run's provenance entry and, if any input table it
+        read has moved under it, emits one plain-English notice (P1.12f-1).
+
+        Called for every run-ending branch of _on_operator_complete WHILE
+        the run is still in self._live_runs, and always before
+        _deregister_run -- a run no longer live at arrival is not
+        recorded (see the "arrived after the project changed" branches,
+        which already return before this would be reached).
+        """
+        outcome    = self._run_outcome(mode, run)
+        superseded = self._superseded_input_tables(run)
+        self._dataset.record_operator_run(
+            operator_name=run["operator_name"],
+            mode=run["mode_name"],
+            label=run["label"],
+            parameters=run["parameters"],
+            target_table=run["target_table"],
+            inputs=run["inputs"],
+            rows_requested=run["rows_requested"],
+            rows_applied=run["applied"] - len(run["unplaceable"]),
+            unplaceable_row_ids=run["unplaceable"],
+            outcome=outcome,
+            superseded_tables=superseded,
+        )
+        if superseded:
+            tables_str = ", ".join(f'"{t}"' for t in superseded)
+            self.error_occurred.emit(
+                f'"{run["label"]}" read {tables_str}, but that data has '
+                f"changed since the run started, so this result may not "
+                f'match what is on screen. Re-running "{run["label"]}" '
+                f"would recompute it against the current data."
+            )
 
     # ── Queue draining (main thread) ──────────────────────────────────
 
@@ -335,6 +554,11 @@ class AppController(QObject):
         # Built in the drain loop below so this is one pass, not one per
         # table.
         tags_by_table: dict[str, dict[str, str]] = {}
+        # P1.12f-1: which live runs put at least one row into this tick's
+        # batch for a table, so that once the batch is applied each of
+        # those runs can record the version its OWN write just produced
+        # (see _superseded_input_tables).
+        contributors_by_table: dict[str, set[str]] = {}
 
         for _ in range(self._drain_budget):
             try:
@@ -354,11 +578,33 @@ class AppController(QObject):
             run["applied"] += 1
             batches.setdefault(table_name, {})[row_id] = result
             row_owner[(table_name, row_id)] = operation_id
+            contributors_by_table.setdefault(table_name, set()).add(operation_id)
             run_tags = run.get("column_tags")
             if run_tags:
                 tags_by_table.setdefault(table_name, {}).update(run_tags)
 
         for table_name, updates in batches.items():
+            # P1.12f-1-fix: latch supersession for every run about to
+            # write here, BEFORE this tick's own apply moves the table
+            # again. This is the only place a foreign write landing
+            # BETWEEN two of this run's own drain ticks is ever visible:
+            # once this tick's apply below runs, THIS run's write becomes
+            # the table's last commit and a foreign write sandwiched
+            # before it is no longer distinguishable at arrival time.
+            version_before_apply = self._dataset.table_version(table_name)
+            for operation_id in contributors_by_table.get(table_name, ()):
+                run = self._live_runs.get(operation_id)
+                if run is None:
+                    continue
+                start_version = self._run_input_start_version(run, table_name)
+                if start_version is None:
+                    # table_name is not a declared input of this run --
+                    # nothing to compare against, so nothing to latch.
+                    continue
+                baseline = run["own_versions"].get(table_name, start_version)
+                if version_before_apply != baseline:
+                    run["superseded_latched"].add(table_name)
+
             column_tags = tags_by_table.get(table_name)
             unplaceable = self._dataset.apply_row_updates(
                 table_name, updates, column_tags=column_tags or None
@@ -369,6 +615,17 @@ class AppController(QObject):
                 run = self._live_runs.get(operation_id)
                 if run is not None:
                     run["unplaceable"].append(row_id)
+
+            # This tick's write-ticket version for the table, read once
+            # here (same thread, right after the apply that produced it)
+            # so every contributing run records the EXACT version its own
+            # write caused -- not a version read later, after some other
+            # write might have landed too.
+            current_version = self._dataset.table_version(table_name)
+            for operation_id in contributors_by_table.get(table_name, ()):
+                run = self._live_runs.get(operation_id)
+                if run is not None:
+                    run["own_versions"][table_name] = current_version
 
             placed = tuple(
                 rid for rid in updates if rid not in unplaceable_set
@@ -537,6 +794,7 @@ class AppController(QObject):
                     f'could not be matched to a row in table '
                     f'"{run["table_name"]}" and were discarded.'
                 )
+            self._finish_run_provenance(mode, run)
             self._deregister_run(operation_id)
             self.operator_complete.emit(operator_name)
             self.columns_updated.emit(self.get_column_names())
@@ -547,8 +805,13 @@ class AppController(QObject):
             # the abort still produced results that are queued behind
             # this message; the create_columns completion that follows
             # owns deregistration once they have landed, so this branch
-            # only surfaces the message.
-            _operation_id, label, message = payload
+            # only surfaces the message. It does record the flag on the
+            # still-live run (P1.12f-1), so that completion's provenance
+            # entry reports outcome "partial" rather than "complete".
+            operation_id, label, message = payload
+            run = self._live_runs.get(operation_id)
+            if run is not None:
+                run["had_setup_error"] = True
             self.error_occurred.emit(
                 f'Cannot run operator "{label}"\n\n{message}'
             )
@@ -556,8 +819,13 @@ class AppController(QObject):
         elif mode == "row_errors":
             # An additional end-of-run summary. Deregistration and the
             # unplaceable report belong to the create_columns completion
-            # that still follows, so this branch does not deregister.
-            _operation_id, label, errors = payload
+            # that still follows, so this branch does not deregister. As
+            # with setup_error, it records the flag on the still-live run
+            # (P1.12f-1) for that completion's outcome.
+            operation_id, label, errors = payload
+            run = self._live_runs.get(operation_id)
+            if run is not None:
+                run["had_row_errors"] = True
             counts: dict[str, int] = {}
             first_msg: dict[str, str] = {}
             for _row_id, exc_type, msg in errors:
@@ -576,7 +844,10 @@ class AppController(QObject):
 
         elif mode == "create_table":
             operation_id, operator_name, result_df = payload
-            was_live = operation_id in self._live_runs
+            run = self._live_runs.get(operation_id)
+            was_live = run is not None
+            if was_live:
+                self._finish_run_provenance(mode, run)
             self._deregister_run(operation_id)
             if not was_live:
                 # Minutes of compute that arrived after the project
@@ -603,7 +874,10 @@ class AppController(QObject):
 
         elif mode == "create_display":
             operation_id, operator_name, result = payload
-            was_live = operation_id in self._live_runs
+            run = self._live_runs.get(operation_id)
+            was_live = run is not None
+            if was_live:
+                self._finish_run_provenance(mode, run)
             self._deregister_run(operation_id)
             if not was_live:
                 self.error_occurred.emit(
@@ -617,6 +891,9 @@ class AppController(QObject):
 
         elif mode == "error":
             operation_id, operator_name, message = payload
+            run = self._live_runs.get(operation_id)
+            if run is not None:
+                self._finish_run_provenance(mode, run)
             self._deregister_run(operation_id)
             self.error_occurred.emit(message)
             self.operator_complete.emit(operator_name)
@@ -1288,6 +1565,15 @@ class AppController(QObject):
                 operation_id, mode_label, table_name,
                 column_tags, token=token,
             )
+            self._attach_run_provenance(
+                operation_id,
+                operator_name=run.spec.operator_name,
+                mode_name=run.spec.mode.name,
+                target_table=run.spec.target_table,
+                parameters=dict(run.spec.parameters),
+                rows_requested=len(row_ids),
+                inputs=self._run_inputs_snapshot(run),
+            )
             try:
                 started = self._op_registry.run_create_columns(
                     operator_name,
@@ -1364,6 +1650,15 @@ class AppController(QObject):
                 operation_id, run.spec.mode_descriptor.label, table_name,
                 token=token,
             )
+            self._attach_run_provenance(
+                operation_id,
+                operator_name=run.spec.operator_name,
+                mode_name=run.spec.mode.name,
+                target_table=run.spec.target_table,
+                parameters=dict(run.spec.parameters),
+                rows_requested=len(row_ids),
+                inputs=self._run_inputs_snapshot(run),
+            )
             try:
                 started = self._op_registry.run_create_table(
                     operator_name,
@@ -1427,6 +1722,15 @@ class AppController(QObject):
             self._register_run(
                 operation_id, run.spec.mode_descriptor.label, table_name,
                 token=token,
+            )
+            self._attach_run_provenance(
+                operation_id,
+                operator_name=run.spec.operator_name,
+                mode_name=run.spec.mode.name,
+                target_table=run.spec.target_table,
+                parameters=dict(run.spec.parameters),
+                rows_requested=len(row_ids),
+                inputs=self._run_inputs_snapshot(run),
             )
             try:
                 started = self._op_registry.run_create_display(

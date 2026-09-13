@@ -508,3 +508,345 @@ def test_only_dataset_replacing_paths_clear_the_run_registry():
     assert not other_clearers, (
         f"unexpected methods clear the run registry: {other_clearers}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 10. P1.12f-1: the operator-run record and input staleness.
+#
+# These drive the controller's queues directly, the same way tests 1-9
+# above do, rather than through run_create_columns/_build_operator_run --
+# that lets each test set up the run's "inputs" and start version
+# explicitly, which is the thing under test.
+# ---------------------------------------------------------------------------
+
+def _operator_run_entries(dataset):
+    return [e for e in dataset.provenance.to_list() if e["action"] == "operator_run"]
+
+
+def test_clean_columns_run_is_recorded_complete_and_not_superseded(tmp_path):
+    controller, dataset, _ = _make_controller(tmp_path)
+    row_ids = controller.get_visible_row_ids()[:3]
+    start_version = dataset.table_version("frames")
+
+    op_id = "op-clean"
+    controller._register_run(
+        op_id, "Probe", "frames",
+        operator_name="probe", mode_name="COLUMNS", target_table="frames",
+        parameters={"threshold": 0.5}, rows_requested=len(row_ids),
+        inputs={"active_table": {"table": "frames", "version": start_version}},
+    )
+    for i, rid in enumerate(row_ids):
+        controller._on_item_complete(op_id, "frames", rid, {"probe": i})
+    controller._on_create_columns_complete(op_id, "probe", len(row_ids))
+    controller._drain_queues()
+
+    # Would still pass if violated? No. An operator run leaves no
+    # provenance trace at all today (the gap this item closes); asserting
+    # the shape of the one entry it now writes catches a run that never
+    # got recorded, and a "superseded" false positive on an ordinary run
+    # that touched nothing else.
+    entries = _operator_run_entries(dataset)
+    assert len(entries) == 1
+    params = entries[0]["params"]
+    assert params["operator"] == "probe"
+    assert params["mode"] == "COLUMNS"
+    assert params["label"] == "Probe"
+    assert params["target_table"] == "frames"
+    assert params["rows_requested"] == len(row_ids)
+    assert params["rows_applied"] == len(row_ids)
+    assert params["unplaceable_row_ids"] == []
+    assert params["outcome"] == "complete"
+    assert params["superseded_tables"] == []
+    assert op_id not in controller._live_runs
+
+
+# ---------------------------------------------------------------------------
+# 10a. THE FALSE-POSITIVE TRAP (step 0b of the spec): a COLUMNS run writes
+# into the very table it read. Its own apply_row_updates() bumps that
+# table's write-ticket version before the completion is processed. This
+# must not read back as "superseded by itself".
+# ---------------------------------------------------------------------------
+
+def test_columns_run_is_not_superseded_by_its_own_writes(tmp_path):
+    controller, dataset, _ = _make_controller(tmp_path)
+    row_ids = controller.get_visible_row_ids()[:5]
+    start_version = dataset.table_version("frames")
+
+    op_id = "op-self-write"
+    controller._register_run(
+        op_id, "Probe", "frames",
+        operator_name="probe", mode_name="COLUMNS", target_table="frames",
+        rows_requested=len(row_ids),
+        inputs={"active_table": {"table": "frames", "version": start_version}},
+    )
+    for i, rid in enumerate(row_ids):
+        controller._on_item_complete(op_id, "frames", rid, {"probe": i})
+    controller._on_create_columns_complete(op_id, "probe", len(row_ids))
+    # One tick: _drain_item_results applies all 5 results (bumping
+    # 'frames' past start_version and recording that bump as THIS run's
+    # own on run["own_versions"]), then _drain_completions sees
+    # applied == emitted and processes the completion in the same tick.
+    controller._drain_queues()
+
+    # Would still pass if violated? No. A naive comparison of
+    # table_version("frames") against start_version alone would see a
+    # version bump (this run's own apply) and wrongly report
+    # superseded_tables == ["frames"] on a run that only ever wrote its
+    # own results.
+    entries = _operator_run_entries(dataset)
+    assert len(entries) == 1
+    assert entries[0]["params"]["superseded_tables"] == []
+    assert dataset.table_version("frames") > start_version, (
+        "sanity: the run's own writes should actually have bumped the version"
+    )
+
+
+def test_columns_run_is_superseded_by_a_different_write(tmp_path):
+    controller, dataset, _ = _make_controller(tmp_path)
+    row_ids = controller.get_visible_row_ids()[:5]
+    start_version = dataset.table_version("frames")
+
+    op_id = "op-foreign-write"
+    controller._register_run(
+        op_id, "Probe", "frames",
+        operator_name="probe", mode_name="COLUMNS", target_table="frames",
+        rows_requested=len(row_ids),
+        inputs={"active_table": {"table": "frames", "version": start_version}},
+    )
+    for i, rid in enumerate(row_ids):
+        controller._on_item_complete(op_id, "frames", rid, {"probe": i})
+    controller._drain_queues()   # applies this run's own writes only
+
+    # A second, unrelated write lands on 'frames' before this run's
+    # completion is processed -- e.g. a computed column added from the
+    # menu while the operator was still running.
+    dataset.add_computed_column("unrelated", "1", table_name="frames")
+
+    controller._on_create_columns_complete(op_id, "probe", len(row_ids))
+    controller._drain_queues()
+
+    # Would still pass if violated? No. If supersession were judged
+    # against the run's own last-caused version alone (never re-checking
+    # the CURRENT version), this foreign write would go unnoticed and
+    # superseded_tables would wrongly stay empty.
+    entries = _operator_run_entries(dataset)
+    assert len(entries) == 1
+    assert entries[0]["params"]["superseded_tables"] == ["frames"]
+
+
+# ---------------------------------------------------------------------------
+# 10a-fix (P1.12f-1-fix): a foreign write SANDWICHED between two of this
+# run's own drain ticks is not visible at arrival -- this run's own later
+# write becomes the table's last commit by completion time. Only a latch
+# taken at the moment the foreign write is still the most recent thing
+# that happened catches it.
+# ---------------------------------------------------------------------------
+
+def test_columns_run_latches_a_foreign_write_sandwiched_between_its_own_ticks(tmp_path):
+    controller, dataset, _ = _make_controller(tmp_path)
+    row_ids = controller.get_visible_row_ids()[:3]
+    start_version = dataset.table_version("frames")
+
+    op_id = "op-sandwiched"
+    controller._register_run(
+        op_id, "Probe", "frames",
+        operator_name="probe", mode_name="COLUMNS", target_table="frames",
+        rows_requested=len(row_ids),
+        inputs={"active_table": {"table": "frames", "version": start_version}},
+    )
+
+    # tick 1: this run applies results -> frames moves to v1, ours.
+    controller._on_item_complete(op_id, "frames", row_ids[0], {"probe": 0})
+    controller._drain_queues()
+
+    # tick 2: this run applies results -> v2, ours.
+    controller._on_item_complete(op_id, "frames", row_ids[1], {"probe": 1})
+    controller._drain_queues()
+
+    # between ticks: a FOREIGN write -> v3, not ours.
+    dataset.add_computed_column("unrelated", "1", table_name="frames")
+
+    # tick 3: this run applies results -> v4, ours.
+    controller._on_item_complete(op_id, "frames", row_ids[2], {"probe": 2})
+    controller._drain_queues()
+
+    controller._on_create_columns_complete(op_id, "probe", len(row_ids))
+    controller._drain_queues()
+
+    # Would still pass if violated? No. At completion time the CURRENT
+    # version (v4) equals the version this run's own tick 3 write just
+    # caused, so a comparison made only at arrival sees nothing wrong --
+    # exactly the missed detection this fix closes. Only the latch,
+    # taken during tick 3's PRE-apply check (current version v3 there,
+    # against this run's own last-caused version v2), ever sees the
+    # foreign write. A missed detection here is a wrong number in a
+    # paper; this pins that it is no longer missed.
+    entries = _operator_run_entries(dataset)
+    assert len(entries) == 1
+    assert entries[0]["params"]["superseded_tables"] == ["frames"]
+
+
+def test_columns_run_not_superseded_across_three_clean_ticks(tmp_path):
+    controller, dataset, _ = _make_controller(tmp_path)
+    row_ids = controller.get_visible_row_ids()[:3]
+    start_version = dataset.table_version("frames")
+
+    op_id = "op-clean-three-tick"
+    controller._register_run(
+        op_id, "Probe", "frames",
+        operator_name="probe", mode_name="COLUMNS", target_table="frames",
+        rows_requested=len(row_ids),
+        inputs={"active_table": {"table": "frames", "version": start_version}},
+    )
+
+    # Three separate drain ticks, one result each, no foreign write at
+    # any point between them.
+    for rid in row_ids:
+        controller._on_item_complete(op_id, "frames", rid, {"probe": 1})
+        controller._drain_queues()
+
+    controller._on_create_columns_complete(op_id, "probe", len(row_ids))
+    controller._drain_queues()
+
+    # Would still pass if violated? No. If the pre-apply latch check
+    # compared against the wrong baseline (e.g. always the start version
+    # rather than this run's own last-caused version), an ordinary
+    # multi-tick COLUMNS run would latch itself as superseded on its own
+    # second and third ticks, exactly the false-positive trap P1.12f-1
+    # already guards against -- this pins that the fix did not reopen it.
+    entries = _operator_run_entries(dataset)
+    assert len(entries) == 1
+    assert entries[0]["params"]["superseded_tables"] == []
+
+
+def test_superseded_run_emits_one_researcher_facing_message(tmp_path):
+    controller, dataset, _ = _make_controller(tmp_path)
+    row_ids = controller.get_visible_row_ids()[:2]
+    start_version = dataset.table_version("frames")
+
+    messages: list[str] = []
+    controller.error_occurred.connect(messages.append)
+
+    op_id = "op-message"
+    controller._register_run(
+        op_id, "My Op", "frames",
+        operator_name="my_op", mode_name="COLUMNS", target_table="frames",
+        rows_requested=len(row_ids),
+        inputs={"active_table": {"table": "frames", "version": start_version}},
+    )
+    for i, rid in enumerate(row_ids):
+        controller._on_item_complete(op_id, "frames", rid, {"probe": i})
+    controller._drain_queues()
+
+    dataset.add_computed_column("unrelated", "1", table_name="frames")
+
+    controller._on_create_columns_complete(op_id, "my_op", len(row_ids))
+    controller._drain_queues()
+
+    # Would still pass if violated? No. Silence here (no message, or one
+    # that names neither the operator nor the table) would leave the
+    # researcher trusting a result that no longer matches the data on
+    # screen -- exactly what step 5 of the spec exists to prevent. No
+    # re-run button and no blocking is asserted here on purpose: this
+    # item is wording only.
+    staleness_messages = [m for m in messages if "My Op" in m and "frames" in m]
+    assert len(staleness_messages) == 1, messages
+
+
+# ---------------------------------------------------------------------------
+# 10b. Outcome: partial (unplaceable rows, or a setup_error / row_errors
+# landed for this run) and failed (the "error" branch fired).
+# ---------------------------------------------------------------------------
+
+def test_operator_run_outcome_partial_on_unplaceable_rows(tmp_path):
+    controller, dataset, _ = _make_controller(tmp_path)
+    start_version = dataset.table_version("frames")
+
+    op_id = "op-unplaceable"
+    controller._register_run(
+        op_id, "My Op", "frames",
+        operator_name="my_op", mode_name="COLUMNS", target_table="frames",
+        rows_requested=1,
+        inputs={"active_table": {"table": "frames", "version": start_version}},
+    )
+    controller._on_item_complete(op_id, "frames", "no-such-row", {"probe": 1})
+    controller._on_create_columns_complete(op_id, "my_op", 1)
+    controller._drain_queues()
+
+    entries = _operator_run_entries(dataset)
+    assert len(entries) == 1
+    params = entries[0]["params"]
+    assert params["outcome"] == "partial"
+    assert params["unplaceable_row_ids"] == ["no-such-row"]
+    assert params["unplaceable_row_count"] == 1
+    assert params["rows_applied"] == 0
+
+
+def test_operator_run_outcome_partial_after_setup_error(tmp_path):
+    controller, dataset, _ = _make_controller(tmp_path)
+    start_version = dataset.table_version("frames")
+
+    op_id = "op-setup-error"
+    controller._register_run(
+        op_id, "My Op", "frames",
+        operator_name="my_op", mode_name="COLUMNS", target_table="frames",
+        rows_requested=0,
+        inputs={"active_table": {"table": "frames", "version": start_version}},
+    )
+    controller._on_operator_setup_error(op_id, "My Op", "model file missing")
+    controller._drain_queues()
+    controller._on_create_columns_complete(op_id, "my_op", 0)
+    controller._drain_queues()
+
+    entries = _operator_run_entries(dataset)
+    assert len(entries) == 1
+    assert entries[0]["params"]["outcome"] == "partial"
+
+
+def test_operator_run_outcome_failed_on_error_branch(tmp_path):
+    controller, dataset, _ = _make_controller(tmp_path)
+    start_version = dataset.table_version("frames")
+
+    op_id = "op-error"
+    controller._register_run(
+        op_id, "My Op", "frames",
+        operator_name="my_op", mode_name="COLUMNS", target_table="frames",
+        rows_requested=1,
+        inputs={"active_table": {"table": "frames", "version": start_version}},
+    )
+    controller._on_operator_error(op_id, "my_op", "boom")
+    controller._drain_queues()
+
+    entries = _operator_run_entries(dataset)
+    assert len(entries) == 1
+    assert entries[0]["params"]["outcome"] == "failed"
+
+
+# ---------------------------------------------------------------------------
+# 10c. Step 6: a run no longer live at arrival (the project was replaced)
+# is not recorded. Same "arrived after the project changed" path every
+# other mode already has -- this only checks the new recording does not
+# fire on top of it.
+# ---------------------------------------------------------------------------
+
+def test_dead_run_completion_is_not_recorded(tmp_path):
+    controller, dataset, _ = _make_controller(tmp_path)
+    start_version = dataset.table_version("frames")
+
+    op_id = "op-dead"
+    controller._register_run(
+        op_id, "Probe", "frames",
+        operator_name="probe", mode_name="COLUMNS", target_table="frames",
+        rows_requested=1,
+        inputs={"active_table": {"table": "frames", "version": start_version}},
+    )
+    controller._live_runs.clear()   # e.g. load_folder() replaced the project
+
+    controller._on_create_columns_complete(op_id, "probe", 0)
+    controller._drain_queues()
+
+    # Would still pass if violated? No. If the completion path recorded
+    # unconditionally, this dead run would still leave a provenance entry
+    # naming a run that no longer exists and rows that mean nothing after
+    # the reload.
+    assert _operator_run_entries(dataset) == []

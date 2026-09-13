@@ -1329,6 +1329,92 @@ run_test("save/load realistic merge round-trip preserves types", test_save_load_
 
 
 # ---------------------------------------------------------------------------
+# Operator run provenance (P1.12f-1)
+#
+# AppController is the only caller of record_operator_run() in the real
+# app (controller.py's _finish_run_provenance); these tests exercise
+# Dataset's half of the contract directly, at the Dataset public seam,
+# without going through the controller's queues at all.
+# ---------------------------------------------------------------------------
+
+def test_record_operator_run_appends_one_provenance_entry():
+    from models.dataset import Dataset
+    ds = Dataset()
+    ds.load_folder(TEST_IMAGES)
+    before = len(ds.provenance.to_list())
+
+    ds.record_operator_run(
+        operator_name="probe",
+        mode="COLUMNS",
+        label="Probe",
+        parameters={"threshold": 0.5},
+        target_table="frames",
+        inputs={"active_table": {"table": "frames", "version": 1}},
+        rows_requested=3,
+        rows_applied=3,
+        unplaceable_row_ids=[],
+        outcome="complete",
+        superseded_tables=[],
+    )
+
+    entries = ds.provenance.to_list()
+    assert len(entries) == before + 1, (
+        "record_operator_run should append exactly one entry"
+    )
+    entry = entries[-1]
+    assert entry["action"] == "operator_run"
+    params = entry["params"]
+    assert params["operator"] == "probe"
+    assert params["mode"] == "COLUMNS"
+    assert params["label"] == "Probe"
+    assert params["parameters"] == {"threshold": 0.5}
+    assert params["target_table"] == "frames"
+    assert params["inputs"] == {"active_table": {"table": "frames", "version": 1}}
+    assert params["rows_requested"] == 3
+    assert params["rows_applied"] == 3
+    assert params["unplaceable_row_ids"] == []
+    assert params["unplaceable_row_count"] == 0
+    assert params["outcome"] == "complete"
+    assert params["superseded_tables"] == []
+
+def test_record_operator_run_entry_is_json_serialisable():
+    # save() writes provenance.json with json.dumps(self.provenance.to_list())
+    # (models/dataset.py, save()) -- prove the new entry survives that,
+    # rather than assume it because every field looks like a plain type.
+    import json
+    from models.dataset import Dataset
+    ds = Dataset()
+    ds.load_folder(TEST_IMAGES)
+
+    ds.record_operator_run(
+        operator_name="probe",
+        mode="COLUMNS",
+        label="Probe",
+        parameters={"threshold": 0.5, "names": ("a", "b")},
+        target_table="frames",
+        inputs={"active_table": {"table": "frames", "version": 1}},
+        rows_requested=2,
+        rows_applied=1,
+        unplaceable_row_ids=["r7"],
+        outcome="partial",
+        superseded_tables=["frames"],
+    )
+
+    # Must not raise. json.dumps has no tuple type, so a tuple parameter
+    # value silently becoming a JSON array is exactly the kind of thing
+    # that would only surface here, not from asserting on the live dict.
+    encoded = json.dumps(ds.provenance.to_list())
+    decoded = json.loads(encoded)
+    op_entries = [e for e in decoded if e["action"] == "operator_run"]
+    assert len(op_entries) == 1
+    assert op_entries[0]["params"]["parameters"]["names"] == ["a", "b"]
+    assert op_entries[0]["params"]["superseded_tables"] == ["frames"]
+
+run_test("record_operator_run() appends one provenance entry", test_record_operator_run_appends_one_provenance_entry)
+run_test("record_operator_run() entry survives json.dumps", test_record_operator_run_entry_is_json_serialisable)
+
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 

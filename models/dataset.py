@@ -1616,6 +1616,83 @@ class Dataset:
         returned dict does not affect Dataset."""
         return dict(self._table_versions)
 
+    def record_operator_run(
+        self,
+        *,
+        operator_name: str,
+        mode: str,
+        label: str,
+        parameters: dict,
+        target_table: str,
+        inputs: dict,
+        rows_requested: int,
+        rows_applied: int,
+        unplaceable_row_ids: list,
+        outcome: str,
+        superseded_tables: list,
+    ) -> None:
+        """Records one operator run in the provenance log (P1.12f-1).
+
+        Dataset is the only component that writes self.provenance
+        (CLAUDE.md, "Data ownership"); AppController calls this rather
+        than reaching into dataset.provenance directly.
+
+        Args:
+            operator_name:       The operator's `name` class attribute.
+            mode:                The ExecutionMode name the run used
+                                  ("COLUMNS", "TABLE" or "DISPLAY").
+            label:                The mode descriptor's researcher-facing
+                                  label.
+            parameters:          This run's parameter values, keyed by
+                                  declared parameter name.
+            target_table:        For COLUMNS mode, the table new columns
+                                  were written into. Empty for TABLE and
+                                  DISPLAY modes, which store nothing into
+                                  an existing table.
+            inputs:               {declared input name: {"table": name,
+                                  "version": n}} -- every table this run
+                                  read, and the write-ticket version it
+                                  was at when the run started.
+            rows_requested:      How many rows the run was asked to
+                                  process.
+            rows_applied:        How many per-row results were actually
+                                  written into the target table. Always 0
+                                  for TABLE and DISPLAY modes, which
+                                  produce no per-row results.
+            unplaceable_row_ids: Row ids a result could not be matched to
+                                  (the row no longer existed in the
+                                  target table).
+            outcome:             One of "complete", "partial" or
+                                  "failed".
+            superseded_tables:   Names of input tables whose write-ticket
+                                  version, at the moment this run's
+                                  completion arrived, differed from the
+                                  version this run itself last caused
+                                  there -- or, for a table this run never
+                                  wrote to, from the version recorded at
+                                  run start. Empty when nothing moved
+                                  under the run.
+
+        Every value stored here must be JSON-serialisable: save() writes
+        the whole provenance log with json.dumps.
+        """
+        self.provenance.record("operator_run", {
+            "operator":              operator_name,
+            "mode":                  mode,
+            "label":                 label,
+            "parameters":            dict(parameters),
+            "target_table":          target_table,
+            "inputs": {
+                name: dict(info) for name, info in inputs.items()
+            },
+            "rows_requested":        rows_requested,
+            "rows_applied":          rows_applied,
+            "unplaceable_row_ids":   list(unplaceable_row_ids),
+            "unplaceable_row_count": len(unplaceable_row_ids),
+            "outcome":               outcome,
+            "superseded_tables":     list(superseded_tables),
+        })
+
     def take_schema_messages(self) -> list[str]:
         """Returns the accumulated plain-English schema-adjustment notes and
         clears the list. The third reporting destination for accept-time
