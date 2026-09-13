@@ -553,6 +553,36 @@ class MainWindow(QMainWindow):
 
         return columns_by_input
 
+    def _confirm_start_despite_conflicts(
+        self, operator_name: str, mode: ExecutionMode
+    ) -> bool:
+        """
+        Asks the controller (P1.12f-2) whether starting operator_name's
+        mode against the active table right now would conflict with a
+        run already in progress. No conflict: returns True immediately
+        and shows nothing -- no extra dialog, no extra click. One or
+        more conflicts: shows a single Yes/No confirm listing every
+        warning sentence and returns the researcher's choice.
+
+        The default button is explicitly No -- not starting -- so
+        pressing Enter, or dismissing the dialog, never starts a run the
+        researcher has not actively agreed to.
+        """
+        warnings = self._controller.get_write_read_conflict_warnings(
+            operator_name, mode.name
+        )
+        if not warnings:
+            return True
+        message = "\n\n".join(warnings) + "\n\nStart anyway?"
+        reply = QMessageBox.question(
+            self,
+            "Another analysis is still running",
+            message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return reply == QMessageBox.StandardButton.Yes
+
     def _on_run_create_columns(self, operator_name: str) -> None:
         """
         Shows the scope and parameter dialogs, then runs
@@ -564,6 +594,10 @@ class MainWindow(QMainWindow):
         if result is None:
             return
         row_ids, parameters = result
+        if not self._confirm_start_despite_conflicts(
+            operator_name, ExecutionMode.COLUMNS
+        ):
+            return
         self._controller.run_create_columns(operator_name, row_ids, parameters)
 
     def _on_run_create_table(self, operator_name: str) -> None:
@@ -581,6 +615,10 @@ class MainWindow(QMainWindow):
         if result is None:
             return
         row_ids, parameters = result
+        if not self._confirm_start_despite_conflicts(
+            operator_name, ExecutionMode.TABLE
+        ):
+            return
         self._controller.run_create_table(operator_name, row_ids, parameters)
 
     def _on_run_create_display(self, operator_name: str) -> None:
@@ -594,6 +632,10 @@ class MainWindow(QMainWindow):
         if result is None:
             return
         row_ids, parameters = result
+        if not self._confirm_start_despite_conflicts(
+            operator_name, ExecutionMode.DISPLAY
+        ):
+            return
         self._controller.run_create_display(operator_name, row_ids, parameters)
 
     # ── Signal connections ────────────────────────────────────────────

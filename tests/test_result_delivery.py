@@ -45,7 +45,7 @@ from operators.descriptor import (
     OutputColumn,
     OutputSpec,
 )
-from controller import AppController
+from controller import AppController, write_read_conflict_warnings
 
 
 def _active_table_input():
@@ -850,3 +850,199 @@ def test_dead_run_completion_is_not_recorded(tmp_path):
     # naming a run that no longer exists and rows that mean nothing after
     # the reload.
     assert _operator_run_entries(dataset) == []
+
+
+# ---------------------------------------------------------------------------
+# 11. P1.12f-2: the pre-emptive write/read conflict check.
+#
+# 11a. The pure, Qt-free function: write_read_conflict_warnings() takes
+# live runs as plain data plus the about-to-start run's own read/write
+# sets and returns plain-English sentences. Tested with no controller and
+# no Qt widget at all.
+# ---------------------------------------------------------------------------
+
+def test_no_live_runs_means_no_warnings():
+    # Would still pass if violated? No. A function that warned regardless
+    # of live_runs being empty would produce a dialog on every single run.
+    assert write_read_conflict_warnings([], "New run", {"frames"}, {"frames"}) == []
+
+
+def test_disjoint_tables_produce_no_warning():
+    live_runs = [{"label": "Other run", "reads": {"clips"}, "writes": {"clips"}}]
+    # The about-to-start run touches "frames" only -- no table in common
+    # with the live run's "clips" -- so nothing should be reported.
+    assert write_read_conflict_warnings(
+        live_runs, "New run", {"frames"}, {"frames"}
+    ) == []
+
+
+def test_new_run_reading_a_table_a_live_run_is_writing_warns():
+    live_runs = [{"label": "Blendshapes", "reads": {"frames"}, "writes": {"frames"}}]
+    # The about-to-start run only READS "frames"; it writes nothing.
+    warnings = write_read_conflict_warnings(
+        live_runs, "Summary stats", {"frames"}, set()
+    )
+    assert len(warnings) == 1
+    assert "Blendshapes" in warnings[0]
+    assert "Summary stats" in warnings[0]
+    assert "frames" in warnings[0]
+
+
+def test_new_run_writing_a_table_a_live_run_is_reading_warns():
+    live_runs = [{"label": "Summary stats", "reads": {"frames"}, "writes": set()}]
+    # The about-to-start run only WRITES "frames"; it reads nothing of
+    # its own (an unrealistic but still valid input to the pure function).
+    warnings = write_read_conflict_warnings(
+        live_runs, "Blendshapes", set(), {"frames"}
+    )
+    assert len(warnings) == 1
+    assert "Summary stats" in warnings[0]
+    assert "Blendshapes" in warnings[0]
+    assert "frames" in warnings[0]
+
+
+def test_read_conflict_and_write_conflict_are_worded_differently():
+    # Would still pass if violated? No. If both situations produced the
+    # same sentence, a researcher could not tell a "your result may be
+    # incomplete" risk from a "the other run's result may go stale" risk
+    # -- the spec calls these two different situations that deserve two
+    # different sentences.
+    reads_conflict = write_read_conflict_warnings(
+        [{"label": "A", "reads": {"t"}, "writes": {"t"}}], "B", {"t"}, set()
+    )
+    writes_conflict = write_read_conflict_warnings(
+        [{"label": "A", "reads": {"t"}, "writes": {"t"}}], "B", set(), {"t"}
+    )
+    assert reads_conflict != writes_conflict
+
+
+def test_each_conflicting_live_run_gets_its_own_sentence():
+    live_runs = [
+        {"label": "Run one", "reads": set(), "writes": {"frames"}},
+        {"label": "Run two", "reads": set(), "writes": {"frames"}},
+    ]
+    warnings = write_read_conflict_warnings(
+        live_runs, "New run", {"frames"}, set()
+    )
+    assert len(warnings) == 2
+    assert any("Run one" in w for w in warnings)
+    assert any("Run two" in w for w in warnings)
+
+
+def test_warning_wording_avoids_technical_jargon():
+    # Undergraduates have never heard "table version" -- the spec bans
+    # these specific words from the researcher-facing sentences.
+    warnings = write_read_conflict_warnings(
+        [{"label": "A", "reads": {"t"}, "writes": {"t"}}], "B", {"t"}, {"t"},
+    )
+    banned = ("superseded", "stale", "write-ticket", "version")
+    for sentence in warnings:
+        lowered = sentence.lower()
+        for word in banned:
+            assert word not in lowered, f"{word!r} found in: {sentence!r}"
+
+
+# ---------------------------------------------------------------------------
+# 11b. AppController.get_write_read_conflict_warnings(): assembles the
+# plain data from self._live_runs and the operator's descriptor, and
+# returns no warnings for anything it cannot resolve.
+# ---------------------------------------------------------------------------
+
+def _register_probe(op_registry, name, label, output_columns):
+    from operators.base import BaseOperator
+
+    class _Probe(BaseOperator):
+        create_columns_label = label
+        descriptor = _columns_descriptor(name, label, output_columns)
+
+        def create_columns(self, row_id, media, metadata, run):
+            return {}
+
+    _Probe.name = name
+    op = _Probe()
+    op_registry.register(op)
+    return op
+
+
+def _register_table_probe(op_registry, name, label):
+    from operators.base import BaseOperator
+
+    class _TableProbe(BaseOperator):
+        create_table_label = label
+        descriptor = _table_descriptor(name, label)
+
+    _TableProbe.name = name
+    op = _TableProbe()
+    op_registry.register(op)
+    return op
+
+
+def test_get_write_read_conflict_warnings_is_empty_with_nothing_live(tmp_path):
+    controller, dataset, op_registry = _make_controller(tmp_path)
+    _register_probe(op_registry, "probe", "Probe", [("probe", "numeric")])
+
+    # Would still pass if violated? No. A version that always compared
+    # against an empty descriptor set would also pass here for the wrong
+    # reason -- the sibling tests below pin the non-empty cases.
+    assert controller.get_write_read_conflict_warnings("probe", "COLUMNS") == []
+
+
+def test_get_write_read_conflict_warnings_when_new_run_reads_a_live_writer(tmp_path):
+    controller, dataset, op_registry = _make_controller(tmp_path)
+    _register_table_probe(op_registry, "aggregate", "Aggregate")
+    start_version = dataset.table_version("frames")
+
+    # A live COLUMNS run whose target table is "frames" -- its write set
+    # is {"frames"} (P1.12f-1's target_table field).
+    controller._register_run(
+        "live-columns-run", "Blendshapes", "frames",
+        operator_name="blendshapes", mode_name="COLUMNS", target_table="frames",
+        rows_requested=5,
+        inputs={"active_table": {"table": "frames", "version": start_version}},
+    )
+
+    # The about-to-start TABLE-mode run reads the active table ("frames")
+    # and writes nothing -- so it conflicts with the live run's write.
+    warnings = controller.get_write_read_conflict_warnings("aggregate", "TABLE")
+    assert len(warnings) == 1
+    assert "Blendshapes" in warnings[0]
+    assert "frames" in warnings[0]
+
+
+def test_get_write_read_conflict_warnings_when_new_run_writes_a_live_reader(tmp_path):
+    controller, dataset, op_registry = _make_controller(tmp_path)
+    _register_probe(op_registry, "probe", "Probe", [("probe", "numeric")])
+    start_version = dataset.table_version("frames")
+
+    # A live TABLE-mode run: it reads "frames" (its declared input) but
+    # its target_table is "" -- TABLE mode writes nothing to an existing
+    # table -- so its write set is empty.
+    controller._register_run(
+        "live-table-run", "Aggregate", "frames",
+        operator_name="aggregate", mode_name="TABLE", target_table="",
+        rows_requested=5,
+        inputs={"active_table": {"table": "frames", "version": start_version}},
+    )
+
+    # The about-to-start COLUMNS run writes into "frames" -- so it
+    # conflicts with the live run's read.
+    warnings = controller.get_write_read_conflict_warnings("probe", "COLUMNS")
+    assert len(warnings) == 1
+    assert "Aggregate" in warnings[0]
+    assert "frames" in warnings[0]
+
+
+def test_get_write_read_conflict_warnings_unknown_operator_returns_empty(tmp_path):
+    controller, dataset, op_registry = _make_controller(tmp_path)
+    # Would still pass if violated? No. A version that raised or crashed
+    # on an unknown name would fail this test loudly instead of quietly
+    # returning no warnings.
+    assert controller.get_write_read_conflict_warnings("does_not_exist", "COLUMNS") == []
+
+
+def test_get_write_read_conflict_warnings_missing_mode_returns_empty(tmp_path):
+    controller, dataset, op_registry = _make_controller(tmp_path)
+    _register_probe(op_registry, "probe", "Probe", [("probe", "numeric")])
+    # "probe" only declares a COLUMNS mode -- asking about TABLE mode
+    # must return no warnings, not raise.
+    assert controller.get_write_read_conflict_warnings("probe", "TABLE") == []

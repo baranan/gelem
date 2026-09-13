@@ -514,6 +514,18 @@ class FakeController(QObject):
         """
         return self._op_registry.get(operator_name)
 
+    def get_write_read_conflict_warnings(
+        self, operator_name: str, mode_name: str
+    ) -> list[str]:
+        """
+        Mirrors AppController.get_write_read_conflict_warnings(), added
+        by P1.12f-2 (tests/test_fake_controller_contract.py fails
+        without this). Fake mode never has a second run in flight --
+        there is no live-run registry here at all -- so there is never
+        a conflict to report.
+        """
+        return []
+
     # Settings pass-throughs -- mirror AppController.get_settings_fields
     # and apply_settings so --fake-data does not crash when settings UI
     # calls them. There is no settings store in fake mode, so both are

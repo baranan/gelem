@@ -50,6 +50,79 @@ from operators.run_context import (
 
 DEFAULT_MEDIA_COLUMN_NAME = "full_path"
 
+
+# ---------------------------------------------------------------------------
+# P1.12f-2: the pre-emptive write/read conflict check.
+#
+# Pure, Qt-free arithmetic plus the researcher-facing sentences it produces
+# -- no widget, no dialog, importable and testable on its own. AppController
+# assembles the plain-data arguments from self._live_runs and calls this;
+# ui/main_window.py calls the ONE public AppController method that wraps it
+# and is the only place a dialog is raised.
+# ---------------------------------------------------------------------------
+
+def write_read_conflict_warnings(
+    live_runs: list[dict],
+    new_run_label: str,
+    new_run_reads: set[str],
+    new_run_writes: set[str],
+) -> list[str]:
+    """The plain-English warning sentences for starting a run that reads
+    new_run_reads and writes new_run_writes, against every already-running
+    operator in live_runs.
+
+    live_runs is plain data, one dict per in-flight run:
+        {"label": str, "reads": set[str], "writes": set[str]}
+    ("reads"/"writes" may be any iterable of table names; they are used
+    as sets here.)
+
+    Two different situations are checked, and each gets its own sentence
+    per conflicting table, because each is a different way the result of
+    one run can end up wrong:
+
+      1. The about-to-start run would READ a table a live run is still
+         WRITING -- its own result could be computed from data that run
+         has not finished producing.
+      2. The about-to-start run would WRITE a table a live run is still
+         READING -- that live run's result may end up computed from data
+         that changed while it was still working.
+
+    Returns an empty list when neither situation applies to any live run
+    -- the caller shows no dialog at all in that case.
+    """
+    warnings: list[str] = []
+    for live_run in live_runs:
+        live_label = live_run["label"]
+        live_reads = set(live_run["reads"])
+        live_writes = set(live_run["writes"])
+
+        # Situation 1: the new run would read data the live run has not
+        # finished writing yet.
+        for table in sorted(new_run_reads & live_writes):
+            warnings.append(
+                f'"{live_label}" is still adding data to the table '
+                f'"{table}". If you start "{new_run_label}" now, it may '
+                f'read that table before "{live_label}" has finished, so '
+                f"its result could be based on incomplete data. Waiting "
+                f'for "{live_label}" to finish first would avoid this.'
+            )
+
+        # Situation 2: the new run would change data the live run is
+        # still reading, so the live run's own result would no longer
+        # match what it read.
+        for table in sorted(new_run_writes & live_reads):
+            warnings.append(
+                f'"{live_label}" is still reading the table "{table}". If '
+                f'you start "{new_run_label}" now, it will change that '
+                f'table while "{live_label}" is still using it, so the '
+                f'result "{live_label}" produces may not match what is on '
+                f'screen by the time it finishes. Waiting for '
+                f'"{live_label}" to finish first would avoid this.'
+            )
+
+    return warnings
+
+
 class AppController(QObject):
     """
     Wires together Dataset, QueryEngine, ArtifactStore,
@@ -496,6 +569,69 @@ class AppController(QObject):
                 f'match what is on screen. Re-running "{run["label"]}" '
                 f"would recompute it against the current data."
             )
+
+    def get_write_read_conflict_warnings(
+        self, operator_name: str, mode_name: str,
+    ) -> list[str]:
+        """The plain-English warning sentences (P1.12f-2) for starting
+        operator_name's mode_name mode ("COLUMNS" / "TABLE" / "DISPLAY",
+        an ExecutionMode member name, not its .value) against the active
+        table right now, given every run already in self._live_runs.
+
+        Empty means no conflict: ui/main_window.py's one caller shows no
+        dialog at all in that case. An unknown operator, an operator
+        carrying no descriptor, or a descriptor with no entry for
+        mode_name all return an empty list rather than raising -- this
+        query only ever adds a warning, and the run itself will refuse
+        for its own reasons (with its own message) when the caller
+        actually tries to start it.
+
+        Only ACTIVE_TABLE inputs exist today (operators/descriptor.py),
+        so the about-to-start run's read set is the active table, once
+        per declared ACTIVE_TABLE input on this mode. Its write set is
+        the active table when the mode's declared output adds columns to
+        it (COLUMNS mode; see OutputSpec), empty otherwise -- the same
+        rule _build_operator_run uses for target_table. Deriving both
+        from the descriptor, rather than comparing mode_name to the
+        literal string "COLUMNS", keeps this correct without a rewrite
+        once a second input kind exists.
+        """
+        operator = self._op_registry.get(operator_name)
+        if operator is None or operator.descriptor is None:
+            return []
+        try:
+            mode = ExecutionMode[mode_name]
+        except KeyError:
+            return []
+        mode_descriptor = operator.descriptor.mode_for(mode)
+        if mode_descriptor is None:
+            return []
+
+        active_table = self._active_table
+        new_reads = {
+            active_table
+            for input_spec in mode_descriptor.inputs
+            if input_spec.kind is InputKind.ACTIVE_TABLE
+        }
+        new_writes = {active_table} if mode_descriptor.output.columns else set()
+
+        # Each live run's read set is the tables it declared as inputs at
+        # start (run["inputs"], P1.12f-1); its write set is its target
+        # table when it has one (empty for TABLE/DISPLAY, see
+        # _build_operator_run) -- both already plain data on the run
+        # dict, nothing to look up on a descriptor a second time.
+        live_runs = [
+            {
+                "label": run["label"],
+                "reads": {info["table"] for info in run["inputs"].values()},
+                "writes": {run["target_table"]} if run["target_table"] else set(),
+            }
+            for run in self._live_runs.values()
+        ]
+
+        return write_read_conflict_warnings(
+            live_runs, mode_descriptor.label, new_reads, new_writes,
+        )
 
     # ── Queue draining (main thread) ──────────────────────────────────
 

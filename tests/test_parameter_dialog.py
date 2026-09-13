@@ -316,10 +316,17 @@ class _ParameterDialogSpy:
 
 
 class _FakeController:
-    """Just the public accessors _show_scope_and_params_dialog calls."""
+    """Just the public accessors _show_scope_and_params_dialog calls, plus
+    (P1.12f-2) the conflict-warning query and the three run_create_*
+    entry points -- stubbed and call-recording, not real, so the
+    write/read confirm seam can be tested without a real controller."""
 
-    def __init__(self, operator):
+    def __init__(self, operator, conflict_warnings=None):
         self._operator = operator
+        self._conflict_warnings = list(conflict_warnings or [])
+        self.run_create_columns_calls: list = []
+        self.run_create_table_calls: list = []
+        self.run_create_display_calls: list = []
 
     def get_all_row_ids(self):
         return ["r1", "r2"]
@@ -338,6 +345,18 @@ class _FakeController:
             tag = "numeric" if column_name == "age" else "media_path"
         return _CT()
 
+    def get_write_read_conflict_warnings(self, operator_name, mode_name):
+        return list(self._conflict_warnings)
+
+    def run_create_columns(self, operator_name, row_ids, parameters):
+        self.run_create_columns_calls.append((operator_name, row_ids, parameters))
+
+    def run_create_table(self, operator_name, row_ids, parameters):
+        self.run_create_table_calls.append((operator_name, row_ids, parameters))
+
+    def run_create_display(self, operator_name, row_ids, parameters):
+        self.run_create_display_calls.append((operator_name, row_ids, parameters))
+
 
 class _Operator:
     def __init__(self, descriptor, name="demo_op"):
@@ -352,6 +371,18 @@ def _display_mode(*, parameters, inputs):
         inputs=tuple(inputs),
         parameters=tuple(parameters),
         output=OutputSpec(is_display_only=True),
+    )
+
+
+def _columns_mode(*, parameters, inputs):
+    from operators.descriptor import OutputColumn
+
+    return ModeDescriptor(
+        mode=ExecutionMode.COLUMNS,
+        label="Demo columns",
+        inputs=tuple(inputs),
+        parameters=tuple(parameters),
+        output=OutputSpec(columns=(OutputColumn(name="out", type_tag="numeric"),)),
     )
 
 
@@ -878,3 +909,172 @@ def test_narrowing_a_multi_select_field_raises_out_of_the_dialog(qapp):
             _mode(), _COLUMNS_BY_INPUT,
             advice_provider=_narrows_a_multi_select_field,
         )
+
+
+# ===========================================================================
+# P1.12f-2: the pre-emptive write/read conflict check, at the MainWindow
+# seam. controller.py's get_write_read_conflict_warnings() and its pure
+# arithmetic are covered by tests/test_result_delivery.py -- these tests
+# pin only the UI wiring: a QMessageBox.question() confirm is raised
+# (with the safe default) when, and only when, the query returns
+# warnings, and declining it starts no run at all.
+#
+# Written from the work-item specification, not the implementation.
+# ===========================================================================
+
+from PySide6.QtWidgets import QMessageBox
+
+
+def _fake_message_box(reply):
+    """A QMessageBox stand-in: records every question() call instead of
+    showing a real modal dialog, and always answers with *reply*."""
+    calls: list = []
+
+    class _FakeQMessageBox:
+        StandardButton = QMessageBox.StandardButton
+
+        @staticmethod
+        def question(
+            parent, title, text, buttons,
+            defaultButton=QMessageBox.StandardButton.NoButton,
+        ):
+            calls.append(
+                {
+                    "title": title,
+                    "text": text,
+                    "buttons": buttons,
+                    "defaultButton": defaultButton,
+                }
+            )
+            return reply
+
+    return _FakeQMessageBox, calls
+
+
+def test_no_conflict_shows_no_dialog(qapp, monkeypatch):
+    # Would still pass if violated? No. A version that always asked,
+    # even with nothing to warn about, would fail this: calls would be
+    # non-empty.
+    fake_box, calls = _fake_message_box(QMessageBox.StandardButton.Yes)
+    monkeypatch.setattr(main_window_module, "QMessageBox", fake_box)
+
+    window = MainWindow.__new__(MainWindow)
+    window._controller = _FakeController(None, conflict_warnings=[])
+
+    result = window._confirm_start_despite_conflicts(
+        "demo_op", ExecutionMode.COLUMNS
+    )
+
+    assert result is True
+    assert calls == []
+
+
+def test_conflict_shows_dialog_defaulting_to_the_safe_choice(qapp, monkeypatch):
+    # The default button must be explicitly No (do not start) -- the spec
+    # is explicit that this must not rely on Qt's own default.
+    fake_box, calls = _fake_message_box(QMessageBox.StandardButton.Yes)
+    monkeypatch.setattr(main_window_module, "QMessageBox", fake_box)
+
+    window = MainWindow.__new__(MainWindow)
+    window._controller = _FakeController(
+        None, conflict_warnings=['"Other run" is still writing to "frames".']
+    )
+
+    result = window._confirm_start_despite_conflicts(
+        "demo_op", ExecutionMode.COLUMNS
+    )
+
+    assert result is True
+    assert len(calls) == 1
+    assert calls[0]["defaultButton"] == QMessageBox.StandardButton.No
+    assert '"Other run" is still writing to "frames".' in calls[0]["text"]
+
+
+def test_declining_the_conflict_confirm_returns_false(qapp, monkeypatch):
+    fake_box, calls = _fake_message_box(QMessageBox.StandardButton.No)
+    monkeypatch.setattr(main_window_module, "QMessageBox", fake_box)
+
+    window = MainWindow.__new__(MainWindow)
+    window._controller = _FakeController(
+        None, conflict_warnings=["some conflict"]
+    )
+
+    result = window._confirm_start_despite_conflicts(
+        "demo_op", ExecutionMode.COLUMNS
+    )
+
+    assert result is False
+
+
+def test_no_conflict_run_create_columns_starts_the_run_with_no_dialog(
+    qapp, monkeypatch
+):
+    from operators.descriptor import OperatorDescriptor
+
+    descriptor = OperatorDescriptor(
+        name="demo_op",
+        version="1.0",
+        description="a COLUMNS-mode operator with nothing running",
+        modes=(_columns_mode(parameters=(), inputs=(_SOURCE_INPUT,)),),
+    )
+    fake_box, calls = _fake_message_box(QMessageBox.StandardButton.Yes)
+    monkeypatch.setattr(main_window_module, "QMessageBox", fake_box)
+    controller = _FakeController(_Operator(descriptor), conflict_warnings=[])
+    window = _bare_window(controller, monkeypatch)
+
+    window._on_run_create_columns("demo_op")
+
+    # No warnings -- no dialog was shown at all -- and the run started.
+    assert calls == []
+    assert controller.run_create_columns_calls == [("demo_op", ["r1"], {})]
+
+
+def test_declining_a_conflict_starts_no_run_and_nothing_else_happens(
+    qapp, monkeypatch
+):
+    from operators.descriptor import OperatorDescriptor
+
+    descriptor = OperatorDescriptor(
+        name="demo_op",
+        version="1.0",
+        description="a COLUMNS-mode operator that conflicts with a live run",
+        modes=(_columns_mode(parameters=(), inputs=(_SOURCE_INPUT,)),),
+    )
+    fake_box, calls = _fake_message_box(QMessageBox.StandardButton.No)
+    monkeypatch.setattr(main_window_module, "QMessageBox", fake_box)
+    controller = _FakeController(
+        _Operator(descriptor),
+        conflict_warnings=['"Other run" is still writing to "frames".'],
+    )
+    window = _bare_window(controller, monkeypatch)
+
+    window._on_run_create_columns("demo_op")
+
+    # The confirm was shown and declined: no run started, and nothing
+    # else happened (no error surfaced either).
+    assert len(calls) == 1
+    assert controller.run_create_columns_calls == []
+    assert window._on_error_calls == []
+
+
+def test_accepting_a_conflict_starts_the_run(qapp, monkeypatch):
+    from operators.descriptor import OperatorDescriptor
+
+    descriptor = OperatorDescriptor(
+        name="demo_op",
+        version="1.0",
+        description="a COLUMNS-mode operator that conflicts with a live run",
+        modes=(_columns_mode(parameters=(), inputs=(_SOURCE_INPUT,)),),
+    )
+    fake_box, calls = _fake_message_box(QMessageBox.StandardButton.Yes)
+    monkeypatch.setattr(main_window_module, "QMessageBox", fake_box)
+    controller = _FakeController(
+        _Operator(descriptor),
+        conflict_warnings=['"Other run" is still writing to "frames".'],
+    )
+    window = _bare_window(controller, monkeypatch)
+
+    window._on_run_create_columns("demo_op")
+
+    assert len(calls) == 1
+    assert controller.run_create_columns_calls == [("demo_op", ["r1"], {})]
