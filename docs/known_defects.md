@@ -152,9 +152,25 @@ to P1.8d, and the two OS-native / non-parsing media-cell entries to P1.8e.
   and the controller, so two attributes are one list. Inert today.
 - **`run_create_columns` keeps `operation_id: str = ""`** because a direct-call
   test passes it positionally. The reasoning is backwards; the risk is near zero.
-- **The "can this operator run in this mode?" guard is duplicated** between
-  `controller.py` and `OperatorRegistry.run_*`, three sites each. Candidate for
-  **P1.12**.
+- **The "can this operator run in this mode?" guard is still duplicated,
+  though narrower than it was.** P1.12d-2a/P1.12d-3 consolidated the
+  `controller.py` side into one implementation, `_build_operator_run`
+  (`controller.py:1491-1525`), called once each from `run_create_columns`,
+  `run_create_table` and `run_create_display` -- the comments at
+  `controller.py:1618-1620`, `:1771-1773` and `:1844-1846` are right that it is
+  now the only such check *on that side*. But `OperatorRegistry` was not
+  touched: `run_create_columns` (`operators/operator_registry.py:291-294`),
+  `run_create_table` (`:603-606`) and `run_create_display` (`:702-705`) each
+  still re-implement the identical `descriptor is None or
+  descriptor.mode_for(...) is None` condition on their own, independently of
+  each other and of `_build_operator_run`. Every call from `AppController`
+  reaches `_build_operator_run` first, so these three registry checks never
+  fire on that path; they still guard `OperatorRegistry`'s own public methods
+  against a caller that skips the controller (a test, or any future direct
+  caller). Four independent implementations of one condition, not the six the
+  original wording implied, but a real duplication -- one shared
+  implementation plus three separate ones would remove it. No item is
+  assigned.
 - **`FakeController._drain_thumb_queue` is unbounded and uses `pop(0)`**, so it
   behaves differently from the real controller. More broadly, `FakeController`'s
   table switching and filtered-set saving are not plausible:

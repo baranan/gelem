@@ -368,41 +368,45 @@ Analysis plugins the researcher runs from a menu.
 
 An operator is described by three things:
 
-**`OperatorDescriptor`** -- `[TARGET -> P1.12]` pure metadata: name, version,
+**`OperatorDescriptor`** -- `[NOW]` pure metadata: name, version,
 human-readable description, supported execution modes, input requirements,
 parameter specifications, output schema, whether results are deterministic and
 cacheable, and **the model lifecycle** (`shared` / `per_worker` / `per_sequence`).
 The last one is a concurrency contract, not documentation: a tracking model shared
 across two clips interleaves state and returns subtly wrong numbers rather than
-failing. See `operators/CLAUDE.md`. The Operators menu and the parameter dialog are **generated from this**.
-It is also what makes the planned natural-language interface possible.
+failing. See `operators/CLAUDE.md`. The Operators menu and the parameter dialog are
+**generated from this**, and a run refuses to start for an operator that carries no
+descriptor, or none for the requested mode. It is also what makes the planned
+natural-language interface possible.
 
-**`OperatorRunSpec`** -- `[TARGET -> P1.12]` an immutable description of one run:
-operator and version, mode, source table, selected rows or query snapshot,
-parameter values, output table name, operation id. Immutable because two concurrent
-runs of one operator currently overwrite each other's parameters -- they are stored
-as mutable attributes on a singleton instance.
+**`OperatorRunSpec`** -- `[NOW]` an immutable description of one run: operation
+id, operator name, mode, mode descriptor, parameter values, target table. Built
+and validated by `operators/run_context.py`: a value outside a declared
+parameter's bounds, or a parameter the descriptor does not declare, raises
+`OperatorRunError` at construction rather than reaching the operator.
 
-**`OperatorRunContext`** -- `[TARGET -> P1.12]` runtime services: cancellation
-token, media resolver, result sink, project paths. Result caching and structured
-logging arrive with `P2.2`. It was originally deferred to Phase 2 on the grounds
-that there was nothing to inject; once the resolver and `ProjectPaths` exist there
-is, and the segment and frame operators are the first that run long enough to need
-cancellation.
+**`OperatorRun`** -- `[NOW]` the object (`operators/run_context.py`) that
+carries runtime services to an operator for one run: the parameter mapping, the
+frozen table snapshots it may read, project directories, the cancellation check,
+the model the runner built for it, and the result sink. *(An earlier draft of
+this document called this `OperatorRunContext` and listed a `resolver` among its
+services; neither name was ever built. `operators/run_context.py` is the
+authority for the real shape -- re-verified 13 Sep 2026, P1.12f-4.)*
 
 ### The uniform execution signature
 
-`[TARGET -> P1.12]` **Every execution method takes the same final argument,
-`run`.** There is no other channel by which parameters or runtime services reach an
-operator. Settle this before P1.12; a per-method signature is how the current
-inconsistency arose.
+`[NOW]` **Every execution method that exists takes the same final argument,
+`run`.** There is no other channel by which parameters or runtime services reach
+an operator.
 
 ```python
 create_columns(row_id, media, metadata, run) -> dict
-iter_column_updates(rows, run)               -> Iterator[tuple[str, dict]]
 create_table(df, run)                        -> pd.DataFrame
 create_display(df, run)                      -> dict
 ```
+
+`[TARGET -> P2.1]` `iter_column_updates(rows, run)` is declared for shape in
+`operators/CLAUDE.md` but is not implemented by any operator yet -- see below.
 
 `run` is an `OperatorRun` carrying:
 
@@ -411,11 +415,15 @@ create_display(df, run)                      -> dict
   **This replaces `group_by=None` on `create_table`**, which was a hardcoded
   special case for one parameter, and replaces reading values off the operator
   instance.
-- `run.cancelled()` -- the cancellation check
-- `run.resolver`, `run.paths` -- media services and this project's directories
+- `run.cancelled()` -- the cancellation check. `[TARGET -> P1.12f-3]` The token
+  behind it exists and is held on `AppController`'s live-run registry, but
+  nothing calls `token.cancel()` yet -- see `CLAUDE.md`, "Long-running work".
+- `run.paths` -- this project's directories
+- `run.model` -- the model the runner built per the mode's `model_lifecycle`,
+  or `None`
 - `run.emit()` -- the result sink
 
-Those are the whole of the minimal context delivered by P1.12. `[TARGET -> P2.2]`
+Those are the whole of the context delivered by P1.12. `[TARGET -> P2.2]`
 `run.cache` (result cache) and `run.log` (structured logging) arrive later and are
 **optional** -- an operator must work without them, and a P1.12-era `run` will not
 have them.
@@ -426,23 +434,71 @@ sequentially. Independent per-row work keeps using `create_columns`. A generator
 gives progressive output and a cancellation point, **not resumability** -- that is
 defined per mode in `docs/media_architecture.md` P2.2.
 
-Two consequences, both violated by the current code:
+One consequence still violated by the current code: **`ProjectPaths` is never
+stored on the operator.** It arrives as `run.paths`. An operator is a singleton
+shared across runs, so anything per-run held on `self` is a race between
+concurrent runs -- the same defect as parameters on `self`, and the reason `run`
+exists at all. Every operator today still defaults to a global temp folder and
+stores it as `self._output_dir`; `operators/CLAUDE.md`'s `[TARGET -> P1.9]` rule
+tracks this. *(The other consequence this section used to list -- `image`
+becoming `media` -- is done: every operator's `create_columns` takes `media`,
+not `image`.)*
 
-- **`ProjectPaths` is never stored on the operator.** It arrives as `run.paths`.
-  An operator is a singleton shared across runs, so anything per-run held on
-  `self` is a race between concurrent runs -- the same defect as parameters on
-  `self`, and the reason `run` exists at all.
-- **`image` becomes `media`**, a typed payload rather than an assumed still image,
-  so the contract extends to video spans and audio without replacement. See
-  `docs/media_architecture.md` §3.3.
-
-`[TARGET -> P1.12]` **Operator modules contain no Qt.** Parameter dialogs are
-generated from the descriptor's parameter schema. Today `plot_advanced.py`,
-`video_frames.py`, `plot_operator.py` and `base.py` all construct `QDialog` and
-`QComboBox`, which puts UI code in the analysis layer and makes operators
-awkward to run from a test or a script.
+`[NOW]` **Operator modules contain no Qt.** `CLAUDE.md`, "Data ownership", is the
+authority for this rule and its guarding test; not restated here.
 
 Full contract and template: `operators/CLAUDE.md`.
+
+### Run provenance and conflict detection
+
+`[NOW]` Every operator run appends one `"operator_run"` entry to
+`ProvenanceLog` (`Dataset.record_operator_run()`, made true by P1.12f-1). The
+entry carries the operator name, the execution mode, the mode's label, the
+parameter values, the target table (COLUMNS mode only), every input table this
+run read together with the write-ticket version it was at when the run
+started, how many rows were requested and how many were actually applied, any
+row ids a result could not be placed back onto, and `superseded_tables` (see
+below). `models/dataset.py`'s `record_operator_run()` docstring is the
+authority for the exact field list; this is a summary, not a restatement.
+
+`outcome` is one of three values:
+
+- `"complete"` -- every requested row produced a result and was applied.
+- `"partial"` -- the run ended with some, but not all, of its results applied
+  (an error partway through, or a result that could not be placed back onto a
+  row that no longer exists).
+- `"failed"` -- the run produced no applied results at all.
+
+Not yet in the entry, and still open: operator and model **version**, and a
+cache identity for the run -- both wait on `P2.2`'s caching design (§8).
+
+**Supersession needs two checks, not one.** A run's input tables can move
+under it while it is still running, and each check catches a different moment
+a foreign write can land (`AppController._superseded_input_tables`):
+
+1. **At arrival**, compare a table's current write-ticket version against the
+   version this run **itself** last caused there (or, for a table it never
+   wrote to, the version recorded at run start). This is what stops a COLUMNS
+   run's own final write from making it look superseded by itself.
+2. **Before each of the run's own writes**, latch the same comparison at that
+   earlier moment. Without this, a foreign write landing between two of the
+   run's own drain ticks is masked: by arrival time the run's own later write
+   is the last thing that happened to the table, so check 1 alone would see
+   nothing wrong.
+
+The standing ruling behind both checks: **a false staleness note is advisory
+and cheap; a missed one is a wrong number in a paper.** The two checks combine
+with OR, not AND, so the rule errs toward over-reporting.
+
+**The pre-emptive write/read warning** fires before a new run starts, if it
+would read a table a live run is still writing, or write a table a live run is
+still reading (`controller.write_read_conflict_warnings()`, P1.12f-2). It
+compares at **table granularity, not row granularity**: the set of tables the
+new run reads and writes against the set each live run reads and writes, so it
+can warn even when the two runs' actual row selections do not overlap at all.
+That over-warning is deliberate, for the same reason supersession errs toward
+over-reporting -- a false pre-emptive warning costs a dismissed dialog; a
+missed one costs a silently wrong result.
 
 Blendshape extraction is one operator among several, not the point of the
 application. Most operators work on ordinary numeric and tabular data.
@@ -509,13 +565,12 @@ documents point here.
   `[]`. **This is Phase 0 (P0.4), not Phase 1** -- demand-driven rendering has to
   know what is on screen in order to prioritise and cancel, so it cannot be built
   while that knowledge lives in a widget's private list.
-- **Provenance and reproducibility.** `ProvenanceLog` records structural
-  operations. It does **not** record operator runs, model versions, parameters,
-  selections, or filters, so a session cannot yet be reproduced from it. A
-  reproducible run entry needs: run id, operator and model versions, parameters,
-  source table and selection, input and output schema, completion state, and cache
-  identity. Until that exists, describe provenance as covering structural
-  operations only. Session export as standalone Python is a renderer over this log
+- **Provenance and reproducibility.** §6 ("Run provenance and conflict
+  detection") is now the authority for what an operator run's provenance entry
+  contains -- not restated here. What is still missing, and still blocks full
+  reproducibility: operator and model **version** are not in the entry, filters
+  and sorts are not recordable actions at all, and there is no cache identity.
+  Session export as standalone Python is a renderer over the provenance log
   once a single "recordable action" abstraction covers runs, filters and sorts.
 - **Crash recovery.** Progressive results survive cancellation, not a crash. If
   crash recovery is wanted, it needs periodic checkpointing or a result journal.

@@ -23,7 +23,7 @@ operator contract. There are no students yet, so nothing depends on it now.
 
 ## Describing an operator
 
-`[TARGET -> P1.12]` Every operator carries an **`OperatorDescriptor`**: name,
+`[NOW]` Every operator carries an **`OperatorDescriptor`**: name,
 version, a human-readable description, which execution modes it supports, what
 input it needs, what parameters it takes, what columns or results it produces, and
 whether its output is deterministic and cacheable.
@@ -38,13 +38,12 @@ This is **mandatory, not optional**, for three reasons:
 
 ### Parameters are declared, not drawn
 
-`[TARGET -> P1.12]` An operator declares what its parameters *are* -- name, type,
-allowed values, whether they name a column, default. The UI generates the dialog.
+`[NOW]` An operator declares what its parameters *are* -- name, type,
+allowed values, whether they name a column, default. `ui/parameter_dialog.py`
+generates the dialog from the declaration; no operator builds one by hand.
 
-**Operator modules contain no Qt.** Today `plot_advanced.py`, `video_frames.py`,
-`plot_operator.py` and the example in `base.py` construct `QDialog` and
-`QComboBox` directly. That puts UI code in the analysis layer and makes an
-operator impossible to run from a test, a script, or a future terminal.
+**Operator modules contain no Qt.** `CLAUDE.md`, "Data ownership", is the
+authority for this rule and its guarding test; it is not restated here.
 
 **Parameter values never live on `self`.** They arrive for one run in
 `run.parameters` -- a read-only mapping backed by an immutable `OperatorRunSpec`.
@@ -55,7 +54,7 @@ each other's parameters.
 
 ### Guiding the form as the researcher fills it -- `refine_form`
 
-`[TARGET -> P1.12]` An operator may override `refine_form(self, values)` to make
+`[NOW]` An operator may override `refine_form(self, values)` to make
 the generated parameter form react as the researcher types -- the live coupling
 a hand-drawn `QDialog` used to give (disable a field that no longer applies,
 narrow a dropdown, show a warning). It returns a `FormAdvice`
@@ -110,8 +109,10 @@ and histogram-with-count each raise a warning.
 
 ## The execution methods
 
-`[TARGET -> P1.12]` **All four take the same final argument, `run`.** It is the
-only channel by which parameters and runtime services reach an operator.
+`[NOW]` **Every execution method that exists takes the same final argument,
+`run`.** It is the only channel by which parameters and runtime services reach
+an operator. `iter_column_updates` is declared here for shape but is not
+implemented yet -- see its own `[TARGET -> P2.1]` below.
 
 ```python
 create_columns(row_id, media, metadata, run) -> dict
@@ -126,7 +127,6 @@ create_display(df, run)                      -> dict
 |---|---|
 | `run.parameters` | this run's parameter values, as declared in `parameters` |
 | `run.cancelled()` | check between units of work; return promptly if true |
-| `run.resolver` | the only way to decode media |
 | `run.model` | `[NOW]` the model the COLUMNS runner built for this run per the mode's `model_lifecycle`; `None` for `NONE`, and `None` in TABLE/DISPLAY modes (no runner builds one there yet). **Never build or cache a model on `self`** -- see "Where a model lives" |
 | `run.paths` | this project's directories; **never store these on `self`** |
 | `run.spec` | the immutable description of the run, including versions |
@@ -292,10 +292,14 @@ the old `plot_html` fallback).
   Dataset validates and normalises a table against its schema when it accepts it.
 - **`[TARGET -> P1.2]` Never open a media file.** Use the resolver -- see
   `docs/media_architecture.md`.
-- **`[TARGET -> P1.12]` Long runs must be cancellable, keeping partial results.**
-  **No cancellation exists today** -- there is no token and no check anywhere in
-  the operator loop, so a started run always runs to completion. Partial results
-  will survive cancellation, but never a process crash.
+- **`[TARGET -> P1.12f-3]` Long runs must be cancellable, keeping partial
+  results.** `CLAUDE.md`, "Long-running work", is the authority for what is
+  built (the token, carried on `run` as `run.cancelled()`) and what is not
+  (nothing calls `token.cancel()` yet); not restated here. What this means for
+  an operator: check `run.cancelled()` between units of work and return
+  promptly -- the check itself already does something once P1.12f-3 wires a
+  caller to `token.cancel()`, so writing it now costs nothing and is not
+  premature.
 - **`[TARGET -> P2.2]` Resumability is a separate, narrower promise.** See
   "Resuming a run" below. Do not state the two as one property.
 
@@ -606,48 +610,11 @@ class MyOperator(BaseOperator):
         score = compute_my_score(media, threshold)   # your analysis here
         return {"my_score": score}
 
-    def get_parameters_dialog(self, parent=None, columns=None):
-        # Nothing generates a dialog from the declared `parameters` yet
-        # (that is later P1.12d/e work). Until then a parameterised
-        # operator builds its own QDialog here and exposes
-        # parameter_values() -> dict, keyed by the descriptor's parameter
-        # names. MainWindow shows this after the scope dialog and passes
-        # the dict to the controller, which validates it against the
-        # descriptor. Store NOTHING on `self`.
-        from PySide6.QtWidgets import (
-            QDialog,
-            QDialogButtonBox,
-            QDoubleSpinBox,
-            QFormLayout,
-        )
-
-        dialog = QDialog(parent)
-        dialog.setWindowTitle("Compute my score")
-        form = QFormLayout(dialog)
-
-        threshold_spin = QDoubleSpinBox()
-        threshold_spin.setRange(0.0, 1.0)
-        threshold_spin.setSingleStep(0.05)
-        threshold_spin.setValue(0.5)            # the descriptor's default
-        form.addRow("Detection threshold:", threshold_spin)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
-        )
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        form.addRow(buttons)
-
-        # Hand the chosen values back BY NAME. Every key must be a
-        # parameter the descriptor declares.
-        chosen = {}
-
-        def _store():
-            chosen["threshold"] = threshold_spin.value()
-
-        dialog.accepted.connect(_store)
-        dialog.parameter_values = lambda: dict(chosen)
-        return dialog
+    # No get_parameters_dialog(). The "threshold" parameter declared above
+    # is enough: ui/parameter_dialog.py builds the form from `parameters`,
+    # and MainWindow passes the researcher's values to the controller, which
+    # validates them against the descriptor. An operator never builds a
+    # dialog itself -- see "Operator modules contain no Qt" above.
 ```
 
 A second execution mode is a second `ModeDescriptor` in `modes=(...)` -- with its

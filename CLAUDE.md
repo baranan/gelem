@@ -122,13 +122,23 @@ state. This rule carries no violation list of its own -- it points at the three
   `test_run_create_columns_does_not_copy_table_per_row`).
 - **`[NOW]`** Operators never access `Dataset` or `AppController`. They receive the
   data they need as arguments and return results.
+- **`[NOW]`** No operator module imports a Qt binding, at module level or inside a
+  function. Made true by P1.12e-2, which deleted every hand-built `get_parameters_dialog`
+  -- the parameter form is generated from the descriptor instead
+  (`operators/CLAUDE.md`, `ui/parameter_dialog.py`). Guarded by an AST walk over
+  every module under `operators/`:
+  `tests/test_operators_are_qt_free.py::test_no_operator_module_imports_qt`.
 - **`[MIGRATING]`** Every structural operation is recorded in
-  `provenance.record()`. Load, merge, aggregate and table creation are recorded.
-  **Operator runs are not**, so provenance is not yet sufficient to reproduce an
-  analysis. See `docs/architecture.md` §8. Also: `save()` writes `provenance.json`
-  before recording the save, so the save action is absent from the file it just
-  wrote. Sites: every `provenance.record()` call is in `models/dataset.py`; the
-  save ordering is `models/dataset.py:790-793`. *(Re-verified 26 Aug 2026.)*
+  `provenance.record()`. Load, merge, aggregate, table creation **and operator
+  runs** are recorded -- `Dataset.record_operator_run()` appends one
+  `"operator_run"` entry per run, made true by P1.12f-1. `docs/architecture.md`
+  §6 ("Run provenance and conflict detection") is the authority for what the
+  entry contains and what its outcome values mean. The one remaining
+  violation: `save()` writes `provenance.json` before recording the save, so
+  the save action is absent from the file it just wrote. Site:
+  `models/dataset.py:1912-1920`. Tests:
+  `tests/test_dataset.py::test_record_operator_run_appends_one_provenance_entry`.
+  *(Re-verified 13 Sep 2026, P1.12f-4.)*
 - **`[NOW]`** Paths **inside the project folder** are stored relative to it, so
   projects stay portable. Paths outside it stay absolute unless the user
   explicitly imports or copies the file into the project. The rewriting parses
@@ -430,10 +440,14 @@ state. This rule carries no violation list of its own -- it points at the three
 
 ### Long-running work
 
-- **`[TARGET -> P1.12]`** Long runs are cancellable, keeping partial results. **No
-  cancellation mechanism exists today** -- there is no cancellation token and no
-  check anywhere in the operator loop, so a started run always runs to completion.
-  Any current statement that runs "can be cancelled" describes the target.
+- **`[TARGET -> P1.12f-3]`** Long runs are cancellable, keeping partial results.
+  **Partial-run recording is already built**: `Dataset.record_operator_run()`
+  records outcome `"partial"` (P1.12f-1). **Cancelling is not**: a
+  `CancellationToken` exists and is carried on every run
+  (`operators/run_context.py`) and held on `AppController`'s live-run
+  registry, but **nothing calls `token.cancel()`** -- there is no control in
+  the window to click yet, so a started run always runs to completion.
+  P1.12f-3 is the item that wires a Cancel control to it.
   *(The `WorkerPool` generation counter added in P0.5b-2i cancels **thumbnail
   jobs**, not operator runs. It does not flip this rule.)*
 - **`[TARGET -> P2.2]`** Resumability is narrower than cancellability and must be
