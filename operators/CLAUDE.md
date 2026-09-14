@@ -350,49 +350,41 @@ An operator that turns one row into many must carry the source's identifying
 columns down and add its own index. This is how everything downstream reconnects
 the pieces -- ordinary tidy-data columns, not hidden pointers.
 
-**Which columns those are is not a judgement call.** `[TARGET -> P1.8]`
-`TableSchema` gives each column **two independent properties**:
+**Which columns those are is not a judgement call.** `docs/architecture.md`
+§4.2 is the authority for `role` (`identifier` / `index` / `measurement`),
+for `carry_to_children`, for why the two are independent, and for the rule
+that decides what a split carries down -- not restated here. You add a new
+`index` column at your own level (`docs/architecture.md` §4.2 again for
+`trial_id`, `frame_index` as examples). `Dataset.columns_to_carry()`
+(`models/dataset.py`) computes the carried set for one caller, honouring an
+explicit `carry_columns` narrowing when the source table is wide -- this is
+what a segment or frame operator's caller uses to build its carried columns.
 
-| Property | Values | Meaning |
-|---|---|---|
-| `role` | `identifier` | names the entity the row belongs to (`participant_id`) |
-| | `index` | position within the parent (`trial_id`, `frame_index`) |
-| | `measurement` | a value observed or computed for this row (`reaction_time`) |
-| `carry_to_children` | bool | whether a split copies this onto derived rows |
+**Initial carry set on a bare folder load.** `load_folder()` creates three
+columns and they are not all alike:
 
-**Carry-down is not derived from the role.** A trial's reaction time is a
-`measurement` and must appear on every frame row of that trial -- it is the
-covariate the analysis turns on. Participant age and trait scores are the same.
-Treating "measurement" as "do not carry" would silently gut the frame table.
+- `row_id` is not a data column -- children get their own.
+- `file_name` is a text column, so it defaults to `identifier` (§4.2's
+  import default) and belongs in the carried set: it tells a frame row
+  which source video it came from.
+- `full_path` is also text and so also defaults to `identifier` with
+  `carry_to_children` true, but a segment or frame operator should narrow
+  it OUT with its own `carry_columns` argument: the child derives its own
+  address from `full_path` directly rather than being handed a copy of it,
+  so carrying it down would just repeat the same path string on every
+  derived row for no use. This is a carry decision the operator makes, not
+  a different `role` -- `full_path`'s "media"-ness is already captured by
+  its `media_path` type tag (`docs/architecture.md` §4.3), which is a
+  separate concern from `role` entirely.
 
-The rule:
-
-- `identifier` and `index` are **always** carried, and you add a new `index` at
-  your own level.
-- Everything else is carried when `carry_to_children` is true, **which is the
-  default**. Dropping a covariate silently is a research error; an extra column is
-  only wasteful. Fail toward keeping the data.
-- Narrow it with an explicit `carry_columns` parameter when the source is wide --
-  copying 52 blendshape columns onto 530,000 frame rows is real memory for little
-  gain.
-**Initial flags on a bare folder load.** "Everything defaults to carried" and
-"nothing is carried when nothing is marked" pull against each other, so state the
-starting point explicitly. `load_folder()` creates three columns and they are not
-all alike:
-
-| Column | Role | Carried? |
-|---|---|---|
-| `row_id` | not a data column | **no** -- children get their own |
-| `full_path` | `media` | **no** -- superseded, the child derives its own address from it |
-| `file_name` | `identifier` | **yes** -- tells a frame row which video it came from |
-
-So a bare folder load carries `file_name` and nothing else, which is the useful
-answer rather than "nothing". The source path also survives inside the address
-itself regardless.
+So a bare folder load's USEFUL carried set is `file_name` alone, not
+"nothing" and not `full_path`. The source path also survives inside the
+address itself regardless.
 
 **Segment rows** carry: the source media address, segment start, segment end,
-duration, a segment index, and **every `identifier` and `index` column from the
-source plus every other source column flagged `carry_to_children`**.
+duration, a segment index, and **everything `Dataset.columns_to_carry()`
+returns for the source table**, narrowed by the operator's own
+`carry_columns` as above.
 
 **Frame rows** carry: the frame address, the source frame ordinal or presentation
 timestamp, absolute time in the source, `time_within_segment`, the segment index,

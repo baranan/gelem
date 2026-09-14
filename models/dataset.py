@@ -32,6 +32,7 @@ from media.media_address import parse as parse_address
 from media.media_address import format as format_address
 from models.table_schema import (
     ColumnHint,
+    ColumnRole,
     SchemaSerialisationError,
     TableSchema,
     check_frame,
@@ -89,6 +90,13 @@ class MergeReport:
     # The joined DataFrame, held privately until confirm_merge() is called.
     _pending_df: pd.DataFrame | None = field(default=None, repr=False)
     _new_columns: list[str] = field(default_factory=list, repr=False)
+    # The key column names merge_csv() joined on, held so confirm_merge() can
+    # hint the CSV's own key column as an identifier (docs/architecture.md
+    # §4.2: "the join key of a merge is an identifier") when it survives the
+    # join as its own column -- see confirm_merge()'s docstring for why only
+    # that column, and not target_key, needs the hint.
+    _csv_key: str = field(default="", repr=False)
+    _target_key: str = field(default="", repr=False)
 
     def summary(self) -> str:
         """Returns a human-readable summary string for display in the UI."""
@@ -546,8 +554,9 @@ class Dataset:
             or a media-address fragment.
 
         'full_path' still needs the hint because on an empty frames table its
-        column carries no values for infer_type_tag to read. No role hints --
-        that decision has not been taken."""
+        column carries no values for infer_type_tag to read. No role hint:
+        'full_path' is text, so infer_schema's own default (§4.2) already
+        gives it 'identifier' with no help from here."""
         return {
             col: ColumnHint(type_tag="media_path")
             for col in df.columns
@@ -1323,18 +1332,40 @@ class Dataset:
         )
         report._pending_df  = joined
         report._new_columns = new_columns
+        report._csv_key     = csv_key
+        report._target_key  = target_key
         return report
 
     def confirm_merge(self, report: MergeReport) -> None:
         """
         Commits the merge described in the MergeReport.
 
+        docs/architecture.md §4.2's import default -- "the join key of a
+        merge is an identifier" -- is applied here to the CSV's own key
+        column, csv_key, when it survives the join as a column distinct
+        from target_key (pandas keeps both when they are named
+        differently; see merge_csv()). target_key itself is never re-hinted:
+        it already named an existing column of target_table, so it already
+        has a role from whenever that table was created, and hints only
+        ever apply to a column _prepare_table sees as new (see
+        _prepare_table's docstring). When csv_key and target_key share a
+        name, the join produces one column, not two, and there is nothing
+        new to hint.
+
         Args:
             report: The MergeReport returned by merge_csv().
         """
         if report._pending_df is not None:
+            hints = None
+            if (
+                report._csv_key
+                and report._csv_key != report._target_key
+                and report._csv_key in report._pending_df.columns
+            ):
+                hints = {report._csv_key: ColumnHint(role=ColumnRole.identifier)}
             self._accept_table(
                 report.target_table, report._pending_df.copy(),
+                hints=hints,
                 source="confirm_merge",
             )
 
@@ -1637,7 +1668,15 @@ class Dataset:
 
         # Step 3: Store the new table. P1.8d-2b-1: no ColumnTypeRegistry
         # write -- the schema the accept built carries every column's tag.
-        self._accept_table(name, agg_df, source="aggregate")
+        # docs/architecture.md §4.2: a group-by column names the entity each
+        # output row belongs to, which is what 'identifier' means -- the
+        # same reasoning as a merge's own join key (see confirm_merge), and
+        # for the same reason it must be an explicit hint rather than left
+        # to infer_schema's dtype default: a numeric group-by key (e.g.
+        # subject_id) would otherwise land as 'measurement'.
+        group_by_columns = [group_by] if isinstance(group_by, str) else list(group_by)
+        hints = {col: ColumnHint(role=ColumnRole.identifier) for col in group_by_columns}
+        self._accept_table(name, agg_df, hints=hints, source="aggregate")
 
         # Step 4: Record the operation in the provenance log.
         self.provenance.record("aggregate", {
@@ -1719,6 +1758,77 @@ class Dataset:
         was never accepted through _accept_table (e.g. a test assigned it
         straight into _tables)."""
         return self._schemas.get(table_name)
+
+    def columns_to_carry(
+        self,
+        source_table: str,
+        *,
+        carry_columns: list[str] | None = None,
+    ) -> list[str]:
+        """The column names of source_table that a row derived from it
+        should carry -- docs/architecture.md §4.2. This is what a segment or
+        frame operator's caller uses to build the carried columns for a
+        split; operators never call Dataset themselves (see "Operators
+        never access Dataset or AppController" in CLAUDE.md), so whichever
+        component drives the run calls this and hands the operator the
+        result as a plain argument, the same way every other operator input
+        arrives.
+
+        Every `identifier` and `index` column of source_table's schema is
+        in the result unconditionally -- they are what reconnects a derived
+        row to its source, so narrowing can never drop them. Every other
+        column is included when its own `carry_to_children` flag is True,
+        which is the import default (see infer_schema).
+
+        `carry_columns`, when given, NARROWS that second group to just the
+        names it lists -- an operator's explicit carry_columns parameter,
+        for when the source table is wide and copying every flagged column
+        onto many derived rows is real memory for little gain. It can only
+        shrink the default carried set: a name in carry_columns whose
+        `carry_to_children` is False is still not carried, and it has no
+        effect at all on identifier or index columns, which are carried
+        either way. `None` means no narrowing -- every flagged column is
+        included, exactly as TableSchema.carried_columns() would return.
+
+        Returns names in the source schema's own column order, not the
+        order carry_columns lists them in.
+
+        Raises:
+            KeyError: source_table does not exist.
+            ValueError: carry_columns names a column source_table's schema
+                does not have.
+        """
+        self._get_stored_table(source_table)  # raises KeyError if unknown
+        schema = self.schema_for(source_table)
+        if schema is None:
+            # No schema at all (e.g. a test assigned the table straight
+            # into _tables): there is no role information to consult, so
+            # -- like a table with no marked columns -- nothing is carried.
+            return []
+
+        always_carried = {
+            spec.name
+            for spec in schema.columns
+            if spec.role in (ColumnRole.identifier, ColumnRole.index)
+        }
+
+        if carry_columns is None:
+            keep = always_carried | {s.name for s in schema.carried_columns()}
+        else:
+            unknown = set(carry_columns) - set(schema.column_names())
+            if unknown:
+                raise ValueError(
+                    f"carry_columns names column(s) {sorted(unknown)}, "
+                    f"which {source_table!r}'s schema does not have"
+                )
+            narrowed = {
+                spec.name
+                for spec in schema.columns
+                if spec.name in carry_columns and spec.carry_to_children
+            }
+            keep = always_carried | narrowed
+
+        return [spec.name for spec in schema.columns if spec.name in keep]
 
     def table_version(self, table_name: str) -> int:
         """The current write-ticket version of a stored table: how many

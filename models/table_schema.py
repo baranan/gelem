@@ -651,11 +651,21 @@ def infer_schema(
 
     The rule, one sentence for every kind: inference keeps the dtype the column
     arrived in (int64, float64, bool, the object/string text dtype, or an
-    already-categorical dtype), makes every column a `measurement` with
-    `carry_to_children` true, and never narrows -- §4.3's narrow defaults
-    (float32, int32, category) govern the dtypes an operator DECLARES when it
-    creates a table, not what Gelem infers, and a caller that wants one of them
-    passes ColumnHint(dtype=...).
+    already-categorical dtype), sets `carry_to_children` true on every column,
+    and never narrows -- §4.3's narrow defaults (float32, int32, category)
+    govern the dtypes an operator DECLARES when it creates a table, not what
+    Gelem infers, and a caller that wants one of them passes
+    ColumnHint(dtype=...).
+
+    §4.2's import-default role: a numeric or bool column is a `measurement`;
+    a text or categorical column is an `identifier`, on the ruling that a
+    non-numeric column not otherwise hinted usually names something
+    ("condition", a participant code) rather than measuring it, and getting
+    this wrong costs nothing because `carry_to_children` defaults true
+    either way. Gelem cannot reliably tell a genuine identifier from a
+    free-text note, so this is a default, not an inference -- a caller with
+    better information (a merge's own join key, an operator's declared
+    output) overrides it with ColumnHint(role=...).
 
     A dtype outside the supported set (see _is_supported_dtype) -- datetime64, a
     timezone-aware datetime, a pandas nullable extension dtype -- raises rather
@@ -713,7 +723,11 @@ def infer_schema(
         # an object-kind text dtype, or a pandas categorical.
         if isinstance(dt, pd.CategoricalDtype):
             # Already categorical on arrival: that IS its dtype, so keep it.
-            role, dtype = ColumnRole.measurement, "category"
+            # A closed vocabulary of repeated labels usually names something
+            # ("condition") rather than measuring it -- see the module-level
+            # docstring on infer_schema for the ruling and why it is a
+            # default, not an inference.
+            role, dtype = ColumnRole.identifier, "category"
         elif dt.kind == "b":
             role, dtype = ColumnRole.measurement, "bool"
         elif dt.kind in ("i", "u"):
@@ -726,8 +740,9 @@ def infer_schema(
             # A repeated-value column is left open, not turned into a category,
             # because Gelem cannot tell a closed vocabulary from a column a
             # researcher will keep adding labels to, and a closed dtype refuses
-            # a new label at write time.
-            role, dtype = ColumnRole.measurement, actual
+            # a new label at write time. Role defaults to identifier for the
+            # same reason as the categorical case just above.
+            role, dtype = ColumnRole.identifier, actual
         carry = True
 
         # Apply the caller's remaining hint fields over the inferred spec.

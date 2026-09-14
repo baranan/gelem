@@ -133,8 +133,13 @@ def test_a_project_with_no_schemas_json_loads_by_inference(tmp_path):
 
     schema = ds2.schema_for("frames")
     assert schema is not None
-    # Inference makes every column a measurement.
-    assert all(s.role is ColumnRole.measurement for s in schema.columns)
+    # Inference's §4.2 default: a numeric column is a measurement, a text
+    # column (including the frames-only full_path/file_name pair) is an
+    # identifier.
+    assert schema.spec_for("score").role is ColumnRole.measurement
+    assert schema.spec_for("subject").role is ColumnRole.identifier
+    assert schema.spec_for("full_path").role is ColumnRole.identifier
+    assert schema.spec_for("file_name").role is ColumnRole.identifier
     # No message: a project saved before P1.8c-2a is the common case.
     assert ds2.take_schema_messages() == []
     assert "no schemas.json" in _last_load_entry(ds2)["params"]["schemas"]
