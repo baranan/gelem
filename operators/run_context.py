@@ -589,6 +589,12 @@ class OperatorRun:
     _token: CancellationToken
     # The per-row result sink, injected by the runner. None until wired.
     _emit_fn: Optional[Callable[..., None]] = None
+    # The free-text progress sink for run.log() (run-indicator-2), injected
+    # by the runner the same way _emit_fn is. None for a bare OperatorRun
+    # built without one (e.g. a test harness), in which case log() is a
+    # no-op -- the same tolerance run.model and run.paths already give a
+    # caller that does not need them.
+    _log_fn: Optional[Callable[[str, str], None]] = None
     # The model instance the runner built for this run according to the
     # mode's declared ``model_lifecycle`` (operators/descriptor.py ->
     # ModelLifecycle). It is ``None`` when the mode declares ``NONE``. An
@@ -647,3 +653,22 @@ class OperatorRun:
             row_id,
             dict(values),
         )
+
+    def log(self, text: str) -> None:
+        """Record free-text progress for this run -- "clip 3 of 40", "no
+        face found in 12 frames so far", anything a percentage cannot say.
+
+        Callable from a worker thread. Does nothing but hand ``text`` to
+        the runner-supplied sink under ``operation_id``: it never blocks,
+        never touches Qt, and never raises -- not when no sink is wired
+        (a bare ``OperatorRun`` built without ``_log_fn``, e.g. in a test),
+        and not when the run has already ended on the main thread. Only
+        the newest message per run is kept (LATEST WINS, PER RUN -- see
+        AppController's coalescing of this the same way it coalesces
+        progress), so a message for a run nobody is tracking any more is
+        simply not attached to anything, the same way a per-row result
+        from a dead run is dropped by the item drain.
+        """
+        if self._log_fn is None:
+            return
+        self._log_fn(self.spec.operation_id, text)

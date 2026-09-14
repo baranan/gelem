@@ -191,6 +191,7 @@ class VideoFramesOperator(BaseOperator):
         videos_seen = 0
         videos_skipped = 0
         non_videos_skipped = 0
+        total_rows = len(work)
 
         for _, src_row in work.iterrows():
             video_path_raw = src_row[video_column]
@@ -226,6 +227,12 @@ class VideoFramesOperator(BaseOperator):
             video_filename = video_path.name
             frame_idx = 0
             kept = 0
+
+            # run-indicator-2: a percentage cannot say which clip a long
+            # multi-video run is on. run.log() is per run (LATEST WINS,
+            # PER RUN), so it costs nothing beyond one dict write per
+            # video -- this is called once per video, not once per frame.
+            run.log(f"video {videos_seen} of {total_rows}: {video_filename}")
 
             try:
                 while True:

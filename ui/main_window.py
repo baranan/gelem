@@ -274,8 +274,13 @@ class MainWindow(QMainWindow):
         (run-indicator-1): it reports which operator(s) are currently
         running, so a long-running operator no longer leaves the window
         looking identical to an idle one. It is updated by
-        _on_live_runs_changed (a run starting or finishing) and
-        _on_operator_progress (the coalesced progress tick).
+        _on_live_runs_changed (a run starting or finishing),
+        _on_operator_progress (the coalesced progress tick), and -- since
+        run-indicator-2 -- the controller's operator_log_changed signal,
+        connected straight to _refresh_run_indicator: a run.log() message
+        is already part of get_live_runs()'s per-run data, so nothing
+        needs caching here the way _latest_run_percent caches the
+        progress tick.
         """
         self._selection_label = QLabel()
         self._selection_label.setStyleSheet("padding: 0 8px;")
@@ -707,6 +712,7 @@ class MainWindow(QMainWindow):
         ctrl.merge_report_ready.connect(self._on_merge_report)
         ctrl.live_runs_changed.connect(self._on_live_runs_changed)
         ctrl.operator_progress.connect(self._on_operator_progress)
+        ctrl.operator_log_changed.connect(self._refresh_run_indicator)
         ctrl.operator_complete.connect(self._on_operator_complete)
         ctrl.table_created.connect(self._on_table_created)
 

@@ -137,6 +137,20 @@ to P1.8d, and the two OS-native / non-parsing media-cell entries to P1.8e.
   parses dates, so nothing writes a datetime column. Nobody has produced or
   opened one to check.
 
+- **Double-clicking a tile opens the detail view on the wrong column.** After
+  an operator adds a media column (for example the per-row plot images), the
+  gallery can show that column in its tiles, but double-clicking a tile opens
+  the detail view on the row's original media column instead of the one the
+  tile was showing -- even when the original column is unchecked and not
+  displayed anywhere. LIKELY CAUSE, not verified: the double-click seam
+  carries only the row, so the detail view chooses a column itself rather
+  than being told which one. Intended behaviour: the tile you double-clicked
+  was showing one column, and that is the column the detail view opens; when
+  a row has several media columns the detail view should additionally let the
+  researcher switch between them, defaulting to the one double-clicked. This
+  is an interface change, not a local fix. Found by eye 13 Sep 2026; no item
+  assigned.
+
 ## Open -- smells, no item assigned
 
 - **`create_table_from_rows()` rebuilds a `set_index("row_id")` over the whole

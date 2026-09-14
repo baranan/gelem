@@ -222,6 +222,10 @@ class BlendshapeOperator(BaseOperator):
         detection_result = landmarker.detect(mp_image)
 
         if not detection_result.face_blendshapes:
+            # run-indicator-2: worth more than a percentage on a run where
+            # many rows come back empty. LATEST WINS, PER RUN, so this
+            # costs one dict write per row, same as any other row.
+            run.log(f"no face detected in row {row_id}")
             return {name: None for name in BLENDSHAPE_NAMES}
 
         detected_scores = detection_result.face_blendshapes[0]

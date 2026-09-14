@@ -1185,3 +1185,64 @@ def test_indicator_label_hides_again_once_the_run_ends(qapp):
 
     assert window._run_indicator_label.isHidden() is True
     assert window._run_indicator_label.text() == ""
+
+
+# ===========================================================================
+# run-indicator-2: the free-text run.log() message, at the same MainWindow
+# seam. controller.format_run_indicator_text()'s handling of "message" and
+# AppController's get_live_runs()/_apply_run_logs() are covered by
+# tests/test_result_delivery.py -- these tests pin only that the widget
+# shows what get_live_runs() currently reports, the same "pull the
+# controller's current state" property the run-indicator-1 tests above pin
+# for label/table/percent.
+#
+# Written from the work-item specification, not the implementation.
+# ===========================================================================
+
+def test_indicator_label_shows_a_run_log_message(qapp):
+    controller = _LiveRunsController(
+        [{
+            "label": "Extract frames",
+            "table_name": "videos",
+            "message": "video 3 of 40: clip.mp4",
+        }]
+    )
+    window = _indicator_window(controller)
+
+    window._refresh_run_indicator()
+
+    assert window._run_indicator_label.isHidden() is False
+    assert "video 3 of 40: clip.mp4" in window._run_indicator_label.text()
+
+
+def test_indicator_label_shows_no_message_text_before_one_arrives(qapp):
+    controller = _LiveRunsController(
+        [{"label": "Extract frames", "table_name": "videos", "message": None}]
+    )
+    window = _indicator_window(controller)
+
+    window._refresh_run_indicator()
+
+    # Would still pass if violated? No. A version that rendered "None"
+    # into the sentence for an unset message would fail this.
+    assert "None" not in window._run_indicator_label.text()
+    assert window._run_indicator_label.text() == (
+        'Running "Extract frames" on "videos"'
+    )
+
+
+def test_indicator_label_reflects_a_message_update_on_refresh(qapp):
+    # Pull-based, like the rest of this section: the widget shows
+    # whatever get_live_runs() reports as of the most recent refresh,
+    # not a value cached from an earlier one.
+    controller = _LiveRunsController(
+        [{"label": "Extract blendshapes", "table_name": "frames", "message": None}]
+    )
+    window = _indicator_window(controller)
+    window._refresh_run_indicator()
+    assert "no face" not in window._run_indicator_label.text()
+
+    controller._live_runs[0]["message"] = "no face detected in row r7"
+    window._refresh_run_indicator()
+
+    assert "no face detected in row r7" in window._run_indicator_label.text()

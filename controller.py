@@ -132,6 +132,27 @@ def write_read_conflict_warnings(
 # latest value it has seen from the operator_progress signal.
 # ---------------------------------------------------------------------------
 
+# run-indicator-2: a run.log() message is researcher-facing free text and
+# could in principle be arbitrarily long. Truncated here, in the Qt-free
+# sentence function, rather than in the controller or the operator -- the
+# STORED message (AppController._latest_logs / run["message"]) is never
+# cut, only what a one-line status bar shows. 100 characters is comfortably
+# longer than the examples in the work item ("clip 3 of 40", "no face found
+# in 12 frames so far") while still leaving room for the operator label and
+# percentage on one line.
+_MAX_INDICATOR_MESSAGE_CHARS = 100
+
+
+def _truncated_message(message: str | None) -> str | None:
+    """message, unchanged if it fits or is None/empty; otherwise cut to
+    _MAX_INDICATOR_MESSAGE_CHARS - 3 characters plus a trailing "..."."""
+    if not message:
+        return message
+    if len(message) <= _MAX_INDICATOR_MESSAGE_CHARS:
+        return message
+    return message[: _MAX_INDICATOR_MESSAGE_CHARS - 3] + "..."
+
+
 def format_run_indicator_text(
     live_runs: list[dict],
     percent: int | None,
@@ -141,10 +162,14 @@ def format_run_indicator_text(
     ui/main_window.py to hide the widget.
 
     live_runs is plain data, one dict per in-flight run, read from the
-    "label" and "table_name" keys only -- exactly the shape
+    "label", "table_name" and "message" keys -- exactly the shape
     AppController.get_live_runs() returns, though this function does not
     look at that dict's "operation_id" (run-indicator-1-fix): a run's
     identity has nothing to say about the sentence describing it.
+    "message" (run-indicator-2) is the run's latest run.log() text, or
+    None/absent if the operator has not called it yet -- a caller such as
+    tests/test_result_delivery.py's older cases may omit the key entirely,
+    which reads the same as None.
 
     percent is the latest value reported by AppController's
     operator_progress signal (0-100), or None if no progress tick has
@@ -156,6 +181,10 @@ def format_run_indicator_text(
     live run -- with two or more, the shared number cannot be attributed
     to either one, so no percentage is shown at all, only how many
     operators are running and their labels.
+
+    A run.log() message has no such ambiguity: it is stored per
+    operation_id (see AppController._latest_logs), so it is shown next to
+    every run it belongs to, whether there is one live run or several.
     """
     if not live_runs:
         return ""
@@ -165,10 +194,19 @@ def format_run_indicator_text(
         text = f'Running "{run["label"]}" on "{run["table_name"]}"'
         if percent is not None:
             text += f" -- {percent}%"
+        message = _truncated_message(run.get("message"))
+        if message:
+            text += f" -- {message}"
         return text
 
-    labels = ", ".join(f'"{run["label"]}"' for run in live_runs)
-    return f"{len(live_runs)} operators running: {labels}"
+    parts = []
+    for run in live_runs:
+        part = f'"{run["label"]}"'
+        message = _truncated_message(run.get("message"))
+        if message:
+            part += f" ({message})"
+        parts.append(part)
+    return f"{len(live_runs)} operators running: {', '.join(parts)}"
 
 
 class AppController(QObject):
@@ -203,6 +241,15 @@ class AppController(QObject):
                                  both register and deregister so a run
                                  indicator can appear the moment a run
                                  starts, before its first progress tick.
+        operator_log_changed:    A run's run.log() message moved onto its
+                                 live-run entry this tick (run-indicator-2).
+                                 Carries no payload -- a listener reads the
+                                 new text via get_live_runs()'s "message"
+                                 field, the same pull-based pattern
+                                 live_runs_changed uses. Emitted at most
+                                 once per drain tick, and only when at
+                                 least one message actually landed on a
+                                 still-live run.
         merge_report_ready:      MergeReport object for display.
         error_occurred:          Human-readable error message string.
         display_result_ready:    Result dict from a create_display
@@ -220,6 +267,7 @@ class AppController(QObject):
     operator_progress        = Signal(int)
     operator_complete        = Signal(str)
     live_runs_changed        = Signal()
+    operator_log_changed     = Signal()
     merge_report_ready       = Signal(object)
     error_occurred           = Signal(str)
     display_result_ready     = Signal(dict)
@@ -294,6 +342,17 @@ class AppController(QObject):
         # coalesces at the source and is bounded by construction.
         self._progress_lock = threading.Lock()
         self._latest_progress: int | None = None
+
+        # run-indicator-2: the newest run.log() message per operation_id.
+        # Coalesced the same way progress is, but keyed per run instead of
+        # a single application-wide value: a worker calls run.log(text),
+        # which reaches _on_run_log and overwrites this run's entry under
+        # the lock, and the drain moves at most one value per run onto its
+        # live-run entry per tick. Not a queue and not a growing list --
+        # LATEST WINS, PER RUN -- so a run that logs once per row over
+        # 50,000 rows costs the same as one that logs twice.
+        self._log_lock = threading.Lock()
+        self._latest_logs: dict[str, str] = {}
 
         # How many items to take from each queue per tick. The same
         # budget is applied to each queue independently. A constructor
@@ -432,10 +491,15 @@ class AppController(QObject):
         by _on_operator_complete's "setup_error" / "row_errors" branches,
         which arrive before this run's own completion and do not
         deregister it.
+
+        "message" (run-indicator-2) starts None and is overwritten by
+        _apply_run_logs with this run's newest run.log() text, moved off
+        self._latest_logs during the drain -- see get_live_runs().
         """
         self._live_runs[operation_id] = {
             "label":              label,
             "table_name":         table_name,
+            "message":            None,
             "applied":            0,
             "unplaceable":        [],
             "column_tags":        dict(column_tags) if column_tags else {},
@@ -470,7 +534,9 @@ class AppController(QObject):
         run-indicator widget (ui/main_window.py) -- never the internal
         dict, the CancellationToken, or any other internal key.
 
-        Returns one {"operation_id": str, "label": str, "table_name": str}
+        Returns one
+        {"operation_id": str, "label": str, "table_name": str,
+         "message": str | None}
         dict per live run, in no particular order.
 
         operation_id is an opaque handle, the same discipline as row_id
@@ -481,12 +547,19 @@ class AppController(QObject):
         called with -- run-indicator-1-fix adds it so a future Cancel
         control (P1.12f-3) has something to name the one run it should
         cancel; this item does not add a Cancel control itself.
+
+        message (run-indicator-2) is this run's newest run.log() text, or
+        None if the operator has not called run.log() yet. Unlike
+        percent -- which AppController coalesces into one value for the
+        whole application (see operator_progress) -- a message is stored
+        per operation_id, so each live run carries its own.
         """
         return [
             {
                 "operation_id": operation_id,
                 "label":        run["label"],
                 "table_name":   run["table_name"],
+                "message":      run["message"],
             }
             for operation_id, run in self._live_runs.items()
         ]
@@ -737,6 +810,7 @@ class AppController(QObject):
         self._drain_thumbnails()
         self._drain_item_results()
         self._emit_progress_if_changed()
+        self._apply_run_logs()
         self._drain_completions()
 
     def _drain_thumbnails(self) -> None:
@@ -875,6 +949,36 @@ class AppController(QObject):
         if percent is not None:
             self.operator_progress.emit(percent)
 
+    def _apply_run_logs(self) -> None:
+        """
+        Moves each run's newest run.log() message (run-indicator-2) onto
+        its live-run entry, at most once per tick per run -- the same
+        coalescing _emit_progress_if_changed applies to the single
+        application-wide percentage, just keyed per operation_id instead
+        of global. A message for a run no longer in self._live_runs
+        (already deregistered, or a stray call from a worker that outlived
+        a failed start) is dropped here rather than in _on_run_log, so a
+        worker thread's log() call never has to know whether its run is
+        still live -- the same "drop silently, no dialog" treatment
+        _drain_item_results gives a result from a dead run.
+
+        Emits operator_log_changed at most once, and only if at least one
+        message actually landed on a still-live run -- an empty tick (no
+        operator called run.log() since the last one) emits nothing, the
+        same discipline _deregister_run applies to live_runs_changed.
+        """
+        with self._log_lock:
+            latest = self._latest_logs
+            self._latest_logs = {}
+        changed = False
+        for operation_id, text in latest.items():
+            run = self._live_runs.get(operation_id)
+            if run is not None:
+                run["message"] = text
+                changed = True
+        if changed:
+            self.operator_log_changed.emit()
+
     def _drain_completions(self) -> None:
         """
         Processes up to _drain_budget completion-queue items.
@@ -924,6 +1028,18 @@ class AppController(QObject):
     def _on_progress(self, percent: int) -> None:
         with self._progress_lock:
             self._latest_progress = percent
+
+    def _on_run_log(self, operation_id: str, text: str) -> None:
+        """The run.log() sink (run-indicator-2), wired as OperatorRun's
+        _log_fn in _build_operator_run. Runs on the worker thread that
+        called run.log(): does nothing but overwrite this run's latest
+        message under the lock -- LATEST WINS, PER RUN, same pattern as
+        _on_progress. Never raises, whether or not operation_id still
+        names a live run: this is a plain dict write, and _apply_run_logs
+        is what checks liveness, on the main thread, next tick.
+        """
+        with self._log_lock:
+            self._latest_logs[operation_id] = text
 
     def _on_create_columns_complete(
         self,
@@ -1674,6 +1790,9 @@ class AppController(QObject):
             # The per-row result sink for a COLUMNS run. Wired for the
             # contract P1.12f consumes; no operator calls run.emit() yet.
             _emit_fn=self._on_item_complete,
+            # run.log() (run-indicator-2). Wired for every mode -- TABLE
+            # and DISPLAY operators may call it too, not just COLUMNS.
+            _log_fn=self._on_run_log,
         )
         return run, token
 

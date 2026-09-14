@@ -131,9 +131,10 @@ create_display(df, run)                      -> dict
 | `run.paths` | this project's directories; **never store these on `self`** |
 | `run.spec` | the immutable description of the run, including versions |
 | `run.emit()` | the result sink |
+| `run.log(text)` | `[NOW]` record free-text progress for this run; see "Progress messages" below |
 
-`[TARGET -> P2.2]` `run.cache` and `run.log` arrive later and are **optional**.
-Guard their use -- an operator must still work on a `run` that has neither.
+`[TARGET -> P2.2]` `run.cache` arrives later and is **optional**. Guard its
+use -- an operator must still work on a `run` that has none.
 
 Everything per-run comes from `run` and nothing per-run is stored on the operator.
 An operator is a singleton shared across runs, so a value on `self` is a race
@@ -202,6 +203,38 @@ failed to decode reported success having processed zero rows and never mentioned
 the missing model.
 
 Guarded by `tests/test_model_lifecycle.py`.
+
+### Progress messages -- `run.log`
+
+`[NOW]` Built by run-indicator-2. An operator may call `run.log(text)` from
+whatever thread its execution method runs on, to record free-text progress
+for this run -- "clip 3 of 40", "no face found in 12 frames so far", anything
+a percentage cannot say. The status-bar run indicator shows it alongside the
+operator's label and, when there is only one live run, its progress
+percentage.
+
+**LATEST WINS, PER RUN.** Only the newest message for this run is kept -- not
+a queue, not a growing list. Calling it once per row over 50,000 rows costs
+the same as calling it twice: `AppController` stores the newest value per
+run under a lock the same way it coalesces the progress percentage, and its
+existing 50ms drain moves that value onto the run's status-bar entry at most
+once per tick.
+
+`run.log()` never blocks, never touches Qt, and never raises -- not when no
+sink is wired (a bare `OperatorRun` built by a test, say), and not when the
+run has already ended on the main thread. A message that arrives after the
+run is gone is simply not attached to anything, the same way a per-row
+result from a dead run is dropped rather than raising. An operator must
+never be able to crash a run, or anything else, by calling `run.log()` at
+the wrong moment.
+
+The message is shown to the researcher exactly as written, with only the
+status bar's one-line display truncated (`controller.py`'s
+`_truncated_message`, 100 characters) -- never the stored text.
+
+`operators/video_frames.py` and `operators/blendshapes.py` are the worked
+examples: one call per video naming its position ("video 3 of 40: ...") and
+one call per row with no detected face, respectively.
 
 ### `create_columns(row_id, media, metadata, run) -> dict`
 

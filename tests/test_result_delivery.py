@@ -1111,18 +1111,32 @@ def test_get_live_runs_empty_initially(tmp_path):
     assert controller.get_live_runs() == []
 
 
-def test_get_live_runs_returns_only_the_three_public_fields(tmp_path):
+def test_get_live_runs_returns_only_the_four_public_fields(tmp_path):
+    # NOTE: this test's name and asserted shape changed for run-indicator-2.
+    # It previously pinned exactly three keys; get_live_runs() now also
+    # carries "message" (the run's newest run.log() text, None until one
+    # arrives) per that item's explicit design decision -- see
+    # controller.py's get_live_runs() docstring and operators/CLAUDE.md's
+    # "Progress messages -- run.log". The property this test guards is
+    # unchanged: only the fields a caller may rely on, never "token",
+    # "column_tags" or the rest of the internal bookkeeping.
     controller, _dataset, _op_registry = _make_controller(tmp_path)
     controller._register_run("op-1", "Probe", "frames")
 
     # Would still pass if violated? No. A version that returned the raw
     # _live_runs dict would also carry "token", "column_tags" and the
     # rest of the internal bookkeeping -- this pins the public read down
-    # to exactly the three fields a caller may rely on: the run's opaque
-    # identity (run-indicator-1-fix) plus its label and table.
+    # to exactly the four fields a caller may rely on: the run's opaque
+    # identity (run-indicator-1-fix), its label and table, and its
+    # newest log message (run-indicator-2, None before one arrives).
     live_runs = controller.get_live_runs()
     assert live_runs == [
-        {"operation_id": "op-1", "label": "Probe", "table_name": "frames"}
+        {
+            "operation_id": "op-1",
+            "label": "Probe",
+            "table_name": "frames",
+            "message": None,
+        }
     ]
 
 
@@ -1230,3 +1244,202 @@ def test_two_concurrent_runs_produce_a_sentence_with_no_percentage():
     text = format_run_indicator_text(live_runs, 10)
     assert "%" not in text
     assert "10" not in text
+
+
+# ---------------------------------------------------------------------------
+# 13. run-indicator-2: free-text run.log() messages.
+#
+# 13a. format_run_indicator_text(): the message half of the sentence
+# builder. Pure, Qt-free -- no controller.
+# ---------------------------------------------------------------------------
+
+def test_indicator_text_includes_a_message_for_one_run():
+    live_runs = [
+        {"label": "Extract frames", "table_name": "videos",
+         "message": "video 3 of 40: clip.mp4"},
+    ]
+    text = format_run_indicator_text(live_runs, None)
+    assert "Extract frames" in text
+    assert "video 3 of 40: clip.mp4" in text
+
+
+def test_indicator_text_omits_the_message_when_none_has_arrived_yet():
+    # A run may carry "message": None (never logged) or omit the key
+    # entirely (an older caller's plain dict, e.g. this file's own
+    # pre-existing live_runs literals) -- both must render identically.
+    text_none = format_run_indicator_text(
+        [{"label": "Op", "table_name": "frames", "message": None}], None
+    )
+    text_missing = format_run_indicator_text(
+        [{"label": "Op", "table_name": "frames"}], None
+    )
+    assert text_none == text_missing == 'Running "Op" on "frames"'
+
+
+def test_indicator_text_truncates_an_absurdly_long_message():
+    # Would still pass if violated? No. A version that showed the message
+    # verbatim would put all 500 characters in the text; asserting a hard
+    # ceiling well under that catches a missing truncation.
+    huge = "x" * 500
+    live_runs = [{"label": "Op", "table_name": "frames", "message": huge}]
+    text = format_run_indicator_text(live_runs, None)
+    assert len(text) < 200
+    assert "..." in text
+    assert huge not in text
+
+
+def test_indicator_text_shows_each_runs_own_message_with_two_live_runs():
+    # Unlike the coalesced application-wide percentage -- which two live
+    # runs must suppress entirely (test 12 above) -- a run.log() message
+    # is stored per operation_id (AppController._latest_logs), so there
+    # is no such ambiguity. Both runs' own messages may appear together.
+    live_runs = [
+        {"label": "Extract blendshapes", "table_name": "frames",
+         "message": "no face detected in row r7"},
+        {"label": "Summary statistics", "table_name": "frames",
+         "message": None},
+    ]
+    text = format_run_indicator_text(live_runs, 77)
+    assert "%" not in text
+    assert "Extract blendshapes" in text
+    assert "no face detected in row r7" in text
+    assert "Summary statistics" in text
+
+
+# ---------------------------------------------------------------------------
+# 13b. AppController: run.log() reaches get_live_runs() through the drain,
+# two concurrent runs keep separate messages, and a message for a run that
+# has already ended is dropped rather than raising.
+# ---------------------------------------------------------------------------
+
+def _message_for(controller, operation_id):
+    for run in controller.get_live_runs():
+        if run["operation_id"] == operation_id:
+            return run["message"]
+    return "<not live>"
+
+
+def test_on_run_log_moves_the_message_onto_the_live_run_entry(tmp_path):
+    controller, _dataset, _op_registry = _make_controller(tmp_path)
+    controller._register_run("op-1", "Probe", "frames")
+
+    controller._on_run_log("op-1", "clip 3 of 40")
+    controller._drain_queues()
+
+    # Would still pass if violated? No. Before _apply_run_logs runs,
+    # get_live_runs() still shows the "message": None it was registered
+    # with -- this pins that the drain is what moves it across.
+    assert _message_for(controller, "op-1") == "clip 3 of 40"
+
+
+def test_two_concurrent_runs_keep_separate_messages(tmp_path):
+    # Required by the work item: LATEST WINS, PER RUN means per
+    # operation_id, not one shared value the way progress is shared.
+    controller, _dataset, _op_registry = _make_controller(tmp_path)
+    controller._register_run("op-a", "Extract frames", "videos")
+    controller._register_run("op-b", "Extract blendshapes", "frames")
+
+    controller._on_run_log("op-a", "video 3 of 40: clip.mp4")
+    controller._on_run_log("op-b", "no face detected in row r7")
+    controller._drain_queues()
+
+    # Would still pass if violated? No. A single shared "latest message"
+    # variable (the progress pattern, applied naively) would leave both
+    # runs showing whichever call happened to land last -- this fails
+    # unless each operation_id keeps its own value.
+    assert _message_for(controller, "op-a") == "video 3 of 40: clip.mp4"
+    assert _message_for(controller, "op-b") == "no face detected in row r7"
+
+
+def test_only_the_newest_message_per_run_is_kept(tmp_path):
+    # LATEST WINS: several calls between two ticks collapse to one value,
+    # the same coalescing the progress percentage already gets.
+    controller, _dataset, _op_registry = _make_controller(tmp_path)
+    controller._register_run("op-1", "Probe", "frames")
+
+    for i in range(50):
+        controller._on_run_log("op-1", f"row {i}")
+    controller._drain_queues()
+
+    assert _message_for(controller, "op-1") == "row 49"
+
+
+def test_logging_after_a_run_has_ended_does_not_raise(tmp_path):
+    # Required by the work item. A worker thread may still be running
+    # (or a straggling call may already be queued) after the main thread
+    # has deregistered its run -- run.log() must not be able to crash
+    # anything by calling in at that moment.
+    controller, _dataset, _op_registry = _make_controller(tmp_path)
+    controller._register_run("op-1", "Probe", "frames")
+    controller._deregister_run("op-1")
+
+    controller._on_run_log("op-1", "the run this belonged to is gone")
+    controller._drain_queues()   # must not raise
+
+    assert controller.get_live_runs() == []
+
+
+def test_operator_log_changed_emitted_once_per_tick_when_a_message_lands(
+    tmp_path,
+):
+    controller, _dataset, _op_registry = _make_controller(tmp_path)
+    controller._register_run("op-1", "Probe", "frames")
+    events: list[None] = []
+    controller.operator_log_changed.connect(lambda: events.append(None))
+
+    controller._on_run_log("op-1", "row 1")
+    controller._on_run_log("op-1", "row 2")
+    controller._drain_queues()
+
+    # Would still pass if violated? No. Emitting once per _on_run_log call
+    # (rather than once per tick, after coalescing) would leave `events`
+    # with 2 entries here.
+    assert len(events) == 1
+
+    # A tick with no new message emits nothing more -- the same discipline
+    # _emit_progress_if_changed already applies to operator_progress.
+    controller._drain_queues()
+    assert len(events) == 1
+
+
+def test_operator_log_changed_not_emitted_for_a_message_on_a_dead_run(
+    tmp_path,
+):
+    controller, _dataset, _op_registry = _make_controller(tmp_path)
+    controller._register_run("op-1", "Probe", "frames")
+    controller._deregister_run("op-1")
+    events: list[None] = []
+    controller.operator_log_changed.connect(lambda: events.append(None))
+
+    controller._on_run_log("op-1", "too late")
+    controller._drain_queues()
+
+    assert events == []
+
+
+def test_run_dot_log_reaches_get_live_runs_through_the_real_wiring(tmp_path):
+    # End-to-end through _build_operator_run's actual _log_fn wiring,
+    # rather than calling controller._on_run_log() directly -- proves the
+    # OperatorRun an operator actually receives is connected all the way
+    # to get_live_runs(), the same seam ui/main_window.py reads.
+    from operators.base import BaseOperator
+
+    class _Probe(BaseOperator):
+        name = "probe_table"
+        descriptor = _table_descriptor("probe_table", "Probe table")
+
+    controller, dataset, op_registry = _make_controller(tmp_path)
+    operator = _Probe()
+    op_registry.register(operator)
+    ids = controller.get_visible_row_ids()[:3]
+    snapshot = dataset.snapshot_rows("frames", ids)
+
+    run, token = controller._build_operator_run(
+        operator, ExecutionMode.TABLE, "op-real", "frames", {}, snapshot,
+    )
+    controller._register_run("op-real", "Probe table", "frames", token=token)
+
+    run.log("clip 1 of 1")
+    controller._drain_queues()
+
+    assert _message_for(controller, "op-real") == "clip 1 of 1"

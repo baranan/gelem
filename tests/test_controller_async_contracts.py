@@ -192,6 +192,7 @@ _WORKER_CALLBACKS = {
     "_on_thumbnail_ready",
     "_on_item_complete",
     "_on_progress",
+    "_on_run_log",
     "_on_create_columns_complete",
     "_on_operator_setup_error",
     "_on_operator_row_errors",
@@ -229,3 +230,94 @@ def test_worker_callbacks_touch_no_component_state():
                     f"{node.name} reads self.{sub.attr} from a worker "
                     f"thread -- it may only enqueue a result"
                 )
+
+
+# ── _WORKER_CALLBACKS itself must not silently fall behind the source ───
+
+def _self_on_call_func_ids(tree: ast.AST) -> set:
+    """id() of every AST node that is the immediate `.func` of a Call node
+    -- e.g. the Attribute node in `self._on_x(...)`. Used to tell "this
+    self._on_* reference IS the callee of a direct call" apart from every
+    other way the same reference can appear.
+    """
+    return {id(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+
+
+def _handed_off_self_on_names(tree: ast.AST) -> set:
+    """Every `self._on_<name>` attribute name with at least one occurrence
+    that is NOT the immediate callee of a direct call -- i.e. handed off
+    as a plain value (assigned onto another object's attribute, or passed
+    as a positional/keyword argument) rather than called by AppController
+    itself. See test_worker_callbacks_set_matches_every_self_on_name_handed_to_another_component
+    for why this is the rule and what it would miss.
+    """
+    call_func_ids = _self_on_call_func_ids(tree)
+    names: set = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "self"
+            and node.attr.startswith("_on_")
+            and id(node) not in call_func_ids
+        ):
+            names.add(node.attr)
+    return names
+
+
+def test_worker_callbacks_set_matches_every_self_on_name_handed_to_another_component():
+    """_WORKER_CALLBACKS above is hand-maintained, and this repo has
+    already hit the failure mode of a hand-maintained list silently
+    walking less than it claims: run-indicator-2 added
+    AppController._on_run_log as a new worker-thread callback (wired as
+    OperatorRun's _log_fn, the same way _on_progress is wired as
+    on_progress=) but never added it to _WORKER_CALLBACKS, so
+    test_worker_callbacks_touch_no_component_state silently did not scan
+    the newest worker-thread callback at all. This test ties the set to
+    the source instead of trusting it to stay current by hand.
+
+    RULE USED: in this codebase, a worker-thread callback is, by
+    construction, a `self._on_*` bound method AppController hands to
+    ANOTHER component to invoke later -- as a plain attribute assignment
+    (`self._store.on_thumbnail_ready = self._on_thumbnail_ready`) or as
+    an argument (`on_progress=self._on_progress`,
+    `_log_fn=self._on_run_log`) -- never a name AppController only ever
+    calls itself. So: walk controller.py's AST for every
+    `self._on_<name>` attribute access; a name counts as a worker
+    callback if at least one of its occurrences is NOT the immediate
+    callee of a direct call. `_on_operator_complete` is the control case
+    this rule has to get right: it IS called directly
+    (`self._on_operator_complete(mode, payload)`, and its own docstring
+    says "Called on the main thread from the completion-queue drain"),
+    and every occurrence of it in the file is that same direct call, so
+    it must NOT appear in the derived set -- and does not.
+
+    WHAT THIS WOULD MISS: a worker-thread callback that does not follow
+    the `self._on_*` naming convention, or one wired through something
+    this AST walk does not see as a literal `self._on_<name>` attribute
+    access -- built inside a lambda, fetched via getattr(), or assembled
+    into a dict/functools.partial rather than passed as a plain
+    argument. It would also miss a callback wired from OUTSIDE
+    controller.py (this test reads only CONTROLLER_FILE). Every
+    worker-thread callback in this codebase today follows the plain
+    `self._on_*` handoff shape this rule looks for, so for the code as
+    it stands this is a real, non-vacuous check -- but it is a
+    structural proxy for "handed to another component to call later",
+    not a proof that a name obeys every rule CLAUDE.md states for
+    worker callbacks (it says nothing about which thread anything
+    actually runs on, only about how the reference reaches that other
+    component).
+    """
+    source = CONTROLLER.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    derived = _handed_off_self_on_names(tree)
+
+    assert derived == _WORKER_CALLBACKS, (
+        "self._on_* names handed off to another component in controller.py "
+        "do not match the hand-maintained _WORKER_CALLBACKS set.\n"
+        f"  handed off in the source but missing from _WORKER_CALLBACKS: "
+        f"{sorted(derived - _WORKER_CALLBACKS)}\n"
+        f"  in _WORKER_CALLBACKS but never handed off anywhere in the "
+        f"source: {sorted(_WORKER_CALLBACKS - derived)}"
+    )
