@@ -196,7 +196,9 @@ else:
         from models.dataset import Dataset, MergeReport
         ds = Dataset()
         ds.load_folder(TEST_IMAGES)
-        report = ds.merge_csv(METADATA_CSV, join_on="file_name")
+        report = ds.merge_csv(
+            METADATA_CSV, target_table="frames", csv_key="file_name", target_key="file_name",
+        )
         assert isinstance(report, MergeReport), (
             f"merge_csv should return a MergeReport, got {type(report)}"
         )
@@ -205,9 +207,11 @@ else:
         from models.dataset import Dataset
         ds = Dataset()
         ds.load_folder(TEST_IMAGES)
-        report = ds.merge_csv(METADATA_CSV, join_on="file_name")
-        assert report.total_image_files == len(ds.get_table("frames")), (
-            "total_image_files should match number of loaded media files"
+        report = ds.merge_csv(
+            METADATA_CSV, target_table="frames", csv_key="file_name", target_key="file_name",
+        )
+        assert report.total_target_rows == len(ds.get_table("frames")), (
+            "total_target_rows should match number of loaded media files"
         )
         assert report.total_csv_rows > 0, "total_csv_rows should be > 0"
         assert report.matched_rows > 0, (
@@ -219,7 +223,9 @@ else:
         ds = Dataset()
         ds.load_folder(TEST_IMAGES)
         cols_before = list(ds.get_table("frames").columns)
-        ds.merge_csv(METADATA_CSV, join_on="file_name")
+        ds.merge_csv(
+            METADATA_CSV, target_table="frames", csv_key="file_name", target_key="file_name",
+        )
         cols_after = list(ds.get_table("frames").columns)
         assert cols_before == cols_after, (
             "Table should not change until confirm_merge() is called"
@@ -229,7 +235,9 @@ else:
         from models.dataset import Dataset
         ds = Dataset()
         ds.load_folder(TEST_IMAGES)
-        report = ds.merge_csv(METADATA_CSV, join_on="file_name")
+        report = ds.merge_csv(
+            METADATA_CSV, target_table="frames", csv_key="file_name", target_key="file_name",
+        )
         ds.confirm_merge(report)
         df = ds.get_table("frames")
         assert "condition" in df.columns,  "condition column missing after merge"
@@ -248,7 +256,9 @@ else:
 
         ds = Dataset()
         ds.load_folder(TEST_IMAGES)
-        report = ds.merge_csv(METADATA_CSV, join_on="file_name")
+        report = ds.merge_csv(
+            METADATA_CSV, target_table="frames", csv_key="file_name", target_key="file_name",
+        )
         ds.confirm_merge(report)
 
         spec = ds.schema_for("frames").spec_for("condition")
@@ -261,7 +271,9 @@ else:
         ds = Dataset()
         ds.load_folder(TEST_IMAGES)
         count_before = len(ds.get_table("frames"))
-        report = ds.merge_csv(METADATA_CSV, join_on="file_name")
+        report = ds.merge_csv(
+            METADATA_CSV, target_table="frames", csv_key="file_name", target_key="file_name",
+        )
         ds.confirm_merge(report)
         count_after = len(ds.get_table("frames"))
         assert count_before == count_after, (
@@ -285,25 +297,28 @@ else:
         frame.to_csv(path, index=False)
         return path
 
-    def test_merge_one_to_many_does_not_crash():
+    def test_merge_expansion_does_not_crash():
         from models.dataset import Dataset, MergeReport
         ds = Dataset()
         ds.load_folder(TEST_IMAGES)
         names = list(ds.get_table("frames")["file_name"])[:2]
-        # Each image name appears twice -> one-to-many.
+        # Each image name appears twice in the CSV -> would expand each of
+        # those two target rows into two rows apiece.
         bad = pd.DataFrame({
             "file_name": [names[0], names[0], names[1], names[1]],
             "score":     [1, 2, 3, 4],
         })
         with tempfile.TemporaryDirectory() as d:
-            report = ds.merge_csv(_write_csv(d, "dupes.csv", bad),
-                                  join_on="file_name")
+            report = ds.merge_csv(
+                _write_csv(d, "dupes.csv", bad),
+                target_table="frames", csv_key="file_name", target_key="file_name",
+            )
         assert isinstance(report, MergeReport), (
-            "merge_csv should return a MergeReport for a one-to-many CSV, "
+            "merge_csv should return a MergeReport for an expanding CSV, "
             "not crash"
         )
 
-    def test_merge_one_to_many_flags_duplicates():
+    def test_merge_expansion_flags_the_keys():
         from models.dataset import Dataset
         ds = Dataset()
         ds.load_folder(TEST_IMAGES)
@@ -313,14 +328,16 @@ else:
             "score":     [1, 2, 3, 4],
         })
         with tempfile.TemporaryDirectory() as d:
-            report = ds.merge_csv(_write_csv(d, "dupes.csv", bad),
-                                  join_on="file_name")
-        assert names[0] in report.one_to_many and names[1] in report.one_to_many, (
-            f"Duplicated image names should be listed in report.one_to_many; "
-            f"got {report.one_to_many}"
+            report = ds.merge_csv(
+                _write_csv(d, "dupes.csv", bad),
+                target_table="frames", csv_key="file_name", target_key="file_name",
+            )
+        assert names[0] in report.would_expand and names[1] in report.would_expand, (
+            f"Duplicated image names should be listed in report.would_expand; "
+            f"got {report.would_expand}"
         )
 
-    def test_merge_one_to_many_does_not_expand():
+    def test_merge_expansion_is_refused_not_applied():
         from models.dataset import Dataset
         ds = Dataset()
         ds.load_folder(TEST_IMAGES)
@@ -331,18 +348,20 @@ else:
             "score":     [1, 2, 3, 4],
         })
         with tempfile.TemporaryDirectory() as d:
-            report = ds.merge_csv(_write_csv(d, "dupes.csv", bad),
-                                  join_on="file_name")
-            ds.confirm_merge(report)   # rejected one-to-many -> no-op
+            report = ds.merge_csv(
+                _write_csv(d, "dupes.csv", bad),
+                target_table="frames", csv_key="file_name", target_key="file_name",
+            )
+            ds.confirm_merge(report)   # refused (would expand) -> no-op
         count_after = len(ds.get_table("frames"))
         assert count_after == count_before, (
-            f"A one-to-many merge must be rejected, not expand rows. "
-            f"Before: {count_before}, after: {count_after}"
+            f"A merge that would expand the table must be refused, not "
+            f"expand rows. Before: {count_before}, after: {count_after}"
         )
 
-    run_test("One-to-many merge does not crash", test_merge_one_to_many_does_not_crash)
-    run_test("One-to-many merge flags duplicates", test_merge_one_to_many_flags_duplicates)
-    run_test("One-to-many merge does not expand rows", test_merge_one_to_many_does_not_expand)
+    run_test("Expanding merge does not crash", test_merge_expansion_does_not_crash)
+    run_test("Expanding merge flags the offending keys", test_merge_expansion_flags_the_keys)
+    run_test("Expanding merge is refused, not applied", test_merge_expansion_is_refused_not_applied)
 
     def test_merge_unmatched_duplicate_still_merges():
         # A duplicate key matching NO image is harmless (can't expand any
@@ -356,13 +375,15 @@ else:
             "score":     [1, 2, 5],
         })
         with tempfile.TemporaryDirectory() as d:
-            report = ds.merge_csv(_write_csv(d, "ghost.csv", bad),
-                                  join_on="file_name")
+            report = ds.merge_csv(
+                _write_csv(d, "ghost.csv", bad),
+                target_table="frames", csv_key="file_name", target_key="file_name",
+            )
             ds.confirm_merge(report)
         df = ds.get_table("frames")
-        assert report.one_to_many == [], (
+        assert report.would_expand == [], (
             f"A duplicate matching no image must not block the merge; "
-            f"got one_to_many={report.one_to_many}"
+            f"got would_expand={report.would_expand}"
         )
         assert "score" in df.columns, (
             "A normal merge should still attach CSV columns"
@@ -383,7 +404,9 @@ else:
         with tempfile.TemporaryDirectory() as d:
             path = _write_csv(d, "noname.csv", csv)
             try:
-                ds.merge_csv(path, join_on="photo_id")
+                ds.merge_csv(
+                    path, target_table="frames", csv_key="photo_id", target_key="file_name",
+                )
                 assert False, "expected a ValueError for the missing join column"
             except ValueError as e:
                 assert "photo_id" in str(e), (
@@ -392,16 +415,18 @@ else:
                 )
 
     def test_merge_with_alternate_join_column():
-        # Filenames living in a differently-named column should still merge
-        # (merge_csv takes join_on as a parameter).
+        # Filenames living in a differently-named CSV column should still
+        # merge (csv_key and target_key are independent parameters).
         from models.dataset import Dataset
         ds = Dataset()
         ds.load_folder(TEST_IMAGES)
         names = list(ds.get_table("frames")["file_name"])[:3]
         csv = pd.DataFrame({"image": names, "score": [1, 2, 3]})
         with tempfile.TemporaryDirectory() as d:
-            report = ds.merge_csv(_write_csv(d, "altcol.csv", csv),
-                                  join_on="image")
+            report = ds.merge_csv(
+                _write_csv(d, "altcol.csv", csv),
+                target_table="frames", csv_key="image", target_key="file_name",
+            )
             ds.confirm_merge(report)
         assert "score" in ds.get_table("frames").columns, (
             "merging on an alternate join column should attach its data"
@@ -420,8 +445,12 @@ else:
         csv = pd.DataFrame({"file_name": names, "path": ["x", "y", "z"]})
         with tempfile.TemporaryDirectory() as d:
             p = _write_csv(d, "coll.csv", csv)
-            ds.confirm_merge(ds.merge_csv(p, join_on="file_name"))  # adds 'path'
-            report = ds.merge_csv(p, join_on="file_name")           # 'path' collides
+            ds.confirm_merge(ds.merge_csv(
+                p, target_table="frames", csv_key="file_name", target_key="file_name",
+            ))  # adds 'path'
+            report = ds.merge_csv(
+                p, target_table="frames", csv_key="file_name", target_key="file_name",
+            )  # 'path' collides
         assert isinstance(report, MergeReport), (
             "a column-collision merge should not crash"
         )
@@ -434,8 +463,9 @@ else:
         csv = pd.DataFrame({"file_name": names, "path": ["x", "y", "z"]})
         with tempfile.TemporaryDirectory() as d:
             p = _write_csv(d, "coll.csv", csv)
-            ds.confirm_merge(ds.merge_csv(p, join_on="file_name"))
-            ds.confirm_merge(ds.merge_csv(p, join_on="file_name"))
+            merge_kwargs = dict(target_table="frames", csv_key="file_name", target_key="file_name")
+            ds.confirm_merge(ds.merge_csv(p, **merge_kwargs))
+            ds.confirm_merge(ds.merge_csv(p, **merge_kwargs))
         cols = list(ds.get_table("frames").columns)
         assert "path_a" in cols and "path_b" in cols, (
             f"both columns should be preserved as path_a/path_b; got {cols}"
@@ -450,8 +480,9 @@ else:
         csv = pd.DataFrame({"file_name": names, "path": ["x", "y", "z"]})
         with tempfile.TemporaryDirectory() as d:
             p = _write_csv(d, "coll.csv", csv)
-            ds.confirm_merge(ds.merge_csv(p, join_on="file_name"))
-            report = ds.merge_csv(p, join_on="file_name")
+            merge_kwargs = dict(target_table="frames", csv_key="file_name", target_key="file_name")
+            ds.confirm_merge(ds.merge_csv(p, **merge_kwargs))
+            report = ds.merge_csv(p, **merge_kwargs)
         assert report.renamed_columns.get("path") == ("path_a", "path_b"), (
             f"the collision should be recorded; got {report.renamed_columns}"
         )
@@ -471,7 +502,10 @@ else:
         bad = pd.DataFrame({"name": ["a", "b"], "score": [1, 2]})  # no join column
         with tempfile.TemporaryDirectory() as d:
             try:
-                ds.merge_csv(_write_csv(d, "bad.csv", bad), join_on="file_name")
+                ds.merge_csv(
+                    _write_csv(d, "bad.csv", bad),
+                    target_table="frames", csv_key="file_name", target_key="file_name",
+                )
             except ValueError:
                 pass  # expected failure
         assert len(ds.get_table("frames")) == rows_before, (
@@ -491,7 +525,10 @@ else:
         bad = pd.DataFrame({"name": ["a"], "score": [1]})  # no join column
         with tempfile.TemporaryDirectory() as d:
             try:
-                ds.merge_csv(_write_csv(d, "bad.csv", bad), join_on="file_name")
+                ds.merge_csv(
+                    _write_csv(d, "bad.csv", bad),
+                    target_table="frames", csv_key="file_name", target_key="file_name",
+                )
             except ValueError:
                 pass
         rows = QueryEngine().apply(ds.get_table("frames"),
@@ -502,6 +539,277 @@ else:
 
     run_test("Failed merge leaves dataset unchanged", test_failed_merge_leaves_dataset_unchanged)
     run_test("Failed merge: filters still work", test_failed_merge_filters_still_work)
+
+    # CASE 5 — P1.5a: many target rows matching one CSV row is the normal
+    # research case (a trial-level CSV merged onto many frame rows from that
+    # trial) and must be ALLOWED, not treated the same as expansion.
+    def test_merge_many_target_rows_per_one_csv_row_is_allowed():
+        from models.dataset import Dataset
+        ds = Dataset()
+        ds.load_folder(TEST_IMAGES)
+        ds.confirm_merge(ds.merge_csv(
+            METADATA_CSV, target_table="frames", csv_key="file_name", target_key="file_name",
+        ))
+        frames = ds.get_table("frames")
+        session_counts = frames["session_id"].value_counts()
+        assert (session_counts > 1).any(), (
+            "test setup assumption: metadata.csv should give at least one "
+            "session_id shared by more than one frame row"
+        )
+        rows_before = len(frames)
+
+        # A session-level CSV: one row per session_id, no duplicate keys on
+        # the CSV side -- so nothing here should be refused as expansion,
+        # even though session_id repeats many times on the target side.
+        sessions   = list(session_counts.index)
+        session_df = pd.DataFrame({
+            "session_id":   sessions,
+            "session_note": [f"note-{s}" for s in sessions],
+        })
+        with tempfile.TemporaryDirectory() as d:
+            path = _write_csv(d, "sessions.csv", session_df)
+            report = ds.merge_csv(
+                path, target_table="frames", csv_key="session_id", target_key="session_id",
+            )
+            assert report.would_expand == [], (
+                f"one CSV row matching many target rows must not be refused "
+                f"as expansion; got would_expand={report.would_expand}"
+            )
+            ds.confirm_merge(report)
+
+        frames_after = ds.get_table("frames")
+        assert len(frames_after) == rows_before, (
+            "row count must stay unchanged -- nothing should be duplicated"
+        )
+        for _, row in frames_after.iterrows():
+            assert row["session_note"] == f"note-{row['session_id']}", (
+                "every frame sharing a session_id should receive that "
+                "session's CSV values"
+            )
+
+    run_test(
+        "Many target rows per one CSV row is allowed",
+        test_merge_many_target_rows_per_one_csv_row_is_allowed,
+    )
+
+    # CASE 6 — P1.5a: reserved column names depend on the target table, not
+    # a hardcoded frames-only list.
+    def test_merge_reserved_columns_are_per_table():
+        from models.dataset import Dataset
+        ds = Dataset()
+        ds.load_folder(TEST_IMAGES)
+        ds.create_table_from_df(
+            "other", pd.DataFrame({"key": ["001_03.jpg", "001_08.jpg"]})
+        )
+
+        # 'full_path' is reserved on frames (Dataset writes it there) but
+        # is an ordinary column name on a table Dataset didn't build.
+        fp_csv = pd.DataFrame({
+            "key": ["001_03.jpg", "001_08.jpg"], "full_path": ["x", "y"],
+        })
+        with tempfile.TemporaryDirectory() as d:
+            path = _write_csv(d, "fp.csv", fp_csv)
+            report = ds.merge_csv(
+                path, target_table="other", csv_key="key", target_key="key",
+            )
+            assert report.matched_rows == 2, (
+                "'full_path' should not be reserved on a table Dataset "
+                "did not build from a folder"
+            )
+            try:
+                ds.merge_csv(
+                    path, target_table="frames", csv_key="key", target_key="file_name",
+                )
+                assert False, "expected a ValueError: full_path is reserved on frames"
+            except ValueError as e:
+                assert "full_path" in str(e), (
+                    f"error should name the reserved column 'full_path'; got: {e}"
+                )
+
+        # row_id is reserved on every table, frames or not.
+        rid_csv = pd.DataFrame({"key": ["001_03.jpg"], "row_id": ["zzz"]})
+        with tempfile.TemporaryDirectory() as d:
+            path = _write_csv(d, "rid.csv", rid_csv)
+            try:
+                ds.merge_csv(
+                    path, target_table="other", csv_key="key", target_key="key",
+                )
+                assert False, "expected a ValueError: row_id is reserved everywhere"
+            except ValueError as e:
+                assert "row_id" in str(e), (
+                    f"error should name the reserved column 'row_id'; got: {e}"
+                )
+
+    run_test(
+        "Reserved column names are per target table",
+        test_merge_reserved_columns_are_per_table,
+    )
+
+    # CASE 7 — P1.5a: confirm_merge must write to the chosen target table,
+    # not always 'frames'.
+    def test_confirm_merge_writes_to_the_target_table():
+        from models.dataset import Dataset
+        ds = Dataset()
+        ds.load_folder(TEST_IMAGES)
+        ds.create_table_from_df(
+            "other", pd.DataFrame({"key": ["a", "b", "c"]})
+        )
+        csv = pd.DataFrame({"key": ["a", "b", "c"], "score": [1, 2, 3]})
+        with tempfile.TemporaryDirectory() as d:
+            path = _write_csv(d, "scores.csv", csv)
+            report = ds.merge_csv(
+                path, target_table="other", csv_key="key", target_key="key",
+            )
+            ds.confirm_merge(report)
+
+        other = ds.get_table("other")
+        assert "score" in other.columns, "the merge should land on the target table"
+        assert list(other["score"]) == [1, 2, 3]
+        assert "score" not in ds.get_table("frames").columns, (
+            "a merge targeting 'other' must not touch 'frames'"
+        )
+
+    run_test(
+        "confirm_merge writes to the chosen target table",
+        test_confirm_merge_writes_to_the_target_table,
+    )
+
+    # CASE 8 — P1.5a-fix: a decimal-number key column earns an advisory
+    # warning (exact-equality matching can silently miss values a
+    # researcher considers equal), but the warning must never block the
+    # merge. A whole-number key -- whether stored as int or as a float
+    # holding only whole numbers -- must not trigger it, nor should text.
+    def test_merge_fractional_csv_key_produces_warning():
+        from models.dataset import Dataset
+        ds = Dataset()
+        ds.create_table_from_df("t", pd.DataFrame({"key": [1, 2, 3]}))
+        csv = pd.DataFrame({"key": [1.5, 2.5], "score": [10, 20]})
+        with tempfile.TemporaryDirectory() as d:
+            report = ds.merge_csv(
+                _write_csv(d, "fractional_csv.csv", csv),
+                target_table="t", csv_key="key", target_key="key",
+            )
+        assert report.float_key_warning, (
+            "a fractional CSV key column should produce a warning"
+        )
+
+    def test_merge_fractional_target_key_produces_warning():
+        from models.dataset import Dataset
+        ds = Dataset()
+        ds.create_table_from_df("t", pd.DataFrame({"key": [1.5, 2.5, 3.5]}))
+        csv = pd.DataFrame({"key": [1, 2], "score": [10, 20]})
+        with tempfile.TemporaryDirectory() as d:
+            report = ds.merge_csv(
+                _write_csv(d, "fractional_target.csv", csv),
+                target_table="t", csv_key="key", target_key="key",
+            )
+        assert report.float_key_warning, (
+            "a fractional target-table key column should produce a warning"
+        )
+
+    def test_merge_text_key_produces_no_warning():
+        from models.dataset import Dataset
+        ds = Dataset()
+        ds.create_table_from_df("t", pd.DataFrame({"key": ["a", "b", "c"]}))
+        csv = pd.DataFrame({"key": ["a", "b"], "score": [10, 20]})
+        with tempfile.TemporaryDirectory() as d:
+            report = ds.merge_csv(
+                _write_csv(d, "textkey.csv", csv),
+                target_table="t", csv_key="key", target_key="key",
+            )
+        assert report.float_key_warning is None, (
+            f"a text key should not produce a warning; "
+            f"got {report.float_key_warning!r}"
+        )
+
+    def test_merge_whole_number_int_key_produces_no_warning():
+        from models.dataset import Dataset
+        ds = Dataset()
+        ds.create_table_from_df("t", pd.DataFrame({"key": [1, 2, 3]}))
+        csv = pd.DataFrame({"key": [1, 2], "score": [10, 20]})
+        with tempfile.TemporaryDirectory() as d:
+            report = ds.merge_csv(
+                _write_csv(d, "intkey.csv", csv),
+                target_table="t", csv_key="key", target_key="key",
+            )
+        assert report.float_key_warning is None, (
+            f"a whole-number int key should not produce a warning; "
+            f"got {report.float_key_warning!r}"
+        )
+
+    def test_merge_whole_number_float_key_produces_no_warning():
+        # A column pandas stores as float64 but which holds only whole
+        # numbers (e.g. every value in the CSV had a trailing '.0', or the
+        # column round-tripped through a save that widened ints to float)
+        # must be told apart from a genuinely fractional column.
+        from models.dataset import Dataset
+        ds = Dataset()
+        ds.create_table_from_df(
+            "t", pd.DataFrame({"key": pd.Series([1.0, 2.0, 3.0], dtype="float64")})
+        )
+        csv = pd.DataFrame({"key": [1.0, 2.0], "score": [10, 20]})
+        with tempfile.TemporaryDirectory() as d:
+            path = _write_csv(d, "wholefloat.csv", csv)
+            # Confirm the CSV really round-trips as float64, the case this
+            # test exists to cover (pd.read_csv would infer int64 if every
+            # value lacked a decimal point, which would not exercise this
+            # path at all).
+            assert pd.read_csv(path)["key"].dtype.kind == "f"
+            report = ds.merge_csv(
+                path, target_table="t", csv_key="key", target_key="key",
+            )
+        assert report.float_key_warning is None, (
+            f"a float column holding only whole numbers should not produce "
+            f"a warning; got {report.float_key_warning!r}"
+        )
+
+    def test_merge_float_key_warning_does_not_block_the_merge():
+        from models.dataset import Dataset
+        ds = Dataset()
+        ds.create_table_from_df("t", pd.DataFrame({"key": [1.5, 2.5, 3.5]}))
+        csv = pd.DataFrame({"key": [1.5, 2.5, 3.5], "score": [10, 20, 30]})
+        with tempfile.TemporaryDirectory() as d:
+            report = ds.merge_csv(
+                _write_csv(d, "fractional_ok.csv", csv),
+                target_table="t", csv_key="key", target_key="key",
+            )
+            assert report.float_key_warning, (
+                "test setup: this merge should trigger the warning"
+            )
+            assert report.would_expand == [], (
+                "the warning must never be treated as an expansion refusal"
+            )
+            ds.confirm_merge(report)
+        t = ds.get_table("t")
+        assert "score" in t.columns, (
+            "confirm_merge must still commit the merge despite the warning"
+        )
+        assert list(t["score"]) == [10, 20, 30]
+
+    run_test(
+        "Fractional CSV key produces a warning",
+        test_merge_fractional_csv_key_produces_warning,
+    )
+    run_test(
+        "Fractional target key produces a warning",
+        test_merge_fractional_target_key_produces_warning,
+    )
+    run_test(
+        "Text key produces no warning",
+        test_merge_text_key_produces_no_warning,
+    )
+    run_test(
+        "Whole-number int key produces no warning",
+        test_merge_whole_number_int_key_produces_no_warning,
+    )
+    run_test(
+        "Whole-number float key produces no warning",
+        test_merge_whole_number_float_key_produces_no_warning,
+    )
+    run_test(
+        "Float key warning does not block the merge",
+        test_merge_float_key_warning_does_not_block_the_merge,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -567,7 +875,9 @@ else:
         from models.dataset import Dataset
         ds = Dataset()
         ds.load_folder(TEST_IMAGES)
-        report = ds.merge_csv(METADATA_CSV, join_on="file_name")
+        report = ds.merge_csv(
+            METADATA_CSV, target_table="frames", csv_key="file_name", target_key="file_name",
+        )
         ds.confirm_merge(report)
         ds.add_computed_column(
             "timestamp_doubled", "timestamp * 2", col_type="numeric"
@@ -579,7 +889,9 @@ else:
         from models.dataset import Dataset
         ds = Dataset()
         ds.load_folder(TEST_IMAGES)
-        report = ds.merge_csv(METADATA_CSV, join_on="file_name")
+        report = ds.merge_csv(
+            METADATA_CSV, target_table="frames", csv_key="file_name", target_key="file_name",
+        )
         ds.confirm_merge(report)
         ds.add_computed_column(
             "timestamp_doubled", "timestamp * 2", col_type="numeric"
@@ -609,7 +921,9 @@ else:
         from models.dataset import Dataset
         ds = Dataset()
         ds.load_folder(TEST_IMAGES)
-        report = ds.merge_csv(METADATA_CSV, join_on="file_name")
+        report = ds.merge_csv(
+            METADATA_CSV, target_table="frames", csv_key="file_name", target_key="file_name",
+        )
         ds.confirm_merge(report)
         ds.aggregate(
             name="by_condition",
@@ -625,7 +939,9 @@ else:
         from models.dataset import Dataset
         ds = Dataset()
         ds.load_folder(TEST_IMAGES)
-        report = ds.merge_csv(METADATA_CSV, join_on="file_name")
+        report = ds.merge_csv(
+            METADATA_CSV, target_table="frames", csv_key="file_name", target_key="file_name",
+        )
         ds.confirm_merge(report)
         ds.aggregate(
             name="by_condition",
@@ -640,7 +956,9 @@ else:
         from models.dataset import Dataset
         ds = Dataset()
         ds.load_folder(TEST_IMAGES)
-        report = ds.merge_csv(METADATA_CSV, join_on="file_name")
+        report = ds.merge_csv(
+            METADATA_CSV, target_table="frames", csv_key="file_name", target_key="file_name",
+        )
         ds.confirm_merge(report)
         ds.aggregate(
             name="by_condition",
@@ -655,7 +973,9 @@ else:
         from models.dataset import Dataset
         ds = Dataset()
         ds.load_folder(TEST_IMAGES)
-        report = ds.merge_csv(METADATA_CSV, join_on="file_name")
+        report = ds.merge_csv(
+            METADATA_CSV, target_table="frames", csv_key="file_name", target_key="file_name",
+        )
         ds.confirm_merge(report)
         ds.aggregate(
             name="by_condition",
@@ -674,7 +994,9 @@ else:
         from models.dataset import Dataset
         ds = Dataset()
         ds.load_folder(TEST_IMAGES)
-        report = ds.merge_csv(METADATA_CSV, join_on="file_name")
+        report = ds.merge_csv(
+            METADATA_CSV, target_table="frames", csv_key="file_name", target_key="file_name",
+        )
         ds.confirm_merge(report)
         ds.aggregate(
             name="by_session",
@@ -712,7 +1034,9 @@ else:
         from models.dataset import Dataset
         ds = Dataset()
         ds.load_folder(TEST_IMAGES)
-        report = ds.merge_csv(METADATA_CSV, join_on="file_name")
+        report = ds.merge_csv(
+            METADATA_CSV, target_table="frames", csv_key="file_name", target_key="file_name",
+        )
         ds.confirm_merge(report)
         return ds
 
@@ -1299,7 +1623,9 @@ def test_save_load_realistic_merge_roundtrip():
         project = Path(d) / "proj"
         ds = Dataset()
         ds.load_folder(TEST_IMAGES)
-        ds.confirm_merge(ds.merge_csv(METADATA_CSV, join_on="file_name"))
+        ds.confirm_merge(ds.merge_csv(
+            METADATA_CSV, target_table="frames", csv_key="file_name", target_key="file_name",
+        ))
         sch = ds.schema_for("frames")
         assert sch.spec_for("condition").type_tag == "text", (
             f"sanity: condition should be 'text' before save; got "

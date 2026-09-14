@@ -96,7 +96,9 @@ def test_wiring_load_csv_as_primary(tmp_path):
 def test_wiring_confirm_merge():
     ds = Dataset()
     ds.load_folder(TEST_IMAGES)
-    ds.confirm_merge(ds.merge_csv(METADATA_CSV, join_on="file_name"))
+    ds.confirm_merge(ds.merge_csv(
+        METADATA_CSV, target_table="frames", csv_key="file_name", target_key="file_name",
+    ))
     _assert_schema_matches_frame(ds, "frames")
 
 

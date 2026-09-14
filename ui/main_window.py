@@ -1220,13 +1220,26 @@ class MainWindow(QMainWindow):
         self._controller.load_csv_as_primary(csv_path, dialog.image_column)
 
     def _on_merge_csv(self) -> None:
-        """Opens a CSV file chooser for merging metadata."""
+        """
+        Opens a CSV file chooser for merging metadata onto the frames
+        table, matching the CSV's own file_name column.
+
+        P1.5a generalised Dataset.merge_csv() to accept any target table
+        and any pair of key columns, but this menu action does not yet
+        offer a picker for them -- it keeps merge_csv's previous fixed
+        behaviour (frames, file_name/file_name) explicit as arguments.
+        """
         path, _ = QFileDialog.getOpenFileName(
             self, "Merge CSV", "", "CSV files (*.csv)"
         )
         if path:
             from pathlib import Path
-            self._controller.load_csv(Path(path), join_on="file_name")
+            self._controller.load_csv(
+                Path(path),
+                target_table="frames",
+                csv_key="file_name",
+                target_key="file_name",
+            )
 
     def _on_save_project(self) -> None:
         """Opens a folder chooser for saving the project."""

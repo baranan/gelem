@@ -1781,19 +1781,25 @@ class AppController(QObject):
     def load_csv(
         self,
         csv_path: Path,
-        join_on: str,
+        target_table: str,
+        csv_key: str,
+        target_key: str,
         preprocess: dict | None = None,
     ) -> None:
         """
         Starts the CSV merge workflow.
 
         Args:
-            csv_path:   Path to the CSV file.
-            join_on:    Column name in the CSV to join on.
-            preprocess: Optional preprocessing rules.
+            csv_path:     Path to the CSV file.
+            target_table: Name of the table to merge the CSV onto.
+            csv_key:      Column name in the CSV to join on.
+            target_key:   Column name in target_table to join on.
+            preprocess:   Optional preprocessing rules.
         """
         try:
-            report = self._dataset.merge_csv(csv_path, join_on, preprocess)
+            report = self._dataset.merge_csv(
+                csv_path, target_table, csv_key, target_key, preprocess
+            )
             self.merge_report_ready.emit(report)
         except Exception as e:
             self.error_occurred.emit(f"Failed to read CSV: {e}")

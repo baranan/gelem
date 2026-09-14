@@ -5,11 +5,12 @@ A diagnostics dialog the researcher sees after starting a CSV merge,
 before any data is written. Replaces the old plain Yes/No QMessageBox.
 
 The dialog reads attributes off a MergeReport object — total counts
-plus four diagnostic lists (unmatched files, unmatched CSV rows,
-duplicate keys on each side). It does NOT import MergeReport itself,
-so ui/ stays inside the import boundary in ARCHITECTURE_RULES.md.
-The dialog uses duck-typing — anything with the expected attribute
-names will work.
+plus diagnostic lists (unmatched target rows, unmatched CSV rows,
+duplicate keys on each side, the keys that would have expanded the
+target table, and an advisory decimal-key warning). It does NOT import
+MergeReport itself, so ui/ stays inside the import boundary in
+ARCHITECTURE_RULES.md. The dialog uses duck-typing — anything with the
+expected attribute names will work.
 """
 
 from __future__ import annotations
@@ -34,23 +35,29 @@ class MergeReportDialog(QDialog):
     what would happen before committing the changes.
 
     Layout:
-        - Counts grid: total CSV rows, total image files, matched rows,
+        - Counts grid: total CSV rows, total target rows, matched rows,
           and four issue counts. Each issue count is colour-coded so
           problems jump out at a glance.
-        - Tabbed list of the actual problem rows (unmatched files,
-          unmatched CSV rows, duplicate keys on either side). Tabs
-          for empty issues are hidden so the dialog stays compact.
+        - Tabbed list of the actual problem rows (rows that would expand
+          the table, unmatched target rows, unmatched CSV rows,
+          duplicate keys on either side, and an advisory decimal-key
+          warning). Tabs for empty issues are hidden so the dialog stays
+          compact.
         - Proceed / Cancel buttons. The accepted attribute is True
-          after exec() returns Accepted; False otherwise.
+          after exec() returns Accepted; False otherwise. Proceed is
+          disabled only when the merge was refused (would_expand) --
+          there is nothing pending to commit then. The decimal-key
+          warning is advisory and never disables Proceed.
     """
 
     def __init__(self, report, parent=None):
         """
         Args:
             report: A MergeReport-like object with attributes
-                    total_csv_rows, total_image_files, matched_rows,
-                    unmatched_files, unmatched_csv_rows,
-                    duplicate_keys_files, duplicate_keys_csv.
+                    total_csv_rows, total_target_rows, matched_rows,
+                    unmatched_target_rows, unmatched_csv_rows,
+                    duplicate_keys_target, duplicate_keys_csv,
+                    would_expand, float_key_warning.
             parent: Parent widget.
         """
         super().__init__(parent)
@@ -61,12 +68,35 @@ class MergeReportDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
 
+        refused = bool(report.would_expand)
+
         # ── Header ────────────────────────────────────────────────────
-        header = QLabel("Review the merge before applying it")
-        header.setStyleSheet(
-            "font-weight: bold; font-size: 13px; color: #4A90D9;"
-        )
+        if refused:
+            header = QLabel(
+                f"Merge refused — {len(report.would_expand)} row(s) would "
+                f"expand the table"
+            )
+            header.setStyleSheet(
+                "font-weight: bold; font-size: 13px; color: #E53935;"
+            )
+        else:
+            header = QLabel("Review the merge before applying it")
+            header.setStyleSheet(
+                "font-weight: bold; font-size: 13px; color: #4A90D9;"
+            )
         layout.addWidget(header)
+
+        if refused:
+            explain = QLabel(
+                "Some rows in the CSV share a key that also matches one row "
+                "of the target table. Merging them would turn that one row "
+                "into several (row expansion), which this merge does not do "
+                "yet — it is planned as a separate feature. No changes have "
+                "been made."
+            )
+            explain.setWordWrap(True)
+            explain.setStyleSheet("font-size: 11px;")
+            layout.addWidget(explain)
 
         # ── Counts grid ──────────────────────────────────────────────
         layout.addWidget(self._build_counts_grid(report))
@@ -83,8 +113,8 @@ class MergeReportDialog(QDialog):
             layout.addWidget(tabs, stretch=1)
         else:
             ok_label = QLabel(
-                "No issues found — every CSV row matches an image file "
-                "and every image file matches a CSV row."
+                "No issues found — every CSV row matches a target row "
+                "and every target row matches a CSV row."
             )
             ok_label.setStyleSheet("color: #43A047; font-size: 11px;")
             ok_label.setWordWrap(True)
@@ -98,8 +128,13 @@ class MergeReportDialog(QDialog):
         cancel_btn.clicked.connect(self.reject)
         btn_row.addWidget(cancel_btn)
 
+        # A refused merge has nothing pending to commit (Dataset.merge_csv
+        # left _pending_df unset), so proceeding would be a silent no-op.
+        # Disabling the button here says so up front instead of letting the
+        # researcher click through into nothing happening.
         proceed_btn = QPushButton("Proceed with merge")
-        proceed_btn.setDefault(True)
+        proceed_btn.setDefault(not refused)
+        proceed_btn.setEnabled(not refused)
         proceed_btn.clicked.connect(self._on_proceed)
         btn_row.addWidget(proceed_btn)
 
@@ -110,7 +145,7 @@ class MergeReportDialog(QDialog):
     def _build_counts_grid(self, report) -> QWidget:
         """
         Builds the counts grid at the top of the dialog. Three top
-        counts on the first row (CSV rows, image files, matched), and
+        counts on the first row (CSV rows, target rows, matched), and
         the four issue counts on the second row, colour-coded.
         """
         wrap   = QWidget()
@@ -121,27 +156,27 @@ class MergeReportDialog(QDialog):
         # Row 0 — totals.
         grid.addWidget(self._stat("CSV rows",
                                   report.total_csv_rows), 0, 0)
-        grid.addWidget(self._stat("Image files",
-                                  report.total_image_files), 0, 1)
+        grid.addWidget(self._stat("Target rows",
+                                  report.total_target_rows), 0, 1)
         grid.addWidget(self._stat("Matched",
                                   report.matched_rows,
                                   good=report.matched_rows > 0), 0, 2)
 
         # Row 1 — issue counts. Bad-news counts are red when non-zero.
-        unmatched_files_n  = len(report.unmatched_files)
+        unmatched_target_n = len(report.unmatched_target_rows)
         unmatched_csv_n    = len(report.unmatched_csv_rows)
-        dup_files_n        = len(report.duplicate_keys_files)
+        dup_target_n       = len(report.duplicate_keys_target)
         dup_csv_n          = len(report.duplicate_keys_csv)
 
-        grid.addWidget(self._stat("Files w/o match",
-                                  unmatched_files_n,
-                                  bad=unmatched_files_n > 0), 1, 0)
-        grid.addWidget(self._stat("CSV rows w/o file",
+        grid.addWidget(self._stat("Target rows w/o match",
+                                  unmatched_target_n,
+                                  bad=unmatched_target_n > 0), 1, 0)
+        grid.addWidget(self._stat("CSV rows w/o match",
                                   unmatched_csv_n,
                                   bad=unmatched_csv_n > 0), 1, 1)
-        grid.addWidget(self._stat("Duplicate file keys",
-                                  dup_files_n,
-                                  bad=dup_files_n > 0), 1, 2)
+        grid.addWidget(self._stat("Duplicate target keys",
+                                  dup_target_n,
+                                  bad=dup_target_n > 0), 1, 2)
         grid.addWidget(self._stat("Duplicate CSV keys",
                                   dup_csv_n,
                                   bad=dup_csv_n > 0), 1, 3)
@@ -150,15 +185,20 @@ class MergeReportDialog(QDialog):
 
     def _build_issue_tabs(self, report) -> QTabWidget | None:
         """
-        Adds one tab per non-empty issue list. Returns None when all
-        four lists are empty so the caller can show a single "no
-        issues" line instead of an empty tab widget.
+        Adds one tab per non-empty issue list. Returns None when every
+        list is empty so the caller can show a single "no issues" line
+        instead of an empty tab widget.
         """
         sources = [
-            ("Files without a CSV match", report.unmatched_files),
-            ("CSV rows without a file",   report.unmatched_csv_rows),
-            ("Duplicate keys (files)",    report.duplicate_keys_files),
-            ("Duplicate keys (CSV)",      report.duplicate_keys_csv),
+            ("Would expand the table",        report.would_expand),
+            ("Target rows without a CSV match", report.unmatched_target_rows),
+            ("CSV rows without a target match", report.unmatched_csv_rows),
+            ("Duplicate keys (target)",         report.duplicate_keys_target),
+            ("Duplicate keys (CSV)",            report.duplicate_keys_csv),
+            # Advisory, not a refusal -- shown the same way (a tab with the
+            # message as its one row) but never affects whether Proceed is
+            # enabled; see the `refused` computation in __init__.
+            ("Decimal key warning", [report.float_key_warning] if report.float_key_warning else []),
         ]
 
         non_empty = [(t, items) for t, items in sources if items]

@@ -295,12 +295,20 @@ class FakeController(QObject):
     def load_folder(self, folder_path: Path) -> None:
         print(f"[FakeController] load_folder({folder_path}) — ignored in fake mode")
 
-    def load_csv(self, csv_path: Path, join_on: str, preprocess=None) -> None:
+    def load_csv(
+        self,
+        csv_path: Path,
+        target_table: str,
+        csv_key: str,
+        target_key: str,
+        preprocess=None,
+    ) -> None:
         print(f"[FakeController] load_csv({csv_path.name}) — fake merge")
         from models.dataset import MergeReport
         report = MergeReport(
+            target_table=target_table,
             total_csv_rows=len(self._row_ids),
-            total_image_files=len(self._row_ids),
+            total_target_rows=len(self._row_ids),
             matched_rows=len(self._row_ids),
         )
         self.merge_report_ready.emit(report)

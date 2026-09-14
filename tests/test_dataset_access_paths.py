@@ -330,14 +330,22 @@ def _case_add_column(ds, tmp_path):
     return "frames"
 
 
+def _merge_metadata_onto_frames(ds):
+    """Shared helper: merge metadata.csv onto frames on file_name/file_name,
+    the same join every merge-scaffolded case here used before P1.5a."""
+    ds.confirm_merge(ds.merge_csv(
+        METADATA_CSV, target_table="frames", csv_key="file_name", target_key="file_name",
+    ))
+
+
 def _case_add_computed_column(ds, tmp_path):
-    ds.confirm_merge(ds.merge_csv(METADATA_CSV, join_on="file_name"))
+    _merge_metadata_onto_frames(ds)
     ds.add_computed_column("probe", "timestamp * 2", "numeric", "frames")
     return "frames"
 
 
 def _case_confirm_merge(ds, tmp_path):
-    ds.confirm_merge(ds.merge_csv(METADATA_CSV, join_on="file_name"))
+    _merge_metadata_onto_frames(ds)
     return "frames"
 
 
@@ -353,7 +361,7 @@ def _case_create_table_from_df(ds, tmp_path):
 
 
 def _case_aggregate(ds, tmp_path):
-    ds.confirm_merge(ds.merge_csv(METADATA_CSV, join_on="file_name"))
+    _merge_metadata_onto_frames(ds)
     ds.aggregate(
         "agg", source_table="frames", group_by="condition",
         aggregations={"timestamp": "mean"},

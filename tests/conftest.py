@@ -90,7 +90,12 @@ def make_controller():
         dataset.load_folder(TEST_IMAGES)
         if merge_csv:
             dataset.confirm_merge(
-                dataset.merge_csv(METADATA_CSV, join_on="file_name")
+                dataset.merge_csv(
+                    METADATA_CSV,
+                    target_table="frames",
+                    csv_key="file_name",
+                    target_key="file_name",
+                )
             )
 
         op_registry = OperatorRegistry()

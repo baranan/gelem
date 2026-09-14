@@ -569,7 +569,9 @@ def test_two_media_columns_on_one_row_render_different_pictures(qapp, tmp_path):
     # so it renders through the same path as full_path.
     csv_path = tmp_path / "avatars.csv"
     csv_path.write_text(f"file_name,avatar_path\nred.png,{blue_path.as_posix()}\n")
-    dataset.confirm_merge(dataset.merge_csv(csv_path, join_on="file_name"))
+    dataset.confirm_merge(dataset.merge_csv(
+        csv_path, target_table="frames", csv_key="file_name", target_key="file_name",
+    ))
 
     row_id = controller.get_all_row_ids()[0]
     row = controller.get_row(row_id)

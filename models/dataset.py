@@ -58,17 +58,33 @@ class MergeReport:
     Produced by Dataset.merge_csv() before any changes are committed.
     Contains diagnostic information about the quality of the join so
     the researcher can decide whether to proceed.
+
+    Field names are table-neutral: merge_csv() can join a CSV onto any
+    table, not just 'frames', so nothing here says "image" or "file".
+
+    `would_expand` is populated only when the merge was refused because
+    it would have turned one target row into several (see merge_csv()'s
+    docstring) -- when it is non-empty, `_pending_df` is None and
+    confirm_merge() has nothing to commit.
+
+    `float_key_warning` is advisory, never a refusal: it is set whenever
+    either key column holds decimal numbers, because matching them
+    relies on exact equality and two values a researcher considers the
+    same may not match. It is set (or not) independently of would_expand
+    and never affects whether _pending_df is populated.
     """
+    target_table: str = ""
     total_csv_rows: int = 0
-    total_image_files: int = 0
+    total_target_rows: int = 0
     matched_rows: int = 0
-    unmatched_files: list[str] = field(default_factory=list)
+    unmatched_target_rows: list[str] = field(default_factory=list)
     unmatched_csv_rows: list[str] = field(default_factory=list)
-    duplicate_keys_files: list[str] = field(default_factory=list)
+    duplicate_keys_target: list[str] = field(default_factory=list)
     duplicate_keys_csv: list[str] = field(default_factory=list)
-    one_to_many: list[str] = field(default_factory=list)
+    would_expand: list[str] = field(default_factory=list)
     renamed_columns: dict = field(default_factory=dict)
     sample_problems: list[dict] = field(default_factory=list)
+    float_key_warning: str | None = None
 
     # The joined DataFrame, held privately until confirm_merge() is called.
     _pending_df: pd.DataFrame | None = field(default=None, repr=False)
@@ -76,11 +92,17 @@ class MergeReport:
 
     def summary(self) -> str:
         """Returns a human-readable summary string for display in the UI."""
+        if self.would_expand:
+            return (
+                f"Merge refused: {len(self.would_expand)} target row(s) each "
+                f"match more than one CSV row, which would expand the table. "
+                f"Row expansion is not supported by this merge yet."
+            )
         return (
             f"Matched: {self.matched_rows} rows | "
-            f"Unmatched files: {len(self.unmatched_files)} | "
+            f"Unmatched target rows: {len(self.unmatched_target_rows)} | "
             f"Unmatched CSV rows: {len(self.unmatched_csv_rows)} | "
-            f"Duplicates: {len(self.duplicate_keys_files)}"
+            f"Duplicates: {len(self.duplicate_keys_target)}"
         )
 
 
@@ -1072,22 +1094,100 @@ class Dataset:
     # CSV merging
     # ------------------------------------------------------------------
 
+    def _reserved_columns_for(self, table_name: str) -> list[str]:
+        """
+        The column names Dataset manages structurally for table_name and
+        which a CSV merge must not silently overwrite.
+
+        row_id is reserved for every table (models/table_schema.py never
+        sees it -- _SCHEMA_EXEMPT_COLUMNS is the one place that exemption
+        lives). The frames table additionally reserves full_path and
+        file_name: the columns load_folder() and load_csv_as_primary()
+        write and that the media address rewriting on save/load depends
+        on. No other table has Dataset-managed columns of its own today.
+        """
+        if table_name == "frames":
+            return list(self.FRAMES_REQUIRED_COLUMNS)
+        return ["row_id"]
+
+    def _has_fractional_values(self, series: pd.Series) -> bool:
+        """
+        True when series is stored as a floating-point dtype and holds at
+        least one non-null value with a nonzero fractional part -- e.g.
+        3.5, but not 3.0.
+
+        This is the whole-number/fractional distinction merge_csv() uses to
+        decide whether joining on this column deserves the decimal-key
+        warning. dtype.kind == 'f' catches every floating-point dtype
+        pandas can produce; `% 1 != 0` on the non-null values then catches
+        whether any of them is not a whole number. A float column holding
+        only whole numbers -- which pandas produces routinely, e.g. from a
+        single missing value in an otherwise-integer CSV column -- returns
+        False here, the same as a genuine int column would. Empty or
+        all-null columns also return False: there is nothing to warn about.
+        """
+        if series.dtype.kind != "f":
+            return False
+        non_null = series.dropna()
+        if non_null.empty:
+            return False
+        return bool((non_null % 1 != 0).any())
+
+    def _float_key_warning(
+        self, csv_key_values: pd.Series, target_key_values: pd.Series,
+    ) -> str | None:
+        """
+        Returns an advisory message when either key column holds decimal
+        numbers, or None when neither does.
+
+        Joining compares key values for exact equality. A decimal number
+        that looks the same as another to a researcher -- written by a
+        different tool, or round-tripped through a CSV -- can be off in
+        its last digit and silently fail to match: the merge then reports
+        fewer matched rows than expected without raising anything. This
+        warning exists so that number is not mistaken for missing data.
+        """
+        if (
+            self._has_fractional_values(csv_key_values)
+            or self._has_fractional_values(target_key_values)
+        ):
+            return (
+                "One of the merge key columns holds numbers with decimal "
+                "points. Matching compares these numbers exactly, so two "
+                "values that look the same may have been written slightly "
+                "differently and will fail to match. A text column or a "
+                "whole-number column is a safer choice for a merge key."
+            )
+        return None
+
     def merge_csv(
         self,
         csv_path: Path,
-        join_on: str,
+        target_table: str,
+        csv_key: str,
+        target_key: str,
         preprocess: dict | None = None,
     ) -> MergeReport:
         """
-        Performs a left join of the CSV onto the frames table.
-        Returns a MergeReport without committing any changes.
-        The researcher must call confirm_merge() after reviewing the report.
+        Performs a left join of the CSV onto target_table, matching
+        csv_key (a CSV column) against target_key (a column of
+        target_table). Returns a MergeReport without committing any
+        changes. The researcher must call confirm_merge() after
+        reviewing the report.
+
+        A target_key value that matches more than one row of
+        target_table is fine -- every matching row gets the CSV row's
+        values, nothing is duplicated. A csv_key value that appears on
+        more than one CSV row AND matches a target_key value is refused:
+        joining it would turn that one target row into several, which
+        this merge does not do (see docs/architecture.md §8, "Merging").
 
         Args:
-            csv_path:   Absolute path to the CSV file.
-            join_on:    Column name in the CSV to join on. Matched
-                        against file_name in the frames table.
-            preprocess: Optional preprocessing rules for key matching.
+            csv_path:     Absolute path to the CSV file.
+            target_table: Name of the table to merge the CSV onto.
+            csv_key:      Column name in the CSV to join on.
+            target_key:   Column name in target_table to join on.
+            preprocess:   Optional preprocessing rules for key matching.
 
         Returns:
             A MergeReport describing the quality of the join.
@@ -1096,73 +1196,99 @@ class Dataset:
         # Step 1: Read the CSV file into a DataFrame.
         csv_df = pd.read_csv(csv_path)
 
-        # Step 1a: The join column must exist in the CSV (it can be any
-        # column the caller chose, not necessarily file_name).
-        if join_on not in csv_df.columns:
+        # Step 1a: Both key columns must exist -- the CSV side is whatever
+        # the caller chose, and so is the target-table side.
+        if csv_key not in csv_df.columns:
             raise ValueError(
-                f"The CSV has no column '{join_on}' to merge on. "
+                f"The CSV has no column '{csv_key}' to merge on. "
                 f"Available columns: {', '.join(csv_df.columns)}."
             )
-
-        # Step 1b: Reject CSVs that reuse Gelem's reserved column names
-        # (the join_on column is allowed).
-        reserved = [
-            c for c in csv_df.columns
-            if c in self.FRAMES_REQUIRED_COLUMNS and c != join_on
-        ]
-        if reserved:
+        target_df = self._get_stored_table(target_table)
+        if target_key not in target_df.columns:
             raise ValueError(
-                f"The CSV contains column name(s) reserved by Gelem: "
-                f"{', '.join(reserved)}. The names "
-                f"{', '.join(self.FRAMES_REQUIRED_COLUMNS)} are used internally "
-                f"by Gelem. Please rename these columns in the CSV before merging."
+                f"Table '{target_table}' has no column '{target_key}' to "
+                f"merge on. Available columns: "
+                f"{', '.join(target_df.columns)}."
+            )
+
+        # Step 1b: Reject CSVs that reuse target_table's own reserved column
+        # names (the csv_key column is allowed).
+        reserved = self._reserved_columns_for(target_table)
+        bad_columns = [
+            c for c in csv_df.columns if c in reserved and c != csv_key
+        ]
+        if bad_columns:
+            raise ValueError(
+                f"The CSV contains column name(s) reserved by Gelem for "
+                f"table '{target_table}': {', '.join(bad_columns)}. The "
+                f"names {', '.join(reserved)} are used internally by "
+                f"Gelem. Please rename these columns in the CSV before "
+                f"merging."
             )
 
         # Step 2: apply preproccesing rules to the keys if needed.
         if preprocess is not None:
             pass # TODO: apply preprocessing rules TBD on.
 
-        # Step 2b: Reject one-to-many merges (a CSV key matching >1 image row
-        # would duplicate that image, e.g. 20 -> 40). Refuse, don't expand.
-        csv_counts    = csv_df[join_on].value_counts()
-        duplicate_csv = list(csv_counts[csv_counts > 1].index.astype(str))
-        frames_keys   = set(self._tables["frames"]["file_name"])
-        one_to_many   = [k for k in duplicate_csv if k in frames_keys]
-        if one_to_many:
+        # Step 2a: Advisory only -- never a refusal. Computed once here so
+        # it is attached to the report whichever way Step 2b/3 comes out.
+        float_key_warning = self._float_key_warning(
+            csv_df[csv_key], target_df[target_key]
+        )
+
+        # Step 2b: Refuse a merge that would EXPAND target_table -- a CSV key
+        # value that appears on more than one CSV row, where that value also
+        # names a target row, joins several CSV rows onto the one target row
+        # and multiplies it (e.g. one participant video row becoming forty
+        # trial rows). This is different from a target key that itself
+        # repeats (many target rows sharing one CSV row's values): that is
+        # the normal case -- every matching target row just gets the CSV
+        # row's values, nothing is duplicated -- and is allowed below.
+        # Compared in the keys' own dtype, not string form, so a numeric key
+        # column (e.g. an integer participant_id) matches correctly; only the
+        # values kept for display are stringified.
+        csv_counts       = csv_df[csv_key].value_counts()
+        duplicate_values = csv_counts[csv_counts > 1].index
+        target_keys      = set(target_df[target_key])
+        expand_values    = [v for v in duplicate_values if v in target_keys]
+        duplicate_csv    = [str(v) for v in duplicate_values]
+        would_expand     = [str(v) for v in expand_values]
+        if would_expand:
             report = MergeReport(
+                target_table=target_table,
                 total_csv_rows=len(csv_df),
-                total_image_files=len(self._tables["frames"]),
+                total_target_rows=len(target_df),
                 matched_rows=0,
                 duplicate_keys_csv=duplicate_csv,
-                one_to_many=one_to_many,
+                would_expand=would_expand,
+                float_key_warning=float_key_warning,
             )
             # _pending_df stays None, so confirm_merge() will not commit.
             return report
 
-        # Step 3: Left join the CSV onto the frames table. A column present in
+        # Step 3: Left join the CSV onto target_table. A column present in
         # BOTH (other than the keys) would collide, so we suffix them: existing
         # -> <name>_a, incoming -> <name>_b, keeping both instead of crashing.
-        frames_df = self._tables["frames"]
         collisions = [
             c for c in csv_df.columns
-            if c in frames_df.columns and c not in ("file_name", join_on)
+            if c in target_df.columns and c not in (target_key, csv_key)
         ]
-        joined = frames_df.merge(
+        joined = target_df.merge(
             csv_df,
-            left_on="file_name",
-            right_on=join_on,
+            left_on=target_key,
+            right_on=csv_key,
             how="left",
             suffixes=("_a", "_b"),
         )
         renamed_columns = {c: (f"{c}_a", f"{c}_b") for c in collisions}
 
         # Step 4: Calculate statistics and build the report. The CSV-side
-        # duplicate_csv and one_to_many were already computed in Step 2b and
+        # duplicate_csv and would_expand were already computed in Step 2b and
         # are reused in the report below. A collided column 'path' arrives in
         # the joined table as 'path_b', so new_columns uses the post-merge name.
         new_columns = [
             (f"{c}_b" if c in collisions else c)
-            for c in csv_df.columns if c != join_on
+            for c in csv_df.columns if c != csv_key
         ]
 
         if new_columns:
@@ -1170,26 +1296,30 @@ class Dataset:
         else:
             matched_mask = pd.Series([False] * len(joined))
 
-        unmatched_files = list(joined.loc[~matched_mask, "file_name"])
-        matched_keys    = set(frames_df.loc[matched_mask.values, "file_name"])
-        unmatched_csv   = list(
-            csv_df.loc[~csv_df[join_on].isin(matched_keys), join_on].astype(str)
+        # target_key is always excluded from the collision suffixing above
+        # (it is never treated as colliding with itself), so it keeps its
+        # own name in `joined` whether or not it equals csv_key.
+        unmatched_target_rows = list(joined.loc[~matched_mask, target_key])
+        matched_keys          = set(target_df.loc[matched_mask.values, target_key])
+        unmatched_csv         = list(
+            csv_df.loc[~csv_df[csv_key].isin(matched_keys), csv_key].astype(str)
         )
 
-        # Duplicate file names among the loaded images themselves (usually none).
-        file_counts     = frames_df["file_name"].value_counts()
-        duplicate_files = list(file_counts[file_counts > 1].index)
+        # Duplicate keys among target_table's own rows (usually none).
+        target_counts         = target_df[target_key].value_counts()
+        duplicate_keys_target = list(target_counts[target_counts > 1].index)
 
         report = MergeReport(
+            target_table=target_table,
             total_csv_rows=len(csv_df),
-            total_image_files=len(frames_df),
+            total_target_rows=len(target_df),
             matched_rows=int(matched_mask.sum()),
-            unmatched_files=unmatched_files,
+            unmatched_target_rows=unmatched_target_rows,
             unmatched_csv_rows=unmatched_csv,
-            duplicate_keys_files=duplicate_files,
+            duplicate_keys_target=duplicate_keys_target,
             duplicate_keys_csv=duplicate_csv,
-            one_to_many=one_to_many,
             renamed_columns=renamed_columns,
+            float_key_warning=float_key_warning,
         )
         report._pending_df  = joined
         report._new_columns = new_columns
@@ -1204,14 +1334,16 @@ class Dataset:
         """
         if report._pending_df is not None:
             self._accept_table(
-                "frames", report._pending_df.copy(), source="confirm_merge"
+                report.target_table, report._pending_df.copy(),
+                source="confirm_merge",
             )
 
         # P1.8d-2b-1: no ColumnTypeRegistry write. The merged-in columns are
         # tagged by the schema the accept above rebuilt.
-        self.provenance.record(
-            "confirm_merge", {"matched_rows": report.matched_rows}
-        )
+        self.provenance.record("confirm_merge", {
+            "target_table": report.target_table,
+            "matched_rows": report.matched_rows,
+        })
 
     # ------------------------------------------------------------------
     # Column operations
