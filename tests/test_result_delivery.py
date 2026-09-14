@@ -26,6 +26,7 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
+import pandas as pd
 import pytest
 
 from PySide6.QtWidgets import QApplication
@@ -45,9 +46,12 @@ from operators.descriptor import (
     OutputColumn,
     OutputSpec,
 )
+from operators.run_context import CancellationToken
 from controller import (
     AppController,
+    format_cancel_message,
     format_run_indicator_text,
+    numbered_run_choices,
     write_read_conflict_warnings,
 )
 
@@ -784,6 +788,10 @@ def test_operator_run_outcome_partial_on_unplaceable_rows(tmp_path):
     assert params["unplaceable_row_ids"] == ["no-such-row"]
     assert params["unplaceable_row_count"] == 1
     assert params["rows_applied"] == 0
+    # run-indicator-3-fix: nobody clicked Cancel here (_register_run was
+    # never given a token) -- "partial" is entirely the unplaceable row's
+    # doing, and cancellation_requested must say so.
+    assert params["cancellation_requested"] is False
 
 
 def test_operator_run_outcome_partial_after_setup_error(tmp_path):
@@ -1443,3 +1451,302 @@ def test_run_dot_log_reaches_get_live_runs_through_the_real_wiring(tmp_path):
     controller._drain_queues()
 
     assert _message_for(controller, "op-real") == "clip 1 of 1"
+
+
+# ===========================================================================
+# run-indicator-3: the Cancel control.
+#
+# AppController.cancel_run(), _run_outcome()'s cancellation check, and the
+# discard-on-arrival behaviour for TABLE/DISPLAY are all exercised here by
+# driving the controller's registry and queues directly -- the same style
+# section 10 above uses -- so each test isolates what THE CONTROLLER does
+# once a run's token is cancelled. Whether the COLUMNS row loop itself
+# actually stops between rows (operators/operator_registry.py) is a
+# separate concern, end-to-end tested in tests/test_run_cancellation.py.
+#
+# Written from the work-item specification, not the implementation.
+# ===========================================================================
+
+def test_cancel_run_sets_the_lives_runs_token(tmp_path):
+    controller, _dataset, _op_registry = _make_controller(tmp_path)
+    token = CancellationToken()
+    controller._register_run("op-1", "Probe", "frames", token=token)
+
+    controller.cancel_run("op-1")
+
+    # Would still pass if violated? No. A version that did nothing, or
+    # that flipped some OTHER run's token, would leave this token
+    # uncancelled.
+    assert token.is_cancelled() is True
+
+
+def test_cancel_run_on_an_id_that_is_not_live_is_a_noop_and_raises_nothing(
+    tmp_path,
+):
+    # Required by the work item: the run may have finished (or never
+    # existed) between the researcher's click and this call arriving.
+    controller, _dataset, _op_registry = _make_controller(tmp_path)
+    token = CancellationToken()
+    controller._register_run("op-1", "Probe", "frames", token=token)
+    controller._deregister_run("op-1")   # the run already finished
+
+    controller.cancel_run("op-1")             # must not raise
+    controller.cancel_run("never-registered")  # must not raise either
+
+    # Would still pass if violated? No. A version that looked up the id
+    # and raised KeyError on a miss would never reach this line. A
+    # version that cancelled SOME live run regardless of id would leave
+    # this token (still held here, though no longer in _live_runs)
+    # flipped -- it is not, because cancel_run() only ever reads
+    # _live_runs, which no longer holds "op-1".
+    assert token.is_cancelled() is False
+
+
+def test_get_live_runs_returns_runs_in_registration_order(tmp_path):
+    # run-indicator-3's Cancel picker numbers live runs "1.", "2." and so
+    # on for the researcher to tell apart -- meaningless unless this order
+    # really is the order the runs started, survives a deregister in the
+    # middle, and is not just an accident of today's dict iteration.
+    controller, _dataset, _op_registry = _make_controller(tmp_path)
+    controller._register_run("op-1", "First", "frames")
+    controller._register_run("op-2", "Second", "frames")
+    controller._register_run("op-3", "Third", "frames")
+    controller._deregister_run("op-2")
+    controller._register_run("op-4", "Fourth", "frames")
+
+    ids = [run["operation_id"] for run in controller.get_live_runs()]
+
+    # Would still pass if violated? No. A version that sorted by label,
+    # or that re-inserted a deregistered id's slot for the next
+    # registration, would produce a different order here.
+    assert ids == ["op-1", "op-3", "op-4"]
+
+
+def test_cancelled_columns_run_keeps_applied_rows_and_is_recorded_partial(
+    tmp_path,
+):
+    # Pins the work item's central guarantee: a COLUMNS run cancelled
+    # after some rows were already applied keeps those rows' values (they
+    # are never rolled back) and is recorded "partial" -- not "complete"
+    # (it did not process every row it was asked to) and not "failed"
+    # (nothing errored; the rows it produced are real, kept results).
+    #
+    # run-indicator-3-fix: "partial" here comes from actually applying
+    # fewer rows than requested (2 of 5), NOT from cancellation alone --
+    # see test_cancelled_columns_run_that_applied_every_row_is_recorded_complete
+    # below for the case that tells the two apart. cancellation_requested
+    # records the separate fact that Cancel was clicked, regardless of
+    # what the outcome turned out to be.
+    controller, dataset, _ = _make_controller(tmp_path)
+    row_ids = controller.get_visible_row_ids()[:5]
+    start_version = dataset.table_version("frames")
+
+    op_id = "op-cancelled"
+    token = CancellationToken()
+    controller._register_run(
+        op_id, "Probe", "frames",
+        operator_name="probe", mode_name="COLUMNS", target_table="frames",
+        rows_requested=len(row_ids),
+        inputs={"active_table": {"table": "frames", "version": start_version}},
+        token=token,
+    )
+
+    # Only 2 of the 5 requested rows were processed before the researcher
+    # clicked Cancel; the per-row runner's between-rows check is what
+    # would stop it there in the real wiring (see
+    # tests/test_run_cancellation.py for that end-to-end behaviour). Here
+    # we feed the controller exactly what such a worker would have handed
+    # it: two results, then cancellation, then a completion reporting only
+    # those two as emitted.
+    cancelled_ids = row_ids[:2]
+    for i, rid in enumerate(cancelled_ids):
+        controller._on_item_complete(op_id, "frames", rid, {"probe": i})
+    controller.cancel_run(op_id)
+    controller._on_create_columns_complete(op_id, "probe", len(cancelled_ids))
+    controller._drain_queues()
+
+    # The two rows the run did produce keep their new values -- nothing
+    # already written is undone.
+    frames_after = dataset.get_table("frames").set_index("row_id")
+    for i, rid in enumerate(cancelled_ids):
+        assert frames_after.loc[rid, "probe"] == i
+
+    entries = _operator_run_entries(dataset)
+    assert len(entries) == 1
+    params = entries[0]["params"]
+    assert params["rows_applied"] == len(cancelled_ids)
+    assert params["outcome"] == "partial"
+    assert params["cancellation_requested"] is True
+    assert op_id not in controller._live_runs
+
+
+def test_cancelled_columns_run_that_applied_every_row_is_recorded_complete(
+    tmp_path,
+):
+    # run-indicator-3-fix RULING: outcome describes what the run
+    # PRODUCED, not what the researcher asked for. A COLUMNS run that
+    # applied every row it was asked to is "complete" even if Cancel was
+    # clicked -- e.g. after the last row had already finished, before the
+    # controller got a chance to process the completion. Recording that
+    # as "partial" would write a false "this is incomplete" into
+    # provenance a researcher may read long after the session ended.
+    # cancellation_requested still records that the click happened, so
+    # that fact is not lost either.
+    controller, dataset, _ = _make_controller(tmp_path)
+    row_ids = controller.get_visible_row_ids()[:3]
+    start_version = dataset.table_version("frames")
+
+    op_id = "op-cancelled-too-late"
+    token = CancellationToken()
+    controller._register_run(
+        op_id, "Probe", "frames",
+        operator_name="probe", mode_name="COLUMNS", target_table="frames",
+        rows_requested=len(row_ids),
+        inputs={"active_table": {"table": "frames", "version": start_version}},
+        token=token,
+    )
+
+    # Every requested row was applied BEFORE cancel_run() is called --
+    # standing in for a Cancel click that reaches the controller only
+    # after the worker thread had already finished every row.
+    for i, rid in enumerate(row_ids):
+        controller._on_item_complete(op_id, "frames", rid, {"probe": i})
+    controller.cancel_run(op_id)
+    controller._on_create_columns_complete(op_id, "probe", len(row_ids))
+    controller._drain_queues()
+
+    # Would still pass if violated? No. Deriving "partial" from
+    # cancellation alone (the pre-fix behaviour) would report "partial"
+    # here even though every requested row was actually applied; this
+    # asserts "complete" specifically.
+    entries = _operator_run_entries(dataset)
+    assert len(entries) == 1
+    params = entries[0]["params"]
+    assert params["rows_applied"] == len(row_ids)
+    assert params["outcome"] == "complete"
+    assert params["cancellation_requested"] is True
+
+
+def test_cancelled_create_table_result_is_discarded_and_recorded_partial(
+    tmp_path,
+):
+    # TABLE mode is single-shot: the runner cannot interrupt it, so
+    # cancelling one does not stop the work. Its finished result must be
+    # discarded when it arrives rather than stored -- an honest limit, not
+    # a bug -- and the run is still recorded "partial", never "complete".
+    controller, dataset, _ = _make_controller(tmp_path)
+    tables_before = dataset.list_tables()
+
+    op_id = "op-table-cancelled"
+    token = CancellationToken()
+    controller._register_run(
+        op_id, "Mean face", "frames",
+        operator_name="mean_face", mode_name="TABLE", target_table="",
+        token=token,
+    )
+    controller.cancel_run(op_id)
+
+    errors: list[str] = []
+    controller.error_occurred.connect(errors.append)
+    tables_updated: list[list[str]] = []
+    controller.tables_updated.connect(tables_updated.append)
+
+    result_df = pd.DataFrame({"x": [1, 2, 3]})
+    controller._on_operator_complete(
+        "create_table", (op_id, "mean_face", result_df)
+    )
+
+    # Would still pass if violated? No. A version that stored the result
+    # before checking cancellation would add "mean_face_result" to the
+    # table list and emit tables_updated; neither happens here.
+    assert dataset.list_tables() == tables_before
+    assert tables_updated == []
+    assert op_id not in controller._live_runs
+    assert any("cancelled" in e.lower() for e in errors)
+
+    entries = _operator_run_entries(dataset)
+    assert len(entries) == 1
+    assert entries[0]["params"]["outcome"] == "partial"
+    # run-indicator-3-fix ruling item 4: a discarded single-shot result
+    # produced nothing, so this stays "partial" -- unlike COLUMNS, there
+    # is no "cancelled but still complete" case for TABLE/DISPLAY in this
+    # codebase, because the store-or-discard decision and this outcome
+    # come from the exact same cancellation check at the exact same
+    # moment (see AppController._run_outcome's docstring).
+    assert entries[0]["params"]["cancellation_requested"] is True
+
+
+def test_cancelled_create_display_result_is_discarded_and_recorded_partial(
+    tmp_path,
+):
+    # Same "cannot interrupt, discard on arrival" limit as TABLE mode
+    # above, for DISPLAY.
+    controller, dataset, _ = _make_controller(tmp_path)
+
+    op_id = "op-display-cancelled"
+    token = CancellationToken()
+    controller._register_run(
+        op_id, "Summary stats", "frames",
+        operator_name="summary_stats", mode_name="DISPLAY", target_table="",
+        token=token,
+    )
+    controller.cancel_run(op_id)
+
+    shown: list[dict] = []
+    controller.display_result_ready.connect(shown.append)
+    errors: list[str] = []
+    controller.error_occurred.connect(errors.append)
+
+    controller._on_operator_complete(
+        "create_display", (op_id, "summary_stats", {"summary": {}})
+    )
+
+    assert shown == []
+    assert op_id not in controller._live_runs
+    assert any("cancelled" in e.lower() for e in errors)
+
+    entries = _operator_run_entries(dataset)
+    assert len(entries) == 1
+    assert entries[0]["params"]["outcome"] == "partial"
+    assert entries[0]["params"]["cancellation_requested"] is True
+
+
+# ---------------------------------------------------------------------------
+# run-indicator-3: numbered_run_choices() and format_cancel_message(), the
+# Qt-free wording and numbering ui/main_window.py's Cancel control reads
+# from rather than composing itself.
+# ---------------------------------------------------------------------------
+
+def test_numbered_run_choices_numbers_in_start_order():
+    live_runs = [
+        {
+            "operation_id": "op-1", "label": "Extract blendshapes",
+            "table_name": "frames",
+        },
+        {
+            "operation_id": "op-2", "label": "Extract blendshapes",
+            "table_name": "frames",
+        },
+    ]
+
+    choices = numbered_run_choices(live_runs)
+
+    assert [op_id for op_id, _label, _text in choices] == ["op-1", "op-2"]
+    assert [label for _op_id, label, _text in choices] == [
+        "Extract blendshapes", "Extract blendshapes",
+    ]
+    # Would still pass if violated? No. Without the number, two runs of
+    # the same operator on the same table would produce identical display
+    # text -- exactly the ambiguity numbering exists to remove.
+    _op1, _label1, text1 = choices[0]
+    _op2, _label2, text2 = choices[1]
+    assert text1 != text2
+    assert text1.startswith("1.")
+    assert text2.startswith("2.")
+
+
+def test_format_cancel_message_names_the_run_and_says_nothing_is_undone():
+    message = format_cancel_message("Extract blendshapes")
+
+    assert "Extract blendshapes" in message
+    assert "undone" in message

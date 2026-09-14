@@ -542,6 +542,16 @@ class FakeController(QObject):
         """
         return []
 
+    def cancel_run(self, operation_id: str) -> None:
+        """
+        Mirrors AppController.cancel_run() (run-indicator-3;
+        tests/test_fake_controller_contract.py fails without this). There
+        is no live-run registry in fake mode (see get_live_runs() above),
+        so there is never a live run to cancel -- the same no-op the real
+        controller documents for an operation_id that is not live.
+        """
+        print(f"[FakeController] cancel_run({operation_id}) — fake, no-op")
+
     # Settings pass-throughs -- mirror AppController.get_settings_fields
     # and apply_settings so --fake-data does not crash when settings UI
     # calls them. There is no settings store in fake mode, so both are

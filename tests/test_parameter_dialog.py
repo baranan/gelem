@@ -1093,26 +1093,34 @@ def test_accepting_a_conflict_starts_the_run(qapp, monkeypatch):
 # Written from the work-item specification, not the implementation.
 # ===========================================================================
 
-from PySide6.QtWidgets import QLabel
+from PySide6.QtWidgets import QLabel, QPushButton
 
 
 class _LiveRunsController:
-    """Just get_live_runs() -- the one thing _refresh_run_indicator()
-    reads from the controller."""
+    """get_live_runs() -- the one thing _refresh_run_indicator() reads
+    from the controller -- plus (run-indicator-3) cancel_run(), recording
+    every call instead of doing anything real."""
 
     def __init__(self, live_runs=None):
         self._live_runs = list(live_runs or [])
+        self.cancel_run_calls: list[str] = []
 
     def get_live_runs(self):
         return list(self._live_runs)
 
+    def cancel_run(self, operation_id):
+        self.cancel_run_calls.append(operation_id)
+
 
 def _indicator_window(controller):
     """A MainWindow with no __init__ run, carrying just the run-indicator
-    state _build_status_bar() would have created."""
+    state _build_status_bar() would have created -- the label
+    (run-indicator-1/2) and, since run-indicator-3, the Cancel button
+    beside it."""
     window = MainWindow.__new__(MainWindow)
     window._controller = controller
     window._run_indicator_label = QLabel()
+    window._cancel_run_button = QPushButton()
     window._latest_run_percent = None
     return window
 
@@ -1246,3 +1254,173 @@ def test_indicator_label_reflects_a_message_update_on_refresh(qapp):
     window._refresh_run_indicator()
 
     assert "no face detected in row r7" in window._run_indicator_label.text()
+
+
+# ===========================================================================
+# run-indicator-3: the Cancel control, at the same MainWindow seam.
+#
+# controller.py's cancel_run(), numbered_run_choices() and
+# format_cancel_message() are covered by tests/test_result_delivery.py --
+# these tests pin only the widget wiring: the Cancel button's visibility
+# mirrors the run-indicator label's, a single live run is cancelled
+# directly with no picker shown, more than one live run shows a pick-one
+# dialog built from numbered_run_choices(), and dismissing that dialog
+# cancels nothing.
+#
+# Written from the work-item specification, not the implementation.
+# ===========================================================================
+
+from controller import numbered_run_choices as _numbered_run_choices
+
+
+def _fake_input_dialog(chosen_text, ok):
+    """A QInputDialog stand-in: records every getItem() call and always
+    returns (chosen_text, ok) instead of showing a real modal dialog."""
+    calls: list = []
+
+    class _FakeQInputDialog:
+        @staticmethod
+        def getItem(parent, title, label, items, current=0, editable=True):
+            calls.append(
+                {"title": title, "label": label, "items": list(items)}
+            )
+            return chosen_text, ok
+
+    return _FakeQInputDialog, calls
+
+
+def _fake_information_box():
+    """A QMessageBox stand-in carrying only .information(), the one
+    QMessageBox member _on_cancel_run_clicked() calls."""
+    calls: list = []
+
+    class _FakeQMessageBox:
+        @staticmethod
+        def information(parent, title, text):
+            calls.append({"title": title, "text": text})
+
+    return _FakeQMessageBox, calls
+
+
+def test_cancel_button_hidden_with_no_live_runs(qapp):
+    window = _indicator_window(_LiveRunsController([]))
+
+    window._refresh_run_indicator()
+
+    assert window._cancel_run_button.isHidden() is True
+
+
+def test_cancel_button_shown_with_one_live_run(qapp):
+    controller = _LiveRunsController(
+        [{
+            "operation_id": "op-1", "label": "Extract blendshapes",
+            "table_name": "frames",
+        }]
+    )
+    window = _indicator_window(controller)
+
+    window._refresh_run_indicator()
+
+    assert window._cancel_run_button.isHidden() is False
+
+
+def test_clicking_cancel_with_no_live_runs_does_nothing(qapp, monkeypatch):
+    controller = _LiveRunsController([])
+    window = _indicator_window(controller)
+    fake_input_dialog, input_calls = _fake_input_dialog("unused", True)
+    fake_message_box, info_calls = _fake_information_box()
+    monkeypatch.setattr(main_window_module, "QInputDialog", fake_input_dialog)
+    monkeypatch.setattr(main_window_module, "QMessageBox", fake_message_box)
+
+    window._on_cancel_run_clicked()
+
+    assert controller.cancel_run_calls == []
+    assert input_calls == []
+    assert info_calls == []
+
+
+def test_clicking_cancel_with_one_live_run_cancels_it_directly(
+    qapp, monkeypatch,
+):
+    controller = _LiveRunsController(
+        [{
+            "operation_id": "op-1", "label": "Extract blendshapes",
+            "table_name": "frames",
+        }]
+    )
+    window = _indicator_window(controller)
+    fake_input_dialog, input_calls = _fake_input_dialog("unused", True)
+    fake_message_box, info_calls = _fake_information_box()
+    monkeypatch.setattr(main_window_module, "QInputDialog", fake_input_dialog)
+    monkeypatch.setattr(main_window_module, "QMessageBox", fake_message_box)
+
+    window._on_cancel_run_clicked()
+
+    # Would still pass if violated? No. Showing the picker even with only
+    # one live run would leave input_calls non-empty; this asserts it is
+    # skipped entirely and the single run is cancelled straight away.
+    assert input_calls == []
+    assert controller.cancel_run_calls == ["op-1"]
+    assert len(info_calls) == 1
+    assert "Extract blendshapes" in info_calls[0]["text"]
+
+
+def test_clicking_cancel_with_two_live_runs_shows_a_numbered_picker(
+    qapp, monkeypatch,
+):
+    controller = _LiveRunsController([
+        {
+            "operation_id": "op-1", "label": "Extract blendshapes",
+            "table_name": "frames",
+        },
+        {
+            "operation_id": "op-2", "label": "Extract blendshapes",
+            "table_name": "frames",
+        },
+    ])
+    window = _indicator_window(controller)
+    # Two runs of the same operator on the same table read identically
+    # without the numbering -- pick the SECOND numbered entry and assert
+    # it is op-2, not op-1, that gets cancelled.
+    expected_choices = _numbered_run_choices(controller.get_live_runs())
+    chosen_text = expected_choices[1][2]
+    fake_input_dialog, input_calls = _fake_input_dialog(chosen_text, True)
+    fake_message_box, info_calls = _fake_information_box()
+    monkeypatch.setattr(main_window_module, "QInputDialog", fake_input_dialog)
+    monkeypatch.setattr(main_window_module, "QMessageBox", fake_message_box)
+
+    window._on_cancel_run_clicked()
+
+    assert len(input_calls) == 1
+    assert input_calls[0]["items"] == [
+        text for _op_id, _label, text in expected_choices
+    ]
+    assert controller.cancel_run_calls == ["op-2"]
+    assert len(info_calls) == 1
+
+
+def test_dismissing_the_picker_cancels_nothing(qapp, monkeypatch):
+    controller = _LiveRunsController([
+        {
+            "operation_id": "op-1", "label": "Extract blendshapes",
+            "table_name": "frames",
+        },
+        {
+            "operation_id": "op-2", "label": "Extract blendshapes",
+            "table_name": "frames",
+        },
+    ])
+    window = _indicator_window(controller)
+    fake_input_dialog, input_calls = _fake_input_dialog("does not matter", False)
+    fake_message_box, info_calls = _fake_information_box()
+    monkeypatch.setattr(main_window_module, "QInputDialog", fake_input_dialog)
+    monkeypatch.setattr(main_window_module, "QMessageBox", fake_message_box)
+
+    window._on_cancel_run_clicked()
+
+    # Would still pass if violated? No. A version that cancelled the
+    # first (or any) run regardless of the dialog's "ok" flag would leave
+    # cancel_run_calls non-empty here.
+    assert len(input_calls) == 1
+    assert controller.cancel_run_calls == []
+    assert info_calls == []

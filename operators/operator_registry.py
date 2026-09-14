@@ -483,6 +483,16 @@ class OperatorRegistry:
             return
 
         for i, row_id in enumerate(row_ids):
+            # P1.12f-3: check for cancellation BETWEEN rows, never mid-row
+            # -- an operator's own row work is its own business (CLAUDE.md,
+            # "Long-running work"). Every result already handed to
+            # on_item_complete for an earlier row stays in it; this only
+            # stops the loop from starting the next one. `emitted` ends up
+            # smaller than `total`, and AppController._run_outcome()
+            # separately checks the same token to record this run
+            # "partial" once its completion arrives.
+            if run.cancelled():
+                break
             metadata = snapshot.iloc[i].to_dict()
             try:
                 full_path = metadata.get("full_path", "")

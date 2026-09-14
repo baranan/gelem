@@ -1630,8 +1630,10 @@ class Dataset:
         unplaceable_row_ids: list,
         outcome: str,
         superseded_tables: list,
+        cancellation_requested: bool = False,
     ) -> None:
-        """Records one operator run in the provenance log (P1.12f-1).
+        """Records one operator run in the provenance log (P1.12f-1;
+        cancellation_requested added by run-indicator-3-fix).
 
         Dataset is the only component that writes self.provenance
         (CLAUDE.md, "Data ownership"); AppController calls this rather
@@ -1672,25 +1674,39 @@ class Dataset:
                                   wrote to, from the version recorded at
                                   run start. Empty when nothing moved
                                   under the run.
+            cancellation_requested: Whether the researcher clicked Cancel
+                                  for this run (AppController.cancel_run()),
+                                  recorded independently of outcome:
+                                  outcome describes what the run PRODUCED,
+                                  and a cancelled run that still produced
+                                  everything it was asked for is
+                                  "complete" -- this field is what keeps
+                                  the fact that cancellation was requested
+                                  from being lost in that case. Defaults
+                                  to False so a caller recording a run
+                                  that was never cancelled (every caller
+                                  before run-indicator-3-fix) need not
+                                  mention it.
 
         Every value stored here must be JSON-serialisable: save() writes
         the whole provenance log with json.dumps.
         """
         self.provenance.record("operator_run", {
-            "operator":              operator_name,
-            "mode":                  mode,
-            "label":                 label,
-            "parameters":            dict(parameters),
-            "target_table":          target_table,
+            "operator":               operator_name,
+            "mode":                   mode,
+            "label":                  label,
+            "parameters":             dict(parameters),
+            "target_table":           target_table,
             "inputs": {
                 name: dict(info) for name, info in inputs.items()
             },
-            "rows_requested":        rows_requested,
-            "rows_applied":          rows_applied,
-            "unplaceable_row_ids":   list(unplaceable_row_ids),
-            "unplaceable_row_count": len(unplaceable_row_ids),
-            "outcome":               outcome,
-            "superseded_tables":     list(superseded_tables),
+            "rows_requested":         rows_requested,
+            "rows_applied":           rows_applied,
+            "unplaceable_row_ids":    list(unplaceable_row_ids),
+            "unplaceable_row_count":  len(unplaceable_row_ids),
+            "outcome":                outcome,
+            "superseded_tables":      list(superseded_tables),
+            "cancellation_requested": cancellation_requested,
         })
 
     def take_schema_messages(self) -> list[str]:

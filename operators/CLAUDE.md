@@ -325,14 +325,14 @@ the old `plot_html` fallback).
   Dataset validates and normalises a table against its schema when it accepts it.
 - **`[TARGET -> P1.2]` Never open a media file.** Use the resolver -- see
   `docs/media_architecture.md`.
-- **`[TARGET -> P1.12f-3]` Long runs must be cancellable, keeping partial
-  results.** `CLAUDE.md`, "Long-running work", is the authority for what is
-  built (the token, carried on `run` as `run.cancelled()`) and what is not
-  (nothing calls `token.cancel()` yet); not restated here. What this means for
-  an operator: check `run.cancelled()` between units of work and return
-  promptly -- the check itself already does something once P1.12f-3 wires a
-  caller to `token.cancel()`, so writing it now costs nothing and is not
-  premature.
+- **`[NOW]` Long runs are cancellable, keeping partial results.** Made true
+  by P1.12f-3. `CLAUDE.md`, "Long-running work", is the authority for what
+  `AppController.cancel_run()` does and how each mode responds; not
+  restated here. What this means for an operator: check `run.cancelled()`
+  between units of work and return promptly. The per-row COLUMNS runner
+  already does this for `create_columns()`, between rows -- an
+  `iter_column_updates` (`[TARGET -> P2.1]`) implementation must do the same
+  between whatever unit it yields at, once it exists.
 - **`[TARGET -> P2.2]` Resumability is a separate, narrower promise.** See
   "Resuming a run" below. Do not state the two as one property.
 

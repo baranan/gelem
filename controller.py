@@ -209,6 +209,60 @@ def format_run_indicator_text(
     return f"{len(live_runs)} operators running: {', '.join(parts)}"
 
 
+# ---------------------------------------------------------------------------
+# run-indicator-3: the Cancel control. Pure, Qt-free wording and numbering --
+# ui/main_window.py builds the pick-one dialog and the confirmation from
+# these, rather than composing either itself, so a future change to the
+# wording or the numbering rule touches one place.
+# ---------------------------------------------------------------------------
+
+def numbered_run_choices(live_runs: list[dict]) -> list[tuple[str, str, str]]:
+    """(operation_id, label, display_text) for every live run, numbered in
+    the order they started.
+
+    live_runs must already be in start order -- exactly what
+    AppController.get_live_runs() returns, because _live_runs is a plain
+    dict keyed by operation_id, populated by _register_run and only ever
+    popped (never reinserted) by _deregister_run, so its iteration order is
+    insertion order, i.e. the order runs started.
+
+    The numbering exists because two runs of the same operator on the same
+    table read identically without it -- "Extract blendshapes on frames"
+    twice tells the researcher nothing about which is which. With this,
+    a Cancel control showing more than one live run can offer "1. ... on
+    ..." and "2. ... on ..." instead.
+    """
+    return [
+        (
+            run["operation_id"],
+            run["label"],
+            f'{i}. "{run["label"]}" on "{run["table_name"]}"',
+        )
+        for i, run in enumerate(live_runs, start=1)
+    ]
+
+
+def format_cancel_message(label: str) -> str:
+    """The plain sentence shown to the researcher once they have requested
+    cancellation of the run named label (run-indicator-3).
+
+    Worded the same for every mode rather than naming COLUMNS / TABLE /
+    DISPLAY, because it must be an honest, plain description of BOTH: a
+    COLUMNS run keeps every row it already wrote and stops before starting
+    the next one (AppController.cancel_run(), the per-row runner checks
+    between rows); a TABLE or DISPLAY run cannot be interrupted
+    mid-computation and instead has its finished result discarded when it
+    arrives, rather than stored or shown. "Nothing already written is
+    undone" and "nothing still in progress will be saved" are both true
+    sentences under either outcome.
+    """
+    return (
+        f'Cancelling "{label}". Nothing already written to the table is '
+        f"undone. Any work still in progress when it stops will not be "
+        f"saved."
+    )
+
+
 class AppController(QObject):
     """
     Wires together Dataset, QueryEngine, ArtifactStore,
@@ -455,10 +509,12 @@ class AppController(QObject):
         declared, not by value inference. Empty for create_table /
         create_display runs, which create no per-row columns.
 
-        token is the run's CancellationToken (P1.12d-2a). Nothing cancels
-        yet -- it is kept here because it is the handle P1.12f's Cancel
-        button will call token.cancel() on, and removing a run from
-        _live_runs is already the shape a cancellation takes.
+        token is the run's CancellationToken (P1.12d-2a), kept here so
+        cancel_run() (P1.12f-3) has something to call .cancel() on by
+        operation_id. Nothing reads it back off this dict except
+        cancel_run() and _run_was_cancelled() -- the row loop that reacts
+        to it is handed the SAME token object through the OperatorRun this
+        run was built with, not through _live_runs.
 
         The keyword-only arguments (P1.12f-1) carry everything
         Dataset.record_operator_run() needs at arrival that is not
@@ -537,16 +593,27 @@ class AppController(QObject):
         Returns one
         {"operation_id": str, "label": str, "table_name": str,
          "message": str | None}
-        dict per live run, in no particular order.
+        dict per live run, IN THE ORDER THOSE RUNS STARTED.
+
+        That order is a real guarantee, not an accident of dict iteration:
+        _live_runs is only ever appended to by _register_run (a fresh
+        operation_id every time -- uuid-generated per run) and popped from
+        by _deregister_run, never reordered or reinserted, so its
+        insertion order -- which Python dicts preserve -- is always the
+        order runs started. run-indicator-3's Cancel control relies on
+        this: with more than one live run it numbers them "1.", "2." and
+        so on (see numbered_run_choices()) so the researcher can tell two
+        runs of the same operator on the same table apart, and that
+        numbering is only meaningful because this order is start order.
 
         operation_id is an opaque handle, the same discipline as row_id
         (see the "Row identity and lineage" rules in CLAUDE.md): the UI
         may hold it, pass it back to the controller, and use it to tell
         two live runs apart, but must not parse it, sort by it, or
         construct one itself. It is the same value _register_run was
-        called with -- run-indicator-1-fix adds it so a future Cancel
-        control (P1.12f-3) has something to name the one run it should
-        cancel; this item does not add a Cancel control itself.
+        called with -- run-indicator-1-fix added it, and run-indicator-3's
+        cancel_run(operation_id) is the caller that now names a run with
+        it.
 
         message (run-indicator-2) is this run's newest run.log() text, or
         None if the operator has not called run.log() yet. Unlike
@@ -563,6 +630,46 @@ class AppController(QObject):
             }
             for operation_id, run in self._live_runs.items()
         ]
+
+    def cancel_run(self, operation_id: str) -> None:
+        """Requests cancellation of the live run named by operation_id
+        (run-indicator-3), the opaque handle get_live_runs() hands back.
+
+        Sets that run's CancellationToken and nothing else. What happens
+        next depends on the mode, and neither path is driven from here:
+
+          * COLUMNS -- OperatorRegistry._run_create_columns_worker checks
+            run.cancelled() BETWEEN rows (never mid-row: an operator's own
+            row work is its own business) and stops there, keeping every
+            result already handed to on_item_complete.
+          * TABLE / DISPLAY -- single-shot; the runner cannot interrupt
+            one mid-computation. Its finished result is discarded when it
+            arrives instead -- see _on_operator_complete's "create_table"
+            / "create_display" branches and _run_was_cancelled().
+
+        Either way _run_outcome() records the run "partial" once it ends.
+
+        Cancelling an operation_id that does not name a live run is a
+        no-op, not an error: the run may have finished, or never started,
+        between the researcher's click and this call reaching the
+        controller.
+        """
+        run = self._live_runs.get(operation_id)
+        if run is None:
+            return
+        token = run.get("token")
+        if token is not None:
+            token.cancel()
+
+    def _run_was_cancelled(self, run: dict) -> bool:
+        """True if cancel_run() was called for this live-run entry.
+
+        Reads the same CancellationToken the run's OperatorRun carries, so
+        this agrees with what run.cancelled() tells the operator/runner --
+        there is no separate "cancelled" flag to fall out of sync with it.
+        """
+        token = run.get("token")
+        return token is not None and token.is_cancelled()
 
     def _attach_run_provenance(
         self,
@@ -621,17 +728,79 @@ class AppController(QObject):
 
     def _run_outcome(self, mode: str, run: dict) -> str:
         """One of "complete", "partial" or "failed" for a run ending at
-        this _on_operator_complete branch (P1.12f-1).
+        this _on_operator_complete branch (P1.12f-1; cancellation folded
+        in by P1.12f-3, corrected by run-indicator-3-fix).
 
         "failed" is exactly the "error" mode -- the run never finished.
         Otherwise "partial" if a setup_error or row_errors landed for
-        this run, or it left rows unplaceable; this is also the shape a
-        cancelled run will use once cancellation exists (CLAUDE.md says
-        so explicitly; not built here). Everything else is "complete".
+        this run, or it left rows unplaceable -- unchanged, and true
+        whether or not anyone cancelled.
+
+        RULING (run-indicator-3-fix): outcome describes what the run
+        PRODUCED, not what the researcher asked for. Cancelling is not,
+        by itself, a reason to call a run "partial" -- a COLUMNS run that
+        happened to apply every row it was asked for before the Cancel
+        click reached the controller produced a complete result, and
+        recording it "partial" would write a false "this is incomplete"
+        into a provenance log a researcher may read months later. Whether
+        cancellation was even REQUESTED is recorded separately (see
+        _finish_run_provenance's cancellation_requested field) so that
+        fact is never lost.
+
+        So a cancelled run is "partial" only if it actually produced less
+        than it was asked for:
+
+          * COLUMNS -- run["applied"] (the count of per-row results the
+            drain actually applied; unplaceable is already ruled out
+            above, so nothing here double-counts it) compared against
+            run["rows_requested"]. Falls short -> "partial" (the between-
+            rows check really did stop it early); reaches it -> "complete"
+            even though cancel_run() was called.
+            WHAT THIS TEST GETS WRONG: a row silently skipped because its
+            image failed to load (BaseOperator.load_image() returning
+            None) is not counted in run["applied"] either, and is not a
+            setup_error, a row_error, or an unplaceable row -- it leaves
+            no trace anywhere else on the run. An UNcancelled run with
+            such a skip is already called "complete" today (this rule
+            does not newly check applied-vs-requested when there is no
+            cancellation). But if the SAME run is also cancelled -- even
+            after the loop had already finished attempting every row --
+            this test sees applied < rows_requested from the skip alone
+            and reports "partial", crediting the shortfall to
+            cancellation when the real cause was an unrelated load
+            failure the run already had before anyone clicked Cancel.
+            Closing that gap needs the load-failure count tracked
+            separately on the run, which nothing does today; not fixed
+            here.
+          * TABLE / DISPLAY -- single-shot; _on_operator_complete's
+            "create_table" / "create_display" branches ALWAYS discard the
+            result once cancel_run() has reached a still-live run (they
+            never store a result and then separately notice it was
+            cancelled -- the store-or-discard decision and this outcome
+            are computed from the very same _run_was_cancelled() check,
+            at the same moment, on the main thread). A discarded result
+            produced nothing, so cancelled COLUMNS's "did it fall short"
+            test collapses to always-true here and is never reached: a
+            cancelled TABLE/DISPLAY run is unconditionally "partial".
+            There is consequently no path in this codebase today that
+            reaches "complete" with cancellation_requested true for
+            either of these two modes -- only "cancelled but too late to
+            matter" (cancel_run() finds the run no longer live, so
+            _run_was_cancelled() is never even asked) reaches "complete",
+            and that case correctly reports cancellation_requested false,
+            because the token was never touched.
         """
         if mode == "error":
             return "failed"
         if run["had_setup_error"] or run["had_row_errors"] or run["unplaceable"]:
+            return "partial"
+        if self._run_was_cancelled(run):
+            if mode == "create_columns":
+                if run["applied"] < run["rows_requested"]:
+                    return "partial"
+                return "complete"
+            # create_table / create_display: always discarded once
+            # cancellation reaches a live run -- see the docstring above.
             return "partial"
         return "complete"
 
@@ -709,6 +878,13 @@ class AppController(QObject):
         _deregister_run -- a run no longer live at arrival is not
         recorded (see the "arrived after the project changed" branches,
         which already return before this would be reached).
+
+        cancellation_requested (run-indicator-3-fix) records the FACT
+        that cancel_run() was called for this run, independently of
+        outcome -- outcome alone can no longer say so, now that a
+        cancelled COLUMNS run that finished everything it was asked for
+        is recorded "complete". Read straight off the same token
+        _run_outcome() itself checks, so the two can never disagree.
         """
         outcome    = self._run_outcome(mode, run)
         superseded = self._superseded_input_tables(run)
@@ -724,6 +900,7 @@ class AppController(QObject):
             unplaceable_row_ids=run["unplaceable"],
             outcome=outcome,
             superseded_tables=superseded,
+            cancellation_requested=self._run_was_cancelled(run),
         )
         if superseded:
             tables_str = ", ".join(f'"{t}"' for t in superseded)
@@ -1189,6 +1366,14 @@ class AppController(QObject):
             operation_id, operator_name, result_df = payload
             run = self._live_runs.get(operation_id)
             was_live = run is not None
+            # P1.12f-3: a TABLE run is single-shot -- the runner cannot
+            # interrupt it mid-computation, so cancel_run() could not stop
+            # this work. It let the run finish and is discarding the
+            # result here instead, once it arrives. Checked before
+            # _deregister_run pops the entry, but `run` (the dict object)
+            # stays valid to read after that -- deregistering only removes
+            # it from self._live_runs, not from this local reference.
+            cancelled = was_live and self._run_was_cancelled(run)
             if was_live:
                 self._finish_run_provenance(mode, run)
             self._deregister_run(operation_id)
@@ -1200,6 +1385,14 @@ class AppController(QObject):
                     f'The "{operator_name}" table result arrived after the '
                     f"project changed and was discarded."
                 )
+                return
+            if cancelled:
+                self.error_occurred.emit(
+                    f'"{run["label"]}" was cancelled. A table result '
+                    f"cannot be produced partway through, so its finished "
+                    f"result was discarded rather than stored."
+                )
+                self.operator_complete.emit(operator_name)
                 return
             table_name = f"{operator_name}_result"
             try:
@@ -1219,6 +1412,9 @@ class AppController(QObject):
             operation_id, operator_name, result = payload
             run = self._live_runs.get(operation_id)
             was_live = run is not None
+            # Same "cannot interrupt, so discard on arrival" limit as
+            # create_table above -- see the comment there.
+            cancelled = was_live and self._run_was_cancelled(run)
             if was_live:
                 self._finish_run_provenance(mode, run)
             self._deregister_run(operation_id)
@@ -1227,6 +1423,14 @@ class AppController(QObject):
                     f'The "{operator_name}" result arrived after the '
                     f"project changed and was discarded."
                 )
+                return
+            if cancelled:
+                self.error_occurred.emit(
+                    f'"{run["label"]}" was cancelled. A result cannot be '
+                    f"produced partway through, so its finished result "
+                    f"was discarded rather than shown."
+                )
+                self.operator_complete.emit(operator_name)
                 return
             result["operator_name"] = operator_name
             self.display_result_ready.emit(result)

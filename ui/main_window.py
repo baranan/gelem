@@ -18,11 +18,16 @@ from PySide6.QtWidgets import (
     QSplitter, QLabel, QComboBox, QToolBar,
     QFileDialog, QMessageBox, QTabWidget,
     QStackedWidget, QScrollArea, QFrame,
+    QPushButton, QInputDialog,
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction
 
-from controller import format_run_indicator_text
+from controller import (
+    format_cancel_message,
+    format_run_indicator_text,
+    numbered_run_choices,
+)
 from operators.descriptor import ExecutionMode, InputKind
 from shared_widgets.checkable_combo_box import CheckableComboBox
 from ui.gallery_widget import GalleryWidget
@@ -281,6 +286,11 @@ class MainWindow(QMainWindow):
         is already part of get_live_runs()'s per-run data, so nothing
         needs caching here the way _latest_run_percent caches the
         progress tick.
+
+        A third permanent widget, the Cancel button (run-indicator-3),
+        sits beside the indicator and shares its visibility: shown
+        exactly when something is running, hidden otherwise. Clicking it
+        goes through _on_cancel_run_clicked().
         """
         self._selection_label = QLabel()
         self._selection_label.setStyleSheet("padding: 0 8px;")
@@ -291,6 +301,12 @@ class MainWindow(QMainWindow):
         self._run_indicator_label = QLabel()
         self._run_indicator_label.setStyleSheet("padding: 0 8px;")
         self.statusBar().addPermanentWidget(self._run_indicator_label)
+
+        self._cancel_run_button = QPushButton("Cancel")
+        self._cancel_run_button.setVisible(False)
+        self._cancel_run_button.clicked.connect(self._on_cancel_run_clicked)
+        self.statusBar().addPermanentWidget(self._cancel_run_button)
+
         # The latest value seen from operator_progress. AppController
         # coalesces progress into one value for the whole application
         # (see controller.format_run_indicator_text), so this is reset
@@ -310,12 +326,70 @@ class MainWindow(QMainWindow):
         just blank, when nothing is running -- chosen over leaving the
         widget visible with empty text so it does not sit in the status
         bar as an empty gap between the permanent widgets.
+
+        The Cancel button (run-indicator-3) shares this same visibility:
+        there is nothing to cancel exactly when there is nothing to show.
         """
         text = format_run_indicator_text(
             self._controller.get_live_runs(), self._latest_run_percent
         )
         self._run_indicator_label.setText(text)
         self._run_indicator_label.setVisible(bool(text))
+        self._cancel_run_button.setVisible(bool(text))
+
+    def _on_cancel_run_clicked(self) -> None:
+        """
+        Handles a click on the status-bar Cancel button (run-indicator-3).
+
+        With exactly one live run, cancels it directly. With more than
+        one, shows a pick-one dialog built from the Qt-free
+        numbered_run_choices() -- the numbering that tells apart two runs
+        of the same operator on the same table, which otherwise read
+        identically (CLAUDE.md, "Long-running work"). Dismissing the
+        picker cancels nothing.
+
+        Either way, tells the researcher what cancellation means for the
+        chosen run (format_cancel_message()) before calling
+        AppController.cancel_run() -- the actual effect (a COLUMNS run
+        stopping between rows, or a TABLE/DISPLAY run's finished result
+        being discarded) happens later, off this click.
+        """
+        live_runs = self._controller.get_live_runs()
+        if not live_runs:
+            return
+
+        if len(live_runs) == 1:
+            operation_id = live_runs[0]["operation_id"]
+            label = live_runs[0]["label"]
+        else:
+            choices = numbered_run_choices(live_runs)
+            display_texts = [text for _op_id, _label, text in choices]
+            chosen_text, ok = QInputDialog.getItem(
+                self,
+                "Cancel which run?",
+                "Choose a run to cancel:",
+                display_texts,
+                0,
+                False,
+            )
+            if not ok:
+                return
+            picked = next(
+                (
+                    (op_id, run_label)
+                    for op_id, run_label, text in choices
+                    if text == chosen_text
+                ),
+                None,
+            )
+            if picked is None:
+                return
+            operation_id, label = picked
+
+        self._controller.cancel_run(operation_id)
+        QMessageBox.information(
+            self, "Cancelling run", format_cancel_message(label)
+        )
 
     def _on_live_runs_changed(self) -> None:
         """A run started or finished. The previous percentage no longer
