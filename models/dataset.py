@@ -63,16 +63,24 @@ class MergeReport:
     Field names are table-neutral: merge_csv() can join a CSV onto any
     table, not just 'frames', so nothing here says "image" or "file".
 
-    `would_expand` is populated only when the merge was refused because
-    it would have turned one target row into several (see merge_csv()'s
-    docstring) -- when it is non-empty, `_pending_df` is None and
-    confirm_merge() has nothing to commit.
+    `would_expand` is populated when a CSV key value that appears on more
+    than one CSV row also names a target row -- joining it in place would
+    turn that one target row into several (see merge_csv()'s docstring).
+    P1.5b turned this from a refusal into an offer: when it is non-empty,
+    `_pending_df` is None (nothing is ever written to target_table) and
+    `_pending_expand_df` holds the rows for a NEW table instead --
+    `expand_table_name`, `expand_row_count` and `expand_carried_columns`
+    describe it for display. confirm_merge() creates that new table
+    rather than touching target_table. See docs/architecture.md §4.2 for
+    the carried-columns rule and confirm_merge()'s docstring for how the
+    new table is built.
 
     `float_key_warning` is advisory, never a refusal: it is set whenever
     either key column holds decimal numbers, because matching them
     relies on exact equality and two values a researcher considers the
     same may not match. It is set (or not) independently of would_expand
-    and never affects whether _pending_df is populated.
+    and never affects whether _pending_df or _pending_expand_df is
+    populated.
     """
     target_table: str = ""
     total_csv_rows: int = 0
@@ -86,10 +94,30 @@ class MergeReport:
     renamed_columns: dict = field(default_factory=dict)
     sample_problems: list[dict] = field(default_factory=list)
     float_key_warning: str | None = None
+    # Populated only alongside would_expand -- the offer to create a new
+    # table instead of joining in place. expand_row_count always equals
+    # total_csv_rows (one new row per CSV row); it is a separate field so
+    # display code does not need to know that equivalence.
+    expand_table_name: str = ""
+    expand_row_count: int = 0
+    # Dataset.columns_to_carry(target_table), MINUS the join key
+    # (target_key) -- the join key is lineage (docs/architecture.md
+    # §4.2) and survives unconditionally, under csv_key's name, by a
+    # separate rule in _build_expand_frame(); it is never one of the
+    # generic carried columns, so it is never listed here either -- see
+    # merge_csv()'s and confirm_merge()'s docstrings. Display code (the
+    # dialog's "carried from" line) can list this field's contents
+    # exactly as-is: every name in it is a column the new table actually
+    # has, under this same name, and no carried column is left unlisted.
+    expand_carried_columns: list[str] = field(default_factory=list)
 
     # The joined DataFrame, held privately until confirm_merge() is called.
     _pending_df: pd.DataFrame | None = field(default=None, repr=False)
     _new_columns: list[str] = field(default_factory=list, repr=False)
+    # The rows for expand_table_name, held privately until confirm_merge()
+    # is called. Mutually exclusive with _pending_df: exactly one of the
+    # two is set, depending on would_expand.
+    _pending_expand_df: pd.DataFrame | None = field(default=None, repr=False)
     # The key column names merge_csv() joined on, held so confirm_merge() can
     # hint the CSV's own key column as an identifier (docs/architecture.md
     # §4.2: "the join key of a merge is an identifier") when it survives the
@@ -102,9 +130,11 @@ class MergeReport:
         """Returns a human-readable summary string for display in the UI."""
         if self.would_expand:
             return (
-                f"Merge refused: {len(self.would_expand)} target row(s) each "
-                f"match more than one CSV row, which would expand the table. "
-                f"Row expansion is not supported by this merge yet."
+                f"{len(self.would_expand)} CSV key value(s) each match one "
+                f"row of '{self.target_table}' more than once. Proceeding "
+                f"will create a new table, '{self.expand_table_name}', with "
+                f"{self.expand_row_count} row(s) -- one per CSV row -- "
+                f"instead of changing '{self.target_table}'."
             )
         return (
             f"Matched: {self.matched_rows} rows | "
@@ -1169,6 +1199,75 @@ class Dataset:
             )
         return None
 
+    def _default_expand_table_name(self, target_table: str) -> str:
+        """The suggested name for the new table an expanding merge offers
+        to create. confirm_merge() refuses to overwrite an existing table
+        of this name rather than silently picking a different one -- see
+        confirm_merge()'s docstring."""
+        return f"{target_table}_expanded"
+
+    def _build_expand_frame(
+        self,
+        csv_df: pd.DataFrame,
+        target_df: pd.DataFrame,
+        csv_key: str,
+        target_key: str,
+        carry_columns: list[str],
+    ) -> pd.DataFrame:
+        """
+        Builds the rows for an expanding merge's new table: one row per
+        CSV row (every CSV column comes across unchanged), plus
+        carry_columns -- target_table's identifier/index/carry_to_children
+        columns, from Dataset.columns_to_carry() -- matched onto each CSV
+        row by target_key.
+
+        The join key itself is lineage (docs/architecture.md §4.2: the
+        connection between a derived row and its source travels in an
+        ordinary data column), so its presence in the result is
+        UNCONDITIONAL and it survives under EXACTLY ONE name -- neither
+        depends on target_key's role, its carry_to_children flag, or
+        whether target_key happens to also be one of carry_columns. It
+        is handled separately from the generic carry-columns copy below
+        for exactly that reason: a generic "was it asked to be carried"
+        check is the wrong test for a column whose presence is not
+        optional.
+
+        The name kept, when csv_key and target_key differ, is the CSV's
+        own (csv_key) -- the new rows are CSV rows, so target_key's
+        column is dropped after the join; csv_key needs no such
+        handling, since it is one of csv_df's own columns and this
+        method never touches csv_df's columns directly. When csv_key
+        and target_key share a name, pandas' merge already collapses
+        them into that one column on its own -- passing the same string
+        as both left_on and right_on merges the two same-named columns
+        rather than suffixing them -- so there is nothing to drop.
+
+        A CSV row whose key matches no target row gets null values in the
+        carried columns -- the same "left join" reasoning merge_csv()
+        already uses for the in-place case.
+
+        Column-name collisions between csv_df and the carried columns
+        (other than the keys) are suffixed exactly as merge_csv()'s
+        in-place join does: existing (target) columns as `<name>_a`,
+        incoming (CSV) columns as `<name>_b`.
+        """
+        # target_key is joined on separately below, never through the
+        # generic carry_columns list -- see the docstring above for why.
+        other_carry_columns = [c for c in carry_columns if c != target_key]
+        join_columns = other_carry_columns + [target_key]
+        target_carry_df = target_df[join_columns]
+
+        joined = csv_df.merge(
+            target_carry_df,
+            left_on=csv_key,
+            right_on=target_key,
+            how="left",
+            suffixes=("_b", "_a"),
+        )
+        if target_key != csv_key and target_key in joined.columns:
+            joined = joined.drop(columns=[target_key])
+        return joined
+
     def merge_csv(
         self,
         csv_path: Path,
@@ -1263,16 +1362,38 @@ class Dataset:
         duplicate_csv    = [str(v) for v in duplicate_values]
         would_expand     = [str(v) for v in expand_values]
         if would_expand:
+            # P1.5b: build the offer to create a NEW table -- one row per
+            # CSV row -- instead of refusing outright. target_table is never
+            # touched: _pending_df stays None, so confirm_merge() has
+            # nothing to commit onto it; _pending_expand_df below is what
+            # confirm_merge() commits, as a new table, instead.
+            carry_columns = self.columns_to_carry(target_table)
+            expand_df = self._build_expand_frame(
+                csv_df, target_df, csv_key, target_key, carry_columns,
+            )
+            # target_key is excluded here even though columns_to_carry()
+            # may have returned it: _build_expand_frame() always makes the
+            # join key survive under its own separate rule (see its
+            # docstring), never as one of the generic carried columns, so
+            # listing it here too would claim a second copy the table does
+            # not have -- see this method's and the dialog's "carried from"
+            # line, which reads this field.
+            expand_carried_columns = [c for c in carry_columns if c != target_key]
             report = MergeReport(
                 target_table=target_table,
                 total_csv_rows=len(csv_df),
                 total_target_rows=len(target_df),
-                matched_rows=0,
+                matched_rows=int(csv_df[csv_key].isin(target_keys).sum()),
                 duplicate_keys_csv=duplicate_csv,
                 would_expand=would_expand,
                 float_key_warning=float_key_warning,
+                expand_table_name=self._default_expand_table_name(target_table),
+                expand_row_count=len(csv_df),
+                expand_carried_columns=expand_carried_columns,
             )
-            # _pending_df stays None, so confirm_merge() will not commit.
+            report._pending_expand_df = expand_df
+            report._csv_key    = csv_key
+            report._target_key = target_key
             return report
 
         # Step 3: Left join the CSV onto target_table. A column present in
@@ -1340,21 +1461,87 @@ class Dataset:
         """
         Commits the merge described in the MergeReport.
 
-        docs/architecture.md §4.2's import default -- "the join key of a
-        merge is an identifier" -- is applied here to the CSV's own key
-        column, csv_key, when it survives the join as a column distinct
-        from target_key (pandas keeps both when they are named
-        differently; see merge_csv()). target_key itself is never re-hinted:
-        it already named an existing column of target_table, so it already
-        has a role from whenever that table was created, and hints only
-        ever apply to a column _prepare_table sees as new (see
+        When report.would_expand is set, merge_csv() built an offer to
+        create a NEW table rather than an in-place join -- see
+        MergeReport's docstring. This method then creates
+        report.expand_table_name from report._pending_expand_df and
+        NEVER writes to report.target_table: one participant video is
+        one row of, say, "frames", and replacing that row with many
+        trial rows would destroy the identity other tables reference
+        (docs/architecture.md §4.2). It refuses -- raising, not silently
+        overwriting -- when a table already exists under that name.
+
+        The new table's carried columns (report.expand_carried_columns,
+        from Dataset.columns_to_carry() minus target_key -- see
+        merge_csv()) keep the role and carry_to_children they have on
+        target_table's own schema, so an identifier or index column
+        carried down stays one -- otherwise a later split of THIS table
+        would have no schema information to decide what it, in turn,
+        should carry (docs/architecture.md §4.2). target_key is excluded
+        from that loop because _build_expand_frame() already gave it its
+        own unconditional, exactly-once handling under csv_key's name
+        (see that method's docstring) -- it is lineage, not an ordinary
+        carried column, and hinting it again here under its target-side
+        name would name a column the table does not have. The CSV's own
+        key column is hinted 'identifier', the same import default the
+        in-place path below applies.
+
+        Otherwise -- the ordinary in-place case -- docs/architecture.md
+        §4.2's import default ("the join key of a merge is an
+        identifier") is applied to the CSV's own key column, csv_key,
+        when it survives the join as a column distinct from target_key
+        (pandas keeps both when they are named differently; see
+        merge_csv()). target_key itself is never re-hinted: it already
+        named an existing column of target_table, so it already has a
+        role from whenever that table was created, and hints only ever
+        apply to a column _prepare_table sees as new (see
         _prepare_table's docstring). When csv_key and target_key share a
-        name, the join produces one column, not two, and there is nothing
-        new to hint.
+        name, the join produces one column, not two, and there is
+        nothing new to hint.
 
         Args:
             report: The MergeReport returned by merge_csv().
+
+        Raises:
+            ValueError: report.would_expand is set and a table named
+                report.expand_table_name already exists.
         """
+        if report.would_expand:
+            if report._pending_expand_df is None:
+                return
+            if report.expand_table_name in self._tables:
+                raise ValueError(
+                    f"Cannot create table {report.expand_table_name!r}: a "
+                    f"table with that name already exists."
+                )
+            hints = {report._csv_key: ColumnHint(role=ColumnRole.identifier)}
+            target_schema = self.schema_for(report.target_table)
+            if target_schema is not None:
+                for name in report.expand_carried_columns:
+                    if name == report._csv_key:
+                        continue
+                    spec = target_schema.spec_for(name)
+                    hints[name] = ColumnHint(
+                        role=spec.role,
+                        carry_to_children=spec.carry_to_children,
+                    )
+            result = report._pending_expand_df.copy().reset_index(drop=True)
+            result.insert(
+                0, "row_id", [self._next_id() for _ in range(len(result))]
+            )
+            self._accept_table(
+                report.expand_table_name, result,
+                hints=hints,
+                source="confirm_merge_expand",
+            )
+            self.provenance.record("confirm_merge_expand", {
+                "target_table": report.target_table,
+                "new_table": report.expand_table_name,
+                "n_rows": len(result),
+                "carried_columns": report.expand_carried_columns,
+            })
+            return
+
         if report._pending_df is not None:
             hints = None
             if (

@@ -6,11 +6,23 @@ before any data is written. Replaces the old plain Yes/No QMessageBox.
 
 The dialog reads attributes off a MergeReport object — total counts
 plus diagnostic lists (unmatched target rows, unmatched CSV rows,
-duplicate keys on each side, the keys that would have expanded the
-target table, and an advisory decimal-key warning). It does NOT import
-MergeReport itself, so ui/ stays inside the import boundary in
-ARCHITECTURE_RULES.md. The dialog uses duck-typing — anything with the
-expected attribute names will work.
+duplicate keys on each side, the CSV key values that would expand the
+target table, and an advisory decimal-key warning), plus -- when the
+merge would expand the target table -- the expansion offer fields
+(expand_table_name, expand_row_count, expand_carried_columns). It does
+NOT import MergeReport itself, so ui/ stays inside the import boundary
+in CLAUDE.md. The dialog uses duck-typing — anything with the expected
+attribute names will work.
+
+The file is in two layers, the same split ui/settings_dialog.py and
+ui/parameter_dialog.py use:
+
+  * Layer A -- module-level functions taking a report and returning plain
+    strings/lists, with no Qt. All the wording lives here, so the tests
+    can exercise it without a QApplication.
+
+  * Layer B -- class MergeReportDialog(QDialog), thin glue that calls
+    Layer A and lays the results out in widgets.
 """
 
 from __future__ import annotations
@@ -29,35 +41,117 @@ from PySide6.QtCore import Qt
 _LIST_PREVIEW_LIMIT = 500
 
 
+# ---------------------------------------------------------------------------
+# Layer A -- wording and arithmetic, no Qt.
+# ---------------------------------------------------------------------------
+
+def is_expand_offer(report) -> bool:
+    """True when this merge would expand the target table -- P1.5b's offer
+    to create a new table, rather than the ordinary in-place join."""
+    return bool(report.would_expand)
+
+
+def header_text(report) -> str:
+    """The dialog's headline. P1.5a's red 'Merge refused' wording is gone:
+    an expanding merge is now an offer, not an error, so it gets the same
+    neutral phrasing as the ordinary review header, just naming what will
+    be created."""
+    if is_expand_offer(report):
+        return (
+            f"This will create a new table — "
+            f"{report.expand_row_count} row(s), one per CSV row"
+        )
+    return "Review the merge before applying it"
+
+
+def explain_text(report) -> str:
+    """The paragraph under the header. Empty string means no paragraph is
+    shown -- the ordinary in-place merge doesn't need one; its counts grid
+    and issue tabs already say everything."""
+    if not is_expand_offer(report):
+        return ""
+    return (
+        f"{len(report.would_expand)} key value(s) in the CSV each match "
+        f"one row of '{report.target_table}' more than once, so joining "
+        f"them in place would turn that one row into several. Proceeding "
+        f"will instead create a new table, '{report.expand_table_name}', "
+        f"with one row per CSV row. '{report.target_table}' itself will "
+        f"not be changed."
+    )
+
+
+def carried_columns_text(report) -> str:
+    """Describes which columns of target_table the new table would carry.
+    Only meaningful when is_expand_offer(report) is true."""
+    if not report.expand_carried_columns:
+        return f"No columns are carried from '{report.target_table}'."
+    cols = ", ".join(report.expand_carried_columns)
+    return f"Carried from '{report.target_table}': {cols}"
+
+
+def proceed_button_text(report) -> str:
+    """Label for the affirmative button -- names the new table when this
+    is an expansion offer, so the researcher sees exactly what Proceed
+    will do."""
+    if is_expand_offer(report):
+        return f"Create '{report.expand_table_name}'"
+    return "Proceed with merge"
+
+
+def issue_tab_sources(report) -> list[tuple[str, list]]:
+    """The (title, items) pairs _build_issue_tabs renders one tab per
+    non-empty entry of. Centralised here so the tab wording is tested the
+    same way as every other string in this module.
+
+    The would_expand tab's title no longer calls these keys a problem --
+    P1.5b turned the refusal they used to cause into the expansion offer
+    described elsewhere in the dialog -- but the list itself (which CSV
+    key values triggered it) is still worth showing.
+    """
+    return [
+        ("CSV keys matching one target row more than once", report.would_expand),
+        ("Target rows without a CSV match", report.unmatched_target_rows),
+        ("CSV rows without a target match", report.unmatched_csv_rows),
+        ("Duplicate keys (target)", report.duplicate_keys_target),
+        ("Duplicate keys (CSV)", report.duplicate_keys_csv),
+        # Advisory, not a refusal -- shown the same way (a tab with the
+        # message as its one row) but never affects whether Proceed is
+        # enabled.
+        ("Decimal key warning", [report.float_key_warning] if report.float_key_warning else []),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Layer B -- thin Qt glue.
+# ---------------------------------------------------------------------------
+
 class MergeReportDialog(QDialog):
     """
     Shows the result of a dry-run merge so the researcher can inspect
     what would happen before committing the changes.
 
     Layout:
+        - Header and, for an expansion offer, an explanatory paragraph
+          and a line naming the columns that would be carried.
         - Counts grid: total CSV rows, total target rows, matched rows,
           and four issue counts. Each issue count is colour-coded so
           problems jump out at a glance.
-        - Tabbed list of the actual problem rows (rows that would expand
-          the table, unmatched target rows, unmatched CSV rows,
-          duplicate keys on either side, and an advisory decimal-key
-          warning). Tabs for empty issues are hidden so the dialog stays
-          compact.
-        - Proceed / Cancel buttons. The accepted attribute is True
+        - Tabbed list of the actual rows behind each count (see
+          issue_tab_sources). Tabs for empty issues are hidden so the
+          dialog stays compact.
+        - Proceed / Cancel buttons. The accepted_merge attribute is True
           after exec() returns Accepted; False otherwise. Proceed is
-          disabled only when the merge was refused (would_expand) --
-          there is nothing pending to commit then. The decimal-key
-          warning is advisory and never disables Proceed.
+          always enabled: merge_csv() always leaves something for
+          confirm_merge() to commit now, whether that is the in-place
+          join or the new-table offer. The decimal-key warning is
+          advisory and never disables Proceed.
     """
 
     def __init__(self, report, parent=None):
         """
         Args:
-            report: A MergeReport-like object with attributes
-                    total_csv_rows, total_target_rows, matched_rows,
-                    unmatched_target_rows, unmatched_csv_rows,
-                    duplicate_keys_target, duplicate_keys_csv,
-                    would_expand, float_key_warning.
+            report: A MergeReport-like object -- see the module docstring
+                    for its attributes.
             parent: Parent widget.
         """
         super().__init__(parent)
@@ -68,35 +162,25 @@ class MergeReportDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
 
-        refused = bool(report.would_expand)
+        expand_offer = is_expand_offer(report)
 
         # ── Header ────────────────────────────────────────────────────
-        if refused:
-            header = QLabel(
-                f"Merge refused — {len(report.would_expand)} row(s) would "
-                f"expand the table"
-            )
-            header.setStyleSheet(
-                "font-weight: bold; font-size: 13px; color: #E53935;"
-            )
-        else:
-            header = QLabel("Review the merge before applying it")
-            header.setStyleSheet(
-                "font-weight: bold; font-size: 13px; color: #4A90D9;"
-            )
+        header = QLabel(header_text(report))
+        header.setStyleSheet(
+            "font-weight: bold; font-size: 13px; color: #4A90D9;"
+        )
         layout.addWidget(header)
 
-        if refused:
-            explain = QLabel(
-                "Some rows in the CSV share a key that also matches one row "
-                "of the target table. Merging them would turn that one row "
-                "into several (row expansion), which this merge does not do "
-                "yet — it is planned as a separate feature. No changes have "
-                "been made."
-            )
+        if expand_offer:
+            explain = QLabel(explain_text(report))
             explain.setWordWrap(True)
             explain.setStyleSheet("font-size: 11px;")
             layout.addWidget(explain)
+
+            carried = QLabel(carried_columns_text(report))
+            carried.setWordWrap(True)
+            carried.setStyleSheet("font-size: 11px; font-style: italic;")
+            layout.addWidget(carried)
 
         # ── Counts grid ──────────────────────────────────────────────
         layout.addWidget(self._build_counts_grid(report))
@@ -128,13 +212,8 @@ class MergeReportDialog(QDialog):
         cancel_btn.clicked.connect(self.reject)
         btn_row.addWidget(cancel_btn)
 
-        # A refused merge has nothing pending to commit (Dataset.merge_csv
-        # left _pending_df unset), so proceeding would be a silent no-op.
-        # Disabling the button here says so up front instead of letting the
-        # researcher click through into nothing happening.
-        proceed_btn = QPushButton("Proceed with merge")
-        proceed_btn.setDefault(not refused)
-        proceed_btn.setEnabled(not refused)
+        proceed_btn = QPushButton(proceed_button_text(report))
+        proceed_btn.setDefault(True)
         proceed_btn.clicked.connect(self._on_proceed)
         btn_row.addWidget(proceed_btn)
 
@@ -189,19 +268,7 @@ class MergeReportDialog(QDialog):
         list is empty so the caller can show a single "no issues" line
         instead of an empty tab widget.
         """
-        sources = [
-            ("Would expand the table",        report.would_expand),
-            ("Target rows without a CSV match", report.unmatched_target_rows),
-            ("CSV rows without a target match", report.unmatched_csv_rows),
-            ("Duplicate keys (target)",         report.duplicate_keys_target),
-            ("Duplicate keys (CSV)",            report.duplicate_keys_csv),
-            # Advisory, not a refusal -- shown the same way (a tab with the
-            # message as its one row) but never affects whether Proceed is
-            # enabled; see the `refused` computation in __init__.
-            ("Decimal key warning", [report.float_key_warning] if report.float_key_warning else []),
-        ]
-
-        non_empty = [(t, items) for t, items in sources if items]
+        non_empty = [(t, items) for t, items in issue_tab_sources(report) if items]
         if not non_empty:
             return None
 

@@ -289,8 +289,11 @@ else:
     run_test("Row count unchanged after merge", test_confirm_merge_row_count_unchanged)
 
     # --- MANUALLY ADDED (Student B): merge edge cases. Tests above unchanged.
-    # CASE 1 — one-to-many: CSV has >1 row per image; must be rejected, not
-    # expanded (20 rows must not become 40).
+    # CASE 1 — one-to-many: CSV has >1 row per image. P1.5b: this must never
+    # expand "frames" in place (20 rows must not become 40) -- it becomes an
+    # offer to create a NEW table instead, one row per CSV row. See
+    # tests/test_merge_expansion.py for the new table's own behaviour; the
+    # tests below only check that "frames" itself is left alone.
     def _write_csv(folder, name, frame):
         """Helper: write `frame` to <folder>/<name> and return the Path."""
         path = Path(folder) / name
@@ -337,7 +340,7 @@ else:
             f"got {report.would_expand}"
         )
 
-    def test_merge_expansion_is_refused_not_applied():
+    def test_merge_expansion_never_touches_the_target_table():
         from models.dataset import Dataset
         ds = Dataset()
         ds.load_folder(TEST_IMAGES)
@@ -352,16 +355,19 @@ else:
                 _write_csv(d, "dupes.csv", bad),
                 target_table="frames", csv_key="file_name", target_key="file_name",
             )
-            ds.confirm_merge(report)   # refused (would expand) -> no-op
+            # P1.5b: confirm_merge() now creates a NEW table for an
+            # expanding merge (see tests/test_merge_expansion.py) -- it
+            # must still never expand "frames" itself in place.
+            ds.confirm_merge(report)
         count_after = len(ds.get_table("frames"))
         assert count_after == count_before, (
-            f"A merge that would expand the table must be refused, not "
-            f"expand rows. Before: {count_before}, after: {count_after}"
+            f"An expanding merge must never change the target table's own "
+            f"row count. Before: {count_before}, after: {count_after}"
         )
 
     run_test("Expanding merge does not crash", test_merge_expansion_does_not_crash)
     run_test("Expanding merge flags the offending keys", test_merge_expansion_flags_the_keys)
-    run_test("Expanding merge is refused, not applied", test_merge_expansion_is_refused_not_applied)
+    run_test("Expanding merge never touches the target table", test_merge_expansion_never_touches_the_target_table)
 
     def test_merge_unmatched_duplicate_still_merges():
         # A duplicate key matching NO image is harmless (can't expand any

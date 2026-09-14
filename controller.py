@@ -1808,13 +1808,24 @@ class AppController(QObject):
         """
         Commits a CSV merge after the researcher reviews the report.
 
+        When report.would_expand is set, Dataset.confirm_merge() creates a
+        new table instead of writing to the target table (see its
+        docstring), so this emits tables_updated and table_created --
+        the same signals an operator's create_table result uses -- rather
+        than columns_updated, and does not refresh the current result
+        since the active table did not change.
+
         Args:
             report: The MergeReport returned by merge_csv().
         """
         try:
             self._dataset.confirm_merge(report)
-            self.columns_updated.emit(self.get_column_names())
-            self._refresh_result()
+            if report.would_expand:
+                self.tables_updated.emit(self._dataset.list_tables())
+                self.table_created.emit(report.expand_table_name)
+            else:
+                self.columns_updated.emit(self.get_column_names())
+                self._refresh_result()
         except Exception as e:
             self.error_occurred.emit(f"Failed to confirm merge: {e}")
 

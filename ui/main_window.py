@@ -1155,8 +1155,10 @@ class MainWindow(QMainWindow):
 
     def _on_table_created(self, table_name: str) -> None:
         """
-        Called when a create_table operator has stored its result.
-        Asks the researcher if they want to switch to the new table.
+        Called when a create_table operator has stored its result, or
+        when confirming an expanding merge (P1.5b) has created its new
+        table. Asks the researcher if they want to switch to the new
+        table.
         """
         reply = QMessageBox.question(
             self,
@@ -1176,8 +1178,10 @@ class MainWindow(QMainWindow):
         """
         Shows the merge diagnostics dialog. The researcher sees the
         match/unmatch counts and per-issue lists (unmatched files,
-        unmatched CSV rows, duplicate keys) before deciding whether
-        to commit the merge.
+        unmatched CSV rows, duplicate keys) before deciding whether to
+        commit the merge -- or, when the CSV would expand the target
+        table, the offer to create a new table instead (P1.5b) -- before
+        deciding whether to proceed.
         """
         dialog = MergeReportDialog(report, parent=self)
         if dialog.exec() != 0 and dialog.accepted_merge:
