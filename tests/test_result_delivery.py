@@ -45,7 +45,11 @@ from operators.descriptor import (
     OutputColumn,
     OutputSpec,
 )
-from controller import AppController, write_read_conflict_warnings
+from controller import (
+    AppController,
+    format_run_indicator_text,
+    write_read_conflict_warnings,
+)
 
 
 def _active_table_input():
@@ -1046,3 +1050,183 @@ def test_get_write_read_conflict_warnings_missing_mode_returns_empty(tmp_path):
     # "probe" only declares a COLUMNS mode -- asking about TABLE mode
     # must return no warnings, not raise.
     assert controller.get_write_read_conflict_warnings("probe", "TABLE") == []
+
+
+# ---------------------------------------------------------------------------
+# 12. run-indicator-1: showing that an operator is running.
+#
+# 12a. format_run_indicator_text(): the pure, Qt-free sentence builder.
+# Tested with plain lists and ints -- no controller, no Qt.
+# ---------------------------------------------------------------------------
+
+def test_indicator_text_is_empty_with_no_live_runs():
+    # Would still pass if violated? No. A version that always produced
+    # some text (even a generic "idle" message) would fail this, and the
+    # empty string is exactly what tells the widget to hide itself.
+    assert format_run_indicator_text([], None) == ""
+    assert format_run_indicator_text([], 50) == ""
+
+
+def test_indicator_text_one_run_no_progress_yet():
+    live_runs = [{"label": "Extract blendshapes", "table_name": "frames"}]
+    text = format_run_indicator_text(live_runs, None)
+    assert "Extract blendshapes" in text
+    assert "frames" in text
+    # No progress tick has arrived -- no percentage should appear.
+    assert "%" not in text
+
+
+def test_indicator_text_one_run_with_progress():
+    live_runs = [{"label": "Extract blendshapes", "table_name": "frames"}]
+    text = format_run_indicator_text(live_runs, 42)
+    assert "Extract blendshapes" in text
+    assert "frames" in text
+    assert "42" in text
+    assert "%" in text
+
+
+def test_indicator_text_two_runs_has_no_percentage():
+    # Would still pass if violated? No. AppController coalesces progress
+    # into one number for the whole application; showing that number
+    # next to either run's label would misattribute it. Even when a
+    # percent is supplied, two live runs must suppress it entirely.
+    live_runs = [
+        {"label": "Extract blendshapes", "table_name": "frames"},
+        {"label": "Summary statistics", "table_name": "frames"},
+    ]
+    text = format_run_indicator_text(live_runs, 77)
+    assert "%" not in text
+    assert "77" not in text
+    assert "Extract blendshapes" in text
+    assert "Summary statistics" in text
+    assert "2" in text
+
+
+# ---------------------------------------------------------------------------
+# 12b. AppController.get_live_runs() and the live_runs_changed signal.
+# ---------------------------------------------------------------------------
+
+def test_get_live_runs_empty_initially(tmp_path):
+    controller, _dataset, _op_registry = _make_controller(tmp_path)
+    assert controller.get_live_runs() == []
+
+
+def test_get_live_runs_returns_only_the_three_public_fields(tmp_path):
+    controller, _dataset, _op_registry = _make_controller(tmp_path)
+    controller._register_run("op-1", "Probe", "frames")
+
+    # Would still pass if violated? No. A version that returned the raw
+    # _live_runs dict would also carry "token", "column_tags" and the
+    # rest of the internal bookkeeping -- this pins the public read down
+    # to exactly the three fields a caller may rely on: the run's opaque
+    # identity (run-indicator-1-fix) plus its label and table.
+    live_runs = controller.get_live_runs()
+    assert live_runs == [
+        {"operation_id": "op-1", "label": "Probe", "table_name": "frames"}
+    ]
+
+
+def test_get_live_runs_identity_matches_what_the_run_was_registered_under(
+    tmp_path,
+):
+    # run-indicator-1-fix: the identity get_live_runs() hands back must be
+    # the SAME value the caller (e.g. run_create_columns) registered the
+    # run under -- it is the handle a future Cancel control passes back
+    # to name which run to stop, so it cannot be some other derived id.
+    controller, _dataset, _op_registry = _make_controller(tmp_path)
+    controller._register_run("the-exact-operation-id", "Probe", "frames")
+
+    live_runs = controller.get_live_runs()
+    assert len(live_runs) == 1
+    assert live_runs[0]["operation_id"] == "the-exact-operation-id"
+
+
+def test_two_concurrent_runs_have_different_identities(tmp_path):
+    # Would still pass if violated? No. If get_live_runs() invented its
+    # own identity (e.g. list position) rather than echoing back
+    # operation_id, two runs with the same label on the same table could
+    # come back indistinguishable -- exactly the case a Cancel control
+    # needs to tell apart.
+    controller, _dataset, _op_registry = _make_controller(tmp_path)
+    controller._register_run("op-1", "Plot columns (bar chart)", "frames")
+    controller._register_run("op-2", "Plot columns (bar chart)", "frames")
+
+    live_runs = controller.get_live_runs()
+    ids = {run["operation_id"] for run in live_runs}
+    assert ids == {"op-1", "op-2"}
+
+
+def test_live_runs_changed_emitted_on_register(tmp_path):
+    controller, _dataset, _op_registry = _make_controller(tmp_path)
+    events = []
+    controller.live_runs_changed.connect(lambda: events.append(True))
+
+    controller._register_run("op-1", "Probe", "frames")
+
+    assert len(events) == 1
+
+
+def test_live_runs_changed_emitted_on_deregister(tmp_path):
+    controller, _dataset, _op_registry = _make_controller(tmp_path)
+    controller._register_run("op-1", "Probe", "frames")
+    events = []
+    controller.live_runs_changed.connect(lambda: events.append(True))
+
+    controller._deregister_run("op-1")
+
+    assert len(events) == 1
+    assert controller.get_live_runs() == []
+
+
+def test_live_runs_changed_not_emitted_on_deregister_of_unknown_id(tmp_path):
+    controller, _dataset, _op_registry = _make_controller(tmp_path)
+    events = []
+    controller.live_runs_changed.connect(lambda: events.append(True))
+
+    # Would still pass if violated? No. An unconditional emit here would
+    # fire the signal for a no-op pop, e.g. a second deregister of an
+    # already-dead run -- this pins "emits only on an actual change".
+    controller._deregister_run("never-registered")
+
+    assert events == []
+
+
+def test_load_folder_emits_live_runs_changed_once_when_a_run_was_live(tmp_path):
+    controller, _dataset, _op_registry = _make_controller(tmp_path)
+    controller._register_run("op-1", "Probe", "frames")
+    controller._register_run("op-2", "Other probe", "frames")
+    events = []
+    controller.live_runs_changed.connect(lambda: events.append(True))
+
+    # load_folder() replaces the dataset, so it clears the run registry
+    # (test 9 above pins that this is one of exactly three such paths).
+    controller.load_folder(TEST_IMAGES)
+
+    assert len(events) == 1
+    assert controller.get_live_runs() == []
+
+
+def test_load_folder_emits_no_live_runs_changed_when_nothing_was_live(tmp_path):
+    controller, _dataset, _op_registry = _make_controller(tmp_path)
+    events = []
+    controller.live_runs_changed.connect(lambda: events.append(True))
+
+    # Would still pass if violated? No. An unconditional emit would fire
+    # this signal on every load_folder() call even when no run was ever
+    # started, which is not a change to the live-run set.
+    controller.load_folder(TEST_IMAGES)
+
+    assert events == []
+
+
+def test_two_concurrent_runs_produce_a_sentence_with_no_percentage():
+    # End-to-end through the same seam ui/main_window.py uses: plain data
+    # from get_live_runs() (two entries) fed straight into
+    # format_run_indicator_text(), pinning that the two layers agree.
+    live_runs = [
+        {"label": "Run one", "table_name": "frames"},
+        {"label": "Run two", "table_name": "frames"},
+    ]
+    text = format_run_indicator_text(live_runs, 10)
+    assert "%" not in text
+    assert "10" not in text

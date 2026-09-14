@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction
 
+from controller import format_run_indicator_text
 from operators.descriptor import ExecutionMode, InputKind
 from shared_widgets.checkable_combo_box import CheckableComboBox
 from ui.gallery_widget import GalleryWidget
@@ -268,13 +269,59 @@ class MainWindow(QMainWindow):
         selected" otherwise. The label is updated by
         _on_selection_changed (selection edits) and the gallery-update
         handlers (filter changes).
+
+        A second permanent widget beside it is the run indicator
+        (run-indicator-1): it reports which operator(s) are currently
+        running, so a long-running operator no longer leaves the window
+        looking identical to an idle one. It is updated by
+        _on_live_runs_changed (a run starting or finishing) and
+        _on_operator_progress (the coalesced progress tick).
         """
         self._selection_label = QLabel()
         self._selection_label.setStyleSheet("padding: 0 8px;")
         # addPermanentWidget pins it to the right side so transient
         # messages from QStatusBar.showMessage() don't displace it.
         self.statusBar().addPermanentWidget(self._selection_label)
+
+        self._run_indicator_label = QLabel()
+        self._run_indicator_label.setStyleSheet("padding: 0 8px;")
+        self.statusBar().addPermanentWidget(self._run_indicator_label)
+        # The latest value seen from operator_progress. AppController
+        # coalesces progress into one value for the whole application
+        # (see controller.format_run_indicator_text), so this is reset
+        # to None whenever the live-run set changes -- a percentage left
+        # over from a run that just finished must not appear to describe
+        # whatever starts next.
+        self._latest_run_percent: int | None = None
+
         self._refresh_status_bar()
+        self._refresh_run_indicator()
+
+    def _refresh_run_indicator(self) -> None:
+        """
+        Rebuilds the run-indicator text from the controller's live-run
+        list and the latest progress tick, via the Qt-free
+        format_run_indicator_text(). Hidden (setVisible(False)), not
+        just blank, when nothing is running -- chosen over leaving the
+        widget visible with empty text so it does not sit in the status
+        bar as an empty gap between the permanent widgets.
+        """
+        text = format_run_indicator_text(
+            self._controller.get_live_runs(), self._latest_run_percent
+        )
+        self._run_indicator_label.setText(text)
+        self._run_indicator_label.setVisible(bool(text))
+
+    def _on_live_runs_changed(self) -> None:
+        """A run started or finished. The previous percentage no longer
+        describes anything live, so it is dropped here rather than
+        carried into whatever the new live-run set shows."""
+        self._latest_run_percent = None
+        self._refresh_run_indicator()
+
+    def _on_operator_progress(self, percent: int) -> None:
+        self._latest_run_percent = percent
+        self._refresh_run_indicator()
 
     def _refresh_status_bar(self) -> None:
         """
@@ -658,6 +705,8 @@ class MainWindow(QMainWindow):
         ctrl.display_result_ready.connect(self._on_display_result)
         ctrl.error_occurred.connect(self._on_error)
         ctrl.merge_report_ready.connect(self._on_merge_report)
+        ctrl.live_runs_changed.connect(self._on_live_runs_changed)
+        ctrl.operator_progress.connect(self._on_operator_progress)
         ctrl.operator_complete.connect(self._on_operator_complete)
         ctrl.table_created.connect(self._on_table_created)
 

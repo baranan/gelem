@@ -1078,3 +1078,110 @@ def test_accepting_a_conflict_starts_the_run(qapp, monkeypatch):
 
     assert len(calls) == 1
     assert controller.run_create_columns_calls == [("demo_op", ["r1"], {})]
+
+
+# ===========================================================================
+# run-indicator-1: the status-bar run indicator, at the MainWindow seam.
+#
+# controller.format_run_indicator_text() and AppController.get_live_runs()
+# are covered by tests/test_result_delivery.py -- these tests pin only the
+# widget wiring: the label is hidden when nothing is running, shown with
+# the right text when something is, and _on_live_runs_changed /
+# _on_operator_progress rebuild it from the controller's current state
+# rather than from their own argument alone.
+#
+# Written from the work-item specification, not the implementation.
+# ===========================================================================
+
+from PySide6.QtWidgets import QLabel
+
+
+class _LiveRunsController:
+    """Just get_live_runs() -- the one thing _refresh_run_indicator()
+    reads from the controller."""
+
+    def __init__(self, live_runs=None):
+        self._live_runs = list(live_runs or [])
+
+    def get_live_runs(self):
+        return list(self._live_runs)
+
+
+def _indicator_window(controller):
+    """A MainWindow with no __init__ run, carrying just the run-indicator
+    state _build_status_bar() would have created."""
+    window = MainWindow.__new__(MainWindow)
+    window._controller = controller
+    window._run_indicator_label = QLabel()
+    window._latest_run_percent = None
+    return window
+
+
+def test_indicator_label_is_hidden_with_no_live_runs(qapp):
+    window = _indicator_window(_LiveRunsController([]))
+
+    window._refresh_run_indicator()
+
+    # Would still pass if violated? No. A version that only cleared the
+    # text but left the widget visible would fail this: isHidden() would
+    # still read False, leaving an empty gap in the status bar.
+    assert window._run_indicator_label.isHidden() is True
+    assert window._run_indicator_label.text() == ""
+
+
+def test_indicator_label_is_shown_with_one_live_run(qapp):
+    controller = _LiveRunsController(
+        [{"label": "Extract blendshapes", "table_name": "frames"}]
+    )
+    window = _indicator_window(controller)
+
+    window._refresh_run_indicator()
+
+    assert window._run_indicator_label.isHidden() is False
+    assert "Extract blendshapes" in window._run_indicator_label.text()
+    assert "frames" in window._run_indicator_label.text()
+
+
+def test_on_live_runs_changed_drops_the_stale_percentage(qapp):
+    # A percentage left over from a run that just finished must not be
+    # shown next to whatever the live-run set becomes next.
+    controller = _LiveRunsController(
+        [{"label": "Extract blendshapes", "table_name": "frames"}]
+    )
+    window = _indicator_window(controller)
+    window._latest_run_percent = 90
+
+    window._on_live_runs_changed()
+
+    assert "90" not in window._run_indicator_label.text()
+    assert window._latest_run_percent is None
+
+
+def test_on_operator_progress_updates_the_label_text(qapp):
+    controller = _LiveRunsController(
+        [{"label": "Extract blendshapes", "table_name": "frames"}]
+    )
+    window = _indicator_window(controller)
+
+    window._on_operator_progress(33)
+
+    assert window._latest_run_percent == 33
+    assert "33" in window._run_indicator_label.text()
+    assert window._run_indicator_label.isHidden() is False
+
+
+def test_indicator_label_hides_again_once_the_run_ends(qapp):
+    controller = _LiveRunsController(
+        [{"label": "Extract blendshapes", "table_name": "frames"}]
+    )
+    window = _indicator_window(controller)
+    window._on_operator_progress(50)
+    assert window._run_indicator_label.isHidden() is False
+
+    # The run finished: the controller's live-run list is now empty by
+    # the time live_runs_changed fires (deregister happens first).
+    controller._live_runs = []
+    window._on_live_runs_changed()
+
+    assert window._run_indicator_label.isHidden() is True
+    assert window._run_indicator_label.text() == ""

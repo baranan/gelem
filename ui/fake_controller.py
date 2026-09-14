@@ -47,6 +47,7 @@ class FakeController(QObject):
     rows_updated             = Signal(object)
     operator_progress        = Signal(int)
     operator_complete        = Signal(str)
+    live_runs_changed        = Signal()
     merge_report_ready       = Signal(object)
     error_occurred           = Signal(str)
     display_result_ready     = Signal(dict)
@@ -523,6 +524,18 @@ class FakeController(QObject):
         without this). Fake mode never has a second run in flight --
         there is no live-run registry here at all -- so there is never
         a conflict to report.
+        """
+        return []
+
+    def get_live_runs(self) -> list[dict]:
+        """
+        Mirrors AppController.get_live_runs() (run-indicator-1,
+        run-indicator-1-fix; tests/test_fake_controller_contract.py
+        fails without this). The real controller returns one
+        {"operation_id", "label", "table_name"} dict per live run --
+        there is no live-run registry in fake mode -- live_runs_changed
+        is declared above for signal parity but is never emitted -- so
+        there is never a live run to report.
         """
         return []
 

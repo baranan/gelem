@@ -123,6 +123,54 @@ def write_read_conflict_warnings(
     return warnings
 
 
+# ---------------------------------------------------------------------------
+# run-indicator-1: the status-bar sentence describing what is running.
+#
+# Pure, Qt-free arithmetic plus the researcher-facing wording -- no widget,
+# importable and testable with no Qt and no controller. ui/main_window.py
+# calls this with the plain data from AppController.get_live_runs() and the
+# latest value it has seen from the operator_progress signal.
+# ---------------------------------------------------------------------------
+
+def format_run_indicator_text(
+    live_runs: list[dict],
+    percent: int | None,
+) -> str:
+    """The sentence the run-indicator status-bar widget should show, or
+    "" when nothing is running -- the empty string is what tells
+    ui/main_window.py to hide the widget.
+
+    live_runs is plain data, one dict per in-flight run, read from the
+    "label" and "table_name" keys only -- exactly the shape
+    AppController.get_live_runs() returns, though this function does not
+    look at that dict's "operation_id" (run-indicator-1-fix): a run's
+    identity has nothing to say about the sentence describing it.
+
+    percent is the latest value reported by AppController's
+    operator_progress signal (0-100), or None if no progress tick has
+    arrived since the live-run set last changed.
+
+    AppController coalesces progress into ONE latest value for the WHOLE
+    APPLICATION, not one per run (see operator_progress on AppController).
+    So a percentage can only be shown honestly when there is exactly one
+    live run -- with two or more, the shared number cannot be attributed
+    to either one, so no percentage is shown at all, only how many
+    operators are running and their labels.
+    """
+    if not live_runs:
+        return ""
+
+    if len(live_runs) == 1:
+        run = live_runs[0]
+        text = f'Running "{run["label"]}" on "{run["table_name"]}"'
+        if percent is not None:
+            text += f" -- {percent}%"
+        return text
+
+    labels = ", ".join(f'"{run["label"]}"' for run in live_runs)
+    return f"{len(live_runs)} operators running: {labels}"
+
+
 class AppController(QObject):
     """
     Wires together Dataset, QueryEngine, ArtifactStore,
@@ -148,6 +196,13 @@ class AppController(QObject):
                                  in this drain tick.
         operator_progress:       Integer 0-100 progress percentage.
         operator_complete:       Name of the operator that finished.
+        live_runs_changed:       The set of in-flight operator runs
+                                 changed -- a run started or finished.
+                                 Carries no payload; a listener reads the
+                                 new set via get_live_runs(). Emitted on
+                                 both register and deregister so a run
+                                 indicator can appear the moment a run
+                                 starts, before its first progress tick.
         merge_report_ready:      MergeReport object for display.
         error_occurred:          Human-readable error message string.
         display_result_ready:    Result dict from a create_display
@@ -164,6 +219,7 @@ class AppController(QObject):
     rows_updated             = Signal(object)
     operator_progress        = Signal(int)
     operator_complete        = Signal(str)
+    live_runs_changed        = Signal()
     merge_report_ready       = Signal(object)
     error_occurred           = Signal(str)
     display_result_ready     = Signal(dict)
@@ -395,10 +451,45 @@ class AppController(QObject):
             "had_setup_error":    False,
             "had_row_errors":     False,
         }
+        # A new operation_id is always a new entry (uuid-generated per
+        # run), so this always changes the set -- see live_runs_changed.
+        self.live_runs_changed.emit()
 
     def _deregister_run(self, operation_id: str) -> None:
-        """Drops a run from the live set. Idempotent."""
-        self._live_runs.pop(operation_id, None)
+        """Drops a run from the live set. Idempotent.
+
+        Only emits live_runs_changed when a run was actually removed --
+        a no-op pop (already-idempotent caller, or a run the failed-start
+        cleanup already dropped) is not a change to the set.
+        """
+        if self._live_runs.pop(operation_id, None) is not None:
+            self.live_runs_changed.emit()
+
+    def get_live_runs(self) -> list[dict]:
+        """Plain data describing every in-flight operator run, for the
+        run-indicator widget (ui/main_window.py) -- never the internal
+        dict, the CancellationToken, or any other internal key.
+
+        Returns one {"operation_id": str, "label": str, "table_name": str}
+        dict per live run, in no particular order.
+
+        operation_id is an opaque handle, the same discipline as row_id
+        (see the "Row identity and lineage" rules in CLAUDE.md): the UI
+        may hold it, pass it back to the controller, and use it to tell
+        two live runs apart, but must not parse it, sort by it, or
+        construct one itself. It is the same value _register_run was
+        called with -- run-indicator-1-fix adds it so a future Cancel
+        control (P1.12f-3) has something to name the one run it should
+        cancel; this item does not add a Cancel control itself.
+        """
+        return [
+            {
+                "operation_id": operation_id,
+                "label":        run["label"],
+                "table_name":   run["table_name"],
+            }
+            for operation_id, run in self._live_runs.items()
+        ]
 
     def _attach_run_provenance(
         self,
@@ -1310,8 +1401,11 @@ class AppController(QObject):
             self._store.reset()
             # The dataset is being replaced: every in-flight operator run
             # now targets rows that will not exist. Drop them so a late
-            # result cannot write onto the new folder's rows.
-            self._live_runs.clear()
+            # result cannot write onto the new folder's rows. Guarded so
+            # live_runs_changed fires only on an actual change.
+            if self._live_runs:
+                self._live_runs.clear()
+                self.live_runs_changed.emit()
             self._active_filters = []
             self._group_by       = None
             self._visible_cols   = None
@@ -1341,8 +1435,11 @@ class AppController(QObject):
         try:
             self._store.reset()
             # See load_folder(): the dataset is being replaced, so no
-            # in-flight run's results are valid any more.
-            self._live_runs.clear()
+            # in-flight run's results are valid any more. Guarded so
+            # live_runs_changed fires only on an actual change.
+            if self._live_runs:
+                self._live_runs.clear()
+                self.live_runs_changed.emit()
             self._active_filters = []
             self._group_by       = None
             self._visible_cols   = None
@@ -2054,7 +2151,10 @@ class AppController(QObject):
             self._dataset.load(project_path)
             # The dataset is now the new project: drop every in-flight run so
             # a late result cannot land in it, and re-root media resolution.
-            self._live_runs.clear()
+            # Guarded so live_runs_changed fires only on an actual change.
+            if self._live_runs:
+                self._live_runs.clear()
+                self.live_runs_changed.emit()
             self._project_root = Path(project_path)
             # reset() BEFORE load_index(): otherwise the new project's
             # index lands on top of the previous project's live image
