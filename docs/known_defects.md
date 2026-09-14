@@ -150,6 +150,14 @@ to P1.8d, and the two OS-native / non-parsing media-cell entries to P1.8e.
   researcher switch between them, defaulting to the one double-clicked. This
   is an interface change, not a local fix. Found by eye 13 Sep 2026; no item
   assigned.
+- **A missing numeric value displays as "nan" in the detail view.** This is
+  correct underneath -- the blendshape columns are floating point, and a
+  missing value in a float column is NaN, not None -- but a researcher
+  reading "nan" has no way to know it means "this was not computed". A blank
+  cell, or a dash, is the honest rendering. The fix belongs wherever a value
+  becomes display text, not in the operator and not in the data. Found by
+  Y B on 14 Sep 2026 while checking a cancelled run by eye; no item
+  assigned.
 
 ## Open -- smells, no item assigned
 
@@ -405,6 +413,21 @@ to P1.8d, and the two OS-native / non-parsing media-cell entries to P1.8e.
   (`MANUAL_CHECK_MODULES`) to tell that apart from a real "nothing collected"
   failure such as a mistyped `-k`. The real fix is renaming them out of the
   `test_` namespace; not done in this item.
+
+## Open -- questions, no item assigned
+
+- **Should `_run_outcome()` compare rows applied against rows requested for
+  every run, not only a cancelled one?** Today `AppController._run_outcome()`
+  makes that comparison only inside its cancelled branch (COLUMNS mode): an
+  UNcancelled run that silently produced less than it was asked for --
+  for example a row whose image failed to load -- is still recorded
+  "complete". Extending the comparison to every run is **not obviously
+  correct**: whether a shortfall means "partial" depends on whether one row
+  in always means one result out for COLUMNS mode, and an operator that
+  legitimately writes nothing for some rows would be mislabelled. Settling
+  it also needs a load-failure counter that nothing tracks today. Raised by
+  Claude Code on 14 Sep 2026 and deferred deliberately -- this is a question,
+  not a bug with a known fix.
 
 ---
 

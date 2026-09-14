@@ -457,17 +457,35 @@ entry carries the operator name, the execution mode, the mode's label, the
 parameter values, the target table (COLUMNS mode only), every input table this
 run read together with the write-ticket version it was at when the run
 started, how many rows were requested and how many were actually applied, any
-row ids a result could not be placed back onto, and `superseded_tables` (see
-below). `models/dataset.py`'s `record_operator_run()` docstring is the
-authority for the exact field list; this is a summary, not a restatement.
+row ids a result could not be placed back onto, `superseded_tables` (see
+below), and `cancellation_requested` (see below). `models/dataset.py`'s
+`record_operator_run()` docstring is the authority for the exact field list;
+this is a summary, not a restatement.
 
 `outcome` is one of three values:
 
 - `"complete"` -- every requested row produced a result and was applied.
-- `"partial"` -- the run ended with some, but not all, of its results applied
-  (an error partway through, or a result that could not be placed back onto a
-  row that no longer exists).
+- `"partial"` -- the run produced less than it was asked for: an error
+  partway through, a result that could not be placed back onto a row that no
+  longer exists, or -- since P1.12f-3 -- a cancelled run that actually fell
+  short. For COLUMNS mode, falling short means applying fewer rows than were
+  requested. A single-shot TABLE or DISPLAY run that was cancelled is always
+  `"partial"` for a different reason: it cannot be interrupted mid-computation
+  (`CLAUDE.md`, "Long-running work", is the authority for what Cancel does and
+  does not interrupt), so it runs to completion and its result is discarded
+  on arrival rather than stored or shown -- discarding the whole result is
+  producing nothing.
 - `"failed"` -- the run produced no applied results at all.
+
+Cancellation and outcome answer two different questions, and the entry keeps
+them separate. `cancellation_requested` records the fact that the researcher
+clicked Cancel (`AppController.cancel_run()`); `outcome` records what the run
+actually produced. A COLUMNS run that had already applied every row it was
+asked for by the time the click reached the controller reads `outcome:
+"complete"`, `cancellation_requested: true` -- clicking Cancel does not
+retroactively make a finished result incomplete. See `docs/known_defects.md`
+for the open question of whether an UNcancelled run that silently produced
+less than it was asked for should be held to the same "partial" standard.
 
 Not yet in the entry, and still open: operator and model **version**, and a
 cache identity for the run -- both wait on `P2.2`'s caching design (§8).

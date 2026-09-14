@@ -443,34 +443,32 @@ state. This rule carries no violation list of its own -- it points at the three
 - **`[NOW]`** Long runs are cancellable, keeping partial results. Made true by
   P1.12f-3. `AppController.cancel_run(operation_id)` sets that run's
   `CancellationToken` (`operators/run_context.py`) and nothing else --
-  cancelling an id that does not name a live run is a no-op, never an error,
-  because the run may have finished between the click and the call. What
-  happens next depends on the mode, and the two differ on purpose:
+  cancelling an id that is not live is a no-op, never an error: the run may
+  already have finished. What happens next depends on the mode:
     - **COLUMNS** -- the per-row runner
       (`OperatorRegistry._run_create_columns_worker`) checks
-      `run.cancelled()` **between rows**, never mid-row (an operator's own
-      row work is its own business), and stops there. Every result already
-      handed to `run.emit()` / `on_item_complete` for an earlier row is kept.
+      `run.cancelled()` **between rows**, never mid-row, and stops there.
+      Every result already handed to `on_item_complete` is kept.
     - **TABLE and DISPLAY** -- single-shot; the runner cannot interrupt one
-      mid-computation. Cancelling does not stop the work: the run finishes,
-      and its result is discarded when it arrives
-      (`AppController._on_operator_complete`'s `"create_table"` /
-      `"create_display"` branches) rather than stored or shown. This is an
-      honest limit, not a bug -- a table or display result cannot be
-      produced partway through.
-  Either way `Dataset.record_operator_run()` records the run outcome
-  `"partial"` (P1.12f-1's mechanism; `AppController._run_outcome()` now also
-  checks the token). The status-bar run indicator's Cancel button
-  (`ui/main_window.py`) numbers live runs in start order when there is more
-  than one -- `AppController.get_live_runs()` already returns them in that
-  order -- because two runs of the same operator on the same table read
-  identically otherwise; the wording and numbering are built in Qt-free
-  functions on `controller.py` (`numbered_run_choices`,
-  `format_cancel_message`), not in the widget. Tests:
+      mid-computation. The run finishes and its result is discarded on
+      arrival (`AppController._on_operator_complete`'s `"create_table"` /
+      `"create_display"` branches) -- an honest limit, not a bug.
+  Outcome reflects what the run PRODUCED, not the click:
+  `AppController._run_outcome()` records a COLUMNS run cancelled partway as
+  `"partial"`, but one that had already applied every requested row as
+  `"complete"`; a cancelled TABLE or DISPLAY run is always `"partial"`, its
+  result being discarded. `cancellation_requested` records the click either
+  way. `docs/architecture.md`'s "Run provenance and conflict detection" is
+  the authority for the outcome-values list and the entry's fields; not
+  restated here. The status-bar Cancel button (`ui/main_window.py`) numbers
+  live runs in start order when more than one is live (`get_live_runs()`
+  returns that order) so two runs of the same operator on the same table can
+  be told apart; the wording and numbering are Qt-free, in `controller.py`
+  (`numbered_run_choices`, `format_cancel_message`). Tests:
   `tests/test_result_delivery.py`, `tests/test_run_cancellation.py`,
   `tests/test_parameter_dialog.py`.
-  *(The `WorkerPool` generation counter added in P0.5b-2i cancels **thumbnail
-  jobs**, not operator runs -- a different mechanism, untouched here.)*
+  *(The `WorkerPool` generation counter added in P0.5b-2i cancels thumbnail
+  jobs, not operator runs -- untouched here.)*
 - **`[TARGET -> P2.2]`** Resumability is narrower than cancellability and must be
   stated per mode; see `operators/CLAUDE.md`. A generator gives progressive output
   and a cancellation point. It does not by itself give resumability.
