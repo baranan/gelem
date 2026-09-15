@@ -1999,6 +1999,9 @@ class AppController(QObject):
                 table_name=table_name,
                 frame=input_frame,
                 version=self._dataset.table_version(table_name),
+                carry_columns=tuple(
+                    self._dataset.columns_to_carry(table_name)
+                ),
             )
         run_data = RunData(tables=tables, projects={})
 

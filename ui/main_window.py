@@ -184,6 +184,17 @@ class MainWindow(QMainWindow):
 
         row.addWidget(QLabel("Table: "), 0, Qt.AlignmentFlag.AlignVCenter)
         self._table_combo = QComboBox()
+        # QComboBox's default AdjustToContentsOnFirstShow policy only sizes
+        # itself once, at first show -- table names are added later, after
+        # a load or an operator run, so a generated name like
+        # "frames_expanded" is truncated. AdjustToContents keeps it sized
+        # to its widest current entry on every repopulation; the maximum
+        # width caps that so one very long name cannot crowd out the rest
+        # of the toolbar.
+        self._table_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToContents
+        )
+        self._table_combo.setMaximumWidth(260)
         self._table_combo.addItem("frames")
         self._table_combo.currentTextChanged.connect(
             self._controller.set_active_table

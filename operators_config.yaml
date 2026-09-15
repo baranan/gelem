@@ -50,3 +50,7 @@ operators:
   video_frames:
     enabled: true
     description: "Decodes each video row with OpenCV and writes one JPEG per kept frame (every Nth frame, N chosen in the dialog), producing a frame-level table that carries the source row's columns plus frame_number and video_file."
+
+  segment:
+    enabled: true
+    description: "Cuts each row into a time-range segment of its source media, using two researcher-chosen start/end columns in seconds. Adds a canonical #t=<start>-<end> address, a per-source segment index, start, end and duration, and carries the source table's identifier, index and carry-flagged columns down. Decodes no media and writes no files."

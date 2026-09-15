@@ -51,6 +51,7 @@ from operators.blendshape_avatar import BlendshapeAvatarOperator
 from operators.mean_face import MeanFaceOperator
 from operators.plot_operator import PlotOperator
 from operators.plot_advanced import PlotAdvancedOperator
+from operators.segment import SegmentOperator
 from operators.stats_operator import StatsOperator
 from operators.summary_stats import SummaryStatsOperator
 from operators.video_frames import VideoFramesOperator
@@ -67,6 +68,7 @@ OPERATORS_UNDER_TEST = {
     "mean_face": MeanFaceOperator,
     "plot": PlotOperator,
     "plot_advanced": PlotAdvancedOperator,
+    "segment": SegmentOperator,
     "stats": StatsOperator,
     "summary_stats": SummaryStatsOperator,
     "video_frames": VideoFramesOperator,
@@ -97,6 +99,10 @@ EXPECTED = {
     },
     "plot_advanced": {
         "modes": {ExecutionMode.DISPLAY},
+        "columns": None,
+    },
+    "segment": {
+        "modes": {ExecutionMode.TABLE},
         "columns": None,
     },
     "stats": {
@@ -181,6 +187,10 @@ def test_plot_descriptor_matches_expected():
 
 def test_plot_advanced_descriptor_matches_expected():
     _assert_descriptor_matches_expected("plot_advanced")
+
+
+def test_segment_descriptor_matches_expected():
+    _assert_descriptor_matches_expected("segment")
 
 
 def test_stats_descriptor_matches_expected():

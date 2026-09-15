@@ -120,6 +120,14 @@ class TableSnapshot:
     ``version`` is the per-table write-ticket version (P1.12b): it changes
     on every accepted commit to that table, so two snapshots of the same
     table with the same version are the same data.
+
+    ``carry_columns`` is the source table's carry set (docs/architecture.md
+    §4.2), in schema order -- computed on the main thread from ``Dataset``
+    (``Dataset.columns_to_carry``) before the run starts. It is ADVISORY:
+    this class does not use it or enforce it. An operator that splits one
+    row into many (a segment or frame operator) reads it off its input
+    snapshot and copies those columns onto its output rows; an operator
+    that does not split rows is free to ignore it entirely.
     """
 
     # The stored table's name.
@@ -128,6 +136,9 @@ class TableSnapshot:
     frame: object
     # The per-table write-ticket version at the moment of the snapshot.
     version: int
+    # The source table's carry set, in schema order. Advisory -- see the
+    # class docstring. Empty by default for a snapshot built without one.
+    carry_columns: tuple = ()
 
     def __post_init__(self) -> None:
         # A snapshot with no table name could not be keyed or reported.

@@ -141,6 +141,12 @@ def _build_video_frames(dirs: OperatorRuntimeDirs):
     return VideoFramesOperator(output_dir=dirs.frames_dir)
 
 
+def _build_segment(dirs: OperatorRuntimeDirs):
+    # SegmentOperator takes no constructor arguments -- it writes no files.
+    from operators.segment import SegmentOperator
+    return SegmentOperator()
+
+
 # OPERATOR_FACTORIES: operator name -> callable(OperatorRuntimeDirs) -> instance.
 # The set of keys here must equal the set of entry keys in
 # operators_config.yaml. Order does not matter -- build order comes from
@@ -154,6 +160,7 @@ OPERATOR_FACTORIES: dict[str, Callable[[OperatorRuntimeDirs], object]] = {
     "plot_advanced": _build_plot_advanced,
     "stats": _build_stats,
     "video_frames": _build_video_frames,
+    "segment": _build_segment,
 }
 
 
