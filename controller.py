@@ -32,6 +32,7 @@ from PySide6.QtCore import QObject, Signal, QTimer
 
 from models.query_result import QueryResult, ResultLayout, GroupSection
 from models.notifications import RowsUpdated, ThumbnailsReady
+from models.project_paths import ProjectPaths, build_project_paths
 from media.media_address import resolve_source, MediaAddressError
 from operators.descriptor import (
     ExecutionMode,
@@ -337,7 +338,7 @@ class AppController(QObject):
         drain_budget: int = 200,
         *,
         settings_gateway=None,
-        runtime_dirs=None,
+        project_paths: ProjectPaths | None = None,
     ):
         super().__init__()
 
@@ -347,17 +348,19 @@ class AppController(QObject):
         self._registry         = registry
         self._op_registry      = operator_registry
 
-        # The project directories operator runs may write to
-        # (operators/operator_config.py OperatorRuntimeDirs). Default None
-        # so existing test construction sites need no edit; main.py builds
-        # the real one and passes it in. It is handed to every OperatorRun
-        # as run.paths. Left None, a run still starts and every bundled
-        # operator still works (they write under their own constructor
-        # output_dir, not run.paths) -- but run.paths is then None, so a
-        # future operator that reads run.paths would fail loudly rather
-        # than silently. main.py always passes it, so production is never
-        # in that state.
-        self._runtime_dirs     = runtime_dirs
+        # This project's directories (models/project_paths.py::ProjectPaths).
+        # Default None so existing test construction sites need no edit;
+        # main.py builds the real one (a fresh workspace) and passes it in.
+        # It is handed to every OperatorRun as run.paths, and replaced
+        # wholesale -- never mutated -- by save_project() and
+        # load_project(), at the same point each already re-roots
+        # ArtifactStore. Left None, a run still starts, but any of the five
+        # operators that write files (video_frames, plot_advanced, plot,
+        # mean_face, blendshape_avatar) fails loudly reading run.paths.
+        # outputs_dir off None rather than silently writing somewhere
+        # unexpected -- main.py always passes a real one, so production is
+        # never in that state.
+        self._project_paths    = project_paths
 
         # The plain-data editing face of the machine-tunable settings
         # (settings/settings_gateway.py). Default None so existing test
@@ -2009,7 +2012,7 @@ class AppController(QObject):
         run = OperatorRun(
             spec=spec,
             data=run_data,
-            paths=self._runtime_dirs,
+            paths=self._project_paths,
             _token=token,
             # The per-row result sink for a COLUMNS run. Wired for the
             # contract P1.12f consumes; no operator calls run.emit() yet.
@@ -2460,6 +2463,14 @@ class AppController(QObject):
             # in the saved index names a file inside project_path/artifacts
             # (P0.5b-2ii-a). Main-thread only -- see set_artifacts_dir.
             self._store.set_artifacts_dir(project_path / "artifacts")
+            # Re-root ProjectPaths at the same point, so run.paths.
+            # outputs_dir for the NEXT operator run lands under the saved
+            # project rather than the workspace it started in
+            # (P1.9a). build_project_paths is pure -- this only swaps the
+            # value the controller holds, same as set_artifacts_dir above.
+            self._project_paths = build_project_paths(
+                project_path, is_workspace=False
+            )
             # Sweep the artifacts directory BEFORE save_index writes the
             # records (P0.5b-2ii-b2). The order is load-bearing:
             # reversed, save_index would serialize records naming files
@@ -2470,7 +2481,10 @@ class AppController(QObject):
             # NOT: self._project_root = project_path. save() does not
             # rewrite the in-memory cells, so the base they resolve
             # against must not move either. load_project() sets the root
-            # because load() does absolutise the cells against it.
+            # because load() does absolutise the cells against it. This is
+            # unchanged by P1.9a: ProjectPaths (run.paths / the artifacts
+            # cache) and _project_root (media cell resolution) answer
+            # different questions and re-root on different conditions.
         except Exception as e:
             self.error_occurred.emit(f"Failed to save project: {e}")
 
@@ -2510,6 +2524,13 @@ class AppController(QObject):
             # re-roots the store and the codec -- the migration path only
             # does work on save.
             self._store.set_artifacts_dir(project_path / "artifacts")
+            # Re-root ProjectPaths at the same point (P1.9a), so the next
+            # operator run writes under the newly opened project rather
+            # than wherever the previously open project (or the launch
+            # workspace) pointed.
+            self._project_paths = build_project_paths(
+                Path(project_path), is_workspace=False
+            )
             # load_index() re-seeds the index AND the fingerprint memo
             # from the persisted (size, mtime) values, so a project that
             # was fully thumbnailed reopens showing its cached pictures

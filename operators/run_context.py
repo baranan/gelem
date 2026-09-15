@@ -18,15 +18,23 @@ that is deliberate.
 
 DESIGN CONSTRAINTS
 
-  * No Qt, and no import from ``models/``, ``controller.py`` or ``ui/``.
+  * No Qt, and no RUNTIME import from ``models/``, ``controller.py`` or
+    ``ui/``. The one exception is ``models.project_paths.ProjectPaths``
+    (the type of ``run.paths``, P1.9a): it is Qt-free and pandas-free by
+    its own contract, so importing it costs nothing, but it is still
+    imported under ``TYPE_CHECKING`` only -- kept gated on principle, so
+    this module's "no runtime import from models/" rule stays true by
+    inspection rather than by accident of what one particular name
+    happens to cost. See the note at that import.
   * pandas is allowed but is not needed here: this module stores whatever
     frames it is handed and never builds or copies one.
   * Frozen dataclasses throughout; every collection field is a tuple or a
     read-only mapping, never a list.
-  * Importing this module must not drag PyYAML in. The only name this
-    module needs from ``operators.operator_config`` is ``OperatorRuntimeDirs``,
-    used purely as a type annotation, so it is imported under
-    ``TYPE_CHECKING`` (see the note at that import).
+  * Importing this module must not drag in a heavy dependency of something
+    it merely annotates. ``models.project_paths`` is light (a frozen
+    dataclass over ``pathlib``), so nothing forces the TYPE_CHECKING gate
+    on it today -- but a future ``run.paths``-adjacent type that pulls in
+    something heavier stays safe under the same discipline.
 """
 
 from __future__ import annotations
@@ -51,11 +59,12 @@ from operators.descriptor import (
 if TYPE_CHECKING:
     # TYPE_CHECKING is a constant that is False at run time and True only
     # while a static type checker (mypy, pyright) is analysing this file.
-    # Importing OperatorRuntimeDirs here therefore gives us the name for
-    # annotations WITHOUT importing operators.operator_config at run time --
-    # and that module imports PyYAML at module scope, which we do not want
-    # to pull into every process that merely touches a run object.
-    from operators.operator_config import OperatorRuntimeDirs
+    # Importing ProjectPaths here therefore gives us the name for
+    # annotations WITHOUT importing models.project_paths at run time -- kept
+    # TYPE_CHECKING-gated rather than plain so this module's "no runtime
+    # import from models/" rule stays true by inspection, not merely by
+    # accident of what project_paths.py happens to import today.
+    from models.project_paths import ProjectPaths
 
 
 # ---------------------------------------------------------------------------
@@ -593,8 +602,9 @@ class OperatorRun:
     spec: OperatorRunSpec
     # The frozen table snapshots this run may read.
     data: RunData
-    # This project's directories. Never store these on the operator.
-    paths: "OperatorRuntimeDirs"
+    # This project's directories (models/project_paths.py::ProjectPaths).
+    # Never store these on the operator.
+    paths: "ProjectPaths"
     # The cancellation flag, held by the runner. Underscore-prefixed
     # because an operator must go through cancelled(), never touch this.
     _token: CancellationToken

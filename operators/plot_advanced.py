@@ -15,7 +15,6 @@ Output: a result dict with two keys --
 
 from __future__ import annotations
 from datetime import datetime
-from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
@@ -161,21 +160,12 @@ class PlotAdvancedOperator(BaseOperator):
         ),
     )
 
-    def __init__(self, output_dir: Path | None = None):
-        # Default to a project-relative folder, not the system Temp
-        # directory (same pattern as VideoFramesOperator). main.py can
-        # pass an explicit output_dir once Dataset.save()/load() define
-        # a real project folder.
-        #
-        # output_dir is a genuine construction-time value and stays here.
-        # The seven run parameters (title, chart_type, x, y, color, facet,
-        # aggregate) travel in run.parameters and nothing about them lives
-        # on the instance -- two concurrent runs must not share one set of
-        # values.
-        self._output_dir = output_dir or (
-            Path.cwd() / "gelem_project" / "plots"
-        )
-        self._output_dir.mkdir(parents=True, exist_ok=True)
+    # No __init__: this operator holds nothing on self. It writes only
+    # under run.paths.outputs_dir, supplied fresh on every run -- an
+    # output directory captured at construction time would be shared by
+    # every concurrent run of this singleton (operators/CLAUDE.md, "Write
+    # only to run.paths"). The seven run parameters (title, chart_type, x,
+    # y, color, facet, aggregate) travel in run.parameters the same way.
 
     # No get_parameters_dialog(). The seven parameters above are declared
     # on the descriptor; MainWindow builds the form from them
@@ -352,8 +342,10 @@ class PlotAdvancedOperator(BaseOperator):
             now.strftime("%Y.%m.%d_%H.%M.%S")
             + f".{now.microsecond // 10000:02d}"
         )
-        html_path = self._output_dir / f"plot_{run_id}.html"
-        png_path  = self._output_dir / f"plot_{run_id}.png"
+        plots_dir = run.paths.outputs_dir / "plots"
+        plots_dir.mkdir(parents=True, exist_ok=True)
+        html_path = plots_dir / f"plot_{run_id}.html"
+        png_path  = plots_dir / f"plot_{run_id}.png"
 
         fig.write_html(str(html_path))
         fig.write_image(str(png_path))  # requires: pip install kaleido

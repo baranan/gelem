@@ -19,7 +19,6 @@ Dependencies:
 """
 
 from __future__ import annotations
-from pathlib import Path
 import numpy as np
 
 from operators.base import BaseOperator
@@ -104,18 +103,19 @@ class PlotOperator(BaseOperator):
     def __init__(
         self,
         columns: list[str] | None = None,
-        output_dir: Path | None = None,
     ):
         """
         Creates the operator.
 
         Args:
-            columns:    List of column names to plot. Set by the
-                        parameter dialog before running. Defaults to
-                        common blendshape columns if not set.
-            output_dir: Where to save plot images.
+            columns: List of column names to plot. Set by the parameter
+                     dialog before running. Defaults to common blendshape
+                     columns if not set.
+
+        columns is a genuine construction-time default; where to write is
+        not -- it comes from run.paths.outputs_dir on every run (operators/
+        CLAUDE.md, "Write only to run.paths").
         """
-        import tempfile
         self._columns = columns or [
             "bs_jawOpen",
             "bs_mouthSmileLeft",
@@ -125,10 +125,6 @@ class PlotOperator(BaseOperator):
             "bs_eyeBlinkRight",
             "bs_cheekPuff",
         ]
-        self._output_dir = output_dir or (
-            Path(tempfile.gettempdir()) / "gelem_plots"
-        )
-        self._output_dir.mkdir(parents=True, exist_ok=True)
 
     # No get_parameters_dialog(). This mode declares no parameters
     # (parameters=() on the descriptor), so MainWindow shows no form and
@@ -177,7 +173,9 @@ class PlotOperator(BaseOperator):
                ax.set_xlim(0, 1)
                ax.set_title(f'Row {row_id}')
             4. Save and close:
-               output_path = self._output_dir / f'{row_id}_plot.png'
+               output_dir = run.paths.outputs_dir / "plots"
+               output_dir.mkdir(parents=True, exist_ok=True)
+               output_path = output_dir / f'{row_id}_plot.png'
                fig.savefig(str(output_path), dpi=72, bbox_inches='tight')
                plt.close(fig)
             5. Return {'plot_path': str(output_path)}
@@ -198,7 +196,9 @@ class PlotOperator(BaseOperator):
             ax.set_title(f"Row {row_id}")
             ax.set_xlabel("Value")
 
-            output_path = self._output_dir / f"{row_id}_plot.png"
+            output_dir = run.paths.outputs_dir / "plots"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            output_path = output_dir / f"{row_id}_plot.png"
             fig.savefig(str(output_path), dpi=72, bbox_inches="tight")
             plt.close(fig)
             return {"plot_path": str(output_path)}

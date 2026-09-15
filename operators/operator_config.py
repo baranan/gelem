@@ -19,30 +19,10 @@ non-widget test group because it never imports Qt.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 import yaml
-
-
-# ---------------------------------------------------------------------------
-# The runtime directories an operator constructor may need.
-#
-# Only two operators are constructed with a directory today:
-# PlotAdvancedOperator wants plots_dir and VideoFramesOperator wants
-# frames_dir. main.py already computes both values; it packs them into
-# this one frozen object and hands the whole thing to every factory. A
-# factory that needs neither simply ignores it. This keeps every factory's
-# signature identical -- callable(OperatorRuntimeDirs) -> operator -- so
-# build_enabled_operators can call them uniformly.
-# ---------------------------------------------------------------------------
-@dataclass(frozen=True)
-class OperatorRuntimeDirs:
-    """Filesystem locations passed to operator constructors at build time."""
-
-    plots_dir: Path
-    frames_dir: Path
 
 
 # ---------------------------------------------------------------------------
@@ -68,13 +48,20 @@ class OperatorConfigError(Exception):
 # ---------------------------------------------------------------------------
 # The per-operator factories.
 #
-# Each factory takes an OperatorRuntimeDirs and returns one constructed
-# operator instance. The import of the operator module lives INSIDE the
-# function body on purpose: importing THIS module then costs nothing and
-# drags in no Qt, mediapipe or plotly, and a heavy or broken operator
-# module is only touched when its factory is actually invoked -- that is,
-# when its YAML entry is enabled. A disabled operator's module is never
-# imported.
+# Each factory takes no arguments and returns one constructed operator
+# instance. Before P1.9a a factory could take an OperatorRuntimeDirs
+# bundling plots_dir/frames_dir, built once from the codebase install
+# directory and never re-rooted on save or load (docs/review/p1.9-survey.md);
+# P1.9a removed that: an operator now writes only under
+# run.paths.outputs_dir (models/project_paths.py::ProjectPaths), which
+# AppController rebuilds on save_project()/load_project(), so a factory
+# needs no directory at build time at all.
+#
+# The import of the operator module lives INSIDE the function body on
+# purpose: importing THIS module then costs nothing and drags in no Qt,
+# mediapipe or plotly, and a heavy or broken operator module is only
+# touched when its factory is actually invoked -- that is, when its YAML
+# entry is enabled. A disabled operator's module is never imported.
 #
 # The dict key is the operator's `name` class attribute, which must equal
 # the key used for that operator in operators_config.yaml. That equality
@@ -85,73 +72,70 @@ class OperatorConfigError(Exception):
 # and construct nothing -- keeping each factory key spelled the same as
 # the operator's `name` attribute is a manual invariant of this table.)
 # ---------------------------------------------------------------------------
-def _build_blendshapes(dirs: OperatorRuntimeDirs):
+def _build_blendshapes():
     # BlendshapeOperator takes no constructor arguments.
     from operators.blendshapes import BlendshapeOperator
     return BlendshapeOperator()
 
 
-def _build_blendshape_avatar(dirs: OperatorRuntimeDirs):
-    # BlendshapeAvatarOperator accepts an optional output_dir; main.py
-    # passed nothing before this item, so we keep passing nothing.
+def _build_blendshape_avatar():
+    # BlendshapeAvatarOperator takes no constructor arguments.
     from operators.blendshape_avatar import BlendshapeAvatarOperator
     return BlendshapeAvatarOperator()
 
 
-def _build_mean_face(dirs: OperatorRuntimeDirs):
-    # MeanFaceOperator accepts an optional output_dir; main.py passed
-    # nothing before this item.
+def _build_mean_face():
+    # MeanFaceOperator takes no constructor arguments.
     from operators.mean_face import MeanFaceOperator
     return MeanFaceOperator()
 
 
-def _build_plot(dirs: OperatorRuntimeDirs):
-    # PlotOperator accepts optional columns / output_dir; main.py passed
-    # nothing before this item.
+def _build_plot():
+    # PlotOperator accepts an optional columns list; nothing is passed here.
     from operators.plot_operator import PlotOperator
     return PlotOperator()
 
 
-def _build_summary_stats(dirs: OperatorRuntimeDirs):
-    # SummaryStatsOperator accepts an optional columns list; main.py
-    # passed nothing before this item.
+def _build_summary_stats():
+    # SummaryStatsOperator accepts an optional columns list; nothing is
+    # passed here.
     from operators.summary_stats import SummaryStatsOperator
     return SummaryStatsOperator()
 
 
-def _build_plot_advanced(dirs: OperatorRuntimeDirs):
-    # PlotAdvancedOperator writes its interactive plots to a directory.
-    # main.py built this as PlotAdvancedOperator(output_dir=plots_dir).
+def _build_plot_advanced():
+    # PlotAdvancedOperator writes under run.paths.outputs_dir, supplied
+    # fresh on every run -- no constructor argument needed.
     from operators.plot_advanced import PlotAdvancedOperator
-    return PlotAdvancedOperator(output_dir=dirs.plots_dir)
+    return PlotAdvancedOperator()
 
 
-def _build_stats(dirs: OperatorRuntimeDirs):
+def _build_stats():
     # StatsOperator takes no constructor arguments. It was registered in
-    # code before this item but was missing from operators_config.yaml --
-    # the drift this item closes.
+    # code before P1.11a but was missing from operators_config.yaml --
+    # the drift that item closed.
     from operators.stats_operator import StatsOperator
     return StatsOperator()
 
 
-def _build_video_frames(dirs: OperatorRuntimeDirs):
-    # VideoFramesOperator writes extracted frames to a directory. main.py
-    # built this as VideoFramesOperator(output_dir=frames_dir).
+def _build_video_frames():
+    # VideoFramesOperator writes under run.paths.outputs_dir, supplied
+    # fresh on every run -- no constructor argument needed.
     from operators.video_frames import VideoFramesOperator
-    return VideoFramesOperator(output_dir=dirs.frames_dir)
+    return VideoFramesOperator()
 
 
-def _build_segment(dirs: OperatorRuntimeDirs):
+def _build_segment():
     # SegmentOperator takes no constructor arguments -- it writes no files.
     from operators.segment import SegmentOperator
     return SegmentOperator()
 
 
-# OPERATOR_FACTORIES: operator name -> callable(OperatorRuntimeDirs) -> instance.
+# OPERATOR_FACTORIES: operator name -> callable() -> instance.
 # The set of keys here must equal the set of entry keys in
 # operators_config.yaml. Order does not matter -- build order comes from
 # the YAML file -- but the entries are kept in menu order for readability.
-OPERATOR_FACTORIES: dict[str, Callable[[OperatorRuntimeDirs], object]] = {
+OPERATOR_FACTORIES: dict[str, Callable[[], object]] = {
     "blendshapes": _build_blendshapes,
     "blendshape_avatar": _build_blendshape_avatar,
     "mean_face": _build_mean_face,
@@ -253,7 +237,7 @@ def load_enabled_operator_names(config_path) -> list[str]:
 # a developer's mistake and should stop the program rather than quietly
 # change what the researcher can do.
 # ---------------------------------------------------------------------------
-def build_enabled_operators(config_path, dirs: OperatorRuntimeDirs) -> list:
+def build_enabled_operators(config_path) -> list:
     """Read operators_config.yaml and return the constructed operator
     instances for every enabled entry, in file order.
 
@@ -288,4 +272,4 @@ def build_enabled_operators(config_path, dirs: OperatorRuntimeDirs) -> list:
 
     # Build in file order, so the caller registers in file order and the
     # Operators menu comes out in file order.
-    return [OPERATOR_FACTORIES[name](dirs) for name in enabled_names]
+    return [OPERATOR_FACTORIES[name]() for name in enabled_names]

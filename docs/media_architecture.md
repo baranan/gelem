@@ -1266,10 +1266,9 @@ analysis those rows exist for. See `docs/architecture.md` §4.2. **Must be settl
 before P1.6.**
 
 **P1.9 ProjectPaths.** Temporary workspace for an unsaved project, project root,
-artifacts and proxies, operator outputs, Save As migration, relative artifact
+artifacts, operator outputs, Save As migration, relative artifact
 indexing, cleanup and cache-version invalidation. A value object injected into
-ArtifactStore and every run -- not an eighth component. **Before the resolver**,
-which needs somewhere to put proxies.
+ArtifactStore and every run -- not an eighth component.
 
 **P1.2 Resolver.** Decoder pool, PyAV backend, typed payloads (§3.3). Route all
 three existing call sites through it. *Done when:* no source-media decode call

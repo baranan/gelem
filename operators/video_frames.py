@@ -18,11 +18,11 @@ run.parameters, never on the operator instance:
     video_column  -- which column holds the video path
     frame_step    -- keep every Nth frame (1 keeps everything)
 
-Frame JPEGs are saved under self._output_dir, one fresh subfolder per
-create_table() call (named run_YYYY.MM.DD_HH.MM.SS.cs) so re-runs never
-overwrite previous extractions. Within a run, filenames are prefixed
-with the source video's stem so frames from different videos do not
-collide on disk.
+Frame JPEGs are saved under run.paths.outputs_dir / "frames", one fresh
+subfolder per create_table() call (named run_YYYY.MM.DD_HH.MM.SS.cs) so
+re-runs never overwrite previous extractions. Within a run, filenames are
+prefixed with the source video's stem so frames from different videos do
+not collide on disk.
 
 Student C is responsible for implementing this operator.
 """
@@ -74,7 +74,7 @@ class VideoFramesOperator(BaseOperator):
     #    fresh timestamped subfolder --
     #        now = datetime.now()
     #        stamp = now.strftime("%Y.%m.%d_%H.%M.%S") + ...
-    #        run_dir = self._output_dir / f"run_{stamp}"
+    #        run_dir = run.paths.outputs_dir / "frames" / f"run_{stamp}"
     #    -- and the output table's overwritten full_path values carry
     #    that timestamp, so identical inputs give different output.
     # ------------------------------------------------------------------
@@ -129,19 +129,11 @@ class VideoFramesOperator(BaseOperator):
         ),
     )
 
-    def __init__(self, output_dir: Path | None = None):
-        # Default to a project-relative folder, not the system Temp
-        # directory. Temp wasn't durable (Disk Cleanup / Storage Sense
-        # could wipe saved frame paths) and accumulated leftovers
-        # across runs. main.py passes an explicit output_dir.
-        #
-        # output_dir is a genuine construction-time value and stays here.
-        # The two run parameters (video_column, frame_step) travel in
-        # run.parameters and nothing about them lives on the instance.
-        self._output_dir = output_dir or (
-            Path.cwd() / "gelem_project" / "frames"
-        )
-        self._output_dir.mkdir(parents=True, exist_ok=True)
+    # No __init__: this operator holds nothing on self. It writes only
+    # under run.paths.outputs_dir, supplied fresh on every run -- an
+    # output directory captured at construction time would be shared by
+    # every concurrent run of this singleton (operators/CLAUDE.md, "Write
+    # only to run.paths").
 
     # No get_parameters_dialog(). video_column and frame_step are declared
     # on the descriptor above; MainWindow builds the form from them
@@ -184,7 +176,7 @@ class VideoFramesOperator(BaseOperator):
             now.strftime("%Y.%m.%d_%H.%M.%S")
             + f".{now.microsecond // 10000:02d}"
         )
-        run_dir = self._output_dir / f"run_{stamp}"
+        run_dir = run.paths.outputs_dir / "frames" / f"run_{stamp}"
         run_dir.mkdir(parents=True, exist_ok=True)
 
         out_rows: list[dict] = []

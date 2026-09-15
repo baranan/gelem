@@ -128,7 +128,7 @@ create_display(df, run)                      -> dict
 | `run.parameters` | this run's parameter values, as declared in `parameters` |
 | `run.cancelled()` | check between units of work; return promptly if true |
 | `run.model` | `[NOW]` the model the COLUMNS runner built for this run per the mode's `model_lifecycle`; `None` for `NONE`, and `None` in TABLE/DISPLAY modes (no runner builds one there yet). **Never build or cache a model on `self`** -- see "Where a model lives" |
-| `run.paths` | this project's directories; **never store these on `self`** |
+| `run.paths` | `[NOW]` this project's directories (`models/project_paths.py::ProjectPaths`) -- write only under `run.paths.outputs_dir`, in a subfolder you name yourself; **never store these on `self`** |
 | `run.spec` | the immutable description of the run, including versions |
 | `run.emit()` | the result sink |
 | `run.log(text)` | `[NOW]` record free-text progress for this run; see "Progress messages" below |
@@ -309,11 +309,20 @@ the old `plot_html` fallback).
   values rather than raising. One bad row must not kill a run.
 - **`[NOW]` Produce files, return paths.** Save the image or HTML and return its
   path as a string. Do not return image data.
-- **`[TARGET -> P1.9]` Write only to `run.paths`**, never into a source data folder
-  and never to a path you chose yourself, and never to a path cached on `self`.
-  Operators currently default to a global temp folder and store it as
-  `self._output_dir`; older documentation called this `self.output_dir`, which
-  never existed.
+- **`[NOW]` Write only to `run.paths.outputs_dir`**, never into a source data
+  folder and never to a path you chose yourself, and never to a path cached on
+  `self`. Made true by P1.9a, which removed the `output_dir` constructor
+  argument (and the `self._output_dir` it fed) from every operator that had
+  one -- `video_frames`, `plot_advanced`, `plot`, `mean_face`,
+  `blendshape_avatar`. Each names its own subfolder under `outputs_dir` (e.g.
+  `"frames"`, `"plots"`) -- there is no operator-specific field on
+  `ProjectPaths` itself. Guarded by an AST walk over every module under
+  `operators/`: `tests/test_operator_output_paths.py::test_no_operator_module_references_a_scratch_directory`.
+- **`[NOW]` An operator that detects boundaries in media itself writes the
+  finished media address, not bare start/end numbers.** Build it through
+  `media/media_address.py` before returning or storing it, so a later step
+  reads one well-formed address rather than reconstructing one from a pair of
+  numbers whose units and inclusivity it would have to guess.
 - **`[NOW]` A declared type tag need not be registered, but an unregistered one
   costs the researcher a placeholder.** The tag still reaches the column's
   `TableSchema`; `AppController` only prints a once-per-run warning when

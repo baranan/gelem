@@ -37,7 +37,6 @@ import pytest
 from operators.operator_config import (
     OPERATOR_FACTORIES,
     OperatorConfigError,
-    OperatorRuntimeDirs,
     build_enabled_operators,
     load_enabled_operator_names,
 )
@@ -67,15 +66,6 @@ def _real_config_entries() -> list[tuple[str, object]]:
 # drift guard keeps the two equal), and it is NOT Y B's enabled roster --
 # see the note at the top of this file.
 REAL_CONFIG_NAMES = [name for name, _enabled in _real_config_entries()]
-
-
-# A throwaway OperatorRuntimeDirs for the build_enabled_operators calls.
-# Every such call in this file raises on drift before any operator is
-# constructed, so these paths are never touched.
-DUMMY_DIRS = OperatorRuntimeDirs(
-    plots_dir=Path("unused_plots"),
-    frames_dir=Path("unused_frames"),
-)
 
 
 def _write_config(tmp_path: Path, body: str) -> Path:
@@ -220,7 +210,7 @@ def test_build_raises_for_yaml_name_with_no_factory(tmp_path):
     path = _write_config(tmp_path, _enabled_entries_yaml(names))
 
     with pytest.raises(OperatorConfigError) as excinfo:
-        build_enabled_operators(path, DUMMY_DIRS)
+        build_enabled_operators(path)
 
     assert "phantom_operator" in str(excinfo.value)
 
@@ -238,7 +228,7 @@ def test_build_raises_for_factory_name_absent_from_yaml(tmp_path):
     path = _write_config(tmp_path, _enabled_entries_yaml(kept))
 
     with pytest.raises(OperatorConfigError) as excinfo:
-        build_enabled_operators(path, DUMMY_DIRS)
+        build_enabled_operators(path)
 
     assert omitted in str(excinfo.value)
 
@@ -259,4 +249,4 @@ def test_present_but_disabled_is_not_drift(tmp_path):
 
     # Every factory name is present in the file, every entry is disabled:
     # no drift, nothing to build.
-    assert build_enabled_operators(path, DUMMY_DIRS) == []
+    assert build_enabled_operators(path) == []

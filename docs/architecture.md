@@ -66,11 +66,18 @@ components:
 **MediaAddress** -- the parsed form of a media value. See
 `docs/media_architecture.md` §3.
 
-**ProjectPaths** -- where this project's files live: temporary workspace for an
-unsaved project, project root, artifacts, proxies, operator outputs. Injected into
-ArtifactStore and into every operator run so nothing invents its own directory.
-`[TARGET -> P1.9]` Today there is a global temp artifacts directory plus hardcoded
-`gelem_project/frames` and `gelem_project/plots`.
+**ProjectPaths** -- where this project's files live. A frozen, Qt-free value
+object (`models/project_paths.py`), not a component: `root` (a saved project's
+folder, or an unsaved project's workspace folder under the per-user app-data
+folder -- never the OS temp directory), `artifacts_dir`, `outputs_dir` (every
+operator writes under here, in a subfolder it names for itself -- there is no
+operator-specific field), and `is_workspace`. Injected into ArtifactStore and
+into every operator run (`run.paths`) so nothing invents its own directory;
+`AppController` rebuilds and swaps it on `save_project()`/`load_project()`, at
+the same point it already re-roots ArtifactStore. Made true by P1.9a.
+`[TARGET -> P1.9b]` Copying operator outputs already on disk into the
+researcher's chosen folder on Save As is not yet built -- files an operator
+wrote in a workspace simply stay there today.
 
 ---
 
@@ -434,13 +441,15 @@ sequentially. Independent per-row work keeps using `create_columns`. A generator
 gives progressive output and a cancellation point, **not resumability** -- that is
 defined per mode in `docs/media_architecture.md` P2.2.
 
-One consequence still violated by the current code: **`ProjectPaths` is never
-stored on the operator.** It arrives as `run.paths`. An operator is a singleton
-shared across runs, so anything per-run held on `self` is a race between
-concurrent runs -- the same defect as parameters on `self`, and the reason `run`
-exists at all. Every operator today still defaults to a global temp folder and
-stores it as `self._output_dir`; `operators/CLAUDE.md`'s `[TARGET -> P1.9]` rule
-tracks this. *(The other consequence this section used to list -- `image`
+`[NOW]` **`ProjectPaths` is never stored on the operator.** It arrives as
+`run.paths`. An operator is a singleton shared across runs, so anything
+per-run held on `self` is a race between concurrent runs -- the same defect
+as parameters on `self`, and the reason `run` exists at all. Made true by
+P1.9a, which removed the `output_dir` constructor argument (and the
+`self._output_dir` it fed) from every operator that had one; each now writes
+under `run.paths.outputs_dir`, in a subfolder it names for itself.
+`operators/CLAUDE.md`'s "Write only to `run.paths.outputs_dir`" rule is the
+authority. *(The other consequence this section used to list -- `image`
 becoming `media` -- is done: every operator's `create_columns` takes `media`,
 not `image`.)*
 

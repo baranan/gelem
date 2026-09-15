@@ -40,15 +40,20 @@ from operators.run_context import (
     OperatorRunSpec,
     RunData,
 )
+from models.project_paths import build_project_paths
 
 
-def _run(op, *, video_column, frame_step):
+def _run(op, *, video_column, frame_step, td):
     """A minimal OperatorRun for a direct create_table() call. The
     parameters are built from and validated against the operator's OWN
     descriptor (P1.12d-2a) -- so this also proves video_column / frame_step
-    reach the operator through run.parameters, which is the behaviour this
-    item introduces. Replaces the old `op._video_column = ...` /
-    `op._frame_step = ...` instance-attribute setup."""
+    reach the operator through run.parameters, which is the behaviour that
+    item introduced. Replaces the old `op._video_column = ...` /
+    `op._frame_step = ...` instance-attribute setup.
+
+    paths is a real ProjectPaths rooted under td/"project" (P1.9a): the
+    operator no longer takes a constructor output_dir, so every call needs
+    a working run.paths.outputs_dir to write frames under."""
     mode_descriptor = op.descriptor.mode_for(ExecutionMode.TABLE)
     spec = OperatorRunSpec(
         operation_id="test-run",
@@ -61,7 +66,7 @@ def _run(op, *, video_column, frame_step):
     return OperatorRun(
         spec=spec,
         data=RunData(tables={}, projects={}),
-        paths=None,
+        paths=build_project_paths(Path(td) / "project", is_workspace=False),
         _token=CancellationToken(),
     )
 
@@ -102,10 +107,10 @@ def test_step_1_keeps_every_frame():
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         df = _make_df(td)
-        op = VideoFramesOperator(output_dir=td / "out")
+        op = VideoFramesOperator()
 
         result = op.create_table(
-            df, _run(op, video_column="full_path", frame_step=1)
+            df, _run(op, video_column="full_path", frame_step=1, td=td)
         )
 
         assert len(result) == 12 + 8, \
@@ -134,10 +139,10 @@ def test_step_n_downsamples():
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         df = _make_df(td)
-        op = VideoFramesOperator(output_dir=td / "out")
+        op = VideoFramesOperator()
 
         result = op.create_table(
-            df, _run(op, video_column="full_path", frame_step=4)
+            df, _run(op, video_column="full_path", frame_step=4, td=td)
         )
 
         v1_rows = result[result["video_file"] == "participant_01.mp4"]
@@ -150,10 +155,10 @@ def test_frames_from_different_videos_do_not_collide():
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         df = _make_df(td)
-        op = VideoFramesOperator(output_dir=td / "out")
+        op = VideoFramesOperator()
 
         result = op.create_table(
-            df, _run(op, video_column="full_path", frame_step=1)
+            df, _run(op, video_column="full_path", frame_step=1, td=td)
         )
         paths = result["full_path"].tolist()
         assert len(paths) == len(set(paths)), \
@@ -165,9 +170,9 @@ def test_input_dataframe_not_mutated():
         td = Path(td)
         df = _make_df(td)
         snapshot = df.copy()
-        op = VideoFramesOperator(output_dir=td / "out")
+        op = VideoFramesOperator()
         op.create_table(
-            df, _run(op, video_column="full_path", frame_step=1)
+            df, _run(op, video_column="full_path", frame_step=1, td=td)
         )
         pd.testing.assert_frame_equal(df, snapshot)
 
@@ -176,9 +181,9 @@ def test_missing_column_returns_empty():
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         df = _make_df(td)
-        op = VideoFramesOperator(output_dir=td / "out")
+        op = VideoFramesOperator()
         result = op.create_table(
-            df, _run(op, video_column="does_not_exist", frame_step=1)
+            df, _run(op, video_column="does_not_exist", frame_step=1, td=td)
         )
         assert len(result) == 0
 
@@ -203,10 +208,10 @@ def test_non_video_extensions_are_skipped():
             ignore_index=True,
         )
 
-        op = VideoFramesOperator(output_dir=td / "out")
+        op = VideoFramesOperator()
 
         result = op.create_table(
-            df, _run(op, video_column="full_path", frame_step=1)
+            df, _run(op, video_column="full_path", frame_step=1, td=td)
         )
 
         assert "P03" not in set(result["participant_id"]), \
@@ -227,11 +232,11 @@ def test_zero_videos_raises():
             "participant_id": "P01",
         }])
 
-        op = VideoFramesOperator(output_dir=td / "out")
+        op = VideoFramesOperator()
 
         try:
             op.create_table(
-                df, _run(op, video_column="full_path", frame_step=1)
+                df, _run(op, video_column="full_path", frame_step=1, td=td)
             )
         except ValueError as e:
             msg = str(e)
@@ -243,10 +248,42 @@ def test_zero_videos_raises():
             )
 
 
+def test_frames_are_written_only_under_run_paths_outputs_dir():
+    # P1.9a: the operator no longer takes a constructor output_dir -- it
+    # must write every frame under run.paths.outputs_dir, and nowhere
+    # else (the source videos, which live directly under td, are the one
+    # thing this test allows outside outputs_dir).
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        df = _make_df(td)
+        files_before = {p.resolve() for p in td.rglob("*") if p.is_file()}
+
+        op = VideoFramesOperator()
+        run = _run(op, video_column="full_path", frame_step=1, td=td)
+        result = op.create_table(df, run)
+
+        assert len(result) > 0
+        outputs_dir = run.paths.outputs_dir.resolve()
+
+        for _, row in result.iterrows():
+            written = Path(row["full_path"]).resolve()
+            assert written.exists(), f"frame missing on disk: {written}"
+            assert outputs_dir in written.parents, (
+                f"{written} was not written under {outputs_dir}"
+            )
+
+        new_files = {
+            p.resolve() for p in td.rglob("*") if p.is_file()
+        } - files_before
+        stray = [p for p in new_files if outputs_dir not in p.parents]
+        assert not stray, f"files written outside outputs_dir: {stray}"
+
+
 if __name__ == "__main__":
     test_step_1_keeps_every_frame()
     test_step_n_downsamples()
     test_frames_from_different_videos_do_not_collide()
+    test_frames_are_written_only_under_run_paths_outputs_dir()
     test_input_dataframe_not_mutated()
     test_missing_column_returns_empty()
     test_non_video_extensions_are_skipped()

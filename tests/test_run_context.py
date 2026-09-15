@@ -570,8 +570,12 @@ def test_emit_on_a_table_mode_run_with_no_sink_reports_the_mode_not_the_sink():
 
 
 # ---------------------------------------------------------------------------
-# Source scan: the module stays Qt-free and does not import models,
-# controller or ui, and imports operator_config only under TYPE_CHECKING.
+# Source scan: the module stays Qt-free and does not runtime-import models,
+# controller or ui, and imports models.project_paths (the type of run.paths,
+# P1.9a) only under TYPE_CHECKING. Before P1.9a this same guard named
+# operators.operator_config, which used to hold that type on a
+# construction-time bag; a P1.9a follow-up deleted that bag entirely once
+# nothing read it any more.
 # ---------------------------------------------------------------------------
 def _module_path():
     return (
@@ -619,9 +623,11 @@ def test_module_does_not_runtime_import_models_controller_ui_or_operator_config(
                 assert alias.name != guarded_only
 
 
-def test_operator_config_is_imported_under_type_checking():
+def test_project_paths_is_imported_under_type_checking():
     # Positive check: the name IS available for annotations, i.e. it appears
-    # inside a TYPE_CHECKING block.
+    # inside a TYPE_CHECKING block. P1.9a moved run.paths' type out of
+    # operators.operator_config to models.project_paths.ProjectPaths; this
+    # test moved with it.
     source = _module_path().read_text(encoding="utf-8")
     tree = ast.parse(source)
 
@@ -638,7 +644,7 @@ def test_operator_config_is_imported_under_type_checking():
             continue
         for inner in node.body:
             if isinstance(inner, ast.ImportFrom) and inner.module == (
-                "operators.operator_config"
+                "models.project_paths"
             ):
                 found_guarded_import = True
 

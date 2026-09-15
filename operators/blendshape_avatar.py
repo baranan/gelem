@@ -15,7 +15,6 @@ Dependencies:
 """
 
 from __future__ import annotations
-from pathlib import Path
 import numpy as np
 
 from operators.base import BaseOperator
@@ -94,21 +93,15 @@ class BlendshapeAvatarOperator(BaseOperator):
         ),
     )
 
-    def __init__(self, output_dir: Path | None = None):
-        """
-        Creates the operator.
-
-        Args:
-            output_dir: Folder where avatar images will be saved.
-
-        TODO (Student C): Initialise the mediapipe face renderer here,
-        if needed.
-        """
-        import tempfile
-        self._output_dir = output_dir or (
-            Path(tempfile.gettempdir()) / "gelem_avatars"
-        )
-        self._output_dir.mkdir(parents=True, exist_ok=True)
+    # No __init__: this operator holds nothing on self. It writes only
+    # under run.paths.outputs_dir, supplied fresh on every run -- an
+    # output directory captured at construction time would be shared by
+    # every concurrent run of this singleton (operators/CLAUDE.md, "Write
+    # only to run.paths").
+    #
+    # TODO (Student C): Initialise the mediapipe face renderer, if needed
+    # -- as a build_model() factory (operators/CLAUDE.md, "Where a model
+    # lives"), never on self.
 
     def create_columns(
         self,
@@ -147,13 +140,17 @@ class BlendshapeAvatarOperator(BaseOperator):
             3. Use mediapipe to render a face mesh deformed by
                these blendshape values.
             4. Save the rendered image:
-               output_path = self._output_dir / f'{row_id}_avatar.jpg'
+               output_dir = run.paths.outputs_dir / "avatars"
+               output_dir.mkdir(parents=True, exist_ok=True)
+               output_path = output_dir / f'{row_id}_avatar.jpg'
                self.save_image(rendered_array, output_path)
             5. Return {'avatar_path': str(output_path)}
         """
         # PLACEHOLDER: creates a gray placeholder image.
         from PIL import Image
-        output_path = self._output_dir / f"{row_id}_avatar.jpg"
+        output_dir = run.paths.outputs_dir / "avatars"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"{row_id}_avatar.jpg"
         placeholder = Image.new("RGB", (256, 256), color=(180, 180, 180))
         placeholder.save(output_path, "JPEG")
         print(f"[BlendshapeAvatarOperator] PLACEHOLDER for {row_id}")

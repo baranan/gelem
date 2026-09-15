@@ -48,16 +48,13 @@ def create_app(fake_data: bool = False):
         return window
 
     # Real mode — create all components.
-    import tempfile
     from models.dataset import Dataset
     from models.query_engine import QueryEngine
+    from models.project_paths import create_workspace, default_workspaces_root
     from artifacts.artifact_store import ArtifactStore
     from column_types.registry import ColumnTypeRegistry
     from operators.operator_registry import OperatorRegistry
-    from operators.operator_config import (
-        OperatorRuntimeDirs,
-        build_enabled_operators,
-    )
+    from operators.operator_config import build_enabled_operators
     from controller import AppController
     from settings.qsettings_backend import QSettingsBackend
     from settings.settings_store import SettingsStore
@@ -80,32 +77,23 @@ def create_app(fake_data: bool = False):
     # dialog that drives it is P0.5b-2ii-c2b2.
     settings_gateway = SettingsGateway(settings_store)
 
-    artifacts_dir = Path(tempfile.gettempdir()) / "gelem_artifacts"
-    # This is the pre-project scratch cache -- where thumbnails land
-    # before any project has been saved or opened. The first
-    # save_project() or load_project() call binds the store to
-    # project_path / "artifacts" via ArtifactStore.set_artifacts_dir()
-    # (P0.5b-2ii-a), so a saved project keeps its thumbnails and reopens
-    # without regenerating them.
+    # P1.9a: before any project is saved or opened, the app works inside a
+    # WORKSPACE folder -- laid out exactly like a saved project (an
+    # artifacts/ and an outputs/ subfolder under one root) under the
+    # per-user app-data folder, never the OS temp directory. One new
+    # workspace folder is created per launch and is never deleted by this
+    # item. AppController.save_project() / load_project() replace this
+    # ProjectPaths with one rooted at the researcher's chosen folder, at
+    # the same point they re-root ArtifactStore (docs/media_architecture.md
+    # section 4.7).
+    workspace_paths = create_workspace(default_workspaces_root())
 
     project_root = Path(__file__).resolve().parent
-    frames_dir = project_root / "gelem_project" / "frames"
-    # TODO: Same migration as artifacts_dir above — once Dataset.save()
-    # / load() define a real project folder, point frames_dir at it:
-    #     frames_dir = project_path / "frames"
-    # TODO (OPTIONAL): let the researcher pick a custom destination per
-    # extraction via a folder picker in the parameter dialog.
-
-    plots_dir = project_root / "gelem_project" / "plots"
-    # TODO: Same migration as artifacts_dir / frames_dir above — once
-    # Dataset.save() / load() define a real project folder, point
-    # plots_dir at it:
-    #     plots_dir = project_path / "plots"
 
     dataset           = Dataset()
     query_engine      = QueryEngine()
     artifact_store    = ArtifactStore(
-        artifacts_dir,
+        workspace_paths.artifacts_dir,
         worker_count=gelem_settings.worker_count,
         disk_cache_max_bytes=gelem_settings.picture_disk_max_bytes,
         memory_cache_max_bytes=gelem_settings.picture_memory_max_bytes,
@@ -120,18 +108,16 @@ def create_app(fake_data: bool = False):
     # operators_config.yaml is the single authority for WHICH operators
     # the application offers, and its entry order is the Operators menu
     # order. main.py keeps only the knowledge of HOW to construct each one
-    # -- the runtime directories some constructors need are packed into
-    # this one object and handed to every factory (see
-    # operators/operator_config.py). A missing config file, malformed YAML,
-    # or drift between the file and the factory table raises
+    # (see operators/operator_config.py). A missing config file, malformed
+    # YAML, or drift between the file and the factory table raises
     # OperatorConfigError here and stops startup rather than quietly
     # changing what the researcher can do.
-    operator_dirs = OperatorRuntimeDirs(
-        plots_dir=plots_dir,
-        frames_dir=frames_dir,
-    )
+    #
+    # No directories are passed to build_enabled_operators() -- every
+    # operator that writes files writes under run.paths.outputs_dir,
+    # supplied fresh on every run rather than at construction time.
     operators_config_path = project_root / "operators_config.yaml"
-    for operator in build_enabled_operators(operators_config_path, operator_dirs):
+    for operator in build_enabled_operators(operators_config_path):
         operator_registry.register(operator)
 
     controller = AppController(
@@ -141,9 +127,9 @@ def create_app(fake_data: bool = False):
         registry=registry,
         operator_registry=operator_registry,
         settings_gateway=settings_gateway,
-        # The same directories the operator factories got; the controller
-        # hands them to every OperatorRun as run.paths.
-        runtime_dirs=operator_dirs,
+        # Handed to every OperatorRun as run.paths, and replaced wholesale
+        # by save_project()/load_project().
+        project_paths=workspace_paths,
     )
 
     window = MainWindow(controller)

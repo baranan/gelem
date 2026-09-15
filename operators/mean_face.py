@@ -22,7 +22,6 @@ Student C is responsible for implementing this operator.
 """
 
 from __future__ import annotations
-from pathlib import Path
 import numpy as np
 import pandas as pd
 
@@ -119,18 +118,11 @@ class MeanFaceOperator(BaseOperator):
         ),
     )
 
-    def __init__(self, output_dir: Path | None = None):
-        """
-        Creates the operator.
-
-        Args:
-            output_dir: Where to save mean face images.
-        """
-        import tempfile
-        self._output_dir = output_dir or (
-            Path(tempfile.gettempdir()) / "gelem_mean_faces"
-        )
-        self._output_dir.mkdir(parents=True, exist_ok=True)
+    # No __init__: this operator holds nothing on self. It writes only
+    # under run.paths.outputs_dir, supplied fresh on every run -- an
+    # output directory captured at construction time would be shared by
+    # every concurrent run of this singleton (operators/CLAUDE.md, "Write
+    # only to run.paths").
 
     def create_table(
         self,
@@ -180,11 +172,12 @@ class MeanFaceOperator(BaseOperator):
         else:
             groups = list(df.groupby(group_by))
 
+        output_dir = run.paths.outputs_dir / "mean_faces"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
         rows = []
         for group_val, group_df in groups:
-            output_path = (
-                self._output_dir / f"mean_face_{group_val}.jpg"
-            )
+            output_path = output_dir / f"mean_face_{group_val}.jpg"
             Image.new("RGB", (256, 256), color=(160, 160, 160)).save(
                 str(output_path), "JPEG"
             )
@@ -238,7 +231,9 @@ class MeanFaceOperator(BaseOperator):
         from PIL import Image
 
         n = len(df)
-        output_path = self._output_dir / f"mean_face_{n}_frames.jpg"
+        output_dir = run.paths.outputs_dir / "mean_faces"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"mean_face_{n}_frames.jpg"
         Image.new("RGB", (256, 256), color=(160, 160, 160)).save(
             str(output_path), "JPEG"
         )
