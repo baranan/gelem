@@ -52,9 +52,13 @@ class DictBackend:
 
 
 class _StubDataset:
-    """A dataset the settings tests never call into -- AppController's
-    constructor stores it but touches no dataset method."""
-    pass
+    """A dataset the settings tests never call into, except that
+    AppController's constructor reads table_versions() to seed the
+    unsaved-changes baseline (unsaved-work item) -- so this stub answers
+    that one call and nothing else."""
+
+    def table_versions(self) -> dict:
+        return {}
 
 
 class _StubStore:

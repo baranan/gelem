@@ -548,6 +548,17 @@ class AppController(QObject):
         # list means the researcher explicitly unchecked every column.
         self._visible_cols:   list[str] | None = None
 
+        # The dirty-flag reference point for has_unsaved_changes(): a
+        # snapshot of Dataset.table_versions() taken right here at
+        # construction, and re-taken right after every successful
+        # save_project() / load_project() (never anywhere else -- a
+        # table changed through any other public path, including
+        # load_folder() and load_csv_as_primary(), is meant to compare
+        # unequal). dict equality catches an added OR removed table key
+        # as well as a changed version, so a new table counts as unsaved
+        # even though its name was never in the baseline.
+        self._unsaved_baseline: dict[str, int] = self._dataset.table_versions()
+
     # ── Run registry ─────────────────────────────────────────────────
 
     def _register_run(
@@ -712,6 +723,28 @@ class AppController(QObject):
         could go live in the gap between the two.
         """
         return bool(self._live_runs)
+
+    def has_unsaved_changes(self) -> bool:
+        """True if any stored table has changed since the last save or
+        load -- the dirty flag ui/close_prompt.py's decide_close_prompt()
+        reads to decide whether closing needs to ask.
+
+        Compares Dataset.table_versions() (a table_name -> write-ticket
+        version dict) against self._unsaved_baseline, a snapshot taken at
+        construction and re-taken right after every successful
+        save_project() / load_project(). dict equality means an added or
+        removed table counts as a change, not just a bumped version, so a
+        fresh load_folder() / load_csv_as_primary() into a session that
+        started with nothing saved reads as unsaved even though every
+        individual table is "new" rather than "changed".
+
+        Deliberately narrower than "everything a researcher might call
+        unsaved": filters, sort, group-by and selection are not Dataset
+        state (see docs/review/unsaved-work-survey.md section 2) and
+        save_project() never persists them, so they are correctly absent
+        from this comparison.
+        """
+        return self._dataset.table_versions() != self._unsaved_baseline
 
     def cancel_run(self, operation_id: str) -> None:
         """Requests cancellation of the live run named by operation_id
@@ -2557,9 +2590,18 @@ class AppController(QObject):
             new_paths.outputs_dir,
         )
 
-    def save_project(self, project_path: Path) -> None:
+    def save_project(self, project_path: Path) -> bool:
         """
         Saves the current project to disk.
+
+        Returns True only if the save actually completed -- False for
+        every refusal (a live run, an output-copy conflict) and every
+        failure caught below, each of which has already reported itself
+        through error_occurred. ui/close_prompt.py's close flow uses this
+        to decide whether closing may proceed after "Save": a cancelled
+        folder dialog or a declined/failed save must leave the window
+        open, which only a real success/failure answer -- not the
+        previous bare None -- lets it tell apart.
 
         Refuses outright while any operator run is live (P1.9b-1),
         checked FIRST -- before the output-copy plan is even built, so
@@ -2589,7 +2631,7 @@ class AppController(QObject):
         """
         if self.is_save_blocked():
             self.error_occurred.emit(format_save_blocked_message())
-            return
+            return False
 
         try:
             plan = self.plan_output_copy(project_path)
@@ -2597,7 +2639,7 @@ class AppController(QObject):
                 self.error_occurred.emit(
                     format_output_copy_conflict_message(plan.conflicts)
                 )
-                return
+                return False
 
             # Main thread only (P1.9b-1). AppController lives on the main
             # thread and save_project() is only ever called directly by
@@ -2672,8 +2714,14 @@ class AppController(QObject):
             # unchanged by P1.9a: ProjectPaths (run.paths / the artifacts
             # cache) and _project_root (media cell resolution) answer
             # different questions and re-root on different conditions.
+            #
+            # Re-baseline the dirty flag now that every table has been
+            # written to disk -- see has_unsaved_changes().
+            self._unsaved_baseline = self._dataset.table_versions()
+            return True
         except Exception as e:
             self.error_occurred.emit(f"Failed to save project: {e}")
+            return False
 
     def load_project(self, project_path: Path) -> None:
         """
@@ -2749,6 +2797,12 @@ class AppController(QObject):
             self.tables_updated.emit(self._dataset.list_tables())
             self.columns_updated.emit(self.get_column_names())
             self._refresh_result()
+            # Re-baseline the dirty flag against what was just loaded --
+            # see has_unsaved_changes(). Dataset.load() mints fresh
+            # table_versions() numbers for every table, so this must be
+            # read back AFTER load() returns, never computed once at
+            # startup (docs/review/unsaved-work-survey.md section 3).
+            self._unsaved_baseline = self._dataset.table_versions()
         except Exception as e:
             self.error_occurred.emit(f"Failed to load project: {e}")
 

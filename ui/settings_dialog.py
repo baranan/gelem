@@ -30,7 +30,6 @@ from __future__ import annotations
 import math
 
 from PySide6.QtWidgets import (
-    QApplication,
     QDialog,
     QDialogButtonBox,
     QHBoxLayout,
@@ -359,7 +358,16 @@ class SettingsDialog(QDialog):
             box.exec()
 
         if quit_after_save:
-            QApplication.instance().quit()
+            # Route through the main window's own closeEvent (unsaved-work
+            # item) rather than QApplication.instance().quit(), which used
+            # to bypass it outright and skip the save/discard/cancel
+            # decision entirely. self.parent() is the MainWindow that
+            # constructed this dialog (ui/main_window.py's
+            # _on_open_settings passes itself as the parent) -- a public
+            # Qt accessor, not a private attribute, so this reaches
+            # closeEvent without reading anything of MainWindow's or the
+            # controller's internals.
+            self.parent().close()
 
         self.accept()
 

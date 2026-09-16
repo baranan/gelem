@@ -467,8 +467,17 @@ class FakeController(QObject):
         """
         return OutputCopyPlan(entries=(), total_bytes=0, conflicts=())
 
-    def save_project(self, project_path: Path) -> None:
+    def save_project(self, project_path: Path) -> bool:
+        """
+        Mirrors AppController.save_project()'s return type (unsaved-work
+        item; tests/test_fake_controller_contract.py fails without this
+        method existing at all). Fake mode has no Dataset to write, so
+        this never actually saves anything -- always False, the same
+        answer a real refusal or failure would give ui/close_prompt.py's
+        close flow.
+        """
         print(f"[FakeController] save_project({project_path}) — not implemented in fake mode")
+        return False
 
     def load_project(self, project_path: Path) -> None:
         print(f"[FakeController] load_project({project_path}) — not implemented in fake mode")
@@ -567,6 +576,16 @@ class FakeController(QObject):
         tests/test_fake_controller_contract.py fails without this). There
         is no live-run registry in fake mode (see get_live_runs() above),
         so saving is never blocked.
+        """
+        return False
+
+    def has_unsaved_changes(self) -> bool:
+        """
+        Mirrors AppController.has_unsaved_changes() (unsaved-work item;
+        tests/test_fake_controller_contract.py fails without this).
+        Fake mode has no Dataset and no table_versions() to compare, so
+        there is nothing to report as unsaved -- always False, so
+        --fake-data's window closes without ever being asked to save.
         """
         return False
 

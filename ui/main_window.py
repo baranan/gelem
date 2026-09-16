@@ -43,6 +43,16 @@ from ui.merge_report_dialog import MergeReportDialog
 from ui.settings_dialog import SettingsDialog
 from ui.output_copy_warning import confirm_output_copy, should_warn
 from ui.parameter_dialog import FormAdviceError, ParameterDialog, ParameterFormError
+from ui.close_prompt import (
+    decide_close_prompt,
+    BUTTON_CANCEL,
+    BUTTON_CLOSE_ANYWAY,
+    BUTTON_DISCARD,
+    BUTTON_SAVE,
+    CLOSE_WITHOUT_ASKING,
+    LIVE_RUN,
+    UNSAVED,
+)
 
 
 class _UnresolvableInputKind(Exception):
@@ -110,6 +120,93 @@ class MainWindow(QMainWindow):
         self._build_central_widget()
         self._build_status_bar()
         self._connect_signals()
+
+    # ── Closing (unsaved-work item) ─────────────────────────────────────
+
+    def closeEvent(self, event) -> None:
+        """Decides whether closing may proceed, or must ask first.
+
+        Layer A -- ui/close_prompt.py's decide_close_prompt() -- makes the
+        decision and supplies the wording, from two controller queries:
+        is_save_blocked() (a live operator run) and has_unsaved_changes()
+        (any stored table changed since the last save/load). A live run
+        always wins over unsaved data -- see decide_close_prompt()'s own
+        docstring for why. This method is the thin Layer B glue: it shows
+        the QMessageBox the decision names and acts on the button clicked.
+        """
+        run_live    = self._controller.is_save_blocked()
+        has_unsaved = self._controller.has_unsaved_changes()
+        prompt = decide_close_prompt(has_unsaved, run_live)
+
+        if prompt.kind == CLOSE_WITHOUT_ASKING:
+            event.accept()
+            return
+
+        choice = self._show_close_prompt(prompt)
+
+        if prompt.kind == LIVE_RUN:
+            if choice == BUTTON_CLOSE_ANYWAY:
+                # Cancel every live run through the same public API the
+                # status-bar Cancel button uses, then close without
+                # waiting for the worker threads to actually stop --
+                # CLAUDE.md's "Long-running work" rule already documents
+                # that a daemon thread cannot be joined from here.
+                for run in self._controller.get_live_runs():
+                    self._controller.cancel_run(run["operation_id"])
+                event.accept()
+            else:
+                event.ignore()
+            return
+
+        # prompt.kind == UNSAVED
+        if choice == BUTTON_SAVE:
+            # Reuses the existing save flow (_on_save_project), which now
+            # reports whether the save actually completed -- a cancelled
+            # folder dialog, a declined copy warning, or a refused/failed
+            # save must leave the window open, not close it.
+            if self._on_save_project():
+                event.accept()
+            else:
+                event.ignore()
+        elif choice == BUTTON_DISCARD:
+            event.accept()
+        else:
+            event.ignore()
+
+    def _show_close_prompt(self, prompt) -> str:
+        """Shows a close_prompt.ClosePrompt as a QMessageBox and returns
+        the label of the button the researcher clicked.
+
+        Purely Qt glue: the title, body text, button set and default
+        button all come from Layer A (ui/close_prompt.py). Only called
+        for a prompt whose kind is not CLOSE_WITHOUT_ASKING, so buttons
+        is never empty here.
+        """
+        box = QMessageBox(self)
+        box.setWindowTitle(prompt.title)
+        box.setText(prompt.text)
+
+        buttons_by_label = {}
+        for label in prompt.buttons:
+            role = (
+                QMessageBox.ButtonRole.RejectRole
+                if label == BUTTON_CANCEL
+                else QMessageBox.ButtonRole.AcceptRole
+            )
+            buttons_by_label[label] = box.addButton(label, role)
+
+        if prompt.default_button is not None:
+            box.setDefaultButton(buttons_by_label[prompt.default_button])
+
+        box.exec()
+
+        clicked = box.clickedButton()
+        for label, button in buttons_by_label.items():
+            if button is clicked:
+                return label
+        # Dismissed with no button resolved (e.g. the window's own close
+        # control on the box itself) -- treat exactly like Cancel.
+        return BUTTON_CANCEL
 
     # ── Building the UI ───────────────────────────────────────────────
 
@@ -1259,7 +1356,7 @@ class MainWindow(QMainWindow):
                 target_key="file_name",
             )
 
-    def _on_save_project(self) -> None:
+    def _on_save_project(self) -> bool:
         """Opens a folder chooser for saving the project, after the
         pre-save checks P1.9b-2 adds (docs/architecture.md section 2).
 
@@ -1273,16 +1370,21 @@ class MainWindow(QMainWindow):
         there -- so nothing above is a substitute for those checks, only a
         UI-side shortcut that avoids opening a folder dialog or running a
         copy plan that would only be refused a moment later.
+
+        Returns True only if the save actually completed -- False for a
+        cancelled folder dialog, a refused save, a declined copy warning,
+        or a save that failed. closeEvent's "Save" button (unsaved-work
+        item) uses this to decide whether closing may proceed.
         """
         if self._controller.is_save_blocked():
             self._on_error(format_save_blocked_message())
-            return
+            return False
 
         folder = QFileDialog.getExistingDirectory(
             self, "Save project to folder"
         )
         if not folder:
-            return
+            return False
 
         from pathlib import Path
         dest_folder = Path(folder)
@@ -1290,14 +1392,14 @@ class MainWindow(QMainWindow):
         plan = self._controller.plan_output_copy(dest_folder)
         if plan.conflicts:
             self._on_error(format_output_copy_conflict_message(plan.conflicts))
-            return
+            return False
 
         threshold = self._controller.get_output_copy_warning_threshold_bytes()
         if should_warn(plan.total_bytes, threshold):
             if not confirm_output_copy(self, len(plan.entries), plan.total_bytes):
-                return
+                return False
 
-        self._controller.save_project(dest_folder)
+        return self._controller.save_project(dest_folder)
 
     def _on_load_project(self) -> None:
         """Opens a folder chooser for loading a project."""
