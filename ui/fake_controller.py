@@ -24,6 +24,7 @@ from PySide6.QtCore import QObject, Signal, QTimer
 
 from models.query_result import GroupSection, QueryResult
 from models.notifications import ThumbnailsReady
+from models.output_copy import OutputCopyPlan
 
 
 class FakeController(QObject):
@@ -456,6 +457,16 @@ class FakeController(QObject):
     def export_csv(self, path: Path, row_ids=None) -> None:
         print(f"[FakeController] export_csv({path}) — not implemented in fake mode")
 
+    def plan_output_copy(self, dest_folder: Path) -> OutputCopyPlan:
+        """
+        Mirrors AppController.plan_output_copy() (P1.9b-1;
+        tests/test_fake_controller_contract.py fails without this).
+        Fake mode has no Dataset and no ProjectPaths, so there is
+        nothing to copy -- an empty plan, the same answer the real
+        controller gives when self._project_paths is None.
+        """
+        return OutputCopyPlan(entries=(), total_bytes=0, conflicts=())
+
     def save_project(self, project_path: Path) -> None:
         print(f"[FakeController] save_project({project_path}) — not implemented in fake mode")
 
@@ -550,6 +561,15 @@ class FakeController(QObject):
         """
         return []
 
+    def is_save_blocked(self) -> bool:
+        """
+        Mirrors AppController.is_save_blocked() (P1.9b-1;
+        tests/test_fake_controller_contract.py fails without this). There
+        is no live-run registry in fake mode (see get_live_runs() above),
+        so saving is never blocked.
+        """
+        return False
+
     def cancel_run(self, operation_id: str) -> None:
         """
         Mirrors AppController.cancel_run() (run-indicator-3;
@@ -569,6 +589,21 @@ class FakeController(QObject):
 
     def apply_settings(self, values: dict) -> list[str]:
         return []
+
+    def get_output_copy_warning_threshold_bytes(self) -> int:
+        """
+        Mirrors AppController.get_output_copy_warning_threshold_bytes()
+        (P1.9b-1; tests/test_fake_controller_contract.py fails without
+        this). There is no settings store in fake mode (see the settings
+        pass-throughs above), so this is inert, same as get_settings_fields()
+        / apply_settings() -- a plain literal, not imported from settings/
+        (tests/test_settings.py::test_only_main_and_settings_package_import_settings
+        forbids ui/ reaching into settings/ at all; only main.py and the
+        settings/ package itself may). 1 GiB matches
+        settings.settings.DEFAULT_OUTPUT_COPY_WARNING_THRESHOLD_BYTES --
+        keep the two in sync by hand if that default ever changes.
+        """
+        return 1024 * 1024 * 1024
 
     def get_group_values(self, column: str) -> list:
         fake_values = {

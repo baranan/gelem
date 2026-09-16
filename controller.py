@@ -33,6 +33,10 @@ from PySide6.QtCore import QObject, Signal, QTimer
 from models.query_result import QueryResult, ResultLayout, GroupSection
 from models.notifications import RowsUpdated, ThumbnailsReady
 from models.project_paths import ProjectPaths, build_project_paths
+from models.output_copy import OutputCopyPlan
+from models.output_copy import execute_output_copy as _execute_output_copy
+from models.output_copy import plan_output_copy as _plan_output_copy
+from media.media_address import from_path as _media_address_from_path
 from media.media_address import resolve_source, MediaAddressError
 from operators.descriptor import (
     ExecutionMode,
@@ -261,6 +265,64 @@ def format_cancel_message(label: str) -> str:
         f'Cancelling "{label}". Nothing already written to the table is '
         f"undone. Any work still in progress when it stops will not be "
         f"saved."
+    )
+
+
+# ---------------------------------------------------------------------------
+# P1.9b-1: saving is refused outright while any operator run is live.
+#
+# Pure, Qt-free wording -- no widget, importable and testable on its own.
+# Two independent reasons both land on the same refusal, so one sentence
+# covers both rather than naming which applies:
+#   1. The copy-on-save step rewrites in-memory media cells through
+#      Dataset's normal accept path, which bumps that table's write-ticket
+#      version (models/dataset.py's _commit_prepared bumps on every
+#      accepted write, unconditionally). A live run reading that table
+#      would see a foreign write land under it and report a false "data
+#      changed" notice when it finishes (controller.py's
+#      _superseded_input_tables) -- nothing about the analysis data
+#      actually changed, only where an output FILE lives on disk.
+#   2. A live run keeps writing new files under the OLD outputs_dir for
+#      as long as it runs (operators read run.paths once per run, at
+#      start -- see operators/CLAUDE.md). A copy planned and executed
+#      before that run finishes would miss every file it writes after the
+#      plan was built, leaving them outside the project regardless.
+# ---------------------------------------------------------------------------
+
+def format_save_blocked_message() -> str:
+    """The plain sentence shown to the researcher when Save or Save As is
+    refused because an operator run is still live. See the module comment
+    above for why both halves of the refusal are covered by one sentence."""
+    return (
+        "Gelem cannot save while an operation is running. Wait for it to "
+        "finish, or stop it, then save again."
+    )
+
+
+def format_output_copy_conflict_message(
+    conflicts: tuple,
+) -> str:
+    """The plain sentence shown to the researcher when the copy-on-save
+    plan (models/output_copy.py::OutputCopyPlan) refuses the save because
+    one or more output files already exist at the destination with a
+    different size than the source -- item 3 of the P1.9b-1 work item:
+    the save must be refused before anything is copied or any parquet is
+    written, never overwritten silently.
+
+    conflicts is plan.conflicts, a tuple of CopyConflict. Names at most
+    three destination files so the message stays readable when many
+    collide at once; the exact count is always given regardless.
+    """
+    count = len(conflicts)
+    shown = ", ".join(f'"{c.dst.name}"' for c in conflicts[:3])
+    if count > 3:
+        shown += f", and {count - 3} more"
+    noun = "file" if count == 1 else "files"
+    return (
+        f"Gelem cannot save: {count} output {noun} already exist at the "
+        f"destination with different content than the project's own copy "
+        f"({shown}). Choose a different folder, or remove the conflicting "
+        f"files there, then save again."
     )
 
 
@@ -633,6 +695,23 @@ class AppController(QObject):
             }
             for operation_id, run in self._live_runs.items()
         ]
+
+    def is_save_blocked(self) -> bool:
+        """True while Save / Save As must be refused (P1.9b-1): any
+        operator run is still live. See the module comment above
+        format_save_blocked_message() for why.
+
+        Thin sugar over get_live_runs() -- self._live_runs is exactly the
+        "any run live" query already public through that method -- kept
+        as its own method so the UI can ask the one question it actually
+        has ("can I even open the save dialog right now?") without
+        building and discarding the full per-run list, and so a future
+        second reason to block saving has one place to add itself.
+        Intended to be checked BEFORE a file dialog is even shown, and
+        save_project() checks the same condition again itself -- a run
+        could go live in the gap between the two.
+        """
+        return bool(self._live_runs)
 
     def cancel_run(self, operation_id: str) -> None:
         """Requests cancellation of the live run named by operation_id
@@ -2449,15 +2528,123 @@ class AppController(QObject):
         except Exception as e:
             self.error_occurred.emit(f"Failed to export CSV: {e}")
 
+    def plan_output_copy(self, dest_folder: Path) -> OutputCopyPlan:
+        """The copy-on-save plan (models/output_copy.py) for saving into
+        dest_folder: which operator-output files under the project's
+        CURRENT ProjectPaths.outputs_dir would need to be copied into
+        dest_folder's own outputs directory, and which destinations
+        would collide (item 3 of P1.9b-1).
+
+        Read-only -- plans nothing on disk and changes no Dataset or
+        controller state. save_project() calls this itself before
+        saving; the researcher-facing warning for a large or colliding
+        copy, shown before Save As is even committed to, is P1.9b-2 and
+        would call this same method first.
+
+        self._project_paths is None for a controller built without
+        project_paths= (several tests construct one this way; main.py
+        always passes a real one in production -- see the comment on
+        __init__'s project_paths parameter). With no CURRENT outputs_dir
+        there is no "old" location for any cell to lie under, so this
+        returns an empty plan rather than raising.
+        """
+        if self._project_paths is None:
+            return OutputCopyPlan(entries=(), total_bytes=0, conflicts=())
+        new_paths = build_project_paths(Path(dest_folder), is_workspace=False)
+        return _plan_output_copy(
+            self._dataset.media_cells_by_table(),
+            self._project_paths.outputs_dir,
+            new_paths.outputs_dir,
+        )
+
     def save_project(self, project_path: Path) -> None:
         """
         Saves the current project to disk.
 
+        Refuses outright while any operator run is live (P1.9b-1),
+        checked FIRST -- before the output-copy plan is even built, so
+        nothing is copied, no parquet is written, and ProjectPaths is
+        not swapped. See format_save_blocked_message() (module level,
+        above this class) for why: a live run's result would come back
+        falsely marked "data changed" by the in-memory cell rewrite
+        below, and a live run keeps writing new files under the OLD
+        outputs_dir for as long as it runs, so a copy planned now would
+        miss them regardless.
+
+        Otherwise: plans the output copy, refuses on a conflict exactly
+        the same way, copies the planned files into project_path's
+        outputs folder, repoints the matching in-memory media cells at
+        the copies, and only then writes Parquet -- so the paths
+        Dataset.save() relativises are already the ones inside
+        project_path. If the cell rewrite or Dataset.save() itself then
+        raises, the rewrite is rolled back before the error is reported
+        (see the comment at that try/except below) -- self._project_paths
+        has not moved yet in that case, so a stranded rewritten cell
+        would otherwise point somewhere a later save could never find it
+        again. A copy failure needs no such rollback: it happens before
+        any cell has moved.
+
         Args:
             project_path: Path to the project folder.
         """
+        if self.is_save_blocked():
+            self.error_occurred.emit(format_save_blocked_message())
+            return
+
         try:
-            self._dataset.save(project_path)
+            plan = self.plan_output_copy(project_path)
+            if plan.conflicts:
+                self.error_occurred.emit(
+                    format_output_copy_conflict_message(plan.conflicts)
+                )
+                return
+
+            # Main thread only (P1.9b-1). AppController lives on the main
+            # thread and save_project() is only ever called directly by
+            # the UI, never by a worker callback, so this blocks the UI
+            # for as long as the copy takes -- the is_save_blocked() check
+            # above already ruled out the one source of a CONCURRENT write
+            # to the table rewrite_media_cell_paths() is about to touch.
+            # If this raises partway, the outer except below catches it
+            # and returns before the rewrite and the save run at all --
+            # whatever files were already copied are left on disk, not
+            # cleaned up (models/output_copy.py's execute_output_copy
+            # never deletes anything). Nothing to roll back for a copy
+            # failure: no in-memory cell has moved yet.
+            _execute_output_copy(plan)
+
+            path_mapping = {
+                _media_address_from_path(entry.src).path:
+                    _media_address_from_path(entry.dst).path
+                for entry in plan.entries
+            }
+            try:
+                self._dataset.rewrite_media_cell_paths(path_mapping)
+                self._dataset.save(project_path)
+            except Exception:
+                # Roll back whatever the rewrite touched -- self.
+                # _project_paths has not moved (the swap below only runs
+                # after Dataset.save() returns), so leaving a rewritten
+                # cell in place here would point it at project_path/
+                # outputs/... while self._project_paths still names the
+                # OLD outputs_dir. A LATER successful save (to
+                # project_path or anywhere else) plans its copy against
+                # self._project_paths.outputs_dir, so a cell stranded
+                # outside that folder would never be recognised as an
+                # operator output again and could never be brought along.
+                # This covers BOTH a rewrite that raised partway through
+                # its own per-table loop (some tables rewritten, later
+                # ones untouched) and a rewrite that fully succeeded but
+                # was followed by a save() failure -- inverting the SAME
+                # path_mapping is a no-op for any table the forward
+                # rewrite never reached, since its cells still hold the
+                # OLD values the inverse mapping's KEYS do not match.
+                inverse_mapping = {
+                    new: old for old, new in path_mapping.items()
+                }
+                if inverse_mapping:
+                    self._dataset.rewrite_media_cell_paths(inverse_mapping)
+                raise
             # Bind the artifact cache to this project's folder BEFORE the
             # index is written, so migration finishes first and every path
             # in the saved index names a file inside project_path/artifacts
@@ -3064,3 +3251,25 @@ class AppController(QObject):
                 )
 
         return messages
+
+    def get_output_copy_warning_threshold_bytes(self) -> int:
+        """The byte threshold above which a Save-As output copy should be
+        called out to the researcher before it runs (P1.9b-2 -- not built
+        yet; this getter exists now only so that item has a value to
+        read). Same pass-through discipline as get_settings_fields() /
+        apply_settings() above -- the controller does not import
+        settings/ and only forwards to the gateway.
+
+        Not one of the five fields get_settings_fields() lists: it is not
+        yet editable through the settings dialog, on purpose (P1.9b-1
+        does not build the warning that would use it).
+
+        Raises:
+            RuntimeError: if no settings gateway was wired in.
+        """
+        if self._settings_gateway is None:
+            raise RuntimeError(
+                "AppController has no settings gateway -- it was constructed "
+                "without settings_gateway=, so settings cannot be read."
+            )
+        return self._settings_gateway.get_output_copy_warning_threshold_bytes()

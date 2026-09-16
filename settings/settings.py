@@ -55,6 +55,20 @@ THUMBNAIL_MAX_SIDE_RANGE = (32, 1024)
 DEFAULT_PREVIEW_MAX_SIDE = 600
 PREVIEW_MAX_SIDE_RANGE = (64, 4096)
 
+# P1.9b-1: the byte total above which a Save-As output copy should be
+# called out to the researcher before it runs, rather than simply blocking
+# the UI while it happens. 1 GiB default; 0 (always warn) to 1 TiB. Not
+# yet read by anything except AppController.get_output_copy_warning_
+# threshold_bytes() -- the warning itself is P1.9b-2. Deliberately not
+# one of "the five values" docs/architecture.md section 9 documents and
+# not in settings/settings_gateway.py's editable fields: it is not yet
+# surfaced in the settings dialog, because nothing checks it yet.
+# settings/settings_store.py also gives it no persisted key yet, on
+# purpose, so it always reads back as this default -- give it one in
+# whichever item first writes a real value.
+DEFAULT_OUTPUT_COPY_WARNING_THRESHOLD_BYTES = 1024 * 1024 * 1024
+OUTPUT_COPY_WARNING_THRESHOLD_BYTES_RANGE = (0, 1024 * 1024 * 1024 * 1024)
+
 
 # ---------------------------------------------------------------------------
 # Tolerant parsing helpers. Each appends at most one problem message and
@@ -121,6 +135,9 @@ class GelemSettings:
     worker_count: int = DEFAULT_WORKER_COUNT
     thumbnail_max_side: int = DEFAULT_THUMBNAIL_MAX_SIDE
     preview_max_side: int = DEFAULT_PREVIEW_MAX_SIDE
+    output_copy_warning_threshold_bytes: int = (
+        DEFAULT_OUTPUT_COPY_WARNING_THRESHOLD_BYTES
+    )
 
     @classmethod
     def from_values(
@@ -175,6 +192,13 @@ class GelemSettings:
             "preview size",
             problems,
         )
+        output_copy_warning_threshold_bytes = _parse_int_field(
+            mapping.get("output_copy_warning_threshold_bytes"),
+            DEFAULT_OUTPUT_COPY_WARNING_THRESHOLD_BYTES,
+            OUTPUT_COPY_WARNING_THRESHOLD_BYTES_RANGE,
+            "output copy warning threshold",
+            problems,
+        )
 
         # Cross-field rule: a preview must not be smaller than a thumbnail.
         # Both are now the largest side directly, so this is a plain compare.
@@ -193,6 +217,9 @@ class GelemSettings:
                 worker_count=worker_count,
                 thumbnail_max_side=thumbnail_max_side,
                 preview_max_side=preview_max_side,
+                output_copy_warning_threshold_bytes=(
+                    output_copy_warning_threshold_bytes
+                ),
             ),
             problems,
         )

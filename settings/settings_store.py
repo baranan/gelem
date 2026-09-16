@@ -45,6 +45,13 @@ class SettingsStore:
     # the app ever wrote the old keys, so there is nothing to migrate.
     _KEY_THUMBNAIL_MAX_SIDE = "artifacts/thumbnail_max_side"
     _KEY_PREVIEW_MAX_SIDE = "artifacts/preview_max_side"
+    # output_copy_warning_threshold_bytes (P1.9b-1, settings/settings.py)
+    # is deliberately NOT given a persisted key here yet: nothing writes a
+    # non-default value for it (it has no dialog entry -- see
+    # settings_gateway.py's get_output_copy_warning_threshold_bytes()), so
+    # load()/save() simply never mention it and GelemSettings.from_values
+    # always defaults it. Give it a key here in the same item that first
+    # writes a real value -- P1.9b-2 or later.
 
     def __init__(self, backend: SettingsBackend):
         self._backend = backend

@@ -15,7 +15,7 @@ Student B is responsible for implementing the real logic in this file.
 
 from __future__ import annotations
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 import weakref
 import pandas as pd
@@ -2276,6 +2276,107 @@ class Dataset:
     # Save and load
     # ------------------------------------------------------------------
 
+    def _media_columns_for(self, table_name: str) -> set[str]:
+        """Column names in table_name that hold media-path values:
+        'full_path' always, plus every column the table's own TableSchema
+        tags 'media_path'.
+
+        P1.8d-2b-1: this used to come from ColumnTypeRegistry; the schema
+        is now the single authority. A table assigned straight into
+        _tables by a test has no schema, so only 'full_path' comes back --
+        the same columns the old registry-less path handled.
+
+        The single place this detection is written (P1.9b-1): save() and
+        the output-copy cell-gathering/rewrite methods below all call this
+        rather than each keeping their own copy, so "which columns are
+        media columns" cannot drift between them.
+        """
+        media_cols = {"full_path"}
+        schema = self.schema_for(table_name)
+        if schema is not None:
+            for spec in schema.columns_with_tag("media_path"):
+                media_cols.add(spec.name)
+        return media_cols
+
+    def media_cells_by_table(self) -> dict[str, list[str]]:
+        """Every non-blank media-path cell value in every stored table, as
+        plain strings, keyed by table name.
+
+        A table with no media columns, or none of its media cells holding
+        a non-blank string, is simply absent from the returned dict. This
+        is the read half P1.9b-1's output-copy planner needs
+        (models/output_copy.py::plan_output_copy) -- the same column set
+        save() rewrites on disk (_media_columns_for), read here without
+        writing anything.
+        """
+        result: dict[str, list[str]] = {}
+        for table_name, df in self._tables.items():
+            media_cols = self._media_columns_for(table_name) & set(df.columns)
+            if not media_cols:
+                continue
+            values: list[str] = []
+            for col in media_cols:
+                for cell in df[col]:
+                    if not _is_blank_cell(cell):
+                        values.append(cell)
+            if values:
+                result[table_name] = values
+        return result
+
+    def rewrite_media_cell_paths(self, path_mapping: dict[str, str]) -> None:
+        """Rewrite every in-memory media cell whose PATH portion is a key
+        in path_mapping to the mapped value, preserving the address
+        fragment (#f=, #t=, #r=, a stream selector) exactly -- the same
+        parse/replace-path/format pattern _rewrite_media_cell uses for
+        save()'s on-disk rewrite, but applied to the STORED table instead
+        of a local copy of it.
+
+        path_mapping keys and values are absolute path strings in the
+        canonical forward-slash form media_address.parse()/format() use
+        (models/output_copy.py's plan entries, passed through
+        media_address.from_path()) -- not raw filesystem strings.
+
+        Goes through apply_row_updates(), Dataset's normal accept path
+        (CLAUDE.md: "Only Dataset may modify a stored table"), so every
+        rewritten table is re-validated and its write-ticket version
+        bumped like any other accepted write. That bump is real and by
+        design (_commit_prepared bumps unconditionally on every accepted
+        write) -- it is what would give a LIVE operator run a false "data
+        changed" notice if one were reading the table being rewritten.
+        P1.9b-1's answer is at the caller: AppController.save_project()
+        refuses outright while any run is live, so this method is never
+        called while one is. This method does not special-case the bump
+        itself.
+
+        A no-op (path_mapping empty, or no stored cell's path matches a
+        key) touches nothing -- apply_row_updates is not even called for
+        a table with no matching cell, so that table's write-ticket
+        version does not move either.
+        """
+        if not path_mapping:
+            return
+        for table_name, df in list(self._tables.items()):
+            media_cols = self._media_columns_for(table_name) & set(df.columns)
+            if not media_cols or "row_id" not in df.columns:
+                continue
+            updates: dict[str, dict] = {}
+            for col in media_cols:
+                for row_id, cell in zip(df["row_id"], df[col]):
+                    if _is_blank_cell(cell):
+                        continue
+                    try:
+                        addr = parse_address(cell)
+                    except MediaAddressError:
+                        continue
+                    new_path = path_mapping.get(addr.path)
+                    if new_path is None:
+                        continue
+                    new_cell = format_address(replace(addr, path=new_path))
+                    if new_cell != cell:
+                        updates.setdefault(row_id, {})[col] = new_cell
+            if updates:
+                self.apply_row_updates(table_name, updates)
+
     def save(self, project_path: Path) -> None:
         """
         Saves tables as Parquet, provenance as JSON. Media-path columns
@@ -2292,17 +2393,9 @@ class Dataset:
         unparseable_media_cells = 0
 
         for name, df in self._tables.items():
-            # Which columns of THIS table hold media paths? 'full_path' always;
-            # every other column the table's own TableSchema tags 'media_path'.
-            # P1.8d-2b-1: this used to come from ColumnTypeRegistry; the schema
-            # is now the single authority. A table assigned straight into
-            # _tables by a test has no schema, so only 'full_path' is rewritten
-            # for it -- the same columns the old registry-less path handled.
-            media_cols = {"full_path"}
-            schema = self.schema_for(name)
-            if schema is not None:
-                for spec in schema.columns_with_tag("media_path"):
-                    media_cols.add(spec.name)
+            # Which columns of THIS table hold media paths? See
+            # _media_columns_for.
+            media_cols = self._media_columns_for(name)
 
             df_out = df
             cols_to_rewrite = [c for c in df.columns if c in media_cols]

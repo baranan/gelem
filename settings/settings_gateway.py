@@ -22,6 +22,7 @@ and when it takes effect.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import Mapping
 
@@ -173,15 +174,30 @@ class SettingsGateway:
         (empty when every value was accepted as given).
         """
         # Start from what is currently persisted, so an omitted field
-        # survives untouched. Keys come from _FIELD_SPECS, not retyped.
+        # survives untouched. EVERY GelemSettings field, not only the ones
+        # _FIELD_SPECS describes for the dialog -- so that a future field
+        # with no dialog entry yet (P1.9b-1's
+        # output_copy_warning_threshold_bytes is the first; it has no
+        # persisted key of its own yet either, so this is a no-op for it
+        # today) is carried through a dialog save rather than silently
+        # falling back to its default the moment _FIELD_SPECS alone built
+        # this mapping.
         current_settings, _problems = self._store.load()
-        merged: dict = {
-            name: getattr(current_settings, name)
-            for name, *_rest in _FIELD_SPECS
-        }
+        merged: dict = dataclasses.asdict(current_settings)
         # Overlay the caller's partial update.
         merged.update(mapping)
 
         corrected_settings, problems = GelemSettings.from_values(merged)
         self._store.save(corrected_settings)
         return list(problems)
+
+    def get_output_copy_warning_threshold_bytes(self) -> int:
+        """The current output_copy_warning_threshold_bytes value (P1.9b-1).
+
+        Not one of the fields describe_fields() lists: this value has no
+        dialog entry yet (nothing checks it yet -- the warning is
+        P1.9b-2), so it is read through its own getter rather than
+        through the SettingField list.
+        """
+        current_settings, _problems = self._store.load()
+        return current_settings.output_copy_warning_threshold_bytes

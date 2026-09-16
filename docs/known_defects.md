@@ -158,6 +158,30 @@ to P1.8d, and the two OS-native / non-parsing media-cell entries to P1.8e.
   becomes display text, not in the operator and not in the data. Found by
   Y B on 14 Sep 2026 while checking a cancelled run by eye; no item
   assigned.
+- **P1.9b-1's Save-As output copy runs on the main thread and blocks the UI
+  for its duration.** `AppController.save_project()` calls
+  `models/output_copy.py::execute_output_copy()` synchronously, with no
+  cancellation and no progress reporting -- a save that needs to move a lot
+  of video is a frozen window until it finishes. Deliberate for this item
+  (saving is already refused while any operator run is live, so there is no
+  concurrent write for a worker thread to race), but a real limitation on a
+  slow disk or a large project. The researcher-facing warning before a large
+  copy (P1.9b-2) can at least tell them it is about to happen; moving the
+  copy off the main thread is not scoped to either item.
+- **A project saved before P1.9 (P1.9a's `ProjectPaths`) that holds
+  operator-output cells pointing at the OS temp directory is not helped by
+  P1.9b-1's copy.** Before P1.9a an operator's `output_dir` was a
+  construction-time scratch folder under the codebase install directory or
+  the OS temp directory, never re-rooted on save -- see
+  `docs/review/p1.9-survey.md`, referenced from `models/project_paths.py`.
+  P1.9b-1's copy plan only ever looks at cells under the CURRENT
+  `ProjectPaths.outputs_dir`; a cell left over from before P1.9a lies
+  somewhere else entirely and is invisible to it. Such a project still opens
+  -- the cell still resolves as an absolute path exactly as it did before --
+  but the file it names is never copied into the project and is exactly as
+  exposed to being cleaned up by something else on the machine as it always
+  was. No item assigned; nothing currently migrates a pre-P1.9 project's
+  scratch-folder outputs into its `outputs_dir`.
 
 ## Open -- smells, no item assigned
 

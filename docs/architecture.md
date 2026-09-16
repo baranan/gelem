@@ -75,9 +75,26 @@ operator-specific field), and `is_workspace`. Injected into ArtifactStore and
 into every operator run (`run.paths`) so nothing invents its own directory;
 `AppController` rebuilds and swaps it on `save_project()`/`load_project()`, at
 the same point it already re-roots ArtifactStore. Made true by P1.9a.
-`[TARGET -> P1.9b]` Copying operator outputs already on disk into the
-researcher's chosen folder on Save As is not yet built -- files an operator
-wrote in a workspace simply stay there today.
+
+`[NOW]` **Copying operator outputs already on disk into the researcher's
+chosen folder happens on save.** `save_project()` refuses outright, before
+planning, copying or writing anything, while any operator run is live
+(`AppController.is_save_blocked()`) -- a live run's own later writes still
+land under the OLD `outputs_dir` (it read `run.paths` once, at start), so a
+copy planned now would miss them regardless, and the in-memory cell rewrite
+below would otherwise give that live run a false "data changed" notice
+(`CLAUDE.md`'s "Run provenance and conflict detection", `_superseded_input_tables`).
+Otherwise, `models/output_copy.py::plan_output_copy` selects every media cell
+whose absolute path lies under the CURRENT `outputs_dir`, and
+`execute_output_copy` copies each to the same relative path under the new
+one; `Dataset.rewrite_media_cell_paths()` then repoints the matching
+in-memory cells at the copies through Dataset's normal accept path, before
+`Dataset.save()` writes Parquet. A destination that already exists with the
+same size is left alone; a different size is a conflict, and the whole save
+is refused before anything is copied or written. Made true by P1.9b-1.
+`[TARGET -> P1.9b-2]` The researcher-facing warning for a large or
+colliding copy -- `AppController.plan_output_copy()` already returns
+everything it would need -- is not yet built.
 
 ---
 
