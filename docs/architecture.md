@@ -92,9 +92,10 @@ in-memory cells at the copies through Dataset's normal accept path, before
 `Dataset.save()` writes Parquet. A destination that already exists with the
 same size is left alone; a different size is a conflict, and the whole save
 is refused before anything is copied or written. Made true by P1.9b-1.
-`[TARGET -> P1.9b-2]` The researcher-facing warning for a large or
-colliding copy -- `AppController.plan_output_copy()` already returns
-everything it would need -- is not yet built.
+`[NOW]` The researcher-facing warning for a large or colliding copy is
+built in `ui/output_copy_warning.py`, called from `ui/main_window.py`'s
+save entry point around the same `plan_output_copy()` call. Made true by
+P1.9b-2.
 
 ---
 

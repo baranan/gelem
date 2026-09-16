@@ -25,7 +25,9 @@ from PySide6.QtGui import QAction
 
 from controller import (
     format_cancel_message,
+    format_output_copy_conflict_message,
     format_run_indicator_text,
+    format_save_blocked_message,
     numbered_run_choices,
 )
 from operators.descriptor import ExecutionMode, InputKind
@@ -39,6 +41,7 @@ from ui.save_table_dialog import SaveTableDialog
 from ui.csv_image_column_dialog import CsvImageColumnDialog
 from ui.merge_report_dialog import MergeReportDialog
 from ui.settings_dialog import SettingsDialog
+from ui.output_copy_warning import confirm_output_copy, should_warn
 from ui.parameter_dialog import FormAdviceError, ParameterDialog, ParameterFormError
 
 
@@ -1257,13 +1260,44 @@ class MainWindow(QMainWindow):
             )
 
     def _on_save_project(self) -> None:
-        """Opens a folder chooser for saving the project."""
+        """Opens a folder chooser for saving the project, after the
+        pre-save checks P1.9b-2 adds (docs/architecture.md section 2).
+
+        Checked in order, each one able to stop the save before the next
+        runs: a live operator run blocks the save outright (checked before
+        the folder dialog even opens, so a blocked save shows no dialog);
+        a destination collision refuses the save; and a large copy asks
+        for confirmation. Below the confirmation threshold, or once
+        confirmed, save_project() itself repeats the is_save_blocked() and
+        conflict checks -- a run could start in the gap between here and
+        there -- so nothing above is a substitute for those checks, only a
+        UI-side shortcut that avoids opening a folder dialog or running a
+        copy plan that would only be refused a moment later.
+        """
+        if self._controller.is_save_blocked():
+            self._on_error(format_save_blocked_message())
+            return
+
         folder = QFileDialog.getExistingDirectory(
             self, "Save project to folder"
         )
-        if folder:
-            from pathlib import Path
-            self._controller.save_project(Path(folder))
+        if not folder:
+            return
+
+        from pathlib import Path
+        dest_folder = Path(folder)
+
+        plan = self._controller.plan_output_copy(dest_folder)
+        if plan.conflicts:
+            self._on_error(format_output_copy_conflict_message(plan.conflicts))
+            return
+
+        threshold = self._controller.get_output_copy_warning_threshold_bytes()
+        if should_warn(plan.total_bytes, threshold):
+            if not confirm_output_copy(self, len(plan.entries), plan.total_bytes):
+                return
+
+        self._controller.save_project(dest_folder)
 
     def _on_load_project(self) -> None:
         """Opens a folder chooser for loading a project."""

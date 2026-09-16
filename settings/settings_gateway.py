@@ -33,6 +33,7 @@ from settings.settings import (
     WORKER_COUNT_RANGE,
     THUMBNAIL_MAX_SIDE_RANGE,
     PREVIEW_MAX_SIDE_RANGE,
+    OUTPUT_COPY_WARNING_THRESHOLD_BYTES_RANGE,
 )
 from settings.settings_store import SettingsStore
 
@@ -56,10 +57,13 @@ class SettingField:
     current_value: int
 
 
-# The five fields, in the order docs/architecture.md section 9's table
-# lists them. minimum and maximum are ALWAYS read from the *_RANGE tuples
-# in settings/settings.py -- never retyped as literals here -- so a bound
-# change in one place cannot silently disagree with another.
+# The five ArtifactStore values docs/architecture.md section 9's table
+# lists, in that order, plus output_copy_warning_threshold_bytes (P1.9b-2)
+# after them -- it is not one of "the five values" section 9 documents,
+# but it is edited the same way. minimum and maximum are ALWAYS read from
+# the *_RANGE tuples in settings/settings.py -- never retyped as literals
+# here -- so a bound change in one place cannot silently disagree with
+# another.
 #
 # Each entry: (name, label, help_text, range_tuple, unit, restart_required)
 _FIELD_SPECS = (
@@ -112,6 +116,16 @@ _FIELD_SPECS = (
         PREVIEW_MAX_SIDE_RANGE,
         "pixels",
         True,
+    ),
+    (
+        "output_copy_warning_threshold_bytes",
+        "Output copy warning threshold",
+        "Above this total size, saving a project asks before copying "
+        "operator output files into the project folder. Below it, the "
+        "copy happens without asking. Takes effect immediately.",
+        OUTPUT_COPY_WARNING_THRESHOLD_BYTES_RANGE,
+        "bytes",
+        False,
     ),
 )
 
@@ -176,12 +190,9 @@ class SettingsGateway:
         # Start from what is currently persisted, so an omitted field
         # survives untouched. EVERY GelemSettings field, not only the ones
         # _FIELD_SPECS describes for the dialog -- so that a future field
-        # with no dialog entry yet (P1.9b-1's
-        # output_copy_warning_threshold_bytes is the first; it has no
-        # persisted key of its own yet either, so this is a no-op for it
-        # today) is carried through a dialog save rather than silently
-        # falling back to its default the moment _FIELD_SPECS alone built
-        # this mapping.
+        # with no dialog entry yet is carried through a dialog save rather
+        # than silently falling back to its default the moment
+        # _FIELD_SPECS alone built this mapping.
         current_settings, _problems = self._store.load()
         merged: dict = dataclasses.asdict(current_settings)
         # Overlay the caller's partial update.
@@ -192,12 +203,13 @@ class SettingsGateway:
         return list(problems)
 
     def get_output_copy_warning_threshold_bytes(self) -> int:
-        """The current output_copy_warning_threshold_bytes value (P1.9b-1).
+        """The current output_copy_warning_threshold_bytes value.
 
-        Not one of the fields describe_fields() lists: this value has no
-        dialog entry yet (nothing checks it yet -- the warning is
-        P1.9b-2), so it is read through its own getter rather than
-        through the SettingField list.
+        Also one of the fields describe_fields() now lists (P1.9b-2), so
+        the settings dialog can edit it. This direct getter stays because
+        the copy-on-save check (ui/output_copy_warning.py) only ever wants
+        this one number and should not build the whole SettingField list
+        to get it.
         """
         current_settings, _problems = self._store.load()
         return current_settings.output_copy_warning_threshold_bytes

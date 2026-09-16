@@ -28,6 +28,7 @@ from settings.settings import (
     DEFAULT_WORKER_COUNT,
     DEFAULT_THUMBNAIL_MAX_SIDE,
     DEFAULT_PREVIEW_MAX_SIDE,
+    DEFAULT_OUTPUT_COPY_WARNING_THRESHOLD_BYTES,
     PICTURE_MEMORY_MAX_BYTES_RANGE,
     WORKER_COUNT_RANGE,
     THUMBNAIL_MAX_SIDE_RANGE,
@@ -297,6 +298,9 @@ def test_settings_store_round_trip_through_dict_backend():
         "artifacts/worker_count": "6",
         "artifacts/thumbnail_max_side": "120",
         "artifacts/preview_max_side": "800",
+        "save/output_copy_warning_threshold_bytes": str(
+            DEFAULT_OUTPUT_COPY_WARNING_THRESHOLD_BYTES
+        ),
     }
     assert backend.data == expected_persisted
 

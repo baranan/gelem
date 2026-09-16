@@ -83,7 +83,7 @@ class _FakeController:
 
 
 def _real_fields() -> list[SettingField]:
-    """The five fields exactly as they ship, read through the gateway."""
+    """The six fields exactly as they ship, read through the gateway."""
     store = SettingsStore(_DictBackend())
     return SettingsGateway(store).describe_fields()
 
@@ -293,10 +293,11 @@ def test_real_fields_render_one_spin_box_each(qapp):
     spins = dialog.findChildren(QSpinBox)
     assert len(spins) == len(fields)
 
-    # The two byte-valued fields are shown in MiB.
+    # The three byte-valued fields (the two cache ceilings plus P1.9b-2's
+    # output-copy warning threshold) are shown in MiB.
     mib_spins = [s for s in spins if s.suffix() == " MiB"]
     byte_fields = [f for f in fields if f.unit == "bytes"]
-    assert len(mib_spins) == len(byte_fields) == 2
+    assert len(mib_spins) == len(byte_fields) == 3
 
 
 def _silence_modal_boxes(monkeypatch):

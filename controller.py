@@ -3253,16 +3253,15 @@ class AppController(QObject):
         return messages
 
     def get_output_copy_warning_threshold_bytes(self) -> int:
-        """The byte threshold above which a Save-As output copy should be
-        called out to the researcher before it runs (P1.9b-2 -- not built
-        yet; this getter exists now only so that item has a value to
-        read). Same pass-through discipline as get_settings_fields() /
+        """The byte threshold above which a Save-As output copy is called
+        out to the researcher before it runs (ui/output_copy_warning.py,
+        P1.9b-2). Same pass-through discipline as get_settings_fields() /
         apply_settings() above -- the controller does not import
         settings/ and only forwards to the gateway.
 
-        Not one of the five fields get_settings_fields() lists: it is not
-        yet editable through the settings dialog, on purpose (P1.9b-1
-        does not build the warning that would use it).
+        Also editable through the settings dialog (P1.9b-2), as one of
+        the fields get_settings_fields() lists -- this direct getter
+        stays because the copy-on-save check only wants this one number.
 
         Raises:
             RuntimeError: if no settings gateway was wired in.
