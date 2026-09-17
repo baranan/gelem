@@ -10,3 +10,4 @@ mediapipe
 pytest
 opencv-python
 PyYAML
+av

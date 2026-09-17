@@ -20,17 +20,21 @@ Run with: python -m pytest tests/test_media_resolver.py
 """
 
 import dataclasses
+import gc
+import os
 import pathlib
 import shutil
 import struct
 import subprocess
 import sys
 import threading
+import time
 
 # Add project root to Python path, matching the other test modules.
 project_root = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
+import av
 import numpy as np
 import pytest
 from PIL import Image, ImageOps
@@ -39,7 +43,13 @@ from media.media_address import MediaAddressError, from_path
 from media.resolver import MediaResolver, MediaResolverError
 
 FFMPEG_MISSING = shutil.which("ffmpeg") is None
+FFPROBE_MISSING = shutil.which("ffprobe") is None
 pytestmark = pytest.mark.skipif(FFMPEG_MISSING, reason="ffmpeg is not on PATH")
+
+# P1.2b: the real recordings this module's GELEM_FIXTURES-gated tests use,
+# following the pattern in tests/test_media_address.py -- skip cleanly
+# rather than fail when the folder is not set (docs/fixtures.md).
+GELEM_FIXTURES = os.environ.get("GELEM_FIXTURES")
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +74,102 @@ def _generate_known_frame_video(tmp_path, width=64, height=64, fps=25, duration_
         str(out_path),
     ])
     return out_path
+
+
+def _generate_bframe_video(tmp_path, width=64, height=64, fps=25, duration_s=2):
+    """An H.264 file with real B-frames: demuxed packet order (decode
+    order) differs from presentation order, which is exactly the case
+    P1.2b's frame-time index must sort its way out of rather than trust.
+
+    x264's lossless mode (crf 0) turns out to disable the B-pyramid on
+    this content -- verified empirically while building this fixture, not
+    assumed -- so this uses a lossy crf with a forced, non-adaptive
+    B-frame pattern instead. Content is the same grayscale geq=lum='N'
+    gradient as _generate_known_frame_video's, but because it is lossy,
+    tests must compare against an independent full decode
+    (see _full_decode), never against pixel value N directly.
+    """
+    out_path = tmp_path / "bframes.mp4"
+    _run_ffmpeg([
+        "-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:r={fps}:d={duration_s}",
+        "-vf", "format=gray,geq=lum='N'",
+        "-pix_fmt", "yuv420p", "-c:v", "libx264", "-crf", "18",
+        "-x264-params", "bframes=3:b-adapt=0:scenecut=0",
+        str(out_path),
+    ])
+    return out_path
+
+
+def _generate_duplicate_pts_video(tmp_path, width=32, height=32, fps=25, duration_s=1):
+    """A file where two presented frames genuinely share one presentation
+    time. `setpts` maps source frames N and N+1 (for even N) onto the
+    same output timestamp; `-fps_mode passthrough` is required to stop
+    the muxer silently dropping the resulting duplicate (verified
+    empirically -- without it, ffmpeg drops every frame whose pts
+    collides with the one before it, `drop=11` in its own summary, and
+    the file ends up with no duplicates at all). Content still varies
+    per source frame (geq=lum='N'), so what collides is purely the
+    timestamp, not the picture.
+    """
+    out_path = tmp_path / "duplicate_pts.mkv"
+    _run_ffmpeg([
+        "-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:r={fps}:d={duration_s}",
+        "-vf", f"format=gray,geq=lum='N',setpts=floor(N/2)/({fps}*TB)",
+        "-fps_mode", "passthrough",
+        "-pix_fmt", "gray", "-c:v", "ffv1",
+        str(out_path),
+    ])
+    return out_path
+
+
+def _full_decode(path):
+    """Ground truth: an independent full decode pass over stream 0, in
+    presentation order (PyAV reorders internally, as demonstrated by
+    test_frame_index_matches_a_full_decode_with_b_frames), returning
+    (raw pts in stream time_base ticks, rgb24 pixel array) per frame.
+
+    Used only to check the resolver's #f= answers against -- this
+    function is not part of resolver.py and duplicates none of its
+    caching or pool logic, so it is a genuinely independent check.
+    """
+    container = av.open(str(path))
+    try:
+        stream = container.streams.video[0]
+        container.seek(0, backward=True, any_frame=False, stream=stream)
+        return [
+            (frame.pts, frame.to_ndarray(format="rgb24").copy())
+            for frame in container.decode(stream)
+        ]
+    finally:
+        container.close()
+
+
+def _run_with_timeout(func, timeout=20):
+    """Run `func` (no arguments) on a background thread and wait up to
+    `timeout` seconds. Fails the test loudly if it is still running past
+    the deadline, rather than letting a deadlock regression hang the
+    whole suite. Returns a dict with 'value' or 'error' (any exception
+    `func` raised, captured so the caller can assert on it from the main
+    thread rather than losing it in the background thread).
+    """
+    outcome = {}
+
+    def _target():
+        try:
+            outcome["value"] = func()
+        except BaseException as exc:  # noqa: BLE001 - reported, not swallowed
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=_target)
+    thread.daemon = True
+    thread.start()
+    thread.join(timeout=timeout)
+    if thread.is_alive():
+        pytest.fail(
+            f"operation did not complete within {timeout}s -- "
+            f"this looks like a hang/deadlock, not a slow pass"
+        )
+    return outcome
 
 
 def _generate_quad_video(tmp_path, name="quad.mp4", width=64, height=64, fps=5, duration_s=1):
@@ -326,13 +432,15 @@ def test_bare_path_midpoint_is_near_the_middle_frame(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Decision 8 -- frame_ordinal is a file-wide presentation-order position,
-# which this module cannot supply without the per-file frame-time index
-# P1.2b builds. Every video resolve must report None, whatever address
-# shape asked for the frame -- a point, a range, or a bare path.
+# Decision 8 -- frame_ordinal is a file-wide presentation-order position.
+# P1.2a reported None unconditionally for video. P1.2b's frame-time index
+# makes a real value possible, but only once it exists: a #t=, range or
+# bare-path resolve never builds the index itself (the cost rule), so it
+# reports the real ordinal only when an earlier #f= resolve on the same
+# MediaResolver already built it, and None otherwise.
 # ---------------------------------------------------------------------------
 
-def test_video_frame_ordinal_is_always_none(tmp_path):
+def test_video_frame_ordinal_is_none_before_any_index_exists(tmp_path):
     video_path = _generate_known_frame_video(tmp_path, fps=25, duration_s=2)
     resolver = MediaResolver(max_open_decoders=2)
     try:
@@ -347,6 +455,68 @@ def test_video_frame_ordinal_is_always_none(tmp_path):
         assert bare_payload.frame_ordinal is None
         assert point_payload.frame_ordinal is None
         assert range_payload.frame_ordinal is None
+    finally:
+        resolver.close()
+
+
+def test_video_frame_ordinal_is_filled_once_an_index_exists(tmp_path):
+    video_path = _generate_known_frame_video(tmp_path, fps=25, duration_s=2)
+    resolver = MediaResolver(max_open_decoders=2)
+    try:
+        # Build the index via one #f= resolve.
+        frame_addr = dataclasses.replace(from_path(str(video_path)), frame=0)
+        resolver.resolve_frame(frame_addr, purpose="display")
+
+        # Frame 1 covers [0.04, 0.08) -- same fact test_time_point_not_on_a
+        # _frame_boundary uses.
+        point_addr = dataclasses.replace(from_path(str(video_path)), time_us=50_000)
+        point_payload = resolver.resolve_frame(point_addr, purpose="display")
+        assert point_payload.frame_ordinal == 1
+        assert point_payload.presentation_time_us == 40_000
+
+        bare_payload = resolver.resolve_frame(str(video_path), purpose="display")
+        assert bare_payload.frame_ordinal == 0
+
+        # Frames at indices 3..7 -- same range as test_range_policy_first.
+        range_addr = dataclasses.replace(
+            from_path(str(video_path)), time_range_us=(100_000, 300_000)
+        )
+        range_payload = resolver.resolve_frame(range_addr, purpose="display", policy="first")
+        assert range_payload.frame_ordinal == 3
+    finally:
+        resolver.close()
+
+
+def test_time_point_and_bare_and_range_resolves_never_build_the_index(tmp_path, monkeypatch):
+    video_path = _generate_known_frame_video(tmp_path, fps=25, duration_s=2)
+    resolver = MediaResolver(max_open_decoders=2)
+    build_calls = []
+    original_build = MediaResolver._build_frame_index
+
+    def _counting_build(self, container, stream, epoch_us):
+        build_calls.append(1)
+        return original_build(self, container, stream, epoch_us)
+
+    monkeypatch.setattr(MediaResolver, "_build_frame_index", _counting_build)
+    try:
+        resolver.resolve_frame(str(video_path), purpose="display")  # bare
+        point_addr = dataclasses.replace(from_path(str(video_path)), time_us=50_000)
+        resolver.resolve_frame(point_addr, purpose="display")
+        range_addr = dataclasses.replace(
+            from_path(str(video_path)), time_range_us=(100_000, 300_000)
+        )
+        resolver.resolve_frame(range_addr, purpose="display")
+        assert build_calls == []
+
+        frame_addr = dataclasses.replace(from_path(str(video_path)), frame=0)
+        resolver.resolve_frame(frame_addr, purpose="display")
+        assert len(build_calls) == 1
+
+        # A second #f= resolve reuses the cached index rather than
+        # rebuilding it.
+        frame_addr_2 = dataclasses.replace(from_path(str(video_path)), frame=1)
+        resolver.resolve_frame(frame_addr_2, purpose="display")
+        assert len(build_calls) == 1
     finally:
         resolver.close()
 
@@ -471,12 +641,266 @@ def test_relative_address_raises():
         resolver.close()
 
 
-def test_frame_ordinal_address_raises_not_implemented():
+# ---------------------------------------------------------------------------
+# P1.2b -- #f= resolution against the known-frame fixture (no B-frames):
+# ordinal N must select exactly the frame whose pixels report N, and one
+# past the last frame must be refused (decision 11).
+# ---------------------------------------------------------------------------
+
+def test_frame_ordinal_selects_the_exact_frame(tmp_path):
+    video_path = _generate_known_frame_video(tmp_path, fps=25, duration_s=2)  # 50 frames: 0..49
     resolver = MediaResolver(max_open_decoders=2)
     try:
-        addr = dataclasses.replace(from_path("C:/videos/clip.mp4"), frame=5)
-        with pytest.raises(NotImplementedError):
+        for n in (0, 25, 49):
+            addr = dataclasses.replace(from_path(str(video_path)), frame=n)
+            payload = resolver.resolve_frame(addr, purpose="analysis")
+            assert set(payload.pixels.flatten().tolist()) == {n}
+            assert payload.frame_ordinal == n
+            assert payload.presentation_time_us == n * 40_000  # 1/25s frame period
+    finally:
+        resolver.close()
+
+
+def test_frame_ordinal_one_past_the_end_is_refused(tmp_path):
+    video_path = _generate_known_frame_video(tmp_path, fps=25, duration_s=2)  # 50 frames: 0..49
+    resolver = MediaResolver(max_open_decoders=2)
+    try:
+        addr = dataclasses.replace(from_path(str(video_path)), frame=50)
+        with pytest.raises(MediaAddressError):
             resolver.resolve_frame(addr, purpose="display")
+    finally:
+        resolver.close()
+
+
+def test_frame_ordinal_combined_with_region_and_stream_selector(tmp_path):
+    out_path = tmp_path / "multi_stream.mp4"
+    _run_ffmpeg([
+        "-f", "lavfi", "-i", "color=c=red:s=32x32:r=5:d=1",
+        "-f", "lavfi", "-i", "color=c=blue:s=32x32:r=5:d=1",
+        "-map", "0:v", "-map", "1:v",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "0",
+        str(out_path),
+    ])
+    resolver = MediaResolver(max_open_decoders=2)
+    try:
+        from media.media_address import Region, StreamSelector
+
+        addr = dataclasses.replace(
+            from_path(str(out_path)),
+            frame=0,
+            stream=StreamSelector(kind="v", index=1),
+            region=Region(x=0, y=0, w=500_000, h=500_000),
+        )
+        payload = resolver.resolve_frame(addr, purpose="display")
+        assert payload.frame_ordinal == 0
+        assert payload.width == 16 and payload.height == 16
+        r, g, b = payload.pixels[8, 8]
+        assert int(b) > 200 and int(r) < 50  # stream 1 is blue
+    finally:
+        resolver.close()
+
+
+# ---------------------------------------------------------------------------
+# P1.2b -- the index must sort by presentation time, not trust demux
+# (decode) order. An H.264 fixture with real, forced B-frames is the case
+# where the two orders genuinely differ (verified while building the
+# fixture generator: demuxed packet pts is not ascending on this file, but
+# container.decode()'s frames are). Compared against an independent full
+# decode, never against pixel value N (this fixture is lossy).
+# ---------------------------------------------------------------------------
+
+def test_frame_index_matches_a_full_decode_with_b_frames(tmp_path):
+    video_path = _generate_bframe_video(tmp_path, fps=25, duration_s=2)
+    ground_truth = _full_decode(video_path)
+    n_frames = len(ground_truth)
+    assert n_frames > 1
+
+    resolver = MediaResolver(max_open_decoders=2)
+    try:
+        for n in (0, n_frames // 2, n_frames - 1):
+            addr = dataclasses.replace(from_path(str(video_path)), frame=n)
+            payload = resolver.resolve_frame(addr, purpose="analysis")
+            assert payload.frame_ordinal == n
+            np.testing.assert_array_equal(payload.pixels, ground_truth[n][1])
+
+        # Index length equals the full decode's frame count (decision 11):
+        # the last valid ordinal succeeds, one past it is refused.
+        last_addr = dataclasses.replace(from_path(str(video_path)), frame=n_frames - 1)
+        resolver.resolve_frame(last_addr, purpose="display")
+        one_past_addr = dataclasses.replace(from_path(str(video_path)), frame=n_frames)
+        with pytest.raises(MediaAddressError):
+            resolver.resolve_frame(one_past_addr, purpose="display")
+    finally:
+        resolver.close()
+
+
+# ---------------------------------------------------------------------------
+# P1.2b -- decode_video_span.
+# ---------------------------------------------------------------------------
+
+def test_decode_video_span_rejects_point_and_frame_addresses(tmp_path):
+    video_path = _generate_known_frame_video(tmp_path, fps=25, duration_s=2)
+    resolver = MediaResolver(max_open_decoders=2)
+    try:
+        point_addr = dataclasses.replace(from_path(str(video_path)), time_us=50_000)
+        with pytest.raises(MediaAddressError):
+            resolver.decode_video_span(point_addr, purpose="display")
+
+        frame_addr = dataclasses.replace(from_path(str(video_path)), frame=0)
+        with pytest.raises(MediaAddressError):
+            resolver.decode_video_span(frame_addr, purpose="display")
+    finally:
+        resolver.close()
+
+
+def test_decode_video_span_acquires_lazily_not_at_call_time(tmp_path):
+    resolver = MediaResolver(max_open_decoders=2)
+    try:
+        missing_path = tmp_path / "does_not_exist.mp4"
+        span = resolver.decode_video_span(str(missing_path), purpose="display")
+        # Constructing the iterator did not touch the file -- only
+        # iterating it does, which is where the pool acquire (and the
+        # inevitable failure to open a missing file) happens.
+        with pytest.raises(Exception):
+            next(span)
+    finally:
+        resolver.close()
+
+
+def test_decode_video_span_empty_range_is_refused(tmp_path):
+    video_path = _generate_known_frame_video(tmp_path, fps=25, duration_s=2)
+    resolver = MediaResolver(max_open_decoders=2)
+    try:
+        # Frame 3 is at 0.12, frame 4 at 0.16 -- same empty gap as
+        # test_range_containing_no_frame_is_refused.
+        addr = dataclasses.replace(
+            from_path(str(video_path)), time_range_us=(121_000, 139_000)
+        )
+        with pytest.raises(MediaAddressError):
+            list(resolver.decode_video_span(addr, purpose="display"))
+    finally:
+        resolver.close()
+
+
+def test_span_yields_frames_in_range_with_consecutive_ordinals(tmp_path):
+    video_path = _generate_known_frame_video(tmp_path, fps=25, duration_s=2)
+    resolver = MediaResolver(max_open_decoders=2)
+    try:
+        # Build the index first -- a span never builds it itself (rule 3
+        # extended to spans), so without this every ordinal below would
+        # be None rather than consecutive.
+        frame_addr = dataclasses.replace(from_path(str(video_path)), frame=0)
+        resolver.resolve_frame(frame_addr, purpose="display")
+
+        # Frames at indices 3..7 -- same range as test_range_policy_first.
+        range_addr = dataclasses.replace(
+            from_path(str(video_path)), time_range_us=(100_000, 300_000)
+        )
+        payloads = list(resolver.decode_video_span(range_addr, purpose="display"))
+
+        assert [set(p.pixels.flatten().tolist()) for p in payloads] == [
+            {n} for n in range(3, 8)
+        ]
+        assert [p.frame_ordinal for p in payloads] == list(range(3, 8))
+        assert [p.presentation_time_us for p in payloads] == [
+            40_000 * n for n in range(3, 8)
+        ]
+    finally:
+        resolver.close()
+
+
+def test_abandoned_span_frees_its_handle_so_a_later_resolve_succeeds(tmp_path):
+    video_path = _generate_known_frame_video(tmp_path, fps=25, duration_s=2)
+    resolver = MediaResolver(max_open_decoders=1)
+    try:
+        span = resolver.decode_video_span(str(video_path), purpose="display")
+        next(span)  # forces the lazy pool acquire
+
+        # Abandon it without calling close() explicitly -- garbage
+        # collection alone must release the handle.
+        del span
+        gc.collect()
+
+        # With only one decoder slot, this hangs forever if the handle
+        # was not actually freed.
+        outcome = _run_with_timeout(
+            lambda: resolver.resolve_frame(str(video_path), purpose="display")
+        )
+        assert "error" not in outcome, outcome.get("error")
+        assert outcome["value"] is not None
+    finally:
+        resolver.close()
+
+
+def test_same_thread_reentry_at_the_bound_raises_instead_of_hanging(tmp_path):
+    video_a = _generate_known_frame_video(tmp_path, fps=25, duration_s=2)
+    video_b = _generate_quad_video(tmp_path)
+    resolver = MediaResolver(max_open_decoders=1)
+
+    def _reentrant_call():
+        span = resolver.decode_video_span(str(video_a), purpose="display")
+        try:
+            next(span)  # holds the pool's only slot, for file A
+            # Same thread, still holding it: a different file cannot be
+            # waited for -- only this thread could ever release the slot,
+            # and it cannot while blocked here.
+            with pytest.raises(MediaResolverError):
+                resolver.resolve_frame(str(video_b), purpose="display")
+        finally:
+            span.close()
+
+    try:
+        outcome = _run_with_timeout(_reentrant_call)
+        assert "error" not in outcome, outcome.get("error")
+    finally:
+        resolver.close()
+
+
+def test_decoder_pool_bound_holds_with_concurrent_span_iterators(tmp_path, monkeypatch):
+    # Five distinct files -- a span holds its handle for its whole
+    # iteration, unlike resolve_frame's brief acquire/release, so this
+    # exercises sustained contention against the bound.
+    paths = []
+    for i in range(5):
+        p = _generate_known_frame_video(tmp_path, width=16, height=16, fps=5, duration_s=1)
+        renamed = tmp_path / f"span_pool_{i}.mkv"
+        p.rename(renamed)
+        paths.append(renamed)
+
+    tracker = _OpenTracker()
+    import media.resolver as resolver_module
+
+    real_open = resolver_module.av.open
+
+    def _tracking_open(path, *args, **kwargs):
+        return _OpenTrackingContainer(real_open(path, *args, **kwargs), tracker)
+
+    monkeypatch.setattr(resolver_module.av, "open", _tracking_open)
+
+    max_open_decoders = 2
+    resolver = MediaResolver(max_open_decoders=max_open_decoders)
+    try:
+        errors = []
+
+        def _worker(path):
+            try:
+                for _payload in resolver.decode_video_span(str(path), purpose="display"):
+                    pass
+            except Exception as exc:  # pragma: no cover - surfaced via `errors`
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=_worker, args=(paths[i % len(paths)],))
+            for i in range(6)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        assert not any(t.is_alive() for t in threads), "a span iterator thread hung"
+        assert not errors, errors
+        assert tracker.peak <= max_open_decoders
     finally:
         resolver.close()
 
@@ -521,6 +945,27 @@ def test_still_jpeg_exif_orientation(tmp_path):
         # not a no-op -- so this test would fail if exif_transpose were
         # silently skipped.
         assert (payload.width, payload.height) == (height, width)
+    finally:
+        resolver.close()
+
+
+def test_still_image_frame_zero_succeeds_frame_one_is_refused(tmp_path):
+    # A still image has exactly one frame, at ordinal 0 (the FramePayload
+    # docstring's "0 for a still image, which has exactly one frame").
+    # #f=0 is that frame; #f=1 is beyond the last frame (decision 11).
+    image = Image.new("RGB", (10, 10), color=(255, 0, 0))
+    jpeg_path = tmp_path / "solid.jpg"
+    image.save(jpeg_path, format="JPEG", quality=100)
+
+    resolver = MediaResolver(max_open_decoders=2)
+    try:
+        zero_addr = dataclasses.replace(from_path(str(jpeg_path)), frame=0)
+        payload = resolver.resolve_frame(zero_addr, purpose="display")
+        assert payload.frame_ordinal == 0
+
+        one_addr = dataclasses.replace(from_path(str(jpeg_path)), frame=1)
+        with pytest.raises(MediaAddressError):
+            resolver.resolve_frame(one_addr, purpose="display")
     finally:
         resolver.close()
 
@@ -642,4 +1087,333 @@ def test_cost_rule_late_time_point_decodes_a_bounded_number_of_frames(tmp_path):
         )
     finally:
         resolver_module.av.open = original_open
+        resolver.close()
+
+
+# ---------------------------------------------------------------------------
+# P1.2b follow-up -- code-review fixes.
+# ---------------------------------------------------------------------------
+
+def test_decoder_pool_bound_holds_under_concurrent_opens(tmp_path, monkeypatch):
+    """Regression test for a race in _DecoderPool.acquire(): the original
+    code decremented _pending_opens and inserted the newly opened entry
+    in two SEPARATE lock acquisitions, so a concurrent acquire could see
+    free capacity for a container that was already open but not yet
+    counted anywhere -- transiently exceeding max_open_decoders.
+
+    The race window itself is only a handful of bytecode instructions, so
+    reproducing it needs two things working together: (1) a slow fake
+    open() so many threads are genuinely mid-open at once, all polling
+    acquire()'s retry loop, and (2) a much smaller
+    sys.setswitchinterval() so CPython's GIL actually hands off between
+    threads often enough to land inside that narrow window -- the
+    default ~5ms interval rarely does, which is why an earlier version of
+    this test passed against the unfixed code by sheer luck.
+    """
+    paths = []
+    for i in range(5):
+        p = _generate_known_frame_video(tmp_path, width=16, height=16, fps=5, duration_s=1)
+        renamed = tmp_path / f"race_{i}.mkv"
+        p.rename(renamed)
+        paths.append(renamed)
+
+    import media.resolver as resolver_module
+
+    real_open = resolver_module.av.open
+
+    original_switch_interval = sys.getswitchinterval()
+    sys.setswitchinterval(0.00001)
+    try:
+        for max_open_decoders in (1, 2):
+            tracker = _OpenTracker()
+
+            def _slow_tracking_open(path, *args, **kwargs):
+                time.sleep(0.005)
+                return _OpenTrackingContainer(real_open(path, *args, **kwargs), tracker)
+
+            monkeypatch.setattr(resolver_module.av, "open", _slow_tracking_open)
+            resolver = MediaResolver(max_open_decoders=max_open_decoders)
+            try:
+                errors = []
+
+                def _worker(path):
+                    try:
+                        for _ in range(6):
+                            resolver.resolve_frame(str(path), purpose="display")
+                    except Exception as exc:  # pragma: no cover - surfaced via `errors`
+                        errors.append(exc)
+
+                threads = [
+                    threading.Thread(target=_worker, args=(paths[i % len(paths)],))
+                    for i in range(16)
+                ]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join(timeout=30)
+
+                assert not errors, errors
+                assert tracker.peak <= max_open_decoders, (
+                    f"peak simultaneously open containers {tracker.peak} exceeded "
+                    f"max_open_decoders={max_open_decoders}"
+                )
+            finally:
+                resolver.close()
+    finally:
+        sys.setswitchinterval(original_switch_interval)
+
+
+def test_epoch_cache_is_invalidated_when_the_file_at_the_same_path_changes(tmp_path):
+    """_epoch_cache was keyed on (path, stream index) only, while the
+    frame-index cache also keys on file size and mtime. Replacing the
+    file at a path made a subsequent #f= resolve compare a fresh index
+    (built from the new file) against a stale epoch (cached from the old
+    file), raising a spurious mismatch error for a perfectly valid file.
+    """
+    video_path = tmp_path / "same_path.mkv"
+    original = _generate_known_frame_video(tmp_path, fps=25, duration_s=2)
+    original.rename(video_path)
+    other_path = _generate_quad_video(tmp_path, name="evict_me.mp4")
+
+    # max_open_decoders=1 so that resolving a second, different file
+    # below forces the pool to evict and actually close() video_path's
+    # container -- on Windows, PyAV holds an OS-level handle open for as
+    # long as a container sits idle in the pool, which would otherwise
+    # make the on-disk replace below fail with a sharing-violation
+    # PermissionError that has nothing to do with the bug under test.
+    resolver = MediaResolver(max_open_decoders=1)
+    try:
+        # Cache the epoch for the original file via a #t= resolve.
+        point_addr = dataclasses.replace(from_path(str(video_path)), time_us=0)
+        original_payload = resolver.resolve_frame(point_addr, purpose="display")
+        assert original_payload.presentation_time_us == 0
+
+        # Evict and close video_path's container.
+        resolver.resolve_frame(str(other_path), purpose="display")
+
+        # Replace the file at the SAME path with a different one whose
+        # first frame's raw pts is genuinely offset (a real epoch
+        # change), and force a new size/mtime.
+        time.sleep(0.05)  # coarse mtime resolution on some filesystems
+        replacement = _generate_known_frame_video(tmp_path, fps=25, duration_s=2)
+        shifted = tmp_path / "shifted.mkv"
+        _run_ffmpeg(["-itsoffset", "5", "-i", str(replacement), "-c", "copy", str(shifted)])
+        shifted.replace(video_path)
+
+        frame_addr = dataclasses.replace(from_path(str(video_path)), frame=0)
+        payload = resolver.resolve_frame(frame_addr, purpose="display")
+        assert payload.frame_ordinal == 0
+        assert set(payload.pixels.flatten().tolist()) == {0}
+    finally:
+        resolver.close()
+
+
+def test_duplicate_presentation_time_refuses_rather_than_guesses(tmp_path):
+    video_path = _generate_duplicate_pts_video(tmp_path)
+
+    # Sanity-check the fixture actually has the property this test needs,
+    # so a future ffmpeg change that stops producing duplicates fails
+    # loudly here rather than this test silently passing for the wrong
+    # reason.
+    ground_truth = _full_decode(video_path)
+    pts_values = [pts for pts, _ in ground_truth]
+    if len(pts_values) == len(set(pts_values)):
+        pytest.skip(
+            "this ffmpeg could not be made to produce a duplicate "
+            "presentation time on this fixture -- duplicate-pts handling "
+            "stays unverified on this machine"
+        )
+
+    resolver = MediaResolver(max_open_decoders=2)
+    try:
+        frame_addr = dataclasses.replace(from_path(str(video_path)), frame=0)
+        with pytest.raises(MediaResolverError):
+            resolver.resolve_frame(frame_addr, purpose="display")
+
+        # Consequently, #t= on the same file must not fill in an ordinal
+        # either -- the index was never cached (the build raised).
+        point_addr = dataclasses.replace(from_path(str(video_path)), time_us=0)
+        point_payload = resolver.resolve_frame(point_addr, purpose="display")
+        assert point_payload.frame_ordinal is None
+    finally:
+        resolver.close()
+
+
+def test_close_does_not_close_a_container_in_use_by_a_live_span(tmp_path):
+    video_path = _generate_known_frame_video(tmp_path, fps=25, duration_s=2)  # 50 frames
+    resolver = MediaResolver(max_open_decoders=2)
+
+    span = resolver.decode_video_span(str(video_path), purpose="display")
+    next(span)  # forces the lazy acquire; the container is now busy
+
+    resolver.close()  # must not close the busy container out from under the span
+
+    # Continuing the span to the end must not raise -- the container it
+    # is using stays open until the span itself releases it.
+    remaining = list(span)
+    assert len(remaining) == 49  # frame 0 already consumed above
+
+    # A new resolve after close() is refused, rather than silently
+    # opening a fresh container from a closed pool.
+    with pytest.raises(MediaResolverError):
+        resolver.resolve_frame(str(video_path), purpose="display")
+
+
+def test_deadlock_guard_waits_when_another_thread_will_release(tmp_path):
+    """The original deadlock guard raised whenever the calling thread
+    held ANY container at all, even when the pool's other busy container
+    was held by a different thread that would release it on its own --
+    refusing a perfectly safe wait. It must raise only when the calling
+    thread holds every busy container in the pool (so no other thread
+    could ever free one).
+    """
+    video_1 = _generate_known_frame_video(tmp_path, fps=25, duration_s=2)
+    video_2 = _generate_quad_video(tmp_path, name="quad_b.mp4")
+    video_3 = _generate_quad_video(tmp_path, name="quad_c.mp4")
+    resolver = MediaResolver(max_open_decoders=2)
+
+    b_acquired = threading.Event()
+    b_released = threading.Event()
+
+    def _hold_and_release_b():
+        span_b = resolver.decode_video_span(str(video_2), purpose="display")
+        next(span_b)  # holds the pool's second slot, for file2
+        b_acquired.set()
+        time.sleep(0.2)  # a short, deliberate delay before releasing
+        span_b.close()
+        b_released.set()
+
+    def _hold_then_resolve_a():
+        span_a = resolver.decode_video_span(str(video_1), purpose="display")
+        next(span_a)  # holds the pool's first slot, for file1
+        try:
+            assert b_acquired.wait(timeout=10), "B never acquired its handle"
+            # Pool is now genuinely at its bound (2/2): this thread holds
+            # one container, thread B holds the other -- not every busy
+            # container is held by THIS thread, so this must wait for
+            # B's release rather than raise.
+            payload = resolver.resolve_frame(str(video_3), purpose="display")
+            assert payload is not None
+            assert b_released.is_set(), (
+                "resolve_frame returned before B released its container "
+                "-- it did not actually wait for it"
+            )
+        finally:
+            span_a.close()
+
+    thread_b = threading.Thread(target=_hold_and_release_b)
+    try:
+        thread_b.start()
+        outcome = _run_with_timeout(_hold_then_resolve_a, timeout=15)
+        assert "error" not in outcome, outcome.get("error")
+    finally:
+        thread_b.join(timeout=10)
+        resolver.close()
+
+
+# ---------------------------------------------------------------------------
+# GELEM_FIXTURES-gated -- real recordings (docs/fixtures.md). Skip cleanly,
+# not fail, when the folder is unset, following test_media_address.py's
+# pattern. These are the only tests in this module that decode a real,
+# large file, so they are opt-in rather than part of the default run.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(GELEM_FIXTURES is None, reason="GELEM_FIXTURES is not set")
+def test_phone_recording_frame_ordinals_match_a_full_decode():
+    """The phone recording: variable frame rate, rotation=90 (portrait
+    stored as landscape). Real per-file frame timings, not a nominal frame
+    rate, and real orientation, in one fixture.
+    """
+    from media.resolver import _ticks_to_us
+
+    path = pathlib.Path(GELEM_FIXTURES) / "VID_20260826_100749315.mp4"
+    if not path.exists():
+        pytest.skip(f"expected fixture not found: {path}")
+
+    ground_truth = _full_decode(path)
+    n_frames = len(ground_truth)
+    assert n_frames > 1000, "fixture is shorter than the requested N values assume"
+
+    container = av.open(str(path))
+    time_base = container.streams.video[0].time_base
+    container.close()
+    epoch_us = _ticks_to_us(ground_truth[0][0], time_base)
+
+    resolver = MediaResolver(max_open_decoders=2)
+    try:
+        for n in (0, 1, 1000, n_frames - 1):
+            addr = dataclasses.replace(from_path(str(path)), frame=n)
+            payload = resolver.resolve_frame(addr, purpose="analysis")
+            assert payload.frame_ordinal == n
+            expected_us = _ticks_to_us(ground_truth[n][0], time_base) - epoch_us
+            assert payload.presentation_time_us == expected_us
+
+        # rotation=90: stored landscape, displayed portrait.
+        bare_payload = resolver.resolve_frame(str(path), purpose="display")
+        assert bare_payload.height > bare_payload.width
+
+        # Index length equals the full decode's frame count (decision 11).
+        one_past_addr = dataclasses.replace(from_path(str(path)), frame=n_frames)
+        with pytest.raises(MediaAddressError):
+            resolver.resolve_frame(one_past_addr, purpose="display")
+    finally:
+        resolver.close()
+
+
+@pytest.mark.skipif(FFPROBE_MISSING, reason="ffprobe is not on PATH")
+@pytest.mark.skipif(GELEM_FIXTURES is None, reason="GELEM_FIXTURES is not set")
+def test_decision12_frame_zero_after_edit_list_matches_time_zero(tmp_path):
+    """Regenerates the same non-keyframe-aligned cut as
+    test_media_address.py::test_decision12_edit_list_on_video_stream_attempt,
+    which produces a genuine video-stream edit list on this machine
+    (verified there by reading the container back with ffprobe, not
+    assumed). #f=0 must be the same frame as #t=0 (decision 12: frame 0
+    and time 0 are the same frame), which only holds if the index excludes
+    the edit list's discarded pre-roll packets.
+    """
+    source = pathlib.Path(GELEM_FIXTURES) / "sid89_video.mp4"
+    if not source.exists():
+        pytest.skip(f"expected fixture not found: {source}")
+
+    out_path = tmp_path / "elst_attempt.mp4"
+    command = [
+        "ffmpeg", "-hide_banner", "-y",
+        "-ss", "10.3", "-i", str(source), "-t", "3",
+        "-c", "copy", "-map", "0:v:0",
+        str(out_path),
+    ]
+    subprocess.run(command, check=True, capture_output=True)
+
+    probe = subprocess.run(
+        ["ffprobe", "-hide_banner", "-v", "debug", str(out_path)],
+        capture_output=True, text=True,
+    )
+    if "Processing st: 0, edit list" not in probe.stderr:
+        pytest.skip(
+            "this attempt did not produce a video-stream edit list; "
+            "decision 12 stays unverified -- see docs/media_architecture.md "
+            "section 3.6, item 12"
+        )
+
+    ground_truth = _full_decode(out_path)
+    n_frames = len(ground_truth)
+
+    resolver = MediaResolver(max_open_decoders=2)
+    try:
+        frame_addr = dataclasses.replace(from_path(str(out_path)), frame=0)
+        frame_payload = resolver.resolve_frame(frame_addr, purpose="display")
+        assert frame_payload.frame_ordinal == 0
+        assert frame_payload.presentation_time_us == 0
+
+        point_addr = dataclasses.replace(from_path(str(out_path)), time_us=0)
+        point_payload = resolver.resolve_frame(point_addr, purpose="display")
+        np.testing.assert_array_equal(frame_payload.pixels, point_payload.pixels)
+
+        # Index length equals the full decode's frame count (decision 11).
+        last_addr = dataclasses.replace(from_path(str(out_path)), frame=n_frames - 1)
+        resolver.resolve_frame(last_addr, purpose="display")
+        one_past_addr = dataclasses.replace(from_path(str(out_path)), frame=n_frames)
+        with pytest.raises(MediaAddressError):
+            resolver.resolve_frame(one_past_addr, purpose="display")
+    finally:
         resolver.close()
