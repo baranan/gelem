@@ -60,6 +60,7 @@ from models.dataset import Dataset as _Dataset
 _Dataset._DEFAULT_STRICT_SCHEMA = True
 
 from PySide6.QtWidgets import QApplication
+from media.resolver import MediaResolver
 
 TEST_IMAGES  = Path(__file__).parent.parent / "test_images"
 METADATA_CSV = TEST_IMAGES / "metadata.csv"
@@ -81,8 +82,17 @@ def make_controller():
     from operators.operator_registry import OperatorRegistry
     from controller import AppController
 
+    # One MediaResolver per _make() call, shared by that call's ArtifactStore
+    # and AppController -- not two independent resolvers (P1.2c-1: main.py
+    # builds exactly one and injects it into both). Tracked here so every
+    # one built by this fixture is closed at teardown, whether _make() is
+    # called once or several times by the same test.
+    resolvers: list[MediaResolver] = []
+
     def _make(tmp_path, *, merge_csv: bool = False):
-        store    = ArtifactStore(tmp_path / "artifacts")
+        resolver = MediaResolver(max_open_decoders=4)
+        resolvers.append(resolver)
+        store    = ArtifactStore(tmp_path / "artifacts", resolver=resolver)
         registry = ColumnTypeRegistry()
         registry.setup_defaults(store)
 
@@ -100,11 +110,15 @@ def make_controller():
 
         op_registry = OperatorRegistry()
         controller  = AppController(
-            dataset, QueryEngine(), store, registry, op_registry
+            dataset, QueryEngine(), store, registry, op_registry,
+            resolver=resolver,
         )
         return controller, dataset, op_registry
 
-    return _make
+    yield _make
+
+    for resolver in resolvers:
+        resolver.close()
 
 
 @pytest.fixture(scope="session")

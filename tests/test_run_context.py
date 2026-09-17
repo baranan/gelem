@@ -102,6 +102,7 @@ def _run(spec, *, token=None, emit_fn=None, model=None):
         spec=spec,
         data=_empty_run_data(),
         paths=object(),
+        resolver=object(),
         _token=token if token is not None else CancellationToken(),
         _emit_fn=emit_fn,
         model=model,

@@ -59,6 +59,7 @@ from models.query_engine import QueryEngine
 from column_types.registry import ColumnTypeRegistry
 from operators.operator_registry import OperatorRegistry
 from controller import AppController
+from media.resolver import MediaResolver
 
 
 # ---------------------------------------------------------------------------
@@ -98,14 +99,14 @@ def _build_controller(tmp_path, scratch: str = "scratch"):
     """A real AppController whose store starts over a scratch folder that
     is NOT inside any project folder -- so a save/load has real migration
     work to do."""
-    store = ArtifactStore(tmp_path / scratch)
+    store = ArtifactStore(tmp_path / scratch, resolver=MediaResolver(max_open_decoders=4))
     registry = ColumnTypeRegistry()
     registry.setup_defaults(store)
     dataset = Dataset()
     op_registry = OperatorRegistry()
     controller = AppController(
         dataset, QueryEngine(), store, registry, op_registry
-    )
+    , resolver=MediaResolver(max_open_decoders=4))
     return controller, dataset, store
 
 
@@ -134,7 +135,7 @@ def test_new_artifact_lands_only_in_the_new_directory(tmp_path):
     old_dir = tmp_path / "old"
     new_dir = tmp_path / "new"
 
-    store = ArtifactStore(old_dir)
+    store = ArtifactStore(old_dir, resolver=MediaResolver(max_open_decoders=4))
     store.set_artifacts_dir(new_dir)
 
     event = _wait_for_thumbnail(store)
@@ -167,7 +168,7 @@ def test_migration_copies_indexed_jpeg_and_repoints_the_entry(tmp_path):
     old_dir = tmp_path / "old"
     new_dir = tmp_path / "new"
 
-    store = ArtifactStore(old_dir)
+    store = ArtifactStore(old_dir, resolver=MediaResolver(max_open_decoders=4))
     event = _wait_for_thumbnail(store)
     addr, src = _address_of(source, tmp_path)
     store.request_thumbnail("r", addr, Path(src), "frames")
@@ -204,7 +205,7 @@ def test_migration_drops_an_entry_whose_file_is_gone(tmp_path):
     old_dir = tmp_path / "old"
     new_dir = tmp_path / "new"
 
-    store = ArtifactStore(old_dir)
+    store = ArtifactStore(old_dir, resolver=MediaResolver(max_open_decoders=4))
     event = _wait_for_thumbnail(store)
     addr, src = _address_of(source, tmp_path)
     store.request_thumbnail("r", addr, Path(src), "frames")
@@ -366,7 +367,7 @@ def test_codec_boundary_moves_with_the_directory(tmp_path):
     old_dir = tmp_path / "old"
     new_dir = tmp_path / "new"
 
-    store = ArtifactStore(old_dir)
+    store = ArtifactStore(old_dir, resolver=MediaResolver(max_open_decoders=4))
     event = _wait_for_thumbnail(store)
     addr, src = _address_of(source, tmp_path)
     store.request_thumbnail("r", addr, Path(src), "frames")
@@ -420,7 +421,7 @@ def test_running_job_commits_nothing_across_a_rebind(tmp_path):
             finally:
                 job_done.set()
 
-    store = Gated(old_dir, worker_count=1)
+    store = Gated(old_dir, worker_count=1, resolver=MediaResolver(max_open_decoders=4))
     notified: list = []
     store.on_thumbnail_ready = lambda t, r: notified.append((t, r))
 
@@ -519,7 +520,7 @@ def test_load_index_skips_a_record_with_an_absolute_path(tmp_path):
     source = tmp_path / "s.png"
     _solid_png(source, (0, 0, 210))
 
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     event = _wait_for_thumbnail(store)
     addr, src = _address_of(source, tmp_path)
     store.request_thumbnail("r", addr, Path(src), "frames")
@@ -540,7 +541,7 @@ def test_load_index_skips_a_record_with_an_absolute_path(tmp_path):
     assert made_absolute is not None and Path(made_absolute).is_absolute()
     index_path.write_text(json.dumps(payload))
 
-    store2 = ArtifactStore(tmp_path / "artifacts")
+    store2 = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     store2.load_index(tmp_path)
 
     assert store2.get(addr, "thumbnail") is None, (
@@ -559,7 +560,7 @@ def test_version_2_index_is_discarded_whole(tmp_path):
     source = tmp_path / "s.png"
     _solid_png(source, (0, 210, 0))
 
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     event = _wait_for_thumbnail(store)
     addr, src = _address_of(source, tmp_path)
     store.request_thumbnail("r", addr, Path(src), "frames")
@@ -572,7 +573,7 @@ def test_version_2_index_is_discarded_whole(tmp_path):
     payload["format_version"] = 2
     index_path.write_text(json.dumps(payload))
 
-    store2 = ArtifactStore(tmp_path / "artifacts")
+    store2 = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     store2.load_index(tmp_path)
 
     assert store2._index == {}, "a version-2 index was not discarded whole"
@@ -586,7 +587,7 @@ def test_version_2_index_is_discarded_whole(tmp_path):
 # ===========================================================================
 
 def test_is_cached_needs_both_thumbnail_and_preview(tmp_path):
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     address = "C:/x/y.png"
     fingerprint = SourceFingerprint(size=10, mtime_ns=20)
 
@@ -610,7 +611,7 @@ def test_is_cached_needs_both_thumbnail_and_preview(tmp_path):
 # ===========================================================================
 
 def test_is_cached_false_without_a_fingerprint_memo(tmp_path):
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     assert store.is_cached("C:/never/seen.png") is False
 
 
@@ -624,7 +625,7 @@ def test_seeded_address_still_queues_a_worker(tmp_path):
     source = tmp_path / "s.png"
     _solid_png(source, (210, 0, 0))
 
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     event = _wait_for_thumbnail(store)
     addr, src = _address_of(source, tmp_path)
     store.request_thumbnail("r", addr, Path(src), "frames")
@@ -632,7 +633,7 @@ def test_seeded_address_still_queues_a_worker(tmp_path):
     store.save_index(tmp_path)
 
     # Reopen: the address is seeded (unverified) from the saved index.
-    store2 = ArtifactStore(tmp_path / "artifacts")
+    store2 = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     store2.load_index(tmp_path)
     assert store2.is_cached(addr) is True, "seeded entry should serve on paint"
 
@@ -664,7 +665,7 @@ def test_load_index_skips_a_relative_path_that_escapes_the_cache_root(tmp_path):
     source = tmp_path / "s.png"
     _solid_png(source, (0, 130, 130))
 
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     event = _wait_for_thumbnail(store)
     addr, src = _address_of(source, tmp_path)
     store.request_thumbnail("r", addr, Path(src), "frames")
@@ -680,7 +681,7 @@ def test_load_index_skips_a_relative_path_that_escapes_the_cache_root(tmp_path):
             record["path"] = "../../elsewhere/x.jpg"
     index_path.write_text(json.dumps(payload))
 
-    store2 = ArtifactStore(tmp_path / "artifacts")
+    store2 = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     store2.load_index(tmp_path)
 
     assert store2.get(addr, "thumbnail") is None, (
@@ -704,7 +705,7 @@ def test_load_index_skips_a_degenerate_empty_path(tmp_path):
     source = tmp_path / "s.png"
     _solid_png(source, (90, 90, 90))
 
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     event = _wait_for_thumbnail(store)
     addr, src = _address_of(source, tmp_path)
     store.request_thumbnail("r", addr, Path(src), "frames")
@@ -718,7 +719,7 @@ def test_load_index_skips_a_degenerate_empty_path(tmp_path):
             record["path"] = ""
     index_path.write_text(json.dumps(payload))
 
-    store2 = ArtifactStore(tmp_path / "artifacts")
+    store2 = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     store2.load_index(tmp_path)
 
     assert store2.get(addr, "thumbnail") is None
@@ -735,7 +736,7 @@ def test_load_index_skips_a_record_with_no_usable_path(tmp_path):
     source = tmp_path / "s.png"
     _solid_png(source, (120, 60, 30))
 
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     event = _wait_for_thumbnail(store)
     addr, src = _address_of(source, tmp_path)
     store.request_thumbnail("r", addr, Path(src), "frames")
@@ -751,7 +752,7 @@ def test_load_index_skips_a_record_with_no_usable_path(tmp_path):
             record["path"] = None       # non-string
     index_path.write_text(json.dumps(payload))
 
-    store2 = ArtifactStore(tmp_path / "artifacts")
+    store2 = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     store2.load_index(tmp_path)  # must not raise
 
     # Both records were unusable, so nothing loaded -- but the call
@@ -772,7 +773,7 @@ def test_run_job_key_resolution_matches_resolution_for(tmp_path):
     source = tmp_path / "s.png"
     _solid_png(source, (70, 140, 210))
 
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     event = _wait_for_thumbnail(store)
     addr, src = _address_of(source, tmp_path)
     store.request_thumbnail("r", addr, Path(src), "frames")

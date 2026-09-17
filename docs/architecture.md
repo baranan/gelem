@@ -413,10 +413,14 @@ parameter's bounds, or a parameter the descriptor does not declare, raises
 **`OperatorRun`** -- `[NOW]` the object (`operators/run_context.py`) that
 carries runtime services to an operator for one run: the parameter mapping, the
 frozen table snapshots it may read, project directories, the cancellation check,
-the model the runner built for it, and the result sink. *(An earlier draft of
-this document called this `OperatorRunContext` and listed a `resolver` among its
-services; neither name was ever built. `operators/run_context.py` is the
-authority for the real shape -- re-verified 13 Sep 2026, P1.12f-4.)*
+the model the runner built for it, the shared `MediaResolver` (`run.resolver`),
+and the result sink. *(An earlier draft of this document called this
+`OperatorRunContext` and listed a `resolver` among its services; neither name
+was built at the time. `run.resolver` landed at P1.2c-1, the one `MediaResolver`
+instance main.py also injects into `ArtifactStore` (section 9); the per-row
+COLUMNS runner reads it for a `FRAME` requirement, not the operator itself.
+`operators/run_context.py` is the authority for the real shape -- re-verified
+17 Sep 2026, P1.2c-1.)*
 
 ### The uniform execution signature
 
@@ -637,13 +641,14 @@ P0.5b-2ii-c1. The editing dialog landed P0.5b-2ii-c2b2
 changes any of these values there. The two byte values are shown and edited in
 MiB, and the dialog submits only the fields that actually changed.
 
-### The five values
+### The six values
 
 | Value | Default | Meaning | Takes effect |
 |---|---|---|---|
 | `picture_memory_max_bytes` | 500 MiB | Ceiling on the RAM the ArtifactStore's in-memory decoded-image cache may hold. Over it, the least recently used images are dropped; they regenerate from disk on next view. | **Immediately** |
 | `picture_disk_max_bytes` | 1 GiB | Ceiling on the total size of the derived-JPEG files in a project's `artifacts/` folder. Over it, the oldest (by write time) are deleted and regenerate on demand. | **Immediately** |
 | `worker_count` | 2 | How many background threads decode and resize source media for thumbnails and previews. Higher uses more CPU and RAM for faster gallery fill. | **On restart** |
+| `max_open_decoders` | 6 | Ceiling on how many source video files the shared `MediaResolver` (media/resolver.py) may have open for decoding at once, across every caller -- `ArtifactStore`'s workers and the per-row COLUMNS runner alike, since P1.2c-1 they share the one resolver instance. Higher lets more files decode in parallel at the cost of more open file handles and memory. | **On restart** |
 | `thumbnail_max_side` | 150 | Largest side, in pixels, of a gallery thumbnail. This number is the "thumbnail resolution" that enters the artifact key and decides, per tile, whether a tile asks for a thumbnail or a preview. | **On restart** |
 | `preview_max_side` | 600 | Largest side, in pixels, of the larger preview image used for bigger tiles and quick previews. | **On restart** |
 
@@ -668,15 +673,21 @@ does the eviction itself, it is not left to the caller).
 Worker count is fixed when the `WorkerPool` builds its threads. Thumbnail and
 preview sizes are read by worker threads without a lock, which is only safe
 because they are written once in `ArtifactStore.__init__` and never mutated --
-see the comment there. Changing any of the three therefore needs a fresh
-process.
+see the comment there. `max_open_decoders` is fixed when `MediaResolver` builds
+its decoder pool (media/resolver.py's `_DecoderPool`). Changing any of these
+four therefore needs a fresh process.
 
 ### How a value reaches a component
 
 `main.py` builds a `QSettingsBackend`, wraps it in a `SettingsStore`, calls
 `load()`, prints any correction messages, and passes the **plain values** into
 the `ArtifactStore` constructor -- exactly as `worker_count` and
-`disk_cache_max_bytes` were already passed. **No component receives the
+`disk_cache_max_bytes` were already passed. `max_open_decoders` is the one
+exception to "straight into `ArtifactStore`": it builds the single
+`MediaResolver` instance (P1.2c-1), which `main.py` then injects into both
+`ArtifactStore` and `AppController` as a REQUIRED constructor argument -- no
+default, no `None` fallback, so a caller that forgets it fails to construct
+rather than silently decoding nothing. **No component receives the
 `SettingsStore` or a `GelemSettings` object. `AppController` receives a
 `SettingsGateway` and only passes calls through to it. No component imports
 `settings/`.** Only `main.py` and the `settings/` package may import `settings/`

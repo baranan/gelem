@@ -29,14 +29,17 @@ from settings.settings import (
     DEFAULT_THUMBNAIL_MAX_SIDE,
     DEFAULT_PREVIEW_MAX_SIDE,
     DEFAULT_OUTPUT_COPY_WARNING_THRESHOLD_BYTES,
+    DEFAULT_MAX_OPEN_DECODERS,
     PICTURE_MEMORY_MAX_BYTES_RANGE,
     WORKER_COUNT_RANGE,
     THUMBNAIL_MAX_SIDE_RANGE,
+    MAX_OPEN_DECODERS_RANGE,
 )
 from settings.settings_store import SettingsStore
 
 from artifacts.artifact_store import ArtifactStore, SweepResult
 from media.artifact_key import ArtifactKey, SourceFingerprint
+from media.resolver import MediaResolver
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +89,7 @@ def test_empty_mapping_gives_documented_defaults_and_no_problems():
     assert settings.worker_count == DEFAULT_WORKER_COUNT
     assert settings.thumbnail_max_side == DEFAULT_THUMBNAIL_MAX_SIDE
     assert settings.preview_max_side == DEFAULT_PREVIEW_MAX_SIDE
+    assert settings.max_open_decoders == DEFAULT_MAX_OPEN_DECODERS
 
 
 def test_default_construction_matches_from_values_defaults():
@@ -118,6 +122,22 @@ def test_out_of_range_values_are_clamped_with_one_message_each():
     # One message for each of the three corrections, nothing else.
     assert len(problems) == 3
     assert all(isinstance(message, str) and message for message in problems)
+
+
+def test_max_open_decoders_is_clamped_with_one_message():
+    low, high = MAX_OPEN_DECODERS_RANGE
+
+    settings, problems = GelemSettings.from_values({
+        "max_open_decoders": str(high + 50),   # above max
+    })
+    assert settings.max_open_decoders == high
+    assert len(problems) == 1
+
+    settings, problems = GelemSettings.from_values({
+        "max_open_decoders": str(low - 1),     # below min
+    })
+    assert settings.max_open_decoders == low
+    assert len(problems) == 1
 
 
 def test_high_side_clamp_is_reported():
@@ -249,6 +269,7 @@ def test_no_way_to_express_an_asymmetric_size(tmp_path):
         tmp_path / "artifacts",
         thumbnail_max_side=settings.thumbnail_max_side,
         preview_max_side=settings.preview_max_side,
+        resolver=MediaResolver(max_open_decoders=4),
     )
     # Equality, not "max side of", not "at least" -- the setting IS the
     # resolution.
@@ -301,6 +322,7 @@ def test_settings_store_round_trip_through_dict_backend():
         "save/output_copy_warning_threshold_bytes": str(
             DEFAULT_OUTPUT_COPY_WARNING_THRESHOLD_BYTES
         ),
+        "artifacts/max_open_decoders": str(DEFAULT_MAX_OPEN_DECODERS),
     }
     assert backend.data == expected_persisted
 
@@ -334,6 +356,7 @@ def test_artifact_store_uses_injected_sizes(tmp_path):
         tmp_path / "artifacts",
         thumbnail_max_side=64,
         preview_max_side=256,
+        resolver=MediaResolver(max_open_decoders=4),
     )
 
     assert store.resolution_for("thumbnail") == 64
@@ -346,7 +369,7 @@ def test_artifact_store_uses_injected_sizes(tmp_path):
 
 
 def test_artifact_store_defaults_match_settings_defaults(tmp_path):
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     assert store.resolution_for("thumbnail") == DEFAULT_THUMBNAIL_MAX_SIDE
     assert store.resolution_for("preview") == DEFAULT_PREVIEW_MAX_SIDE
 
@@ -356,7 +379,7 @@ def test_artifact_store_defaults_match_settings_defaults(tmp_path):
 # ===========================================================================
 
 def test_set_memory_cache_max_bytes_evicts_now(tmp_path):
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
 
     # Five 100x100 RGB images -> 30_000 bytes each by the store's estimate.
     for index in range(5):
@@ -379,7 +402,7 @@ def test_set_memory_cache_max_bytes_evicts_now(tmp_path):
 
 
 def test_set_memory_cache_max_bytes_rejects_below_one(tmp_path):
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     with pytest.raises(ValueError):
         store.set_memory_cache_max_bytes(0)
 
@@ -389,7 +412,7 @@ def test_set_memory_cache_max_bytes_rejects_below_one(tmp_path):
 # ===========================================================================
 
 def test_set_disk_cache_max_bytes_sweeps_now(tmp_path):
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
 
     # Three indexed 100-byte JPEGs with distinct mtimes; not in mtime order.
     made = []
@@ -412,7 +435,7 @@ def test_set_disk_cache_max_bytes_sweeps_now(tmp_path):
 
 
 def test_set_disk_cache_max_bytes_rejects_below_one(tmp_path):
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     with pytest.raises(ValueError):
         store.set_disk_cache_max_bytes(0)
 

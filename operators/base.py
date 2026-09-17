@@ -380,29 +380,6 @@ class BaseOperator:
 
     # ── Convenience methods ───────────────────────────────────────────
 
-    def load_image(self, full_path) -> np.ndarray | None:
-        """
-        Loads an image file and returns it as a numpy array (RGB uint8).
-        Convenience method so operators do not need to import PIL.
-
-        Args:
-            full_path: Path to the image file (str or Path).
-
-        Returns:
-            numpy array of shape (height, width, 3), dtype uint8.
-            None if the file does not exist or cannot be loaded.
-        """
-        try:
-            from PIL import Image
-            path = Path(str(full_path))
-            if not path.exists():
-                return None
-            with Image.open(path) as img:
-                return np.array(img.convert("RGB"), dtype=np.uint8)
-        except Exception as e:
-            print(f"[{self.name}] load_image error for {full_path}: {e}")
-            return None
-
     def save_image(
         self,
         image: np.ndarray,

@@ -56,6 +56,7 @@ def _run(spec, *, log_fn=None):
         spec=spec,
         data=RunData(tables={}, projects={}),
         paths=object(),
+        resolver=object(),
         _token=CancellationToken(),
         _log_fn=log_fn,
     )

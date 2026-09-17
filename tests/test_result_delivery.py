@@ -54,6 +54,7 @@ from controller import (
     numbered_run_choices,
     write_read_conflict_warnings,
 )
+from media.resolver import MediaResolver
 
 
 def _active_table_input():
@@ -122,7 +123,7 @@ def _qapp():
 
 def _make_controller(tmp_path, *, drain_budget=200):
     """A real controller over the 20-row test_images 'frames' table."""
-    store    = ArtifactStore(tmp_path / "artifacts")
+    store    = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     registry = ColumnTypeRegistry()
     registry.setup_defaults(store)
 
@@ -133,7 +134,7 @@ def _make_controller(tmp_path, *, drain_budget=200):
     controller  = AppController(
         dataset, QueryEngine(), store, registry, op_registry,
         drain_budget=drain_budget,
-    )
+    resolver=MediaResolver(max_open_decoders=4))
     controller.set_filters([])   # publish an initial result
     return controller, dataset, op_registry
 

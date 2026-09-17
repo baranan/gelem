@@ -56,6 +56,29 @@ from operators.run_context import (
 DEFAULT_MEDIA_COLUMN_NAME = "full_path"
 
 
+def _is_blank_media_cell(value: object) -> bool:
+    """True if a media cell is missing or blank.
+
+    The same check operators/segment.py's own _is_blank_media_value makes,
+    kept as a local copy rather than imported: AppController is the wiring
+    layer and must not depend on any one operator's implementation module
+    (operators are interchangeable, registered through operators_config.yaml
+    -- controller.py otherwise only ever imports the shared, operator-
+    agnostic vocabulary in operators/descriptor.py and operators/run_context.py).
+
+    pd.isna() alone is not enough: str() on a missing (NaN/None) cell yields
+    the literal text "nan", which the address parser happily accepts as a
+    plausible-looking one-segment relative path, so a row with no media
+    value would otherwise resolve to a wrong address (e.g. "<project_root>/
+    nan") instead of being recognised as blank.
+    """
+    if pd.isna(value):
+        return True
+    if isinstance(value, str) and value.strip() == "":
+        return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # P1.12f-2: the pre-emptive write/read conflict check.
 #
@@ -399,6 +422,7 @@ class AppController(QObject):
         operator_registry,
         drain_budget: int = 200,
         *,
+        resolver,
         settings_gateway=None,
         project_paths: ProjectPaths | None = None,
     ):
@@ -409,6 +433,14 @@ class AppController(QObject):
         self._store            = artifact_store
         self._registry         = registry
         self._op_registry      = operator_registry
+
+        # The one shared MediaResolver (media/resolver.py), built once in
+        # main.py and injected here AND into ArtifactStore -- REQUIRED, no
+        # default, no None fallback (docs/architecture.md section 9).
+        # _build_operator_run hands it to every OperatorRun as run.resolver;
+        # the per-row COLUMNS runner reads it to decode a FRAME requirement.
+        # The controller never decodes anything with it itself.
+        self._resolver          = resolver
 
         # This project's directories (models/project_paths.py::ProjectPaths).
         # Default None so existing test construction sites need no edit;
@@ -872,19 +904,21 @@ class AppController(QObject):
             rows check really did stop it early); reaches it -> "complete"
             even though cancel_run() was called.
             WHAT THIS TEST GETS WRONG: a row silently skipped because its
-            image failed to load (BaseOperator.load_image() returning
-            None) is not counted in run["applied"] either, and is not a
-            setup_error, a row_error, or an unplaceable row -- it leaves
-            no trace anywhere else on the run. An UNcancelled run with
+            frame failed to decode (operators/operator_registry.py's FRAME
+            path catching MediaResolverError / MediaAddressError / OSError
+            from run.resolver.resolve_frame() and continuing) is not
+            counted in run["applied"] either, and is not a setup_error, a
+            row_error, or an unplaceable row -- it leaves no trace
+            anywhere else on the run. An UNcancelled run with
             such a skip is already called "complete" today (this rule
             does not newly check applied-vs-requested when there is no
             cancellation). But if the SAME run is also cancelled -- even
             after the loop had already finished attempting every row --
             this test sees applied < rows_requested from the skip alone
             and reports "partial", crediting the shortfall to
-            cancellation when the real cause was an unrelated load
+            cancellation when the real cause was an unrelated decode
             failure the run already had before anyone clicked Cancel.
-            Closing that gap needs the load-failure count tracked
+            Closing that gap needs the decode-failure count tracked
             separately on the run, which nothing does today; not fixed
             here.
           * TABLE / DISPLAY -- single-shot; _on_operator_complete's
@@ -2125,6 +2159,7 @@ class AppController(QObject):
             spec=spec,
             data=run_data,
             paths=self._project_paths,
+            resolver=self._resolver,
             _token=token,
             # The per-row result sink for a COLUMNS run. Wired for the
             # contract P1.12f consumes; no operator calls run.emit() yet.
@@ -2232,6 +2267,58 @@ class AppController(QObject):
                     f'runner cannot supply.'
                 )
                 return
+
+            # FRAME: resolve every row's media cell to an absolute address
+            # HERE, once, on the main thread -- before the worker starts --
+            # so operators/operator_registry.py can hand it straight to
+            # run.resolver.resolve_frame() without resolving anything
+            # itself. OperatorRegistry has no controller access and cannot
+            # reach _resolve_media_cell; run.paths (ProjectPaths, where an
+            # operator WRITES its outputs) is the wrong base for a stored
+            # cell (where to READ one), because the two re-root on
+            # different events -- save_project() (Save As) moves
+            # self._project_paths to the new folder but deliberately
+            # leaves self._project_root where it was, since save() never
+            # rewrites the in-memory cells (see that method's own note).
+            # Using the SAME method and base the display path uses
+            # (_resolve_media_cell -> self._project_root) is therefore the
+            # only base that is correct in every project state. Mutated in
+            # place on `snapshot`, which run.data's TableSnapshot already
+            # wraps by reference (TableSnapshot never copies its frame),
+            # so both see the same absolute values.
+            if media_requirement is MediaRequirement.FRAME:
+                media_column = DEFAULT_MEDIA_COLUMN_NAME
+                if media_column in snapshot.columns:
+                    def _absolute_media_cell(cell):
+                        if _is_blank_media_cell(cell):
+                            # A genuinely blank cell (NaN, None, "" or
+                            # whitespace) must stay blank -- never
+                            # resolved into a plausible-looking absolute
+                            # path such as "<project_root>/nan".
+                            # Normalised to "" so it reaches
+                            # resolve_frame() as a value it refuses
+                            # cleanly and uniformly (MediaAddressError:
+                            # "got a relative path"), caught by the
+                            # existing per-row except in
+                            # operator_registry.py with a message that
+                            # names an empty value, not a raw NaN
+                            # resolve_frame cannot even parse.
+                            return ""
+                        try:
+                            return self._resolve_media_cell(cell)[0]
+                        except MediaAddressError:
+                            # Not a parseable address -- leave it as
+                            # stored. resolve_frame() then fails on it
+                            # exactly as a missing/malformed file always
+                            # has, and the existing per-row except in
+                            # operator_registry.py skips just this row
+                            # rather than aborting the whole run
+                            # (CLAUDE.md: "one bad row must not kill a
+                            # run").
+                            return cell
+                    snapshot[media_column] = snapshot[media_column].map(
+                        _absolute_media_cell
+                    )
 
             # The runner builds this operator's model once per worker
             # (PER_WORKER) or once per application (SHARED), but the

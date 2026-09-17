@@ -46,6 +46,7 @@ from operators.descriptor import (
     OutputSpec,
 )
 from controller import AppController
+from media.resolver import MediaResolver
 
 TEST_IMAGES = project_root / "test_images"
 
@@ -91,7 +92,7 @@ def _qapp():
 
 def _make_controller(tmp_path):
     """A real controller over the test_images 'frames' table."""
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     registry = ColumnTypeRegistry()
     registry.setup_defaults(store)
 
@@ -101,7 +102,7 @@ def _make_controller(tmp_path):
     op_registry = OperatorRegistry()
     controller = AppController(
         dataset, QueryEngine(), store, registry, op_registry
-    )
+    , resolver=MediaResolver(max_open_decoders=4))
     controller.set_filters([])  # publish an initial result
     return controller, dataset, op_registry
 

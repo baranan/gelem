@@ -415,14 +415,13 @@ state. This rule carries no violation list of its own -- it points at the three
   measurement -- never a constant in the code.** The rule covers two different
   mechanisms: a number that varies **by machine** needs a setting; a number that
   varies **by file or dataset** needs a runtime measurement.
-  The five machine-dependent numbers -- the in-memory cache ceiling, the disk
-  cache ceiling, the worker count, the thumbnail largest side and the preview
-  largest side --
-  now come from `settings/` and are passed into the `ArtifactStore` constructor
-  by `main.py` (P0.5b-2ii-c1). `docs/architecture.md` §9 is the single authority
-  for them; do not restate the list. The module-level `DEFAULT_` constants that
-  remain are fallbacks only. This tag flipped at P0.5b-2ii-c2b2: a researcher
-  can now change every one of the five from **File -> Settings...**
+  The machine-dependent numbers this produced now come from `settings/` and
+  are passed into the `ArtifactStore` / `MediaResolver` constructors by
+  `main.py` (P0.5b-2ii-c1). `docs/architecture.md` §9 is the single authority
+  for the list and its count; do not restate either here. The module-level
+  `DEFAULT_` constants that remain are fallbacks only. This tag flipped at
+  P0.5b-2ii-c2b2: a researcher can now change every one of them from
+  **File -> Settings...**
   (`ui/settings_dialog.py`), which edits through
   `AppController.get_settings_fields()` / `apply_settings()` and submits only
   the fields that moved. Guarded by `tests/test_settings_dialog.py` (Layer A
@@ -539,6 +538,7 @@ history is in `docs/archive/rule_verification_log.md`.
 - **Prefer explicit, readable Python over terse idioms.** Y B's background is
   JavaScript and C. Comment each block before the block.
 - **Use `--` rather than em dashes** in prose and comments.
+- **Never ask the user a multiple-choice question** (no option lists, no question tool). Ask in plain prose.
 - **Read only what the work item names, and read only the parts you need.** Use
   the Read tool's offset and limit on any file over about 1,000 lines --
   `docs/media_architecture.md` is about 100KB and must never be read whole. Do

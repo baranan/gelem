@@ -41,9 +41,10 @@ app = QApplication(sys.argv)
 
 from artifacts.artifact_store import ArtifactStore
 from column_types.registry import ColumnTypeRegistry
+from media.resolver import MediaResolver
 
 # Set up registry with a temporary artifact store.
-store    = ArtifactStore(Path(tempfile.gettempdir()) / "gelem_test_artifacts")
+store    = ArtifactStore(Path(tempfile.gettempdir()) / "gelem_test_artifacts", resolver=MediaResolver(max_open_decoders=4))
 registry = ColumnTypeRegistry()
 registry.setup_defaults(store)
 

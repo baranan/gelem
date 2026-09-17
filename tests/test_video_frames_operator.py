@@ -67,6 +67,7 @@ def _run(op, *, video_column, frame_step, td):
         spec=spec,
         data=RunData(tables={}, projects={}),
         paths=build_project_paths(Path(td) / "project", is_workspace=False),
+        resolver=object(),
         _token=CancellationToken(),
     )
 

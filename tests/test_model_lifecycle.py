@@ -61,8 +61,20 @@ from operators.descriptor import (
     OutputSpec,
 )
 from controller import AppController
+from media.resolver import MediaResolver, MediaResolverError
 
 TEST_IMAGES = project_root / "test_images"
+
+
+class _FailingResolver:
+    """A resolver double whose resolve_frame() always raises, so every row
+    that would decode a frame fails instead -- the resolver-based
+    replacement for monkeypatching BaseOperator.load_image, which P1.2c-1
+    deleted (operator_registry.py's FRAME path now decodes through
+    run.resolver, not through the operator)."""
+
+    def resolve_frame(self, *args, **kwargs):
+        raise MediaResolverError("forced decode failure (test)")
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +84,7 @@ TEST_IMAGES = project_root / "test_images"
 def _make_controller(tmp_path):
     """A real AppController over the test_images 'frames' table -- the same
     no-widget construction tests/test_media_requirement.py uses."""
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     registry = ColumnTypeRegistry()
     registry.setup_defaults(store)
 
@@ -82,7 +94,7 @@ def _make_controller(tmp_path):
     op_registry = OperatorRegistry()
     controller = AppController(
         dataset, QueryEngine(), store, registry, op_registry
-    )
+    , resolver=MediaResolver(max_open_decoders=4))
     controller.set_filters([])  # publish an initial query result
     return controller, dataset, op_registry
 
@@ -416,7 +428,7 @@ def test_setup_error_surfaces_even_when_every_row_would_fail_to_decode(
     row_ids = controller.get_visible_row_ids()[:3]
 
     # Every row fails to decode.
-    monkeypatch.setattr(op, "load_image", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "_resolver", _FailingResolver())
 
     errors: list[str] = []
     controller.error_occurred.connect(errors.append)
@@ -427,8 +439,8 @@ def test_setup_error_surfaces_even_when_every_row_would_fail_to_decode(
     assert errors, "the missing-model error was swallowed when no row decoded"
     assert "model file missing (test)" in errors[-1]
 
-    # Would still pass under the old lazy-load behaviour? No -- load_image
-    # returns None for every row, so create_columns (and the lazy loader
+    # Would still pass under the old lazy-load behaviour? No -- every
+    # row's decode would raise, so create_columns (and the lazy loader
     # it used to hold) was never reached, and the run completed clean.
 
 

@@ -34,6 +34,7 @@ from PIL import Image
 from artifacts.artifact_store import ArtifactStore
 from artifacts.worker_pool import WorkerPool
 from media.media_address import resolve_source
+from media.resolver import MediaResolver
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +168,7 @@ def test_store_honours_its_worker_count_bound(tmp_path):
                 active -= 1
             return super()._decode_source(source_path)
 
-    store = Gated(tmp_path / "artifacts", worker_count=1)
+    store = Gated(tmp_path / "artifacts", worker_count=1, resolver=MediaResolver(max_open_decoders=4))
     done = threading.Semaphore(0)
     store.on_thumbnail_ready = lambda table_name, row_id: done.release()
 
@@ -205,7 +206,7 @@ def test_request_thumbnail_runs_the_decode_off_the_caller_thread(tmp_path):
             decoded_on.append(threading.get_ident())
             return super()._decode_source(source_path)
 
-    store = Recording(tmp_path / "artifacts")
+    store = Recording(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     done = threading.Event()
     store.on_thumbnail_ready = lambda table_name, row_id: done.set()
 
@@ -237,11 +238,11 @@ def test_requests_for_one_address_coalesce_to_one_decode(tmp_path):
 
     class Gated(ArtifactStore):
         def _decode_source(self, source_path):
-            decode_calls.append(source_path.name)
+            decode_calls.append(Path(source_path).name)
             assert release.wait(timeout=10)
             return super()._decode_source(source_path)
 
-    store = Gated(tmp_path / "artifacts", worker_count=2)
+    store = Gated(tmp_path / "artifacts", worker_count=2, resolver=MediaResolver(max_open_decoders=4))
 
     notified: list[tuple[str, str]] = []
     notify_lock = threading.Lock()
@@ -291,13 +292,13 @@ def test_reset_drops_a_still_queued_job(tmp_path):
 
     class Gated(ArtifactStore):
         def _decode_source(self, source_path):
-            entered.append(source_path.name)
+            entered.append(Path(source_path).name)
             assert hold.wait(timeout=10)
             return super()._decode_source(source_path)
 
     # One worker: the blocker occupies it while the target job waits in
     # the queue.
-    store = Gated(tmp_path / "artifacts", worker_count=1)
+    store = Gated(tmp_path / "artifacts", worker_count=1, resolver=MediaResolver(max_open_decoders=4))
     notified: list[tuple[str, str]] = []
     store.on_thumbnail_ready = lambda t, r: notified.append((t, r))
 
@@ -330,7 +331,7 @@ def test_reset_drops_an_already_running_job(tmp_path):
             assert proceed.wait(timeout=10)
             return super()._decode_source(source_path)
 
-    store = Gated(tmp_path / "artifacts", worker_count=1)
+    store = Gated(tmp_path / "artifacts", worker_count=1, resolver=MediaResolver(max_open_decoders=4))
     notified: list[tuple[str, str]] = []
     store.on_thumbnail_ready = lambda t, r: notified.append((t, r))
 
@@ -366,7 +367,7 @@ def test_verified_short_circuit_does_no_work_and_no_stat(tmp_path, monkeypatch):
     _solid_png(source_file, (0, 0, 200))
     address, source = _address_of(source_file, tmp_path)
 
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     first_ready = threading.Event()
     store.on_thumbnail_ready = lambda t, r: first_ready.set()
 
@@ -416,11 +417,11 @@ def test_verified_short_circuit_does_no_work_and_no_stat(tmp_path, monkeypatch):
 def test_worker_count_is_a_keyword_only_constructor_parameter(tmp_path):
     # Positional single-argument construction -- as in main.py and every
     # existing test -- still works and gets the default.
-    default_store = ArtifactStore(tmp_path / "default")
+    default_store = ArtifactStore(tmp_path / "default", resolver=MediaResolver(max_open_decoders=4))
     assert default_store._pool._worker_count == 2
 
     # The parameter is honoured.
-    custom_store = ArtifactStore(tmp_path / "custom", worker_count=3)
+    custom_store = ArtifactStore(tmp_path / "custom", worker_count=3, resolver=MediaResolver(max_open_decoders=4))
     assert custom_store._pool._worker_count == 3
 
     # It is keyword-only: a second positional argument is a TypeError,
@@ -588,12 +589,12 @@ def test_set_wanted_addresses_drops_a_queued_request_for_an_unwanted_address(tmp
 
     class Gated(ArtifactStore):
         def _decode_source(self, source_path):
-            entered.append(source_path.name)
+            entered.append(Path(source_path).name)
             assert hold.wait(timeout=10)
             return super()._decode_source(source_path)
 
     # One worker: the blocker holds it while the next two sit in the queue.
-    store = Gated(tmp_path / "artifacts", worker_count=1)
+    store = Gated(tmp_path / "artifacts", worker_count=1, resolver=MediaResolver(max_open_decoders=4))
     notified: list = []
     store.on_thumbnail_ready = lambda t, r: notified.append((t, r))
 
@@ -627,11 +628,11 @@ def test_a_request_for_a_dropped_address_starts_a_new_job(tmp_path):
 
     class Gated(ArtifactStore):
         def _decode_source(self, source_path):
-            entered.append(source_path.name)
+            entered.append(Path(source_path).name)
             assert hold.wait(timeout=10)
             return super()._decode_source(source_path)
 
-    store = Gated(tmp_path / "artifacts", worker_count=1)
+    store = Gated(tmp_path / "artifacts", worker_count=1, resolver=MediaResolver(max_open_decoders=4))
     notified: list = []
     store.on_thumbnail_ready = lambda t, r: notified.append((t, r))
 
@@ -665,12 +666,12 @@ def test_set_wanted_addresses_keeps_wanted_jobs_in_queue_order(tmp_path):
 
     class Gated(ArtifactStore):
         def _decode_source(self, source_path):
-            entered.append(source_path.name)
-            if source_path.name == "blk.png":
+            entered.append(Path(source_path).name)
+            if Path(source_path).name == "blk.png":
                 assert hold.wait(timeout=10)
             return super()._decode_source(source_path)
 
-    store = Gated(tmp_path / "artifacts", worker_count=1)
+    store = Gated(tmp_path / "artifacts", worker_count=1, resolver=MediaResolver(max_open_decoders=4))
     store.on_thumbnail_ready = lambda t, r: None
 
     blk_addr, blk_src = files["blk"]
@@ -706,7 +707,7 @@ def test_set_wanted_addresses_does_not_disturb_a_running_job(tmp_path):
             assert proceed.wait(timeout=10)
             return super()._decode_source(source_path)
 
-    store = Gated(tmp_path / "artifacts", worker_count=1)
+    store = Gated(tmp_path / "artifacts", worker_count=1, resolver=MediaResolver(max_open_decoders=4))
     done = threading.Event()
     store.on_thumbnail_ready = lambda t, r: done.set()
 

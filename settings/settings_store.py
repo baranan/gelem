@@ -50,6 +50,10 @@ class SettingsStore:
     # namespace rather than joining "artifacts/". Given a real persisted key
     # by P1.9b-2, which also gave it a settings-dialog entry.
     _KEY_OUTPUT_COPY_WARNING_THRESHOLD = "save/output_copy_warning_threshold_bytes"
+    # max_open_decoders (P1.2c-1) is a MediaResolver bound, not one of the
+    # ArtifactStore five -- its own "artifacts/" key, same namespace as the
+    # other decode-side numbers, alongside worker_count.
+    _KEY_MAX_OPEN_DECODERS = "artifacts/max_open_decoders"
 
     def __init__(self, backend: SettingsBackend):
         self._backend = backend
@@ -76,6 +80,9 @@ class SettingsStore:
             "output_copy_warning_threshold_bytes": self._backend.get(
                 self._KEY_OUTPUT_COPY_WARNING_THRESHOLD
             ),
+            "max_open_decoders": self._backend.get(
+                self._KEY_MAX_OPEN_DECODERS
+            ),
         }
         return GelemSettings.from_values(raw)
 
@@ -99,4 +106,7 @@ class SettingsStore:
         self._backend.set(
             self._KEY_OUTPUT_COPY_WARNING_THRESHOLD,
             str(settings.output_copy_warning_threshold_bytes),
+        )
+        self._backend.set(
+            self._KEY_MAX_OPEN_DECODERS, str(settings.max_open_decoders)
         )

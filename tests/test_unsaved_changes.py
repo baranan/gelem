@@ -32,6 +32,7 @@ from artifacts.artifact_store import ArtifactStore
 from column_types.registry import ColumnTypeRegistry
 from operators.operator_registry import OperatorRegistry
 from controller import AppController
+from media.resolver import MediaResolver
 
 
 def _make_controller(tmp_path: Path) -> AppController:
@@ -39,13 +40,13 @@ def _make_controller(tmp_path: Path) -> AppController:
     CSV loaded yet, unlike tests/conftest.py's make_controller fixture,
     so has_unsaved_changes() can be exercised from a genuinely fresh
     session."""
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     registry = ColumnTypeRegistry()
     registry.setup_defaults(store)
 
     dataset = Dataset()
     op_registry = OperatorRegistry()
-    return AppController(dataset, QueryEngine(), store, registry, op_registry)
+    return AppController(dataset, QueryEngine(), store, registry, op_registry, resolver=MediaResolver(max_open_decoders=4))
 
 
 def test_fresh_controller_has_no_unsaved_changes(tmp_path):

@@ -30,7 +30,10 @@ def create_app(fake_data: bool = False):
                    UI widgets independently.
 
     Returns:
-        The MainWindow instance (already visible).
+        (MainWindow instance (already visible), MediaResolver or None).
+        The resolver is None in --fake-data mode, which builds no real
+        data components at all. The caller (main()) closes the resolver
+        after the Qt event loop returns.
     """
     from ui.main_window import MainWindow
 
@@ -45,7 +48,7 @@ def create_app(fake_data: bool = False):
         window.show()
         # Start emitting signals after the window has connected them.
         QTimer.singleShot(100, controller.start)
-        return window
+        return window, None
 
     # Real mode — create all components.
     from models.dataset import Dataset
@@ -56,6 +59,7 @@ def create_app(fake_data: bool = False):
     from operators.operator_registry import OperatorRegistry
     from operators.operator_config import build_enabled_operators
     from controller import AppController
+    from media.resolver import MediaResolver
     from settings.qsettings_backend import QSettingsBackend
     from settings.settings_store import SettingsStore
     from settings.settings_gateway import SettingsGateway
@@ -90,10 +94,19 @@ def create_app(fake_data: bool = False):
 
     project_root = Path(__file__).resolve().parent
 
+    # ONE shared MediaResolver for the whole app -- the only place a source
+    # image or video is decoded (CLAUDE.md's media rules). Injected into
+    # both ArtifactStore and AppController as a REQUIRED constructor
+    # argument (no default, no None fallback): docs/architecture.md
+    # section 9 is the authority for max_open_decoders. Closed after the
+    # Qt event loop returns, at the bottom of this function's caller.
+    resolver = MediaResolver(max_open_decoders=gelem_settings.max_open_decoders)
+
     dataset           = Dataset()
     query_engine      = QueryEngine()
     artifact_store    = ArtifactStore(
         workspace_paths.artifacts_dir,
+        resolver=resolver,
         worker_count=gelem_settings.worker_count,
         disk_cache_max_bytes=gelem_settings.picture_disk_max_bytes,
         memory_cache_max_bytes=gelem_settings.picture_memory_max_bytes,
@@ -126,6 +139,7 @@ def create_app(fake_data: bool = False):
         artifact_store=artifact_store,
         registry=registry,
         operator_registry=operator_registry,
+        resolver=resolver,
         settings_gateway=settings_gateway,
         # Handed to every OperatorRun as run.paths, and replaced wholesale
         # by save_project()/load_project().
@@ -134,7 +148,7 @@ def create_app(fake_data: bool = False):
 
     window = MainWindow(controller)
     window.show()
-    return window
+    return window, resolver
 
 
 def main():
@@ -145,9 +159,18 @@ def main():
     app.setApplicationName("Gelem")
     app.setOrganizationName("ResearchLab")
 
-    window = create_app(fake_data=fake_data)
+    window, resolver = create_app(fake_data=fake_data)
 
-    sys.exit(app.exec())
+    try:
+        exit_code = app.exec()
+    finally:
+        # Closes every idle pooled decoder now; one a live decode is still
+        # using closes itself once that use ends (media/resolver.py's
+        # MediaResolver.close() docstring). None in --fake-data mode.
+        if resolver is not None:
+            resolver.close()
+
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

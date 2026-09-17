@@ -46,6 +46,8 @@ import pandas as pd
 
 from operators.base import BaseOperator, OperatorSetupError
 from operators.descriptor import ExecutionMode, MediaRequirement, ModelLifecycle
+from media.media_address import MediaAddressError
+from media.resolver import MediaResolverError
 
 
 class OperatorRegistry:
@@ -497,14 +499,30 @@ class OperatorRegistry:
             try:
                 full_path = metadata.get("full_path", "")
 
-                # FRAME: decode one frame and skip the row if it will not
-                # load. METADATA / ADDRESS: hand the operator None.
+                # FRAME: decode one frame through the shared resolver and
+                # skip the row if it will not load. METADATA / ADDRESS:
+                # hand the operator None. `full_path` arrives here ALREADY
+                # ABSOLUTE: AppController.run_create_columns resolves every
+                # FRAME run's media column with the same method the display
+                # path uses (_resolve_media_cell) before this worker ever
+                # starts -- this registry has no controller access and
+                # cannot do that resolution itself, and run.paths (project
+                # directories, for output-writing operators) is the WRONG
+                # base for a stored media cell: after Save As it re-roots
+                # to the new folder while cell resolution deliberately does
+                # not (AppController.save_project's note on _project_root).
+                # resolve_frame refuses a still-relative address with
+                # MediaAddressError, caught below like any other decode
+                # failure.
                 if needs_frame:
-                    media = operator.load_image(full_path)
-                    if media is None:
+                    try:
+                        media = run.resolver.resolve_frame(
+                            full_path, "analysis"
+                        ).pixels
+                    except (MediaResolverError, MediaAddressError, OSError) as e:
                         print(
                             f"[OperatorRegistry] Could not load image "
-                            f"for {row_id}: {full_path}"
+                            f"for {row_id}: {full_path} ({e})"
                         )
                         continue
                 else:

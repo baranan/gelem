@@ -44,6 +44,7 @@ from models.query_engine import QueryEngine
 from column_types.registry import ColumnTypeRegistry
 from operators.operator_registry import OperatorRegistry
 from controller import AppController
+from media.resolver import MediaResolver
 
 
 # ---------------------------------------------------------------------------
@@ -82,12 +83,12 @@ def _centre_colour(pixmap):
 
 
 def _build_controller(tmp_path):
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     registry = ColumnTypeRegistry()
     registry.setup_defaults(store)
     dataset = Dataset()
     op_registry = OperatorRegistry()
-    controller = AppController(dataset, QueryEngine(), store, registry, op_registry)
+    controller = AppController(dataset, QueryEngine(), store, registry, op_registry, resolver=MediaResolver(max_open_decoders=4))
     return controller, dataset, store
 
 
@@ -104,7 +105,7 @@ def test_second_media_column_gets_its_own_cached_artifact(tmp_path):
     _solid_png(red_path, (255, 0, 0))
     _solid_png(blue_path, (0, 0, 255))
 
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     event = _wait_for_thumbnail(store)
 
     red_addr, red_src = _address_of(red_path, tmp_path)
@@ -139,7 +140,7 @@ def test_same_file_two_tables_share_one_cache_entry(tmp_path):
     source = tmp_path / "shared.png"
     _solid_png(source, (10, 200, 30))
 
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     event = _wait_for_thumbnail(store)
     addr, src = _address_of(source, tmp_path)
 
@@ -353,7 +354,7 @@ def test_persisted_fingerprint_is_re_stated_on_next_request(tmp_path):
     source = tmp_path / "s.png"
     _solid_png(source, (220, 0, 0))  # red
 
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     event = _wait_for_thumbnail(store)
     addr, src = _address_of(source, tmp_path)
 
@@ -368,7 +369,7 @@ def test_persisted_fingerprint_is_re_stated_on_next_request(tmp_path):
     future = time.time() + 30
     os.utime(source, (future, future))
 
-    store2 = ArtifactStore(tmp_path / "artifacts")
+    store2 = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     event2 = _wait_for_thumbnail(store2)
     store2.load_index(tmp_path)  # seeds the STALE (red) fingerprint
 
@@ -454,7 +455,7 @@ def test_same_row_id_two_tables_different_media_do_not_collide(tmp_path):
     _solid_png(green_path, (0, 200, 0))
     _solid_png(yellow_path, (220, 220, 0))
 
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     event = _wait_for_thumbnail(store)
 
     green_addr, green_src = _address_of(green_path, tmp_path)
@@ -504,11 +505,13 @@ def test_constructor_coerces_settings_values_to_int(tmp_path):
         tmp_path / "artifacts",
         thumbnail_max_side=150,
         preview_max_side=600,
+        resolver=MediaResolver(max_open_decoders=4),
     )
     str_store = ArtifactStore(
         tmp_path / "artifacts",
         thumbnail_max_side="150",
         preview_max_side="600",
+        resolver=MediaResolver(max_open_decoders=4),
     )
 
     # resolution_for returns real integers from both, equal to each other.

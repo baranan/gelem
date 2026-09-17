@@ -44,6 +44,7 @@ from operators.run_context import (
     OperatorRunSpec,
     RunData,
 )
+from media.resolver import MediaResolver
 
 
 def _run(op):
@@ -71,6 +72,7 @@ def _run(op):
         spec=spec,
         data=RunData(tables={}, projects={}),
         paths=None,
+        resolver=MediaResolver(max_open_decoders=2),
         _token=CancellationToken(),
         model=op.build_model(),
     )
@@ -79,10 +81,14 @@ def _run(op):
 def test_face_image_returns_scores():
     op = BlendshapeOperator()
     image_path = ROOT / "test_images" / "001_08.jpg"
-    image = op.load_image(image_path)
-    assert image is not None, f"could not load {image_path}"
+    run = _run(op)
+    # P1.2c-1 deleted BaseOperator.load_image -- a FRAME row's pixels now
+    # come from the shared resolver, exactly as operator_registry.py's
+    # per-row runner gets them. resolve_frame requires an absolute
+    # address; as_posix() gives the forward-slash form it expects.
+    image = run.resolver.resolve_frame(image_path.as_posix(), "analysis").pixels
 
-    scores = op.create_columns("test_face", image, {}, _run(op))
+    scores = op.create_columns("test_face", image, {}, run)
 
     assert set(scores.keys()) == set(BLENDSHAPE_NAMES), \
         "result keys do not match BLENDSHAPE_NAMES"

@@ -26,6 +26,7 @@ from settings.settings import (
     THUMBNAIL_MAX_SIDE_RANGE,
     PREVIEW_MAX_SIDE_RANGE,
     OUTPUT_COPY_WARNING_THRESHOLD_BYTES_RANGE,
+    MAX_OPEN_DECODERS_RANGE,
 )
 from settings.settings_store import SettingsStore
 from settings.settings_gateway import SettingsGateway, SettingField
@@ -139,6 +140,7 @@ def _make_controller(gateway, store):
         object(),   # registry -- untouched by __init__
         object(),   # operator_registry -- untouched by __init__
         settings_gateway=gateway,
+        resolver=object(),   # resolver -- untouched by __init__
     )
 
 
@@ -174,7 +176,7 @@ def test_apply_settings_pushes_both_ceilings_into_the_store():
 def test_settings_methods_raise_without_a_gateway():
     store = _StubStore()
     controller = AppController(
-        _StubDataset(), object(), store, object(), object()
+        _StubDataset(), object(), store, object(), object(), resolver=object()
     )
     with pytest.raises(RuntimeError):
         controller.get_settings_fields()
@@ -219,10 +221,10 @@ def test_apply_settings_pushes_the_corrected_value_not_the_raw_one():
 
 # ===========================================================================
 # CHECK 4 -- the persisted layout, pinned. This is the first code in the app
-# that ever writes these six keys, so the layout is pinned on purpose.
+# that ever writes these seven keys, so the layout is pinned on purpose.
 # ===========================================================================
 
-def test_save_values_writes_exactly_the_six_settings_keys():
+def test_save_values_writes_exactly_the_seven_settings_keys():
     backend = DictBackend()
     gateway = SettingsGateway(SettingsStore(backend))
 
@@ -230,6 +232,7 @@ def test_save_values_writes_exactly_the_six_settings_keys():
         "picture_memory_max_bytes": 268435456,
         "picture_disk_max_bytes": 536870912,
         "worker_count": 4,
+        "max_open_decoders": 8,
         "thumbnail_max_side": 128,
         "preview_max_side": 512,
         "output_copy_warning_threshold_bytes": 2147483648,
@@ -240,6 +243,7 @@ def test_save_values_writes_exactly_the_six_settings_keys():
         "artifacts/picture_memory_max_bytes": "268435456",
         "artifacts/picture_disk_max_bytes": "536870912",
         "artifacts/worker_count": "4",
+        "artifacts/max_open_decoders": "8",
         "artifacts/thumbnail_max_side": "128",
         "artifacts/preview_max_side": "512",
         "save/output_copy_warning_threshold_bytes": "2147483648",
@@ -260,6 +264,7 @@ def test_describe_fields_metadata_comes_from_the_range_constants():
         "picture_memory_max_bytes",
         "picture_disk_max_bytes",
         "worker_count",
+        "max_open_decoders",
         "thumbnail_max_side",
         "preview_max_side",
         "output_copy_warning_threshold_bytes",
@@ -269,6 +274,7 @@ def test_describe_fields_metadata_comes_from_the_range_constants():
         PICTURE_MEMORY_MAX_BYTES_RANGE,
         PICTURE_DISK_MAX_BYTES_RANGE,
         WORKER_COUNT_RANGE,
+        MAX_OPEN_DECODERS_RANGE,
         THUMBNAIL_MAX_SIDE_RANGE,
         PREVIEW_MAX_SIDE_RANGE,
         OUTPUT_COPY_WARNING_THRESHOLD_BYTES_RANGE,
@@ -278,11 +284,11 @@ def test_describe_fields_metadata_comes_from_the_range_constants():
         assert field.maximum == high
 
     assert [f.restart_required for f in fields] == [
-        False, False, True, True, True, False,
+        False, False, True, True, True, True, False,
     ]
 
     assert [f.unit for f in fields] == [
-        "bytes", "bytes", "count", "pixels", "pixels", "bytes",
+        "bytes", "bytes", "count", "count", "pixels", "pixels", "bytes",
     ]
 
 
@@ -319,13 +325,14 @@ def test_cross_field_correction_is_applied_before_the_value_is_written():
 # and are NOT reset to defaults.
 # ===========================================================================
 
-# Six NON-default in-range values, so a reset-to-defaults is visibly
-# different from a correct overlay. (Defaults are 500 MiB / 1 GiB / 2 /
+# Seven NON-default in-range values, so a reset-to-defaults is visibly
+# different from a correct overlay. (Defaults are 500 MiB / 1 GiB / 2 / 6 /
 # 150 / 600 / 1 GiB.)
 _SEED_PERSISTED = {
     "artifacts/picture_memory_max_bytes": "268435456",   # 256 MiB
     "artifacts/picture_disk_max_bytes": "536870912",      # 512 MiB
     "artifacts/worker_count": "5",
+    "artifacts/max_open_decoders": "9",
     "artifacts/thumbnail_max_side": "200",
     "artifacts/preview_max_side": "700",
     "save/output_copy_warning_threshold_bytes": "3221225472",   # 3 GiB
@@ -340,11 +347,12 @@ def test_save_values_overlays_a_partial_mapping_and_keeps_the_rest():
     problems = gateway.save_values({"worker_count": 8})
     assert problems == []
 
-    # The named field changed; the other five are exactly as seeded.
+    # The named field changed; the other six are exactly as seeded.
     assert backend.data == {
         "artifacts/picture_memory_max_bytes": "268435456",
         "artifacts/picture_disk_max_bytes": "536870912",
         "artifacts/worker_count": "8",
+        "artifacts/max_open_decoders": "9",
         "artifacts/thumbnail_max_side": "200",
         "artifacts/preview_max_side": "700",
         "save/output_copy_warning_threshold_bytes": "3221225472",

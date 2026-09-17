@@ -42,6 +42,7 @@ from operators.descriptor import (
     OutputSpec,
 )
 from controller import AppController
+from media.resolver import MediaResolver
 
 
 def _table_with_explicit_roles(ds: Dataset) -> None:
@@ -109,7 +110,7 @@ def _make_controller(tmp_path):
     """A real AppController over a Dataset holding only the 'source'
     table built by _table_with_explicit_roles. No test_images folder and
     no worker thread: this item never starts a run, only builds one."""
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     registry = ColumnTypeRegistry()
     registry.setup_defaults(store)
 
@@ -119,7 +120,7 @@ def _make_controller(tmp_path):
     op_registry = OperatorRegistry()
     controller = AppController(
         dataset, QueryEngine(), store, registry, op_registry
-    )
+    , resolver=MediaResolver(max_open_decoders=4))
     return controller, dataset
 
 

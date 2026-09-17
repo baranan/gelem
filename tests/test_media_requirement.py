@@ -53,6 +53,7 @@ from operators.descriptor import (
     OutputSpec,
 )
 from controller import AppController
+from media.resolver import MediaResolver
 
 TEST_IMAGES = project_root / "test_images"
 
@@ -64,7 +65,7 @@ TEST_IMAGES = project_root / "test_images"
 def _make_controller(tmp_path):
     """A real AppController over the test_images 'frames' table -- the same
     no-widget construction tests/test_operator_run_wiring.py uses."""
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     registry = ColumnTypeRegistry()
     registry.setup_defaults(store)
 
@@ -74,7 +75,7 @@ def _make_controller(tmp_path):
     op_registry = OperatorRegistry()
     controller = AppController(
         dataset, QueryEngine(), store, registry, op_registry
-    )
+    , resolver=MediaResolver(max_open_decoders=4))
     controller.set_filters([])  # publish an initial query result
     return controller, dataset, op_registry
 

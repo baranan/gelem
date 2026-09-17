@@ -49,6 +49,7 @@ from operators.operator_registry import OperatorRegistry
 from controller import AppController
 from ui.gallery_widget import GalleryWidget, TileWidget
 from ui.main_window import MainWindow
+from media.resolver import MediaResolver
 
 # The controller factory is the make_controller fixture in
 # tests/conftest.py -- it used to be copied into this file and
@@ -543,12 +544,12 @@ def test_two_media_columns_on_one_row_render_different_pictures(qapp, tmp_path):
     blue_path = tmp_path / "blue.png"
     _solid_png(blue_path, (0, 0, 255))
 
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     registry = ColumnTypeRegistry()
     registry.setup_defaults(store)
     dataset = Dataset()
     op_registry = OperatorRegistry()
-    controller = AppController(dataset, QueryEngine(), store, registry, op_registry)
+    controller = AppController(dataset, QueryEngine(), store, registry, op_registry, resolver=MediaResolver(max_open_decoders=4))
 
     # Wait for thumbnail generation deterministically: chain the
     # store's ready callback and block on an Event, not a fixed sleep.

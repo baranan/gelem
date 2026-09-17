@@ -65,6 +65,10 @@ if TYPE_CHECKING:
     # import from models/" rule stays true by inspection, not merely by
     # accident of what project_paths.py happens to import today.
     from models.project_paths import ProjectPaths
+    # Same reasoning for MediaResolver: media/resolver.py imports PyAV and
+    # PIL, both heavy, and this module only ever annotates the type -- it
+    # never constructs or calls into a resolver itself.
+    from media.resolver import MediaResolver
 
 
 # ---------------------------------------------------------------------------
@@ -605,6 +609,14 @@ class OperatorRun:
     # This project's directories (models/project_paths.py::ProjectPaths).
     # Never store these on the operator.
     paths: "ProjectPaths"
+    # The one shared MediaResolver (media/resolver.py), built once in
+    # main.py and injected into both ArtifactStore and AppController
+    # (docs/architecture.md section 9). The per-row COLUMNS runner
+    # (operators/operator_registry.py) reads run.resolver.resolve_frame()
+    # to decode a FRAME requirement's media -- CLAUDE.md's media rule is
+    # that nothing else opens a source file. Not read by an operator's own
+    # create_columns(): the runner decodes before calling it.
+    resolver: "MediaResolver"
     # The cancellation flag, held by the runner. Underscore-prefixed
     # because an operator must go through cancelled(), never touch this.
     _token: CancellationToken

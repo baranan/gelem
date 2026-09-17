@@ -36,7 +36,15 @@ from media.media_address import POLICIES
 # preview could alter the pixels it produces (a different resize filter, a
 # colour-space fix, a new border). An old cached picture then simply stops
 # being reused -- it is not overwritten and not served stale.
-RENDERER_CACHE_VERSION = 1
+#
+# 1 -> 2 (P1.2c-1): source decoding moved from PIL/cv2 (no EXIF
+# orientation, video always first frame, #t=/#f= ignored) to the shared
+# MediaResolver (EXIF-transposed still images, display-matrix-oriented
+# video, and an address's own #t=/#f= selector honoured). Every field
+# ArtifactKey already carries -- address, fingerprint, purpose, resolution,
+# policy -- is unchanged for a picture made under the old decoder, so
+# without this bump it would keep being served as a cache hit forever.
+RENDERER_CACHE_VERSION = 2
 
 # The two purposes ArtifactStore produces today. 'preview' is the larger
 # variant a big tile asks for; 'thumbnail' is the small one.

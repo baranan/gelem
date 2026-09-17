@@ -50,6 +50,7 @@ from models.dataset import Dataset
 from models.query_engine import QueryEngine
 from operators.operator_registry import OperatorRegistry
 from controller import AppController
+from media.resolver import MediaResolver
 
 
 # ---------------------------------------------------------------------------
@@ -61,12 +62,12 @@ def _solid_png(path: Path, colour: tuple[int, int, int]) -> None:
 
 
 def _build_controller(tmp_path):
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     registry = ColumnTypeRegistry()
     registry.setup_defaults(store)
     dataset = Dataset()
     op_registry = OperatorRegistry()
-    controller = AppController(dataset, QueryEngine(), store, registry, op_registry)
+    controller = AppController(dataset, QueryEngine(), store, registry, op_registry, resolver=MediaResolver(max_open_decoders=4))
     return controller, dataset, store
 
 
@@ -105,7 +106,7 @@ def _boom_open(*_args, **_kwargs):
 def test_thumbnail_miss_image_opens_no_source_and_returns_placeholder(
     qapp, tmp_path, monkeypatch
 ):
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     render = make_media_path_renderer(store)
 
     # A real file, but not a decodable image: Image.open would raise if it
@@ -133,7 +134,7 @@ def test_thumbnail_miss_image_opens_no_source_and_returns_placeholder(
 def test_thumbnail_miss_video_opens_no_source_and_returns_placeholder(
     qapp, tmp_path, monkeypatch
 ):
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     render = make_media_path_renderer(store)
 
     # Instrument the decode: any cv2.VideoCapture call on the paint path
@@ -288,7 +289,7 @@ def test_load_project_missing_index_entry_renders_by_demand_not_decode(
 # ===========================================================================
 
 def test_detail_mode_still_opens_the_source(qapp, tmp_path):
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     render = make_media_path_renderer(store)
 
     src = tmp_path / "real.png"

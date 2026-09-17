@@ -39,6 +39,7 @@ from operators.descriptor import (
     OutputColumn,
     OutputSpec,
 )
+from media.resolver import MediaResolver
 
 TEST_IMAGES  = project_root / "test_images"
 METADATA_CSV = TEST_IMAGES / "metadata.csv"
@@ -139,7 +140,7 @@ def test_run_create_columns_does_not_copy_table_per_row(monkeypatch, tmp_path):
         def create_columns(self, row_id, media, metadata, run):
             return {"dummy_score": 1.0}
 
-    store    = ArtifactStore(tmp_path / "artifacts")
+    store    = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     registry = ColumnTypeRegistry()
     registry.setup_defaults(store)
 
@@ -149,7 +150,7 @@ def test_run_create_columns_does_not_copy_table_per_row(monkeypatch, tmp_path):
     op_registry = OperatorRegistry()
     op_registry.register(_DummyOperator())
 
-    controller = AppController(dataset, QueryEngine(), store, registry, op_registry)
+    controller = AppController(dataset, QueryEngine(), store, registry, op_registry, resolver=MediaResolver(max_open_decoders=4))
     row_ids    = list(dataset.get_table("frames")["row_id"])
 
     counts = {"get_row": 0, "get_table": 0}
@@ -262,7 +263,7 @@ def test_run_create_columns_pairs_snapshot_rows_with_correct_row_id(monkeypatch,
             # pairing shows up as a wrong value at every affected row.
             return {"probe": int(row_id)}
 
-    store    = ArtifactStore(tmp_path / "artifacts")
+    store    = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     registry = ColumnTypeRegistry()
     registry.setup_defaults(store)
 
@@ -272,7 +273,7 @@ def test_run_create_columns_pairs_snapshot_rows_with_correct_row_id(monkeypatch,
     op_registry = OperatorRegistry()
     op_registry.register(_EchoRowIdOperator())
 
-    controller = AppController(dataset, QueryEngine(), store, registry, op_registry)
+    controller = AppController(dataset, QueryEngine(), store, registry, op_registry, resolver=MediaResolver(max_open_decoders=4))
     row_ids    = list(dataset.get_table("frames")["row_id"])
 
     # Capture the worker thread run_create_columns starts, so we can join

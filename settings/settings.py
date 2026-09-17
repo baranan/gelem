@@ -42,6 +42,14 @@ PICTURE_DISK_MAX_BYTES_RANGE = (64 * 1024 * 1024, 1024 * 1024 * 1024 * 1024)
 DEFAULT_WORKER_COUNT = 2
 WORKER_COUNT_RANGE = (1, 32)
 
+# The MediaResolver's decoder pool bound: how many PyAV containers may be
+# open at once, across every caller sharing the one resolver instance
+# (ArtifactStore's workers and the per-row COLUMNS runner). 6 default; 1 to
+# 32 -- machine dependent (CLAUDE.md's generality rule), same reasoning as
+# worker_count.
+DEFAULT_MAX_OPEN_DECODERS = 6
+MAX_OPEN_DECODERS_RANGE = (1, 32)
+
 # Thumbnail target size: the largest side, in pixels. 32 to 1024. Only the
 # larger side is ever used downstream -- ArtifactStore turns it straight
 # into the resolution that enters the artifact key -- so it is a single
@@ -135,6 +143,7 @@ class GelemSettings:
     output_copy_warning_threshold_bytes: int = (
         DEFAULT_OUTPUT_COPY_WARNING_THRESHOLD_BYTES
     )
+    max_open_decoders: int = DEFAULT_MAX_OPEN_DECODERS
 
     @classmethod
     def from_values(
@@ -196,6 +205,13 @@ class GelemSettings:
             "output copy warning threshold",
             problems,
         )
+        max_open_decoders = _parse_int_field(
+            mapping.get("max_open_decoders"),
+            DEFAULT_MAX_OPEN_DECODERS,
+            MAX_OPEN_DECODERS_RANGE,
+            "maximum open decoders",
+            problems,
+        )
 
         # Cross-field rule: a preview must not be smaller than a thumbnail.
         # Both are now the largest side directly, so this is a plain compare.
@@ -217,6 +233,7 @@ class GelemSettings:
                 output_copy_warning_threshold_bytes=(
                     output_copy_warning_threshold_bytes
                 ),
+                max_open_decoders=max_open_decoders,
             ),
             problems,
         )

@@ -83,6 +83,7 @@ def _run(op, *, media_column, start_column, end_column, carry_columns):
         spec=spec,
         data=RunData(tables={"active_table": snapshot}, projects={}),
         paths=None,
+        resolver=None,
         _token=CancellationToken(),
     )
 

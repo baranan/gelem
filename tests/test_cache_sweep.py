@@ -49,6 +49,7 @@ from models.query_engine import QueryEngine
 from column_types.registry import ColumnTypeRegistry
 from operators.operator_registry import OperatorRegistry
 from controller import AppController
+from media.resolver import MediaResolver
 
 
 # ---------------------------------------------------------------------------
@@ -81,14 +82,14 @@ def _wait_for_thumbnail(store: ArtifactStore) -> threading.Event:
 def _build_controller(tmp_path, scratch: str = "scratch"):
     """A real AppController whose store starts over a scratch folder that
     is NOT inside any project folder."""
-    store = ArtifactStore(tmp_path / scratch)
+    store = ArtifactStore(tmp_path / scratch, resolver=MediaResolver(max_open_decoders=4))
     registry = ColumnTypeRegistry()
     registry.setup_defaults(store)
     dataset = Dataset()
     op_registry = OperatorRegistry()
     controller = AppController(
         dataset, QueryEngine(), store, registry, op_registry
-    )
+    , resolver=MediaResolver(max_open_decoders=4))
     return controller, dataset, store
 
 
@@ -224,7 +225,7 @@ def test_plan_sweep_delete_orphans_false_keeps_orphans_but_still_reports_missing
 # ===========================================================================
 
 def test_orphan_jpeg_is_deleted(tmp_path):
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     orphan = store._dir / _hash_name("b")
     orphan.write_bytes(b"\x00" * 4096)
 
@@ -240,7 +241,7 @@ def test_orphan_jpeg_is_deleted(tmp_path):
 # ===========================================================================
 
 def test_non_hash_named_files_are_never_swept(tmp_path):
-    store = ArtifactStore(tmp_path / "artifacts", disk_cache_max_bytes=0)
+    store = ArtifactStore(tmp_path / "artifacts", disk_cache_max_bytes=0, resolver=MediaResolver(max_open_decoders=4))
 
     index_json = store._dir / "artifact_index.json"
     index_json.write_bytes(b"x" * 10_000)
@@ -273,7 +274,7 @@ def test_non_hash_named_files_are_never_swept(tmp_path):
 # ===========================================================================
 
 def test_indexed_but_absent_entry_flips_is_cached_false(tmp_path):
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     address = "C:/never/on/disk.png"
     made = _seed_address_fully_indexed(store, address, on_disk=False)
 
@@ -298,7 +299,7 @@ def test_after_sweep_a_request_queues_a_job_again(tmp_path):
     source = tmp_path / "s.png"
     _solid_png(source, (200, 10, 10))
 
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     event = _wait_for_thumbnail(store)
     addr, src = _address_of(source, tmp_path)
 
@@ -335,7 +336,7 @@ def test_after_sweep_a_request_queues_a_job_again(tmp_path):
 # ===========================================================================
 
 def test_reconcile_evicts_oldest_mtime_first(tmp_path):
-    store = ArtifactStore(tmp_path / "artifacts", disk_cache_max_bytes=250)
+    store = ArtifactStore(tmp_path / "artifacts", disk_cache_max_bytes=250, resolver=MediaResolver(max_open_decoders=4))
 
     made = []
     # Deliberately not in mtime order, so "oldest" cannot be "first added".
@@ -366,7 +367,7 @@ def test_reconcile_evicts_oldest_mtime_first(tmp_path):
 # ===========================================================================
 
 def test_no_surviving_index_key_names_a_missing_file(tmp_path):
-    store = ArtifactStore(tmp_path / "artifacts", disk_cache_max_bytes=150)
+    store = ArtifactStore(tmp_path / "artifacts", disk_cache_max_bytes=150, resolver=MediaResolver(max_open_decoders=4))
 
     # One real indexed file (small, stays), one indexed-but-absent, and a
     # big orphan the ceiling would force out anyway.
@@ -393,7 +394,7 @@ def test_no_surviving_index_key_names_a_missing_file(tmp_path):
 # ===========================================================================
 
 def test_delete_oserror_does_not_propagate_or_block_reconcile(tmp_path, monkeypatch):
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
 
     orphan = store._dir / _hash_name("b")
     orphan.write_bytes(b"\x00" * 32)
@@ -462,7 +463,7 @@ def test_saving_a_project_writes_an_index_naming_no_deleted_file(qapp, tmp_path)
 # ===========================================================================
 
 def test_clean_directory_is_untouched(tmp_path):
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
     made = _seed_address_fully_indexed(store, "C:/ok/pic.png", on_disk=True)
 
     result = store.reconcile_and_evict()
@@ -481,7 +482,7 @@ def test_clean_directory_is_untouched(tmp_path):
 # ===========================================================================
 
 def test_load_index_return_value_signals_authoritativeness(tmp_path):
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
 
     # No index file: a saved project always has one, so this is a lost
     # or unsynced file, not "nothing cached" -> NOT safe to sweep.
@@ -614,7 +615,7 @@ def test_save_after_unparseable_index_load_does_not_wipe_the_cache(qapp, tmp_pat
 # ===========================================================================
 
 def test_index_authoritative_flag_does_not_latch_across_reset(tmp_path):
-    store = ArtifactStore(tmp_path / "artifacts")
+    store = ArtifactStore(tmp_path / "artifacts", resolver=MediaResolver(max_open_decoders=4))
 
     # A failed load (no index file) drops the flag.
     assert store.load_index(tmp_path) is False

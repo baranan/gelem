@@ -48,6 +48,7 @@ def _run(op, *, parameters, paths):
         spec=spec,
         data=RunData(tables={}, projects={}),
         paths=paths,
+        resolver=object(),
         _token=CancellationToken(),
     )
 

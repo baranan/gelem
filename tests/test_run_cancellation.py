@@ -143,6 +143,7 @@ def _build_run(operator: BaseOperator, token: CancellationToken) -> OperatorRun:
         spec=spec,
         data=RunData(tables={}, projects={}),
         paths=object(),
+        resolver=object(),
         _token=token,
     )
 

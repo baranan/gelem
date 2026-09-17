@@ -83,7 +83,7 @@ class _FakeController:
 
 
 def _real_fields() -> list[SettingField]:
-    """The six fields exactly as they ship, read through the gateway."""
+    """The seven fields exactly as they ship, read through the gateway."""
     store = SettingsStore(_DictBackend())
     return SettingsGateway(store).describe_fields()
 

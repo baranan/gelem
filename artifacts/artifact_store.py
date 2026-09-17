@@ -4,9 +4,15 @@ artifacts/artifact_store.py
 ArtifactStore manages thumbnail and preview images used by the gallery
 for fast display. It handles both image and video source files.
 
-For images: thumbnails are generated using PIL.
-For videos:  the first frame is extracted using OpenCV, then the same
-             PIL-based resizing pipeline is applied.
+Source decoding (P1.2c-1). A picture is decoded through the shared
+`MediaResolver` (media/resolver.py), injected as a required constructor
+argument -- this file itself opens no source image or video any more.
+`resolve_frame(address, "display", policy="first")` returns upright RGB
+pixels (still images EXIF-transposed, video frames display-matrix
+rotated) for whatever the address selects -- the first frame for a bare
+path, or the address's own `#t=`/`#f=` selector when one is present, which
+the pre-resolver decode ignored. The result is wrapped in a PIL Image and
+the existing PIL-based resizing pipeline runs unchanged.
 
 Identity (P0.5b-1, docs/media_architecture.md section 4.5). A derived
 image is identified by an `ArtifactKey` -- canonical media address, source
@@ -44,8 +50,7 @@ Reading and writing the JPEGs themselves goes through `ArtifactCodec`,
 which is the boundary `CLAUDE.md`'s media rules name: derived artifacts
 are encoded and read back only by the codec. The matching half -- source
 media decoded only by the resolver, so nothing else opens an image at all
--- waits on P1.2; until then `_decode_source` still decodes source media
-here.
+-- is `_decode_source` below, made true by P1.2c-1.
 
 Request queue (P0.5b-2i, docs/media_architecture.md section 4.4). A
 request is served off a bounded `WorkerPool` rather than a raw thread per
@@ -82,10 +87,7 @@ from artifacts.artifact_codec import ArtifactCodec, ArtifactCodecError
 from artifacts.cache_sweep import SweepFile, plan_sweep
 from artifacts.worker_pool import WorkerPool
 from media.artifact_key import ArtifactKey, SourceFingerprint
-
-# Import the extension sets from dataset so they stay in sync.
-# We only need to know which extensions are videos here.
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+from media.resolver import MediaResolver
 
 # Fallback thumbnail / preview target sizes: the largest side, in pixels.
 # DEFAULTS ONLY: the real values come from settings/ via main.py and are
@@ -99,10 +101,14 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 DEFAULT_THUMBNAIL_MAX_SIDE = 150
 DEFAULT_PREVIEW_MAX_SIDE   = 600
 
-# For now the store always records the first frame of a video (or the
-# whole image) and ignores any frame or time specifier in the address.
-# The key still carries the policy explicitly, so a later 'midpoint'
-# policy (which needs real per-frame timings -- P1.2) produces a
+# The representative-frame policy the store asks the resolver for
+# (media/resolver.py: resolve_frame's `policy` argument). It only governs
+# a BARE PATH or an explicit RANGE address -- decision 4's "which frame
+# represents this span". An address that already names a single frame
+# (`#t=` a time point, `#f=` a frame ordinal) is decoded exactly as
+# addressed regardless of this policy; P1.2c-1 made that true by routing
+# the whole address, not a bare path, through the resolver. The key still
+# carries the policy explicitly, so a later 'midpoint' policy produces a
 # different key and does not collide with these pictures.
 REPRESENTATIVE_FRAME_POLICY = "first"
 
@@ -161,18 +167,28 @@ class ArtifactStore:
         self,
         artifacts_dir: Path,
         *,
+        resolver: MediaResolver,
         worker_count: int = 2,
         disk_cache_max_bytes: int = DEFAULT_DISK_CACHE_MAX_BYTES,
         memory_cache_max_bytes: int = DEFAULT_CACHE_MAX_BYTES,
         thumbnail_max_side: int = DEFAULT_THUMBNAIL_MAX_SIDE,
         preview_max_side: int = DEFAULT_PREVIEW_MAX_SIDE,
     ):
-        # Every keyword parameter defaults to the module DEFAULT_ constant,
-        # so the positional ArtifactStore(dir) construction used by older
-        # tests keeps working. main.py passes all five from settings/
-        # (P0.5b-2ii-c1, docs/architecture.md section 9). None of these
-        # five is machine-independent, so none is a bare constant in the
-        # code -- CLAUDE.md's generality rule.
+        # `resolver` is REQUIRED -- no default, no None fallback. It is the
+        # one shared MediaResolver main.py builds and also injects into
+        # AppController (docs/architecture.md section 9); this store never
+        # builds its own. Keyword-only, like the five settings-sourced
+        # values below, but deliberately without a default of theirs: a
+        # missing resolver must fail construction loudly, not silently
+        # decode nothing.
+        self._resolver = resolver
+
+        # Every OTHER keyword parameter defaults to the module DEFAULT_
+        # constant, so the positional ArtifactStore(dir, resolver=...)
+        # construction used by older tests keeps working. main.py passes
+        # all five from settings/ (P0.5b-2ii-c1, docs/architecture.md
+        # section 9). None of these five is machine-independent, so none
+        # is a bare constant in the code -- CLAUDE.md's generality rule.
         #
         # Coerce all five with int() as they are stored. These five come
         # from a settings store (GelemSettings) that persists everything
@@ -1325,10 +1341,9 @@ class ArtifactStore:
         a JPEG it encoded before the losing commit stays on disk with no
         index entry pointing at it -- reclaiming that is P0.5b-2ii.
 
-        For image files the source is loaded via PIL; for video files the
-        first frame is extracted via OpenCV. Both are source-media
-        decodes that P1.2 will route through the resolver -- this diff
-        leaves them where they were, behind `_decode_source`.
+        The source-media decode -- image or video, still image EXIF
+        orientation or video display-matrix orientation -- goes through
+        the shared MediaResolver, behind `_decode_source`.
         """
         generation, address = job_key
 
@@ -1365,10 +1380,12 @@ class ArtifactStore:
 
             pending_index: dict[ArtifactKey, Path] = {}
             if not already_have_both:
-                image = self._decode_source(source_path)
-                if image is None:
-                    self._discard_subscribers(job_key)
-                    return
+                # Decodes through the shared resolver by ADDRESS, not the
+                # bare source_path -- see _decode_source. A resolver
+                # failure (MediaResolverError, MediaAddressError, a file
+                # error) raises out of here and is caught by the except
+                # below, exactly like any other failure in this block.
+                image = self._decode_source(address)
 
                 # Courtesy check: skip the encode work if reset() has
                 # already happened. The commit below is the check that
@@ -1439,21 +1456,25 @@ class ArtifactStore:
                 return
             self._notify_ready(table_name, row_id)
 
-    def _decode_source(self, source_path: Path) -> Image.Image | None:
-        """Decode the source media file to one RGB PIL image -- the first
-        frame for a video, the whole image otherwise. Returns None if it
-        cannot be read.
+    def _decode_source(self, address: str) -> Image.Image:
+        """Decode `address` to one upright RGB PIL image through the
+        shared MediaResolver -- the only source-media decode in this file
+        (CLAUDE.md's media rule). `address` is the job's canonical media
+        address (already absolute -- see the note on request_thumbnail's
+        `address` argument), so a video address's own `#t=`/`#f=`
+        selector is honoured; a bare path resolves its first frame, per
+        REPRESENTATIVE_FRAME_POLICY.
 
-        The single source-media decode in this file. P1.2 routes it
-        through the resolver; until then it is a direct decode, exactly
-        as before the worker pool. It is its own method so a test can
-        hold a worker inside it while it exercises coalescing and
-        cancellation.
+        Raises (MediaResolverError, MediaAddressError, an OSError from a
+        vanished file) rather than returning None on failure -- the
+        caller's surrounding try/except is this store's existing failure
+        path (discard subscribers, log, no crash) and needs no new
+        swallowing here.
         """
-        suffix = source_path.suffix.lower()
-        if suffix in VIDEO_EXTENSIONS:
-            return self._first_frame_as_pil(source_path)
-        return Image.open(source_path).convert("RGB")
+        payload = self._resolver.resolve_frame(
+            address, "display", policy=REPRESENTATIVE_FRAME_POLICY
+        )
+        return Image.fromarray(payload.pixels)
 
     def _is_stale(self, generation: int) -> bool:
         """True if reset() has bumped the generation since `generation`
@@ -1470,44 +1491,6 @@ class ArtifactStore:
     def _notify_ready(self, table_name: str, row_id: str) -> None:
         if self.on_thumbnail_ready is not None:
             self.on_thumbnail_ready(table_name, row_id)
-
-    def _first_frame_as_pil(self, video_path: Path) -> Image.Image | None:
-        """
-        Extracts the first frame of a video file and returns it as a
-        PIL Image in RGB mode.
-
-        Uses OpenCV (cv2). Returns None if OpenCV is not installed or
-        if the video cannot be read.
-
-        Args:
-            video_path: Path to the video file.
-
-        Returns:
-            A PIL Image, or None.
-        """
-        try:
-            import cv2
-
-            cap = cv2.VideoCapture(str(video_path))
-            ok, frame = cap.read()
-            cap.release()
-
-            if not ok or frame is None:
-                print(f"[ArtifactStore] Could not read first frame "
-                      f"from {video_path}")
-                return None
-
-            # OpenCV returns BGR — convert to RGB.
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            return Image.fromarray(frame_rgb)
-
-        except ImportError:
-            print("[ArtifactStore] OpenCV (cv2) not installed — "
-                  "cannot generate video thumbnail.")
-            return None
-        except Exception as e:
-            print(f"[ArtifactStore] Video frame error for {video_path}: {e}")
-            return None
 
     def _add_to_cache(
         self,

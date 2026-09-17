@@ -34,6 +34,7 @@ from settings.settings import (
     THUMBNAIL_MAX_SIDE_RANGE,
     PREVIEW_MAX_SIDE_RANGE,
     OUTPUT_COPY_WARNING_THRESHOLD_BYTES_RANGE,
+    MAX_OPEN_DECODERS_RANGE,
 )
 from settings.settings_store import SettingsStore
 
@@ -57,13 +58,13 @@ class SettingField:
     current_value: int
 
 
-# The five ArtifactStore values docs/architecture.md section 9's table
-# lists, in that order, plus output_copy_warning_threshold_bytes (P1.9b-2)
-# after them -- it is not one of "the five values" section 9 documents,
-# but it is edited the same way. minimum and maximum are ALWAYS read from
-# the *_RANGE tuples in settings/settings.py -- never retyped as literals
-# here -- so a bound change in one place cannot silently disagree with
-# another.
+# The six ArtifactStore/MediaResolver values docs/architecture.md section 9's
+# table lists, in that order, plus output_copy_warning_threshold_bytes
+# (P1.9b-2) after them -- it is not one of "the six values" section 9
+# documents, but it is edited the same way. minimum and maximum are ALWAYS
+# read from the *_RANGE tuples in settings/settings.py -- never retyped as
+# literals here -- so a bound change in one place cannot silently disagree
+# with another.
 #
 # Each entry: (name, label, help_text, range_tuple, unit, restart_required)
 _FIELD_SPECS = (
@@ -94,6 +95,18 @@ _FIELD_SPECS = (
         "thumbnails and previews. Higher uses more CPU and RAM for faster "
         "gallery fill. Takes effect on restart.",
         WORKER_COUNT_RANGE,
+        "count",
+        True,
+    ),
+    (
+        "max_open_decoders",
+        "Maximum open decoders",
+        "Ceiling on how many source video files the media resolver may "
+        "have open for decoding at once, shared across thumbnail "
+        "generation and analysis runs. Higher lets more files be decoded "
+        "in parallel at the cost of more open file handles and memory. "
+        "Takes effect on restart.",
+        MAX_OPEN_DECODERS_RANGE,
         "count",
         True,
     ),
