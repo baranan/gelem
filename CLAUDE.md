@@ -305,12 +305,16 @@ state. This rule carries no violation list of its own -- it points at the three
 
 ### Media
 
-- **`[TARGET -> P1.2]`** **Only the media resolver decodes *source* media.** No
+- **`[NOW]`** **Only the media resolver decodes *source* media.** No
   `cv2.VideoCapture`, `av.open`, or `Image.open` **of a user's media file**
-  anywhere else. Two places do today: `BaseOperator.load_image` and
-  `ArtifactStore._decode_source`. (`column_types/renderers.py` came off this
-  list in P0.5b-3i: thumbnail mode is cache-or-placeholder and decodes
-  nothing, and detail mode loads through Qt's `QPixmap(path)`, not PIL or cv2.)
+  anywhere else. Made true by P1.2c-1 and P1.2c-2: `BaseOperator.load_image`
+  is deleted, `ArtifactStore._decode_source` and `operators/video_frames.py`
+  (the last operator that opened a video file itself) both decode through
+  `run.resolver` / the shared `MediaResolver`. (`column_types/renderers.py`
+  came off this list in P0.5b-3i: thumbnail mode is cache-or-placeholder and
+  decodes nothing, and detail mode loads through Qt's `QImageReader(path)`,
+  not PIL or cv2.) Guarded by an AST walk over every non-test module in the
+  repository: `tests/test_source_decode_guard.py`.
 - **`[NOW]`** **Reading and writing Gelem's own derived artifacts is a different
   operation and is not covered by that rule.** `ArtifactStore` reads back the JPEGs
   it wrote, and must keep being able to. P0.5b-1 built the narrow `ArtifactCodec`
@@ -319,12 +323,14 @@ state. This rule carries no violation list of its own -- it points at the three
   The boundary is checked by behaviour, not source inspection -- a test hands it
   a source-media path and asserts the raise
   (`tests/test_artifact_identity.py::test_codec_refuses_path_outside_cache_root`).
-  `[TARGET -> P1.2]` The matching half -- source decoding confined to the
-  resolver, so that *nothing else opens an image at all* -- waits on the
-  resolver. `column_types/renderers.py` stopped decoding source media in
+  `[NOW]` The matching half -- source decoding confined to the resolver, so
+  that *nothing else opens an image at all* -- is made true by P1.2c-1 and
+  P1.2c-2. `column_types/renderers.py` stopped decoding source media in
   P0.5b-3i (its `_render_image` `Image.open` fallback and
   `_video_first_frame_pixmap` `cv2` path are gone). `ArtifactStore._decode_source`
-  still decodes source media directly until the resolver lands.
+  decodes through `MediaResolver`, and `operators/video_frames.py` decodes
+  through `run.resolver` rather than opening a video file itself. Guarded by
+  `tests/test_source_decode_guard.py`.
 - **`[NOW]`** The artifact cache directory is bound to the project folder on save
   and load, and swept to stay in bounds. `docs/media_architecture.md` §4.7 is the
   authority for where derived JPEGs live, why their one-way filenames force
@@ -436,6 +442,8 @@ state. This rule carries no violation list of its own -- it points at the three
   `select_frame()` takes frame times as a plain argument and never measures
   them itself; that measurement is the resolver's, in P1.2. **The next feature
   that needs a runtime-measured per-file property should cite itself here.**
+  Built by `media/resolver.py`'s frame-time index (see its own module
+  docstring); tested by `tests/test_media_resolver.py`.
 
 ### Long-running work
 

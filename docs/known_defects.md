@@ -383,6 +383,45 @@ to P1.8d, and the two OS-native / non-parsing media-cell entries to P1.8e.
   of scope for P1.6b), since narrowing only ever touches `measurement`
   columns and an `index` column is supposed to be exempt from it. No item
   assigned.
+- **A FRAME-requirement COLUMNS run reads only the `full_path` metadata key**
+  (`operators/operator_registry.py`'s `_run_create_columns_worker`), never a
+  column the researcher picked or a differently-named media_path column type
+  inference tagged. This is narrower than `AppController._absolutise_media_columns`
+  (P1.2c-2), which pre-resolves every column the active table's schema tags
+  `media_path`, not only one named `full_path` -- an ADDRESS-requirement run
+  already benefits from that (an operator can read any such column itself,
+  as `tests/test_media_resolver.py::test_address_run_resolves_a_relative_cell_in_a_non_full_path_media_column`
+  exercises), but a FRAME run's fixed key means a table whose media lives
+  under another column name gets no decoded frame at all, silently, however
+  the pre-resolution step improves. Which column a FRAME operator reads is a
+  contract question -- letting an operator or its descriptor name the column,
+  the same way `video_frames.py`'s `video_column` parameter does for a TABLE
+  operator -- not a patch to this file. No item assigned.
+- **The per-file frame-time index (`media/resolver.py`'s `_build_frame_index`)
+  identifies a frame by its presentation time rounded to the nearest
+  microsecond, not by its exact timestamp.** It refuses two presented frames
+  whose raw ticks are an exact tie, and (review round 5) two presented frames
+  whose raw ticks are distinct but round to the same microsecond -- but a
+  file whose real per-frame timings are closer together than microsecond
+  resolution allows (a container time_base finer than 1 tick per
+  microsecond, encoding two frames within that same microsecond) would still
+  trip this refusal on genuine, non-duplicate content. No real fixture has
+  been found that does this, and no video encoder in ordinary use places two
+  presented frames a fraction of a microsecond apart. The clean fix, if one
+  ever does, is exact-timestamp frame identity (keyed on the raw tick or an
+  exact rational, never a rounded microsecond value) rather than loosening
+  the refusal. No item assigned.
+- **Two threads that both miss the per-file frame-time index cache build it
+  concurrently.** `MediaResolver._get_frame_index` checks the cache under
+  `_frame_index_lock`, releases the lock, and (on a miss) calls the expensive
+  `_build_frame_index` demux pass OUTSIDE the lock -- deliberately, so one
+  slow build never blocks an unrelated file's lookup -- then re-acquires the
+  lock only to store the result. Two threads racing to resolve the same
+  file's first `#f=` address (or first `with_ordinals=True` span) can
+  therefore both demux the whole file, and whichever finishes last simply
+  overwrites the other's entry with an equivalent one -- wasted work, not a
+  correctness bug, since the index is a pure function of the file. No item
+  assigned.
 
 ## Open -- test-suite instability and process leaks
 

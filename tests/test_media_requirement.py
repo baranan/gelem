@@ -185,6 +185,122 @@ def test_frame_mode_run_receives_a_decoded_image(tmp_path, monkeypatch):
     # None (the METADATA behaviour)? No -- the isinstance check fails.
 
 
+def _operator_run_entries(dataset):
+    """Copied from tests/test_result_delivery.py's helper of the same
+    name (not imported, per this suite's convention of copying small
+    pieces of a pattern rather than sharing a module across test files)."""
+    return [e for e in dataset.provenance.to_list() if e["action"] == "operator_run"]
+
+
+def test_frame_run_reports_one_skip_with_the_whole_video_reason(tmp_path, monkeypatch):
+    """A FRAME row whose media cell is a bare video address (no #t=/#f=
+    selector) is refused before create_columns() is ever called
+    (operator_registry.py's _is_bare_video_address) -- see P1.2c-2's
+    "whole-video row" rule. This must reach the researcher, not just a
+    console print(): the refusal is routed through the same row_errors
+    channel an unexpected create_columns() exception already uses, so
+    AppController._on_operator_complete's "row_errors" branch surfaces
+    one end-of-run error_occurred message naming the count and this
+    exact reason, and the run's provenance entry records outcome
+    "partial" rather than "complete".
+    """
+    controller, dataset, op_registry = _make_controller(tmp_path)
+    row_ids = controller.get_visible_row_ids()
+    image_row_id = row_ids[0]
+    video_row_id = row_ids[1]
+
+    # No real video file is needed: the refusal is decided from the
+    # address alone, before run.resolver.resolve_frame() is ever called
+    # for a bare video address (operator_registry.py never opens it). An
+    # absolute, non-existent path with a video extension is enough.
+    fake_video_path = str(tmp_path / "whole_clip.mp4")
+    dataset.apply_row_updates(
+        "frames", {video_row_id: {"full_path": fake_video_path}}
+    )
+
+    messages: list[str] = []
+    controller.error_occurred.connect(messages.append)
+
+    op = _RecordingOperator(MediaRequirement.FRAME)
+    op_registry.register(op)
+    _run_columns_and_wait(
+        controller, op.name, [image_row_id, video_row_id], monkeypatch
+    )
+
+    # The image row was processed normally; the whole-video row was not.
+    assert len(op.images_seen) == 1
+    assert isinstance(op.images_seen[0], np.ndarray)
+
+    skip_messages = [
+        m for m in messages if "this operator reads single frames" in m
+    ]
+    assert len(skip_messages) == 1, (
+        f"expected exactly one end-of-run message naming the whole-video "
+        f"reason, got: {messages}"
+    )
+    assert "1 row" in skip_messages[0], skip_messages[0]
+
+    entries = _operator_run_entries(dataset)
+    assert len(entries) == 1
+    assert entries[0]["params"]["outcome"] == "partial", (
+        "a run whose only problem was one refused row must not be "
+        "recorded as a clean 'complete'"
+    )
+
+    # Would still pass if the refusal only print()ed to the console, as
+    # it did before this fix? No -- messages would be empty and outcome
+    # would be "complete".
+
+
+def test_frame_run_reports_one_skip_for_a_missing_media_cell(tmp_path, monkeypatch):
+    """A FRAME row whose media cell is missing/blank is a different
+    problem from a whole-video row -- there is no address to even try
+    reading, let alone one naming a whole file -- and review round 4
+    found it was being folded into the "WholeVideoRow" reason (an empty
+    path also happens to satisfy decision 4's "whole file" shape), which
+    would tell a researcher their row names a video when it actually has
+    no media value at all. This pins the accurate, distinct reason
+    ("MissingMedia") and that it still reaches the researcher: one
+    end-of-run error_occurred message and provenance outcome "partial",
+    exactly as the whole-video case does.
+    """
+    controller, dataset, op_registry = _make_controller(tmp_path)
+    row_ids = controller.get_visible_row_ids()
+    image_row_id = row_ids[0]
+    blank_row_id = row_ids[1]
+
+    dataset.apply_row_updates("frames", {blank_row_id: {"full_path": ""}})
+
+    messages: list[str] = []
+    controller.error_occurred.connect(messages.append)
+
+    op = _RecordingOperator(MediaRequirement.FRAME)
+    op_registry.register(op)
+    _run_columns_and_wait(
+        controller, op.name, [image_row_id, blank_row_id], monkeypatch
+    )
+
+    # The image row was processed normally; the blank row was not.
+    assert len(op.images_seen) == 1
+    assert isinstance(op.images_seen[0], np.ndarray)
+
+    skip_messages = [
+        m for m in messages if "this row has no media value" in m
+    ]
+    assert len(skip_messages) == 1, (
+        f"expected exactly one end-of-run message naming the missing-"
+        f"media reason, got: {messages}"
+    )
+    assert "1 row" in skip_messages[0], skip_messages[0]
+    assert "whole video" not in skip_messages[0], (
+        "a missing media cell must not be reported as a whole-video row"
+    )
+
+    entries = _operator_run_entries(dataset)
+    assert len(entries) == 1
+    assert entries[0]["params"]["outcome"] == "partial"
+
+
 # ---------------------------------------------------------------------------
 # METADATA -- the operator receives None
 # ---------------------------------------------------------------------------

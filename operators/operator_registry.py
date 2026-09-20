@@ -46,8 +46,28 @@ import pandas as pd
 
 from operators.base import BaseOperator, OperatorSetupError
 from operators.descriptor import ExecutionMode, MediaRequirement, ModelLifecycle
-from media.media_address import MediaAddressError
+from media.extensions import IMAGE_EXTENSIONS
+from media.media_address import MediaAddressError, parse as parse_address
 from media.resolver import MediaResolverError
+
+
+def _is_bare_video_address(addr) -> bool:
+    """True for an address with no #t=/#f= selector at all -- decision 4's
+    "the whole file" -- whose path does not look like a still image
+    (media.extensions.IMAGE_EXTENSIONS is the one authoritative
+    image/video split, shared with media/resolver.py's own dispatch). A
+    FRAME operator declares that it reads a single, addressed frame; a
+    bare video address does not name one, so the runner refuses the row
+    rather than silently defaulting to that video's first frame.
+    """
+    is_bare = (
+        addr.frame is None
+        and addr.time_us is None
+        and addr.time_range_us is None
+    )
+    if not is_bare:
+        return False
+    return Path(addr.path).suffix.lower() not in IMAGE_EXTENSIONS
 
 
 class OperatorRegistry:
@@ -256,11 +276,19 @@ class OperatorRegistry:
                               `label` is the COLUMNS mode's descriptor
                               label, computed by the worker.
             on_row_errors:    Called once at the end of the run if any rows
-                              raised an unexpected exception. Lets the
-                              controller surface a single end-of-run
-                              summary to the user so unexpected failures
-                              are visibly distinct from the normal "no
-                              face detected" case.
+                              raised an unexpected exception, OR were
+                              refused before create_columns() was ever
+                              called -- a FRAME row whose media cell is
+                              missing/blank ("MissingMedia"), unparseable
+                              ("UnparseableMedia"), or a whole video where
+                              a single addressed frame was expected
+                              ("WholeVideoRow"); see the media_requirement
+                              branch below. Lets the controller surface a
+                              single end-of-run summary to the user so
+                              unexpected failures and deliberate refusals
+                              are both visibly distinct from the normal
+                              "no face detected" case, which returns None
+                              values rather than landing here.
                               Signature: (operation_id: str,
                                           label: str,
                                           errors: list[tuple[str, str, str]])
@@ -515,9 +543,51 @@ class OperatorRegistry:
                 # MediaAddressError, caught below like any other decode
                 # failure.
                 if needs_frame:
+                    # A missing/blank cell and an unparseable one are, like
+                    # the whole-video refusal below, not decode failures --
+                    # there is no address to even try resolving yet -- but
+                    # they are just as invisible to the researcher as a
+                    # bare print() would leave them. Routed through the
+                    # same row_errors channel, each under its own reason,
+                    # rather than folded into "WholeVideoRow" (an empty
+                    # path also satisfies decision 4's "whole file" shape,
+                    # but telling the researcher their row is missing
+                    # media is a different, more accurate answer than
+                    # telling them it names a whole video).
+                    if not full_path or pd.isna(full_path):
+                        row_errors.append((
+                            row_id, "MissingMedia",
+                            "this row has no media value to read",
+                        ))
+                        continue
+                    try:
+                        addr = parse_address(full_path)
+                    except MediaAddressError as e:
+                        row_errors.append((
+                            row_id, "UnparseableMedia",
+                            f"could not parse the media value {full_path!r}: {e}",
+                        ))
+                        continue
+                    if _is_bare_video_address(addr):
+                        # Not a decode failure -- a deliberate refusal, but
+                        # the researcher must still be told: routed through
+                        # the same row_errors channel an unexpected
+                        # create_columns() exception uses below, so the
+                        # end-of-run summary (AppController._on_operator_
+                        # complete's "row_errors" branch) reports the count
+                        # and this exact reason, and the run's provenance
+                        # records outcome "partial" rather than "complete"
+                        # -- a print() alone reaches nobody but a developer
+                        # watching the console.
+                        message = (
+                            "this operator reads single frames; this row "
+                            "is a whole video"
+                        )
+                        row_errors.append((row_id, "WholeVideoRow", message))
+                        continue
                     try:
                         media = run.resolver.resolve_frame(
-                            full_path, "analysis"
+                            addr, "analysis"
                         ).pixels
                     except (MediaResolverError, MediaAddressError, OSError) as e:
                         print(

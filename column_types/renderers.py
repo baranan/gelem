@@ -205,12 +205,18 @@ def _cached_thumbnail(context: dict | None, size: int, artifact_store):
 def _render_image(path: Path):
     """
     Renders an image file for detail mode: a ZoomableImageView widget
-    with the full-resolution image loaded through Qt's QPixmap.
+    with the full-resolution image loaded through Qt's QImageReader.
 
     Thumbnail mode never reaches here -- render() serves it
     cache-or-placeholder and never decodes a source (P0.5b-3i). This is
     not a source decode by PIL or cv2; it is Qt loading a file for a
     full-size view, the same as detail mode has always done.
+
+    QImageReader with setAutoTransform(True) applies the file's EXIF
+    orientation the same way the resolver does for analysis (decision 6,
+    docs/media_architecture.md section 3.6) -- a plain QPixmap(path)
+    construction does not apply it, so a sideways-stored, upright-
+    displayed photo would show sideways here otherwise.
 
     Args:
         path: Path to the image file.
@@ -218,13 +224,15 @@ def _render_image(path: Path):
     Returns:
         A ZoomableImageView widget.
     """
-    from PySide6.QtGui import QPixmap
+    from PySide6.QtGui import QImageReader, QPixmap
     from shared_widgets.zoomable_image_view import ZoomableImageView
 
     widget = ZoomableImageView()
-    pixmap = QPixmap(str(path))
-    if not pixmap.isNull():
-        widget.show_pixmap(pixmap)
+    reader = QImageReader(str(path))
+    reader.setAutoTransform(True)
+    image = reader.read()
+    if not image.isNull():
+        widget.show_pixmap(QPixmap.fromImage(image))
     return widget
 
 

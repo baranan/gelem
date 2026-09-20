@@ -64,7 +64,7 @@ This is the authoritative reference for **media handling** and supersedes any
 contrary assumption in the original design doc or in the student-era code.
 
 Read this before proposing changes to: `column_types/renderers.py`,
-`artifacts/artifact_store.py`, `operators/base.py` (`load_image`),
+`artifacts/artifact_store.py`, `media/resolver.py`,
 `operators/video_frames.py`, or anything that opens a media file.
 
 Sections 1-5 are decisions with their reasoning. Section 6 is the work. Section 9
@@ -198,14 +198,21 @@ of `METADATA`, `FRAME`, `VIDEO_SPAN`, `AUDIO_SPAN` or `ADDRESS`. The old boolean
 `requires_image` was removed in P1.12d-2b-1, when the `create_columns` runner
 started reading `media_requirement` off the descriptor.
 
-**Nothing else in Gelem decodes media.** Today three places do, and all three must
-route through the resolver:
-
-1. `BaseOperator.load_image` -- analysis path
-2. `column_types/renderers.py` (`_render_image`, `_video_first_frame_pixmap`) --
-   display path
-3. `ArtifactStore._decode_source` / `_first_frame_as_pil` (was
-   `_generate_thumbnails` until P0.5b-2i split out the decode)
+**Nothing else in Gelem decodes media.** Made true by P1.2c-1 and P1.2c-2:
+`BaseOperator.load_image` (the analysis path) is deleted -- an operator that
+needs a decoded frame reads `run.resolver` instead, or (for `ADDRESS` mode)
+calls it directly; `ArtifactStore._decode_source` (the thumbnail path) and
+`operators/video_frames.py`'s frame-extraction loop (the last operator that
+opened a video file itself, via `cv2.VideoCapture`) both now decode through
+the one shared `MediaResolver` instance, injected by `main.py` into both
+`ArtifactStore` and `AppController`. `column_types/renderers.py` decodes no
+source media at all: thumbnail mode is cache-or-placeholder (P0.5b-3i) and
+never opens a file, and detail mode is the one Qt exception below.
+`artifacts/artifact_codec.py`'s `ArtifactCodec` reads back JPEGs
+`ArtifactStore` itself wrote, which is a different operation (CLAUDE.md,
+"Reading and writing Gelem's own derived artifacts"), not a source decode.
+Guarded by `tests/test_source_decode_guard.py`, an AST walk over every
+non-test module in the repository.
 
 ### 3.4 Playback is the one explicit exception
 

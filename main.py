@@ -30,25 +30,35 @@ def create_app(fake_data: bool = False):
                    UI widgets independently.
 
     Returns:
-        (MainWindow instance (already visible), MediaResolver or None).
-        The resolver is None in --fake-data mode, which builds no real
-        data components at all. The caller (main()) closes the resolver
-        after the Qt event loop returns.
+        (MainWindow instance (already visible), MediaResolver). Every
+        mode builds a real MediaResolver now -- --fake-data has no
+        Dataset/ArtifactStore/OperatorRegistry, but FakeController still
+        decodes real thumbnails from test_images/ through one, the same
+        "only the media resolver decodes source media" rule the real
+        components follow. The caller (main()) closes the resolver after
+        the Qt event loop returns.
     """
     from ui.main_window import MainWindow
 
     if fake_data:
-        # Use FakeController — no real data layer needed.
+        # Use FakeController -- no real Dataset/ArtifactStore/OperatorRegistry
+        # needed, but real thumbnail decoding still goes through a real
+        # MediaResolver (CLAUDE.md's media rule; docs/architecture.md
+        # section 9 is the authority for max_open_decoders in real mode --
+        # fake mode has no settings store at all, so this is a small,
+        # fake-mode-only constant, not a setting).
         from ui.fake_controller import FakeController
+        from media.resolver import MediaResolver
         test_folder = Path("test_images")
         if not test_folder.exists():
             test_folder = Path(".")
-        controller = FakeController(test_folder)
+        resolver = MediaResolver(max_open_decoders=2)
+        controller = FakeController(test_folder, resolver=resolver)
         window = MainWindow(controller)
         window.show()
         # Start emitting signals after the window has connected them.
         QTimer.singleShot(100, controller.start)
-        return window, None
+        return window, resolver
 
     # Real mode — create all components.
     from models.dataset import Dataset

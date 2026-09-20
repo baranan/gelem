@@ -4,13 +4,20 @@ ui/fake_controller.py
 FakeController is a stand-in for AppController that allows Student A
 to develop and test all UI widgets without needing any real data layer.
 
-It uses real images from the test_images/ folder so the gallery looks
-realistic, but it never touches Dataset, QueryEngine, ArtifactStore,
-or any operator. All data is hardcoded or generated on the fly.
+It uses real images (and videos) from the test_images/ folder so the
+gallery looks realistic, but it never touches Dataset, QueryEngine,
+ArtifactStore, or any operator. All data is hardcoded or generated on
+the fly. It still decodes real media for its thumbnails, so it takes a
+MediaResolver the same way the real components do -- CLAUDE.md's media
+rule ("only the media resolver decodes source media") applies here too,
+since this file is reachable from real main.py via --fake-data, not
+test-only scaffolding.
 
 Usage (already wired into main.py --fake-data):
     from ui.fake_controller import FakeController
-    controller = FakeController(test_images_folder)
+    from media.resolver import MediaResolver
+    resolver = MediaResolver(max_open_decoders=2)
+    controller = FakeController(test_images_folder, resolver=resolver)
     window = MainWindow(controller)
 """
 
@@ -20,11 +27,39 @@ import threading
 import tempfile
 import uuid
 
-from PySide6.QtCore import QObject, Signal, QTimer
+from PySide6.QtCore import QObject, Signal, QTimer, Qt
+from PySide6.QtGui import QImage, QPixmap
 
 from models.query_result import GroupSection, QueryResult
 from models.notifications import ThumbnailsReady
 from models.output_copy import OutputCopyPlan
+
+
+def _pixels_to_pixmap(pixels, max_side: int) -> QPixmap:
+    """A decoded RGB uint8 frame (media.resolver.FramePayload.pixels) to a
+    QPixmap scaled to fit within max_side x max_side, keeping aspect
+    ratio.
+
+    Pure Qt, on purpose: this file must import no numpy, pandas or PIL
+    (it decodes real media now, through the injected MediaResolver, so
+    the source-decode guard applies to it -- tests/
+    test_source_decode_guard.py). `pixels` is a numpy array, but nothing
+    here imports numpy -- it only reads attributes (.shape) and calls a
+    method (.tobytes()) on the array object the resolver already handed
+    in, exactly as this module already reads attributes off a Path or a
+    QPixmap without importing pathlib or PySide6.QtGui's own module a
+    second time for that purpose.
+    """
+    height, width = pixels.shape[0], pixels.shape[1]
+    qimage = QImage(
+        pixels.tobytes(), width, height, width * 3, QImage.Format.Format_RGB888,
+    )
+    pixmap = QPixmap.fromImage(qimage)
+    return pixmap.scaled(
+        max_side, max_side,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
 
 
 class FakeController(QObject):
@@ -55,9 +90,23 @@ class FakeController(QObject):
     display_result_ready     = Signal(dict)
     table_created            = Signal(str)
 
-    def __init__(self, test_images_folder: Path):
+    def __init__(self, test_images_folder: Path, *, resolver):
         super().__init__()
 
+        # The one shared MediaResolver (media/resolver.py) -- REQUIRED,
+        # no default, matching how the real components take it (CLAUDE.md's
+        # media rule; docs/architecture.md section 9). Only _generate_thumb
+        # and render_column_value's thumbnail-not-ready fallback use it.
+        self._resolver = resolver
+
+        # Resolved to absolute up front: MediaResolver.resolve_frame()
+        # requires an absolute address (a real project always absolutises
+        # a stored cell before handing it to the resolver -- see
+        # AppController._resolve_media_cell), and FakeController has no
+        # project-root concept of its own to do that lazily, so a caller
+        # passing a relative folder (main.py's Path("test_images")) must
+        # not leak a relative path into self._metadata / self._path_map.
+        test_images_folder = Path(test_images_folder).resolve()
         self._folder = test_images_folder
 
         # Scan for real media files (images and videos).
@@ -240,40 +289,19 @@ class FakeController(QObject):
         thread.start()
 
     def _generate_thumb(self, row_id: str) -> None:
-        """Background thread: generates thumbnail using Pillow or OpenCV."""
+        """Background thread: generates a thumbnail through the injected
+        MediaResolver. One call handles both an image and a video --
+        resolve_frame() dispatches on the path's extension internally and
+        returns a representative frame either way (docs/media_architecture.md
+        section 3.3), so there is no VIDEO_EXT branch to maintain here.
+        """
         try:
-            from pathlib import Path as P
             path = self._path_map.get(row_id)
             if path is None or not path.exists():
                 return
-
-            VIDEO_EXT = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
-
-            if path.suffix.lower() in VIDEO_EXT:
-                # Extract first frame for video thumbnail.
-                import cv2
-                cap = cv2.VideoCapture(str(path))
-                ok, frame = cap.read()
-                cap.release()
-                if not ok:
-                    return
-                import cv2 as _cv2
-                frame_rgb = _cv2.cvtColor(frame, _cv2.COLOR_BGR2RGB)
-                from PIL import Image
-                img = Image.fromarray(frame_rgb)
-            else:
-                from PIL import Image
-                with Image.open(path) as img:
-                    img = img.convert("RGB")
-                    img.thumbnail((150, 150), Image.LANCZOS)
-                    self._thumb_cache[row_id] = img.copy()
-                    self._thumb_queue.append(row_id)
-                    return
-
-            img.thumbnail((150, 150), Image.LANCZOS)
-            self._thumb_cache[row_id] = img.copy()
+            payload = self._resolver.resolve_frame(str(path), "display")
+            self._thumb_cache[row_id] = _pixels_to_pixmap(payload.pixels, 150)
             self._thumb_queue.append(row_id)
-
         except Exception as e:
             print(f"[FakeController] Thumbnail error for {row_id}: {e}")
 
@@ -674,32 +702,28 @@ class FakeController(QObject):
         Renders a column value as a QPixmap (thumbnail mode) or QWidget
         (detail mode).
 
-        For media_path columns in thumbnail mode: converts the cached
-        PIL thumbnail to a QPixmap.
+        For media_path columns in thumbnail mode: uses the cached
+        thumbnail if available, otherwise resolves one directly through
+        the injected MediaResolver as a fallback.
         For media_path columns in detail mode: delegates to the real
         renderer so the video player or ZoomableImageView is returned.
         For other columns: returns a colored placeholder.
         """
         if self._column_types.get(column_name) == "media_path" and value:
             if mode == "thumbnail":
-                # Use cached PIL thumbnail if available, otherwise load from disk.
-                from column_types.renderers import _pil_to_pixmap
-                from PIL import Image
-                pil_image = self._thumb_cache.get(
-                    self._find_row_id_for_path(value)
-                )
-                if pil_image is None:
-                    # Thumbnail not ready yet — load directly from disk as fallback.
-                    try:
-                        with Image.open(value) as img:
-                            img = img.convert("RGB")
-                            img.thumbnail((size, size), Image.LANCZOS)
-                            return _pil_to_pixmap(img)
-                    except Exception:
-                        return None
-                img = pil_image.copy()
-                img.thumbnail((size, size), Image.LANCZOS)
-                return _pil_to_pixmap(img)
+                cached = self._thumb_cache.get(self._find_row_id_for_path(value))
+                if cached is not None:
+                    return cached.scaled(
+                        size, size,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                # Thumbnail not ready yet -- resolve directly as a fallback.
+                try:
+                    payload = self._resolver.resolve_frame(value, "display")
+                    return _pixels_to_pixmap(payload.pixels, size)
+                except Exception:
+                    return None
             else:
                 # detail mode — use the real renderer so images and
                 # videos display correctly even in fake mode.

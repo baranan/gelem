@@ -73,6 +73,7 @@ sys.path.insert(0, str(project_root))
 
 from ui.fake_controller import FakeController
 from ui.gallery_widget import GalleryWidget
+from media.resolver import MediaResolver
 
 
 def main():
@@ -85,7 +86,8 @@ def main():
         print("The gallery will show placeholder tiles instead of real images.")
         test_folder = project_root
 
-    controller = FakeController(test_folder)
+    resolver = MediaResolver(max_open_decoders=2)
+    controller = FakeController(test_folder, resolver=resolver)
 
     # Create the widget you want to test.
     # Change this line to test a different widget.

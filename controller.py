@@ -2268,57 +2268,35 @@ class AppController(QObject):
                 )
                 return
 
-            # FRAME: resolve every row's media cell to an absolute address
-            # HERE, once, on the main thread -- before the worker starts --
-            # so operators/operator_registry.py can hand it straight to
-            # run.resolver.resolve_frame() without resolving anything
-            # itself. OperatorRegistry has no controller access and cannot
-            # reach _resolve_media_cell; run.paths (ProjectPaths, where an
-            # operator WRITES its outputs) is the wrong base for a stored
-            # cell (where to READ one), because the two re-root on
-            # different events -- save_project() (Save As) moves
-            # self._project_paths to the new folder but deliberately
-            # leaves self._project_root where it was, since save() never
-            # rewrites the in-memory cells (see that method's own note).
-            # Using the SAME method and base the display path uses
-            # (_resolve_media_cell -> self._project_root) is therefore the
-            # only base that is correct in every project state. Mutated in
-            # place on `snapshot`, which run.data's TableSnapshot already
-            # wraps by reference (TableSnapshot never copies its frame),
-            # so both see the same absolute values.
-            if media_requirement is MediaRequirement.FRAME:
-                media_column = DEFAULT_MEDIA_COLUMN_NAME
-                if media_column in snapshot.columns:
-                    def _absolute_media_cell(cell):
-                        if _is_blank_media_cell(cell):
-                            # A genuinely blank cell (NaN, None, "" or
-                            # whitespace) must stay blank -- never
-                            # resolved into a plausible-looking absolute
-                            # path such as "<project_root>/nan".
-                            # Normalised to "" so it reaches
-                            # resolve_frame() as a value it refuses
-                            # cleanly and uniformly (MediaAddressError:
-                            # "got a relative path"), caught by the
-                            # existing per-row except in
-                            # operator_registry.py with a message that
-                            # names an empty value, not a raw NaN
-                            # resolve_frame cannot even parse.
-                            return ""
-                        try:
-                            return self._resolve_media_cell(cell)[0]
-                        except MediaAddressError:
-                            # Not a parseable address -- leave it as
-                            # stored. resolve_frame() then fails on it
-                            # exactly as a missing/malformed file always
-                            # has, and the existing per-row except in
-                            # operator_registry.py skips just this row
-                            # rather than aborting the whole run
-                            # (CLAUDE.md: "one bad row must not kill a
-                            # run").
-                            return cell
-                    snapshot[media_column] = snapshot[media_column].map(
-                        _absolute_media_cell
-                    )
+            # FRAME and ADDRESS: resolve every media-tagged column's cells
+            # to an absolute address HERE, once, on the main thread --
+            # before the worker starts -- so operators/operator_registry.py
+            # can hand a FRAME cell straight to run.resolver.resolve_frame()
+            # and an ADDRESS operator can do the same itself from metadata,
+            # without either resolving anything on its own. OperatorRegistry
+            # has no controller access and cannot reach _resolve_media_cell;
+            # run.paths (ProjectPaths, where an operator WRITES its outputs)
+            # is the wrong base for a stored cell (where to READ one),
+            # because the two re-root on different events -- save_project()
+            # (Save As) moves self._project_paths to the new folder but
+            # deliberately leaves self._project_root where it was, since
+            # save() never rewrites the in-memory cells (see that method's
+            # own note). Using the SAME method and base the display path
+            # uses (_resolve_media_cell -> self._project_root) is therefore
+            # the only base that is correct in every project state. Mutated
+            # in place on `snapshot`, which run.data's TableSnapshot already
+            # wraps by reference (TableSnapshot never copies its frame), so
+            # both see the same absolute values.
+            #
+            # Which columns to absolutise is the active table's SCHEMA --
+            # every column tagged "media_path" -- never the fixed name
+            # DEFAULT_MEDIA_COLUMN_NAME: an ADDRESS operator's metadata may
+            # hold its media reference under any column the researcher
+            # picked, or one type inference tagged on its own.
+            if media_requirement in (
+                MediaRequirement.FRAME, MediaRequirement.ADDRESS,
+            ):
+                self._absolutise_media_columns(table_name, snapshot)
 
             # The runner builds this operator's model once per worker
             # (PER_WORKER) or once per application (SHARED), but the
@@ -3003,6 +2981,50 @@ class AppController(QObject):
         Raises MediaAddressError for a value that is not an address.
         """
         return resolve_source(str(value), str(self._project_root))
+
+    def _absolutise_media_columns(
+        self, table_name: str, snapshot: pd.DataFrame,
+    ) -> None:
+        """Resolve every media-tagged column of `snapshot` to an absolute
+        address, in place, against self._project_root.
+
+        The one helper `run_create_columns` calls for both a FRAME and an
+        ADDRESS run (see the call site's own note) -- so there is exactly
+        one place that decides which columns are media (the active table's
+        TableSchema, via columns_with_tag("media_path"), the same source
+        _update_wanted_addresses() already uses) and exactly one place
+        that turns a stored cell into the absolute form a resolver call
+        needs.
+
+        A blank cell (NaN, None, "" or whitespace) is left as "" rather
+        than resolved into a plausible-looking absolute path such as
+        "<project_root>/nan" -- it then reaches resolve_frame() (or an
+        ADDRESS operator's own resolver call) as a value that is refused
+        cleanly and uniformly (MediaAddressError: "got a relative path"),
+        caught by the existing per-row except in operator_registry.py. A
+        cell that does not parse as an address at all is left exactly as
+        stored, for the same reason: resolve_frame() then fails on it
+        exactly as a missing/malformed file always has, and the existing
+        per-row except skips just that row rather than aborting the whole
+        run (CLAUDE.md: "one bad row must not kill a run").
+        """
+        schema = self._dataset.schema_for(table_name)
+        if schema is None:
+            return
+
+        def _absolute_media_cell(cell):
+            if _is_blank_media_cell(cell):
+                return ""
+            try:
+                return self._resolve_media_cell(cell)[0]
+            except MediaAddressError:
+                return cell
+
+        for spec in schema.columns_with_tag("media_path"):
+            if spec.name in snapshot.columns:
+                snapshot[spec.name] = snapshot[spec.name].map(
+                    _absolute_media_cell
+                )
 
     def get_artifact_pixmap(
         self,

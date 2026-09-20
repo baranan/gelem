@@ -54,10 +54,18 @@ stream) is skipped. A packet the edit list marks discard
 (`packet.is_discard`) is skipped too -- it is reference data the
 decoder needs but never presents, and per decision 12, frame 0 and time
 0 are the same frame, which only holds if discarded pre-roll packets
-are excluded. The index is built once per (path, stream index, file
-size, mtime) and cached for the life of the MediaResolver instance, so
-a file edited after it was indexed is re-indexed rather than served a
-stale answer. Its first entry is required to equal the epoch this
+are excluded. The index is cached per (path, stream index, file size,
+mtime) for the life of the MediaResolver instance, so a file edited
+after it was indexed is re-indexed rather than served a stale answer.
+"Cached", not "built exactly once": the cache check and the build are
+not one atomic step (`_get_frame_index` checks the cache, then builds
+outside the lock on a miss so one slow build never blocks an unrelated
+file's lookup), so two threads racing to resolve the same file's first
+`#f=` address can both demux it and both write an equivalent result --
+wasted work, not a wrong one, since the index is a pure function of the
+file (see `docs/known_defects.md`).
+
+Its first entry is required to equal the epoch this
 module already caches from decoding (P1.2a's `_get_epoch_us`); if they
 disagree, resolving raises MediaResolverError rather than silently
 choosing one of the two candidate answers.
@@ -102,6 +110,7 @@ import numpy as np
 from av.sidedata.sidedata import Type as _SideDataType
 from PIL import Image, ImageOps
 
+from media.extensions import IMAGE_EXTENSIONS
 from media.media_address import (
     MediaAddress,
     MediaAddressError,
@@ -126,13 +135,6 @@ class MediaResolverError(ValueError):
 
 _PURPOSES = ("display", "analysis")
 
-# Mirrors the image half of media/extensions.py's MEDIA_EXTENSIONS. No
-# authoritative image/video split exists yet (see docs/review/p1.2-survey.md
-# section 10's note on column_types/renderers.py's own, separate, private
-# split) -- this is this module's own minimal, local dispatch, not a claim
-# to be the authority other modules should import.
-_IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"})
-
 _DRIVE_LETTER_PATH = re.compile(r"^[A-Za-z]:/")
 
 
@@ -149,7 +151,7 @@ def _is_absolute(path: str) -> bool:
 
 
 def _is_image_path(path: str) -> bool:
-    return pathlib.PurePosixPath(path).suffix.lower() in _IMAGE_EXTENSIONS
+    return pathlib.PurePosixPath(path).suffix.lower() in IMAGE_EXTENSIONS
 
 
 # ---------------------------------------------------------------------------
@@ -564,11 +566,44 @@ class MediaResolver:
         return self._resolve_video_frame(addr, purpose, policy)
 
     def decode_video_span(
-        self, address: Union[str, MediaAddress], purpose: str
+        self, address: Union[str, MediaAddress], purpose: str,
+        *, with_ordinals: bool = False,
     ) -> Iterator[FramePayload]:
         """Decode every frame of a range or bare-path video address, in
         presentation order, as an iterator of FramePayload (decision 3's
         half-open membership; a bare path is the whole stream, decision 4).
+
+        `with_ordinals` (default False) decides whether every yielded
+        FramePayload's frame_ordinal is real or None:
+
+          * False (the default, and the only behaviour before this
+            argument existed): the cost rule applies exactly as it does
+            to resolve_frame's own #t=/bare cases -- this call does NOT
+            BUILD the per-file frame-time index, but it DOES reuse one
+            if some earlier #f= resolve (or an earlier
+            with_ordinals=True call) already built and cached it for
+            this file. frame_ordinal is None whenever no cached index
+            exists yet, real otherwise.
+          * True: the index is built (or reused, if it already exists)
+            BEFORE any frame is yielded, so every yielded frame_ordinal
+            is that frame's real, file-wide position -- never None. This
+            costs one full demux pass over the file (no decode) -- the
+            SAME cost a #f= address already pays, per the module
+            docstring's "Frame-time index" -- and that cost is normally
+            paid once per (path, stream, file size, mtime): the index is
+            cached, so a LATER with_ordinals=True span, or a #f=
+            resolve, on the same file within this resolver's lifetime
+            reuses it for free. Two calls racing to resolve the SAME
+            file's first such request can each miss the cache and each
+            pay the cost once, concurrently, before either result is
+            cached -- see the module docstring's "Frame-time index" and
+            `docs/known_defects.md`; the two results agree, so this
+            wastes work rather than producing a wrong answer. A caller
+            must not substitute counting the frames it happens to yield
+            for this: a span that starts
+            partway through a file (a #t= range) yields frames whose
+            first index is NOT 0, so an enumeration counter is only ever
+            correct by coincidence, for a bare path starting at time 0.
 
         Raises immediately -- before any file is touched -- for a
         malformed purpose or address, a relative address, a #t= point or
@@ -607,10 +642,10 @@ class MediaResolver:
                 f"looks like a still image"
             )
 
-        return self._decode_video_span_frames(addr, purpose)
+        return self._decode_video_span_frames(addr, purpose, with_ordinals)
 
     def _decode_video_span_frames(
-        self, addr: MediaAddress, purpose: str
+        self, addr: MediaAddress, purpose: str, with_ordinals: bool
     ) -> Iterator[FramePayload]:
         # Nothing above this line runs until the first next() -- this is a
         # generator function, so the pool acquire below is the lazy
@@ -622,9 +657,17 @@ class MediaResolver:
         try:
             stream = self._select_video_stream(container, addr)
             epoch_us = self._get_epoch_us(container, stream)
-            # Never builds the index (rule 3, extended to spans) -- only
-            # reused if an earlier #f= resolve already built it.
-            frame_times = self._peek_frame_index(container, stream)
+            if with_ordinals:
+                # Builds the index if it does not already exist -- the
+                # one extra demux pass with_ordinals=True's docstring
+                # promises, paid at most once per (path, stream, size,
+                # mtime).
+                frame_times = self._get_frame_index(container, stream, epoch_us)
+            else:
+                # Never builds the index (rule 3, extended to spans) --
+                # only reused if an earlier #f= resolve, or an earlier
+                # with_ordinals=True call, already built it.
+                frame_times = self._peek_frame_index(container, stream)
 
             is_bare = addr.time_range_us is None
             if is_bare:
@@ -876,6 +919,26 @@ class MediaResolver:
                 )
 
         raw_us = [_ticks_to_us(ticks, stream.time_base) for ticks in raw_ticks]
+
+        for previous, current in zip(raw_us, raw_us[1:]):
+            if previous == current:
+                # raw_ticks are strictly increasing (the check above already
+                # refused an exact tie there) but rounding to microseconds
+                # can still collapse two DISTINCT raw ticks onto the same
+                # microsecond value -- a fine enough time_base (a high
+                # sample rate) makes this a real possibility, not merely a
+                # tick-level tie under a coarser clock. The same ambiguity
+                # the raw-tick check exists to prevent, one rounding step
+                # later: refuse rather than guess which frame an ordinal or
+                # a #f= address means.
+                raise MediaResolverError(
+                    f"{path!r} stream {stream.index} has two presented "
+                    f"frames whose presentation times round to the same "
+                    f"microsecond ({current}) -- the file's timestamps "
+                    f"collide at microsecond resolution, so refusing to "
+                    f"guess which one a frame ordinal means"
+                )
+
         if raw_us[0] != epoch_us:
             raise MediaResolverError(
                 f"the frame-time index's first entry ({raw_us[0]} "

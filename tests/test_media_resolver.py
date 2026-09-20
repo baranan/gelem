@@ -809,6 +809,127 @@ def test_span_yields_frames_in_range_with_consecutive_ordinals(tmp_path):
         resolver.close()
 
 
+def test_span_with_ordinals_true_yields_real_ordinals_with_no_manual_priming(tmp_path):
+    """decode_video_span(..., with_ordinals=True) builds the per-file
+    frame-time index itself -- unlike test_span_yields_frames_in_range_
+    with_consecutive_ordinals above, this test never resolves a #f=
+    address first. The fixture's own "every pixel of frame N equals N"
+    rule is the ground truth the yielded ordinals are checked against,
+    not merely internal consistency.
+    """
+    video_path = _generate_known_frame_video(tmp_path, fps=25, duration_s=2)
+    resolver = MediaResolver(max_open_decoders=2)
+    try:
+        # Frames at indices 3..7 -- same range as test_range_policy_first.
+        range_addr = dataclasses.replace(
+            from_path(str(video_path)), time_range_us=(100_000, 300_000)
+        )
+        payloads = list(
+            resolver.decode_video_span(
+                range_addr, purpose="display", with_ordinals=True
+            )
+        )
+
+        assert [p.frame_ordinal for p in payloads] == list(range(3, 8))
+        assert [set(p.pixels.flatten().tolist()) for p in payloads] == [
+            {n} for n in range(3, 8)
+        ]
+    finally:
+        resolver.close()
+
+
+def test_span_with_ordinals_false_never_builds_the_index(tmp_path, monkeypatch):
+    """The default (with_ordinals=False) must cost nothing extra: no demux
+    pass over the whole file, for a bare path OR a #t= range. Asserted on
+    the same mechanism tests/test_media_resolver.py's own
+    test_time_point_and_bare_and_range_resolves_never_build_the_index
+    uses for resolve_frame -- counting calls to _build_frame_index,
+    the one place a demux pass actually happens.
+    """
+    video_path = _generate_known_frame_video(tmp_path, fps=25, duration_s=2)
+    resolver = MediaResolver(max_open_decoders=2)
+    build_calls = []
+    original_build = MediaResolver._build_frame_index
+
+    def _counting_build(self, container, stream, epoch_us):
+        build_calls.append(1)
+        return original_build(self, container, stream, epoch_us)
+
+    monkeypatch.setattr(MediaResolver, "_build_frame_index", _counting_build)
+    try:
+        bare_payloads = list(
+            resolver.decode_video_span(str(video_path), purpose="display")
+        )
+        assert all(p.frame_ordinal is None for p in bare_payloads)
+
+        range_addr = dataclasses.replace(
+            from_path(str(video_path)), time_range_us=(100_000, 300_000)
+        )
+        range_payloads = list(
+            resolver.decode_video_span(range_addr, purpose="display")
+        )
+        assert all(p.frame_ordinal is None for p in range_payloads)
+
+        assert build_calls == [], (
+            "with_ordinals=False (the default) must never build the "
+            "per-file frame-time index"
+        )
+    finally:
+        resolver.close()
+
+
+@pytest.mark.skipif(GELEM_FIXTURES is None, reason="GELEM_FIXTURES is not set")
+def test_span_with_ordinals_matches_resolve_frame_on_a_vfr_fixture():
+    """The phone recording (variable frame rate, real per-frame timings,
+    not a nominal frame rate) is the real input decision 8's per-file
+    index exists for. A range span's with_ordinals=True ordinals must
+    name exactly the same frames resolve_frame(#f=N) names, one at a
+    time, on the same file.
+    """
+    from media.resolver import _ticks_to_us
+
+    path = pathlib.Path(GELEM_FIXTURES) / "VID_20260826_100749315.mp4"
+    if not path.exists():
+        pytest.skip(f"expected fixture not found: {path}")
+
+    ground_truth = _full_decode(path)
+    n_frames = len(ground_truth)
+    assert n_frames > 1010, "fixture is shorter than the requested range assumes"
+
+    container = av.open(str(path))
+    time_base = container.streams.video[0].time_base
+    container.close()
+    epoch_us = _ticks_to_us(ground_truth[0][0], time_base)
+
+    start_n, end_n = 1000, 1005  # a small, arbitrary mid-file window
+    start_us = _ticks_to_us(ground_truth[start_n][0], time_base) - epoch_us
+    end_us = _ticks_to_us(ground_truth[end_n][0], time_base) - epoch_us
+
+    resolver = MediaResolver(max_open_decoders=2)
+    try:
+        range_addr = dataclasses.replace(
+            from_path(str(path)), time_range_us=(start_us, end_us)
+        )
+        span_payloads = list(
+            resolver.decode_video_span(
+                range_addr, purpose="analysis", with_ordinals=True
+            )
+        )
+        assert [p.frame_ordinal for p in span_payloads] == list(
+            range(start_n, end_n)
+        )
+
+        for payload in span_payloads:
+            frame_addr = dataclasses.replace(
+                from_path(str(path)), frame=payload.frame_ordinal
+            )
+            direct = resolver.resolve_frame(frame_addr, purpose="analysis")
+            assert direct.presentation_time_us == payload.presentation_time_us
+            np.testing.assert_array_equal(direct.pixels, payload.pixels)
+    finally:
+        resolver.close()
+
+
 def test_abandoned_span_frees_its_handle_so_a_later_resolve_succeeds(tmp_path):
     video_path = _generate_known_frame_video(tmp_path, fps=25, duration_s=2)
     resolver = MediaResolver(max_open_decoders=1)
@@ -1239,6 +1360,83 @@ def test_duplicate_presentation_time_refuses_rather_than_guesses(tmp_path):
         resolver.close()
 
 
+# ---------------------------------------------------------------------------
+# Review round 5: two DISTINCT raw ticks that round to the SAME microsecond
+# are just as ambiguous as an exact raw-tick duplicate (the check just
+# above), but no real encoder places two presented frames a fraction of a
+# microsecond apart -- video frame rates are milliseconds apart at their
+# very fastest. A genuine file cannot be made to demonstrate this the way
+# _generate_duplicate_pts_video demonstrates an exact tie, so this test
+# fabricates the one thing _build_frame_index actually reads -- a
+# container/stream pair narrow enough to demux fake packets and report a
+# fine time_base -- and calls the resolver's own, unmodified
+# _build_frame_index with it. This is the same "proxy the pieces PyAV
+# would supply" technique the pool-bound and cost-rule tests above use
+# (_FrameCountingContainer, _OpenTrackingContainer), applied to a
+# container two orders of magnitude cheaper to fake than a real decode.
+# ---------------------------------------------------------------------------
+
+class _FakePacket:
+    def __init__(self, pts, is_discard=False):
+        self.pts = pts
+        self.is_discard = is_discard
+
+
+class _FakeStream:
+    def __init__(self, time_base, index=0):
+        self.time_base = time_base
+        self.index = index
+
+
+class _FakeDemuxContainer:
+    """The minimum surface _build_frame_index actually calls: seek() (a
+    no-op here -- there is no real file position to move), demux(stream)
+    (yields the canned packets, ignoring which stream was asked for -- one
+    fake stream is all this test needs), and .name (what
+    MediaResolver._container_path reads).
+    """
+
+    def __init__(self, name, packets):
+        self.name = name
+        self._packets = packets
+
+    def seek(self, *args, **kwargs):
+        pass
+
+    def demux(self, stream):
+        return iter(self._packets)
+
+
+def test_frame_index_refuses_when_two_ticks_round_to_the_same_microsecond():
+    from fractions import Fraction
+    from media.resolver import _ticks_to_us
+
+    # time_base of 1/2,000,000 -- two ticks per microsecond -- so raw
+    # ticks 100 and 101 (a genuine, non-tied pair: 100 != 101, so the
+    # raw-tick duplicate check above does not fire) both round to
+    # microsecond 50 (100/2 = 50.0; 101/2 = 50.5, and Python's
+    # round-half-to-even rounds 50.5 down to 50). Tick 200 (-> 100us) is
+    # an unambiguous third, later frame, so this fixture isolates the
+    # rounding collision from every other refusal _build_frame_index can
+    # raise.
+    time_base = Fraction(1, 2_000_000)
+    packets = [
+        _FakePacket(pts=100),
+        _FakePacket(pts=101),
+        _FakePacket(pts=200),
+    ]
+    stream = _FakeStream(time_base)
+    container = _FakeDemuxContainer("fake_collision.mkv", packets)
+    epoch_us = _ticks_to_us(100, time_base)  # matches the first entry, 50
+
+    resolver = MediaResolver(max_open_decoders=2)
+    try:
+        with pytest.raises(MediaResolverError, match="collide at microsecond resolution"):
+            resolver._build_frame_index(container, stream, epoch_us)
+    finally:
+        resolver.close()
+
+
 def test_close_does_not_close_a_container_in_use_by_a_live_span(tmp_path):
     video_path = _generate_known_frame_video(tmp_path, fps=25, duration_s=2)  # 50 frames
     resolver = MediaResolver(max_open_decoders=2)
@@ -1415,5 +1613,354 @@ def test_decision12_frame_zero_after_edit_list_matches_time_zero(tmp_path):
         one_past_addr = dataclasses.replace(from_path(str(out_path)), frame=n_frames)
         with pytest.raises(MediaAddressError):
             resolver.resolve_frame(one_past_addr, purpose="display")
+    finally:
+        resolver.close()
+
+
+# ---------------------------------------------------------------------------
+# P1.2c-2 -- routing operators/video_frames.py and the FRAME/ADDRESS
+# per-row runner through this same resolver. These three tests reach one
+# level above media/resolver.py itself (the operator, and the
+# controller/registry layers), because that is what the work item asks
+# this file to cover for this sub-item. The controller/dataset/registry
+# scaffolding is copied from tests/test_resolver_wiring.py's own pattern
+# rather than imported, per that file's own note that the pattern is
+# copied, not shared, between the P1.2 test modules.
+# ---------------------------------------------------------------------------
+
+TEST_IMAGES = project_root / "test_images"
+
+
+def _video_frames_run(op, *, video_column, frame_step, tmp_path, resolver):
+    from operators.descriptor import ExecutionMode
+    from operators.run_context import (
+        CancellationToken, OperatorRun, OperatorRunSpec, RunData,
+    )
+    from models.project_paths import build_project_paths
+
+    mode_descriptor = op.descriptor.mode_for(ExecutionMode.TABLE)
+    spec = OperatorRunSpec(
+        operation_id="p1.2c2-test-run",
+        operator_name=op.name,
+        mode=ExecutionMode.TABLE,
+        mode_descriptor=mode_descriptor,
+        parameters={"video_column": video_column, "frame_step": frame_step},
+        target_table="",
+    )
+    return OperatorRun(
+        spec=spec,
+        data=RunData(tables={}, projects={}),
+        paths=build_project_paths(tmp_path / "project", is_workspace=False),
+        resolver=resolver,
+        _token=CancellationToken(),
+    )
+
+
+def test_video_frames_bare_path_and_time_range_give_real_frame_numbers(tmp_path):
+    """(a) A bare video path walks the whole file, keeping every Nth frame
+    (frame_step=2 keeps 0, 2, 4, ...); a #t= range walks only the frames
+    that range contains (decision 3), still keeping every Nth of THOSE.
+    frame_number in both cases is the frame's real, file-wide position
+    (payload.frame_ordinal), not a position local to the range.
+    """
+    import pandas as pd
+    from operators.video_frames import VideoFramesOperator
+
+    # fps=10, duration_s=2 -> 20 frames at t = 0.0, 0.1, ..., 1.9 seconds,
+    # each frame's every pixel equal to its (bare-path) ordinal.
+    video_path = _generate_known_frame_video(
+        tmp_path, width=32, height=32, fps=10, duration_s=2
+    )
+    op = VideoFramesOperator()
+    resolver = MediaResolver(max_open_decoders=4)
+    try:
+        # -- Bare path: every one of the 20 frames is in range; step 2
+        #    keeps ordinals 0, 2, 4, ..., 18. --
+        df = pd.DataFrame([{"row_id": "r1", "full_path": str(video_path)}])
+        run = _video_frames_run(
+            op, video_column="full_path", frame_step=2, tmp_path=tmp_path,
+            resolver=resolver,
+        )
+        result = op.create_table(df, run)
+        assert list(result["frame_number"]) == list(range(0, 20, 2))
+        for _, row in result.iterrows():
+            pixel = np.asarray(Image.open(row["full_path"]).convert("L"))
+            # JPEG re-encode of a uniform field: the known-frame fixture's
+            # "every pixel of frame N equals N" rule survives to within a
+            # couple of levels, never enough to be mistaken for a
+            # different frame's value.
+            assert abs(int(pixel.max()) - row["frame_number"]) <= 2
+
+        # -- #t= range 0.5-1.0 (half-open) contains ordinals 5..9; step 2
+        #    keeps the 1st and 3rd and 5th MEMBERS OF THAT RANGE -- real
+        #    ordinals 5, 7, 9, not a range-local 0, 2, 4. --
+        df_range = pd.DataFrame(
+            [{"row_id": "r1", "full_path": f"{video_path.as_posix()}#t=0.5-1.0"}]
+        )
+        run_range = _video_frames_run(
+            op, video_column="full_path", frame_step=2, tmp_path=tmp_path,
+            resolver=resolver,
+        )
+        result_range = op.create_table(df_range, run_range)
+        assert list(result_range["frame_number"]) == [5, 7, 9]
+        for _, row in result_range.iterrows():
+            pixel = np.asarray(Image.open(row["full_path"]).convert("L"))
+            assert abs(int(pixel.max()) - row["frame_number"]) <= 2
+    finally:
+        resolver.close()
+
+
+def _run_columns_and_wait(controller, operator_name, row_ids, monkeypatch):
+    """Start a create_columns run, join every worker thread it spawned,
+    then pump the controller's drain by hand (no Qt event loop here) --
+    copied from tests/test_resolver_wiring.py's helper of the same name.
+    """
+    created: list[threading.Thread] = []
+    real_thread = threading.Thread
+
+    class _Tracked(real_thread):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            created.append(self)
+
+    monkeypatch.setattr(threading, "Thread", _Tracked)
+    try:
+        controller.run_create_columns(operator_name, row_ids)
+    finally:
+        monkeypatch.setattr(threading, "Thread", real_thread)
+
+    for thread in created:
+        thread.join(timeout=10)
+        assert not thread.is_alive(), "worker thread did not finish in time"
+
+    for _ in range(4):
+        controller._drain_queues()
+
+
+def _make_frame_recording_operator():
+    """A minimal FRAME-requirement COLUMNS operator, recording the media
+    it is handed per row_id (absent for a row_id the runner refused).
+    """
+    from operators.base import BaseOperator
+    from operators.descriptor import (
+        ExecutionMode, InputKind, InputSpec, MediaRequirement,
+        ModeDescriptor, OperatorDescriptor, OutputColumn, OutputSpec,
+    )
+
+    class _FrameRecordingOperator(BaseOperator):
+        def __init__(self):
+            super().__init__()
+            self.name = "p1_2c2_frame_recorder"
+            self.descriptor = OperatorDescriptor(
+                name=self.name,
+                version="1.0",
+                description="Test double recording the media it is handed.",
+                modes=(
+                    ModeDescriptor(
+                        mode=ExecutionMode.COLUMNS,
+                        label="Recording",
+                        inputs=(
+                            InputSpec(
+                                name="active_table", label="Active table",
+                                kind=InputKind.ACTIVE_TABLE,
+                            ),
+                        ),
+                        media_requirement=MediaRequirement.FRAME,
+                        parameters=(),
+                        output=OutputSpec(
+                            columns=(OutputColumn(name="out", type_tag="numeric"),)
+                        ),
+                    ),
+                ),
+            )
+            self.media_by_row: dict = {}
+
+        def create_columns(self, row_id, media, metadata, run):
+            self.media_by_row[row_id] = media
+            return {"out": 1.0}
+
+    return _FrameRecordingOperator()
+
+
+def _make_frame_controller(tmp_path, resolver):
+    from models.dataset import Dataset
+    from models.query_engine import QueryEngine
+    from artifacts.artifact_store import ArtifactStore
+    from column_types.registry import ColumnTypeRegistry
+    from operators.operator_registry import OperatorRegistry
+    from controller import AppController
+
+    store = ArtifactStore(tmp_path / "artifacts", resolver=resolver)
+    registry = ColumnTypeRegistry()
+    registry.setup_defaults(store)
+    dataset = Dataset()
+    dataset.load_folder(TEST_IMAGES)
+    op_registry = OperatorRegistry()
+    controller = AppController(
+        dataset, QueryEngine(), store, registry, op_registry, resolver=resolver
+    )
+    controller.set_filters([])
+    return controller, dataset, op_registry
+
+
+def test_frame_run_refuses_a_whole_video_row_but_still_processes_an_image_row(
+    tmp_path, monkeypatch
+):
+    """(b) A FRAME operator declares that it reads one addressed frame. A
+    row whose media cell is a BARE video path names no frame at all, so
+    the per-row runner must refuse it (rather than silently decoding that
+    video's first frame) while an ordinary image row in the same run is
+    unaffected.
+    """
+    resolver = MediaResolver(max_open_decoders=4)
+    try:
+        controller, dataset, op_registry = _make_frame_controller(tmp_path, resolver)
+        row_ids = controller.get_visible_row_ids()
+        image_row_id = row_ids[0]
+        video_row_id = row_ids[1]
+
+        video_path = _generate_known_frame_video(tmp_path, fps=10, duration_s=1)
+        dataset.apply_row_updates(
+            "frames", {video_row_id: {"full_path": str(video_path)}}
+        )
+
+        op = _make_frame_recording_operator()
+        op_registry.register(op)
+        _run_columns_and_wait(
+            controller, op.name, [image_row_id, video_row_id], monkeypatch
+        )
+
+        assert image_row_id in op.media_by_row, (
+            "the image row must still be processed"
+        )
+        assert video_row_id not in op.media_by_row, (
+            "a bare video path names no single frame -- the runner must "
+            "refuse it rather than default to that video's first frame"
+        )
+    finally:
+        resolver.close()
+
+
+def test_address_run_resolves_a_relative_cell_in_a_non_full_path_media_column(
+    tmp_path, monkeypatch
+):
+    """(c) An ADDRESS-requirement operator resolves its own media from
+    metadata. The controller's pre-resolution (AppController.
+    _absolutise_media_columns) must reach every column the active table's
+    schema tags media_path -- not only a column literally named
+    "full_path" -- so a relative cell in a differently-named media column
+    still resolves against the project root before the operator reads it.
+    """
+    from operators.base import BaseOperator
+    from operators.descriptor import (
+        ExecutionMode, InputKind, InputSpec, MediaRequirement,
+        ModeDescriptor, OperatorDescriptor, OutputColumn, OutputSpec,
+    )
+    from models.dataset import Dataset
+    from models.query_engine import QueryEngine
+    from artifacts.artifact_store import ArtifactStore
+    from column_types.registry import ColumnTypeRegistry
+    from operators.operator_registry import OperatorRegistry
+    from controller import AppController
+
+    class _AddressRecordingOperator(BaseOperator):
+        def __init__(self):
+            super().__init__()
+            self.name = "p1_2c2_address_recorder"
+            self.descriptor = OperatorDescriptor(
+                name=self.name,
+                version="1.0",
+                description="Resolves its own media from a non-full_path column.",
+                modes=(
+                    ModeDescriptor(
+                        mode=ExecutionMode.COLUMNS,
+                        label="Recording",
+                        inputs=(
+                            InputSpec(
+                                name="active_table", label="Active table",
+                                kind=InputKind.ACTIVE_TABLE,
+                            ),
+                        ),
+                        media_requirement=MediaRequirement.ADDRESS,
+                        parameters=(),
+                        output=OutputSpec(
+                            columns=(OutputColumn(name="out", type_tag="numeric"),)
+                        ),
+                    ),
+                ),
+            )
+            self.pixels_by_row: dict = {}
+
+        def create_columns(self, row_id, media, metadata, run):
+            payload = run.resolver.resolve_frame(metadata["clip"], "analysis")
+            self.pixels_by_row[row_id] = payload.pixels
+            return {"out": 1.0}
+
+    project_root_dir = tmp_path / "project_root"
+    (project_root_dir / "videos").mkdir(parents=True)
+    video_path = project_root_dir / "videos" / "known_frames.mkv"
+    _run_ffmpeg([
+        "-f", "lavfi", "-i", "color=c=black:s=16x16:r=5:d=1",
+        "-vf", "format=gray,geq=lum=0",
+        "-pix_fmt", "gray", "-c:v", "ffv1",
+        str(video_path),
+    ])
+
+    import pandas as pd
+
+    csv_path = project_root_dir / "data.csv"
+    pd.DataFrame({
+        "clip": ["videos/known_frames.mkv"],
+        "label": ["x"],
+    }).to_csv(csv_path, index=False)
+
+    resolver = MediaResolver(max_open_decoders=4)
+    try:
+        store = ArtifactStore(tmp_path / "artifacts", resolver=resolver)
+        registry = ColumnTypeRegistry()
+        registry.setup_defaults(store)
+        dataset = Dataset()
+        op_registry = OperatorRegistry()
+        controller = AppController(
+            dataset, QueryEngine(), store, registry, op_registry, resolver=resolver
+        )
+
+        # image_column=None: no full_path is set from a chosen column, but
+        # every CSV column is still copied verbatim onto each row -- so
+        # "clip" survives as its own column and, since its value has a
+        # directory separator and a media extension, type inference tags
+        # it media_path on accept (models/table_schema.py's
+        # _looks_like_media_path).
+        controller.load_csv_as_primary(csv_path, image_column=None)
+        row_id = controller.get_visible_row_ids()[0]
+
+        stored_cell = dataset.get_row(row_id, "frames")["clip"]
+        assert "/" in stored_cell, (
+            f"test setup did not produce a relative media cell: {stored_cell!r}"
+        )
+        schema = dataset.schema_for("frames")
+        media_columns = {spec.name for spec in schema.columns_with_tag("media_path")}
+        assert "clip" in media_columns, (
+            f"'clip' was not inferred as a media_path column: {media_columns!r}"
+        )
+        assert controller._project_root == project_root_dir
+
+        op = _AddressRecordingOperator()
+        op_registry.register(op)
+        _run_columns_and_wait(controller, op.name, [row_id], monkeypatch)
+
+        assert row_id in op.pixels_by_row, (
+            "the ADDRESS operator could not resolve its own media -- the "
+            "relative cell in the non-full_path 'clip' column was never "
+            "absolutised against the project root before the run started"
+        )
+        assert op.pixels_by_row[row_id].max() <= 2, (
+            "resolved to something other than the all-black known-frame "
+            "video"
+        )
+
+        # Dataset's own stored cell is untouched -- absolutisation happens
+        # on the run's private snapshot, never on the stored table.
+        assert dataset.get_row(row_id, "frames")["clip"] == stored_cell
     finally:
         resolver.close()
