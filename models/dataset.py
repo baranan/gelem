@@ -1457,19 +1457,34 @@ class Dataset:
         report._target_key  = target_key
         return report
 
-    def confirm_merge(self, report: MergeReport) -> None:
+    def confirm_merge(
+        self, report: MergeReport, expand_table_name: str | None = None,
+    ) -> None:
         """
         Commits the merge described in the MergeReport.
 
         When report.would_expand is set, merge_csv() built an offer to
         create a NEW table rather than an in-place join -- see
-        MergeReport's docstring. This method then creates
-        report.expand_table_name from report._pending_expand_df and
-        NEVER writes to report.target_table: one participant video is
-        one row of, say, "frames", and replacing that row with many
-        trial rows would destroy the identity other tables reference
-        (docs/architecture.md §4.2). It refuses -- raising, not silently
-        overwriting -- when a table already exists under that name.
+        MergeReport's docstring. This method then creates that table from
+        report._pending_expand_df and NEVER writes to report.target_table:
+        one participant video is one row of, say, "frames", and replacing
+        that row with many trial rows would destroy the identity other
+        tables reference (docs/architecture.md §4.2). It refuses --
+        raising, not silently overwriting -- when a table already exists
+        under that name.
+
+        expand_table_name (table-name-validation round 4) is the name to
+        create that table under. None -- every caller before this round,
+        and every caller since that has no opinion -- means "use
+        report.expand_table_name", merge_csv()'s own raw
+        f"{target}_expanded" suggestion (models/dataset.py's
+        _default_expand_table_name). A caller that resolved or let the
+        researcher choose a different name (ui/merge_report_dialog.py, via
+        AppController.confirm_merge()) passes it explicitly instead.
+        Either way this method never writes back to `report` -- the
+        report object is read-only to it, same as always; a caller that
+        wants to know the researcher's choice keeps it itself (see
+        MergeReportDialog.chosen_expand_table_name).
 
         The new table's carried columns (report.expand_carried_columns,
         from Dataset.columns_to_carry() minus target_key -- see
@@ -1497,21 +1512,30 @@ class Dataset:
         apply to a column _prepare_table sees as new (see
         _prepare_table's docstring). When csv_key and target_key share a
         name, the join produces one column, not two, and there is
-        nothing new to hint.
+        nothing new to hint. expand_table_name is meaningless here and
+        simply ignored, since this path never creates a new table.
 
         Args:
             report: The MergeReport returned by merge_csv().
+            expand_table_name: The name for the expansion offer's new
+                table, or None to use report.expand_table_name.
 
         Raises:
-            ValueError: report.would_expand is set and a table named
-                report.expand_table_name already exists.
+            ValueError: report.would_expand is set and a table already
+                exists under the name this call resolves to (either
+                expand_table_name, or report.expand_table_name when it
+                is None).
         """
         if report.would_expand:
             if report._pending_expand_df is None:
                 return
-            if report.expand_table_name in self._tables:
+            table_name = (
+                expand_table_name if expand_table_name is not None
+                else report.expand_table_name
+            )
+            if table_name in self._tables:
                 raise ValueError(
-                    f"Cannot create table {report.expand_table_name!r}: a "
+                    f"Cannot create table {table_name!r}: a "
                     f"table with that name already exists."
                 )
             hints = {report._csv_key: ColumnHint(role=ColumnRole.identifier)}
@@ -1530,13 +1554,13 @@ class Dataset:
                 0, "row_id", [self._next_id() for _ in range(len(result))]
             )
             self._accept_table(
-                report.expand_table_name, result,
+                table_name, result,
                 hints=hints,
                 source="confirm_merge_expand",
             )
             self.provenance.record("confirm_merge_expand", {
                 "target_table": report.target_table,
-                "new_table": report.expand_table_name,
+                "new_table": table_name,
                 "n_rows": len(result),
                 "carried_columns": report.expand_carried_columns,
             })

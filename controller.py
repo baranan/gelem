@@ -54,6 +54,7 @@ from operators.run_context import (
     RunData,
     TableSnapshot,
 )
+from table_names import resolve_table_name
 
 DEFAULT_MEDIA_COLUMN_NAME = "full_path"
 
@@ -352,30 +353,6 @@ def format_row_error_summary(
         f'"{label}" finished, but {n} row(s) hit unexpected errors.\n\n'
         f"Error types seen:\n" + "\n".join(lines) + "\n\n" + tail
     )
-
-
-def resolve_table_name(suggested: str, existing) -> str:
-    """The name a TABLE-mode run's result should actually be stored under
-    (fix round, item 1): `suggested` itself if it is free, otherwise
-    `suggested` suffixed `_1`, `_2`, ... up to the first free one --
-    `existing` is checked with `in`, so a set is cheapest, though a list or
-    a dict's keys work too.
-
-    This is the ONE place that picks a fresh name; Dataset.create_table_from_df
-    (item 2) refuses a collision outright rather than working around it, so
-    every caller that wants a table to land under a name close to what it
-    asked for, rather than fail, resolves it through this function first.
-    Qt-free, per the two-layer pattern format_row_error_summary and
-    format_cancel_message above already use -- this is the arithmetic half;
-    format_table_name_changed_message below is the wording half, for when
-    the resolved name surprises the researcher.
-    """
-    if suggested not in existing:
-        return suggested
-    n = 1
-    while f"{suggested}_{n}" in existing:
-        n += 1
-    return f"{suggested}_{n}"
 
 
 def _new_table_name_param(mode_descriptor):
@@ -2415,7 +2392,7 @@ class AppController(QObject):
         except Exception as e:
             self.error_occurred.emit(f"Failed to read CSV: {e}")
 
-    def confirm_merge(self, report) -> None:
+    def confirm_merge(self, report, expand_table_name: str | None = None) -> None:
         """
         Commits a CSV merge after the researcher reviews the report.
 
@@ -2426,14 +2403,30 @@ class AppController(QObject):
         than columns_updated, and does not refresh the current result
         since the active table did not change.
 
+        expand_table_name (table-name-validation round 4) is forwarded to
+        Dataset.confirm_merge() unchanged -- None means "use
+        report.expand_table_name", exactly as there. table_created is
+        emitted with the name ACTUALLY USED: this parameter's own value
+        when the caller gave one (ui/main_window.py always does, reading
+        it live off the dialog -- see MergeReportDialog.chosen_expand_table_name),
+        falling back to report.expand_table_name only when it is None --
+        never read back off `report` when a name WAS given, since this
+        dialog no longer writes one there at all.
+
         Args:
             report: The MergeReport returned by merge_csv().
+            expand_table_name: The name for the expansion offer's new
+                table, or None to use report.expand_table_name.
         """
         try:
-            self._dataset.confirm_merge(report)
+            self._dataset.confirm_merge(report, expand_table_name)
             if report.would_expand:
+                stored_name = (
+                    expand_table_name if expand_table_name is not None
+                    else report.expand_table_name
+                )
                 self.tables_updated.emit(self._dataset.list_tables())
-                self.table_created.emit(report.expand_table_name)
+                self.table_created.emit(stored_name)
             else:
                 self.columns_updated.emit(self.get_column_names())
                 self._refresh_result()

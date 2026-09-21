@@ -342,7 +342,26 @@ class FakeController(QObject):
         )
         self.merge_report_ready.emit(report)
 
-    def confirm_merge(self, report) -> None:
+    def confirm_merge(self, report, expand_table_name: str | None = None) -> None:
+        # table-name-validation round 5 (narrowed in round 6):
+        # ui/main_window.py always calls
+        # confirm_merge(report, dialog.chosen_expand_table_name) now, so
+        # this must at least accept the same arguments AppController
+        # does. Round 5 raised unconditionally, which broke the ORDINARY
+        # merge case: load_csv() above already fakes a real result for
+        # that path (no would_expand, matched_rows set, nothing pending
+        # to commit beyond the fake UI refresh below), so that path is
+        # restored exactly as it was before round 5. Only an expansion
+        # offer has nothing honest to fake -- report.would_expand is
+        # never set by load_csv() today, so this branch is not reachable
+        # through the fake controller's own flow yet, but stays as a
+        # deliberate refusal rather than silently building a fake new
+        # table if that ever changes.
+        if report.would_expand:
+            raise NotImplementedError(
+                "--fake-data mode does not support merging. Run the real "
+                "application to merge a CSV."
+            )
         self.columns_updated.emit(list(self._column_types.keys()))
         self._emit_result(self._visible_ids)
 

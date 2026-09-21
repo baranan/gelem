@@ -42,6 +42,7 @@ from operators.descriptor import (
     InputKind,
     InputSpec,
     ModeDescriptor,
+    NewTableNameParameter,
     NumberParameter,
     OutputSpec,
     TextParameter,
@@ -337,6 +338,15 @@ class _FakeController:
     def get_active_table(self):
         return "frames"
 
+    def get_table_names(self):
+        # table-name-validation, round 2: _show_scope_and_params_dialog
+        # now calls this unconditionally whenever the mode declares any
+        # parameters, to build ParameterDialog's existing_table_names --
+        # every test below that reaches that branch needs it to exist.
+        # A test that cares about a specific collision overrides this on
+        # its own controller instance.
+        return ["frames"]
+
     def get_column_names(self, table_name=None):
         return ["age", "clip"]
 
@@ -471,7 +481,8 @@ class _RealSpecsParameterDialog:
     """
 
     def __init__(
-        self, mode_descriptor, columns_by_input, parent=None, advice_provider=None
+        self, mode_descriptor, columns_by_input, parent=None, advice_provider=None,
+        existing_table_names=(),
     ):
         build_field_specs(mode_descriptor, columns_by_input)
 
@@ -524,7 +535,8 @@ class _RealAdviceParameterDialog:
     """
 
     def __init__(
-        self, mode_descriptor, columns_by_input, parent=None, advice_provider=None
+        self, mode_descriptor, columns_by_input, parent=None, advice_provider=None,
+        existing_table_names=(),
     ):
         specs = build_field_specs(mode_descriptor, columns_by_input)
         # The advice a buggy or mistaken refine_form might return: it
@@ -1424,3 +1436,430 @@ def test_dismissing_the_picker_cancels_nothing(qapp, monkeypatch):
     assert len(input_calls) == 1
     assert controller.cancel_run_calls == []
     assert info_calls == []
+
+
+# ===========================================================================
+# table-name-validation: a taken NewTableNameParameter name disables OK and
+# shows a red message under the field, live, on every keystroke -- and
+# re-enables OK the moment the name is changed to a free one.
+# ===========================================================================
+
+def _new_table_name_mode(*, default="segments"):
+    """A TABLE mode with a single NewTableNameParameter field."""
+    return ModeDescriptor(
+        mode=ExecutionMode.TABLE,
+        label="Cut into segments",
+        inputs=(_SOURCE_INPUT,),
+        parameters=(
+            NewTableNameParameter(
+                name="output_table", label="New table name", default=default,
+            ),
+        ),
+        output=OutputSpec(creates_table=True),
+    )
+
+
+def test_ok_is_disabled_on_a_taken_name_and_re_enabled_on_a_free_one(qapp):
+    dialog = ParameterDialog(
+        _new_table_name_mode(),
+        _COLUMNS_BY_INPUT,
+        existing_table_names=("frames", "segments"),
+    )
+    field = dialog._widgets["output_table"]
+
+    # The dialog is constructed but never exec()'d/shown() (the pattern
+    # every other widget test in this file follows), so a child widget's
+    # isVisible() always reads False regardless of what setVisible() was
+    # called with -- isHidden() is the flag this code actually set. See
+    # test_ok_re_enables_when_an_allowed_value_is_picked above for the
+    # same distinction on the shared _message_label.
+    error_label = dialog._table_name_error_labels["output_table"]
+
+    # The declared default itself is already taken -- table-name-validation
+    # is a live check, not something limited to a hand-typed collision, so
+    # this must catch it on construction, before any edit.
+    assert dialog._ok_button.isEnabled() is False
+    assert error_label.isHidden() is False
+    assert "segments" in error_label.text()
+
+    # Editing to another taken name changes nothing about the block.
+    field.setText("frames")
+    assert dialog._ok_button.isEnabled() is False
+
+    # Would still pass if violated? No. If the live check only ran once,
+    # at construction, this edit to a free name would leave OK disabled.
+    field.setText("segments_2")
+    assert dialog._ok_button.isEnabled() is True
+    assert error_label.isHidden() is True
+
+    # And back to a taken name blocks again.
+    field.setText("frames")
+    assert dialog._ok_button.isEnabled() is False
+
+
+def test_taken_name_check_never_reaches_refine_form(qapp):
+    # An operator must never be given a way to learn which tables exist
+    # (CLAUDE.md). The advice_provider is the operator's own refine_form;
+    # this proves the table-name collision is decided without ever
+    # consulting it -- the provider here declares no opinion at all about
+    # output_table, and OK is still blocked on a taken name.
+    calls: list[dict] = []
+
+    def _advice_provider(raw_values):
+        calls.append(dict(raw_values))
+        return FormAdvice()
+
+    dialog = ParameterDialog(
+        _new_table_name_mode(default="free_name"),
+        _COLUMNS_BY_INPUT,
+        advice_provider=_advice_provider,
+        existing_table_names=("segments",),
+    )
+    assert dialog._ok_button.isEnabled() is True
+
+    dialog._widgets["output_table"].setText("segments")
+    assert dialog._ok_button.isEnabled() is False
+
+    # The provider was called (it drives the rest of the form), but never
+    # told "the name is taken" -- it only ever sees the raw field values,
+    # the same thing it always saw, and returned no opinion either way.
+    assert calls
+    assert all(call.get("output_table") in ("free_name", "segments") for call in calls)
+
+
+def test_default_existing_table_names_leaves_the_form_unblocked(qapp):
+    # No existing_table_names given (the pre-item behaviour): the field
+    # never reads as "taken", whatever the default is.
+    dialog = ParameterDialog(_new_table_name_mode(), _COLUMNS_BY_INPUT)
+    assert dialog._ok_button.isEnabled() is True
+    # isHidden(), not isVisible() -- the dialog is never shown, so
+    # isVisible() reads False regardless of what setVisible() was called
+    # with (see test_ok_is_disabled_on_a_taken_name_and_re_enabled_on_a_free_one).
+    assert dialog._table_name_error_labels["output_table"].isHidden() is True
+
+
+# ===========================================================================
+# table-name-validation, round 2: MainWindow._show_scope_and_params_dialog
+# actually wires existing_table_names through, and the REAL dialog it
+# builds genuinely blocks OK on a taken name -- not just that the argument
+# was forwarded.
+# ===========================================================================
+
+class _CapturingRealParameterDialog(ParameterDialog):
+    """The REAL ParameterDialog -- real widgets, real OK-button and
+    per-field label logic -- with exec() short-circuited to "cancelled"
+    so the test never enters an actual modal loop, and every instance
+    built kept so the test can inspect it afterwards.
+
+    Deliberately NOT a spy that skips construction (like
+    _ParameterDialogSpy above): the whole point here is to prove the real
+    _render_table_name_validation machinery reacts to what MainWindow
+    passed in, which only the real class can show.
+    """
+
+    instances: list = []
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        _CapturingRealParameterDialog.instances.append(self)
+
+    def exec(self):
+        return 0
+
+
+def test_the_real_dialog_built_by_main_window_blocks_ok_on_a_taken_name(
+    qapp, monkeypatch,
+):
+    # Proves the WIRING produces the real BEHAVIOUR: MainWindow calls the
+    # controller's get_table_names() and the REAL ParameterDialog it
+    # builds from the result genuinely blocks OK when the declared
+    # default collides with an existing table name. A test that only
+    # checked "the constructor received existing_table_names=[...]"
+    # would still pass if _render_table_name_validation were deleted
+    # entirely; this would not.
+    from operators.descriptor import OperatorDescriptor
+
+    descriptor = OperatorDescriptor(
+        name="segment_demo",
+        version="1.0",
+        description="cuts into segments",
+        modes=(
+            ModeDescriptor(
+                mode=ExecutionMode.TABLE,
+                label="Cut into segments",
+                inputs=(_SOURCE_INPUT,),
+                parameters=(
+                    NewTableNameParameter(
+                        name="output_table", label="New table name",
+                        default="segments",
+                    ),
+                ),
+                output=OutputSpec(creates_table=True),
+            ),
+        ),
+    )
+    controller = _FakeController(_Operator(descriptor, name="segment_demo"))
+    # "segments" -- the declared default -- is already taken.
+    controller.get_table_names = lambda: ["frames", "segments"]
+
+    _CapturingRealParameterDialog.instances.clear()
+    monkeypatch.setattr(main_window_module, "RunOperatorDialog", _FakeScopeDialog)
+    monkeypatch.setattr(
+        main_window_module, "ParameterDialog", _CapturingRealParameterDialog
+    )
+    # A bare MainWindow.__new__() (the pattern _bare_window uses above)
+    # never runs QMainWindow's own __init__, so it is not a valid Qt
+    # parent object -- fine for the fake dialog stand-ins, which never
+    # touch `parent`, but the REAL ParameterDialog's QDialog.__init__(parent)
+    # needs one. QMainWindow.__init__ is run directly instead of
+    # MainWindow's own (which would build the whole real UI).
+    from PySide6.QtWidgets import QMainWindow
+    window = MainWindow.__new__(MainWindow)
+    QMainWindow.__init__(window)
+    window._controller = controller
+    monkeypatch.setattr(window, "_collect_selected_row_ids", lambda: [], raising=False)
+    monkeypatch.setattr(window, "_collect_visible_row_ids", lambda: [], raising=False)
+    monkeypatch.setattr(window, "_on_error", lambda *a: None, raising=False)
+
+    window._show_scope_and_params_dialog("segment_demo", ExecutionMode.TABLE)
+
+    # Would still pass if violated? No. If MainWindow forgot to pass
+    # existing_table_names, or passed the wrong thing (an empty list, the
+    # visible table's name instead of the project's), the real dialog
+    # would build with OK enabled and no message shown.
+    assert len(_CapturingRealParameterDialog.instances) == 1
+    dialog = _CapturingRealParameterDialog.instances[0]
+    assert dialog._ok_button.isEnabled() is False
+    error_label = dialog._table_name_error_labels["output_table"]
+    assert error_label.isHidden() is False
+    assert "segments" in error_label.text()
+
+
+def test_the_real_dialog_built_by_main_window_allows_a_free_name(qapp, monkeypatch):
+    # The mirror case: nothing collides, so OK opens enabled.
+    from operators.descriptor import OperatorDescriptor
+
+    descriptor = OperatorDescriptor(
+        name="segment_demo2",
+        version="1.0",
+        description="cuts into segments",
+        modes=(
+            ModeDescriptor(
+                mode=ExecutionMode.TABLE,
+                label="Cut into segments",
+                inputs=(_SOURCE_INPUT,),
+                parameters=(
+                    NewTableNameParameter(
+                        name="output_table", label="New table name",
+                        default="segments",
+                    ),
+                ),
+                output=OutputSpec(creates_table=True),
+            ),
+        ),
+    )
+    controller = _FakeController(_Operator(descriptor, name="segment_demo2"))
+    controller.get_table_names = lambda: ["frames"]
+
+    _CapturingRealParameterDialog.instances.clear()
+    monkeypatch.setattr(main_window_module, "RunOperatorDialog", _FakeScopeDialog)
+    monkeypatch.setattr(
+        main_window_module, "ParameterDialog", _CapturingRealParameterDialog
+    )
+    from PySide6.QtWidgets import QMainWindow
+    window = MainWindow.__new__(MainWindow)
+    QMainWindow.__init__(window)
+    window._controller = controller
+    monkeypatch.setattr(window, "_collect_selected_row_ids", lambda: [], raising=False)
+    monkeypatch.setattr(window, "_collect_visible_row_ids", lambda: [], raising=False)
+    monkeypatch.setattr(window, "_on_error", lambda *a: None, raising=False)
+
+    window._show_scope_and_params_dialog("segment_demo2", ExecutionMode.TABLE)
+
+    dialog = _CapturingRealParameterDialog.instances[0]
+    assert dialog._ok_button.isEnabled() is True
+    assert dialog._table_name_error_labels["output_table"].isHidden() is True
+
+
+# ===========================================================================
+# table-name-validation round 3: ui/merge_report_dialog.py's expand-table-name
+# box gets the same red-text treatment. Placed here, not in
+# tests/test_merge_expansion.py, because these tests realise a real
+# MergeReportDialog widget -- tests/test_merge_expansion.py stays Qt-free
+# (it only calls Layer A functions on a duck-typed report) and this file is
+# already isolated in run_tests.py's WIDGET_MODULES for exactly that reason;
+# adding a newly-widget-realising module elsewhere would need run_tests.py
+# updated too, which is outside this item's allowed files.
+# ===========================================================================
+
+class _FakeExpandReport:
+    """Duck-typed stand-in for MergeReport -- ui/merge_report_dialog.py
+    never imports the real class (see its own module docstring)."""
+
+    def __init__(self, **kwargs):
+        self.target_table = "source"
+        self.total_csv_rows = 5
+        self.total_target_rows = 2
+        self.matched_rows = 5
+        self.unmatched_target_rows = []
+        self.unmatched_csv_rows = []
+        self.duplicate_keys_target = []
+        self.duplicate_keys_csv = []
+        self.would_expand = ["p07"]
+        self.float_key_warning = None
+        self.expand_table_name = "source_expanded"
+        self.expand_row_count = 5
+        self.expand_carried_columns = []
+        self.__dict__.update(kwargs)
+
+
+def test_merge_report_dialog_blocks_proceed_on_a_taken_expand_name(qapp):
+    from ui.merge_report_dialog import MergeReportDialog
+
+    report = _FakeExpandReport()
+    dialog = MergeReportDialog(
+        report, existing_table_names=("frames", "source_expanded"),
+    )
+
+    # "source_expanded" (the report's own suggestion) is taken, so the box
+    # opens on the resolved, genuinely free name -- resolve_table_name can
+    # never itself open the box already blocked.
+    assert dialog._name_box.text() == "source_expanded_1"
+    assert dialog._proceed_btn.isEnabled() is True
+    assert dialog._name_error_label.isHidden() is True
+
+    # The researcher types over it with a name that IS taken.
+    dialog._name_box.setText("frames")
+    assert dialog._proceed_btn.isEnabled() is False
+    assert dialog._name_error_label.isHidden() is False
+    assert "frames" in dialog._name_error_label.text()
+
+    # Would still pass if violated? No. If the live check only ran once,
+    # at construction, this edit to a free name would leave Proceed
+    # disabled.
+    dialog._name_box.setText("participant_trials")
+    assert dialog._proceed_btn.isEnabled() is True
+    assert dialog._name_error_label.isHidden() is True
+
+    # A blank name is refused too, even though nothing collides.
+    dialog._name_box.setText("   ")
+    assert dialog._proceed_btn.isEnabled() is False
+    assert dialog._name_error_label.isHidden() is False
+    # table-name-validation round 6: the disabled button's own label must
+    # not read "Create ''" -- a blank name gets a plain fallback label
+    # instead of a quoted empty string.
+    assert dialog._proceed_btn.text() == "Create the new table"
+
+
+def test_merge_report_dialog_has_no_name_box_for_an_ordinary_merge(qapp):
+    from ui.merge_report_dialog import MergeReportDialog
+
+    report = _FakeExpandReport(would_expand=[])
+    dialog = MergeReportDialog(report, existing_table_names=("frames",))
+    assert dialog._name_box is None
+    assert dialog._name_error_label is None
+
+
+def test_a_chosen_expand_name_becomes_the_stored_tables_name(qapp, tmp_path):
+    # table-name-validation round 4: proves the WIRING produces the real
+    # BEHAVIOUR through the NEW route -- a real Dataset, a real
+    # merge_csv()-produced report, a real MergeReportDialog the
+    # researcher edits, and Dataset.confirm_merge() actually storing the
+    # table under the EXPLICIT expand_table_name argument
+    # ui/main_window.py reads off dialog.chosen_expand_table_name --
+    # never by way of a mutated report field, which this test also
+    # pins by asserting the report's own attribute is untouched.
+    import pandas as pd
+    from models.dataset import Dataset
+    from ui.merge_report_dialog import MergeReportDialog
+
+    ds = Dataset()
+    ds._accept_table(
+        "source",
+        pd.DataFrame({
+            "row_id": ["1", "2"],
+            "participant_id": ["p07", "p08"],
+        }),
+        source="test",
+    )
+    csv_path = tmp_path / "trials.csv"
+    pd.DataFrame({
+        "participant_id": ["p07", "p07", "p08", "p08"],
+        "trial_num": [1, 2, 1, 2],
+    }).to_csv(csv_path, index=False)
+
+    report = ds.merge_csv(
+        csv_path, target_table="source",
+        csv_key="participant_id", target_key="participant_id",
+    )
+    assert report.would_expand
+    assert report.expand_table_name == "source_expanded"
+
+    dialog = MergeReportDialog(
+        report, existing_table_names=tuple(ds.list_tables()),
+    )
+    # Nothing collides yet, so the box opens on the bare default.
+    assert dialog._name_box.text() == "source_expanded"
+
+    # The researcher renames it and proceeds.
+    dialog._name_box.setText("participant_trials")
+    assert dialog._proceed_btn.isEnabled() is True
+    dialog._on_proceed()
+
+    # Would still pass if violated? No. This is the whole point of round
+    # 4: the dialog must never write to the report it was given. If it
+    # still did, this would read "participant_trials" instead.
+    assert report.expand_table_name == "source_expanded"
+
+    chosen = dialog.chosen_expand_table_name
+    assert chosen == "participant_trials"
+
+    ds.confirm_merge(report, chosen)
+
+    # Would still pass if violated? No -- this is the route the report
+    # mutation used to prove, now proven through the explicit argument
+    # instead: the test cannot pass by the old route, because nothing
+    # about `report` was ever changed.
+    assert "participant_trials" in ds.list_tables()
+    assert "source_expanded" not in ds.list_tables()
+    # The target table itself is unaffected, as confirm_merge already
+    # guarantees for every expansion offer.
+    assert len(ds.get_table("source")) == 2
+
+
+# ===========================================================================
+# table-name-validation round 6: FakeController.confirm_merge() -- round 5's
+# unconditional raise broke the ordinary (non-expanding) merge path in
+# --fake-data mode, which worked before that round. Only an expansion offer
+# has nothing honest to fake, so only that case raises.
+# ===========================================================================
+
+def test_fake_controller_confirm_merge_restores_the_ordinary_path_and_still_refuses_an_expand_offer(
+    qapp,
+):
+    from media.resolver import MediaResolver
+    from models.dataset import MergeReport
+    from ui.fake_controller import FakeController
+
+    resolver = MediaResolver(max_open_decoders=2)
+    controller = FakeController(PROJECT_ROOT / "test_images", resolver=resolver)
+
+    columns_updates: list = []
+    controller.columns_updated.connect(columns_updates.append)
+
+    # An ordinary merge (would_expand empty, matching load_csv()'s own
+    # fake report) must behave exactly as it did before round 5 -- no
+    # exception, the same fake refresh.
+    ordinary_report = MergeReport(target_table="frames", would_expand=[])
+    controller.confirm_merge(ordinary_report)
+
+    # Would still pass if violated? No. Before this fix, this call always
+    # raised NotImplementedError regardless of would_expand.
+    assert columns_updates
+
+    # An expansion offer still has nothing honest to fake, and still
+    # refuses -- unchanged from round 5, just no longer reached for the
+    # ordinary case above.
+    expand_report = MergeReport(target_table="frames", would_expand=["p07"])
+    with pytest.raises(NotImplementedError, match="does not support merging"):
+        controller.confirm_merge(expand_report, "chosen_name")

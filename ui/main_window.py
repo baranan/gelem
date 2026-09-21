@@ -729,11 +729,22 @@ class MainWindow(QMainWindow):
                 # operator object. An operator that overrides nothing hands
                 # over BaseOperator.refine_form, which returns the empty
                 # FormAdvice(), so the form behaves as it did before.
+                #
+                # existing_table_names (table-name-validation, round 2):
+                # fetched from the controller right here, at the moment
+                # the dialog is built, never cached earlier and never read
+                # from Dataset directly -- this widget must never reach
+                # Dataset. Another run can still claim a name while this
+                # dialog stays open; that is exactly why
+                # create_table_from_df's own refusal at store time
+                # (CLAUDE.md, "Data ownership") remains the real guarantee
+                # and this is only ever a courtesy.
                 param_dialog = ParameterDialog(
                     mode_descriptor,
                     columns_by_input,
                     parent=self,
                     advice_provider=getattr(operator, "refine_form", None),
+                    existing_table_names=self._controller.get_table_names(),
                 )
             except (
                 _UnresolvableInputKind, ParameterFormError, FormAdviceError
@@ -1291,12 +1302,30 @@ class MainWindow(QMainWindow):
         match/unmatch counts and per-issue lists (unmatched files,
         unmatched CSV rows, duplicate keys) before deciding whether to
         commit the merge -- or, when the CSV would expand the target
-        table, the offer to create a new table instead (P1.5b) -- before
+        table, the offer to create a new table instead (P1.5b), now with
+        an editable name for it (table-name-validation) -- before
         deciding whether to proceed.
+
+        existing_table_names is fetched from the controller right here,
+        at the moment the dialog is built -- never cached earlier, never
+        read from Dataset directly (this widget must never reach it).
+        Harmless for an ordinary in-place merge too: MergeReportDialog
+        only ever consults it for an expansion offer.
+
+        Round 4: the dialog never writes to `report` any more. If it is
+        accepted, the researcher's chosen name (or None, for an ordinary
+        merge, or when nothing was edited away from the resolved default)
+        is read off dialog.chosen_expand_table_name and passed to
+        AppController.confirm_merge() as an explicit argument.
         """
-        dialog = MergeReportDialog(report, parent=self)
+        dialog = MergeReportDialog(
+            report, parent=self,
+            existing_table_names=self._controller.get_table_names(),
+        )
         if dialog.exec() != 0 and dialog.accepted_merge:
-            self._controller.confirm_merge(report)
+            self._controller.confirm_merge(
+                report, dialog.chosen_expand_table_name
+            )
 
     # ── Menu actions ──────────────────────────────────────────────────
 

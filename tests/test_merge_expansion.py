@@ -198,6 +198,71 @@ def test_confirm_merge_refuses_an_existing_table_name(tmp_path):
     pd.testing.assert_frame_equal(ds.get_table("source_expanded"), existing_before)
 
 
+# ---------------------------------------------------------------------------
+# table-name-validation round 4: Dataset.confirm_merge()'s new
+# expand_table_name keyword argument.
+# ---------------------------------------------------------------------------
+
+def test_confirm_merge_with_no_name_argument_uses_the_derived_default(tmp_path):
+    # Every caller before this round, and every caller since with no
+    # opinion, passes only `report` -- None must keep meaning "use
+    # report.expand_table_name", unchanged.
+    ds = Dataset()
+    _build_target_table(ds)
+    report = ds.merge_csv(
+        _expanding_csv(tmp_path),
+        target_table="source", csv_key="participant_id", target_key="participant_id",
+    )
+    assert report.expand_table_name == "source_expanded"
+
+    ds.confirm_merge(report)  # no expand_table_name argument at all
+
+    # Would still pass if violated? No. If None stopped meaning "use the
+    # report's own value", this table would never be created under
+    # merge_csv()'s own derived name.
+    assert "source_expanded" in ds.list_tables()
+
+
+def test_confirm_merge_expand_table_name_argument_overrides_the_report(tmp_path):
+    # The argument wins over report.expand_table_name, and the report
+    # itself is never touched -- proven at the Dataset layer alone,
+    # without needing a real dialog (see
+    # tests/test_parameter_dialog.py::test_a_chosen_expand_name_becomes_the_stored_tables_name
+    # for the same guarantee driven through the real widget).
+    ds = Dataset()
+    _build_target_table(ds)
+    report = ds.merge_csv(
+        _expanding_csv(tmp_path),
+        target_table="source", csv_key="participant_id", target_key="participant_id",
+    )
+    assert report.expand_table_name == "source_expanded"
+
+    ds.confirm_merge(report, "chosen_name")
+
+    # Would still pass if violated? No. If the argument were ignored (or
+    # merely used to overwrite report.expand_table_name before falling
+    # through to the old code path), either this table would be missing
+    # or the report's own field would have changed.
+    assert "chosen_name" in ds.list_tables()
+    assert "source_expanded" not in ds.list_tables()
+    assert report.expand_table_name == "source_expanded"
+
+
+def test_confirm_merge_expand_table_name_argument_still_refuses_a_taken_name(tmp_path):
+    # Dataset's own collision refusal (item 4 of the "already decided"
+    # list) applies to WHICHEVER name confirm_merge() resolves to --
+    # unchanged in shape, now just reachable through either source.
+    ds = Dataset()
+    _build_target_table(ds)
+    ds.create_table_from_df("chosen_name", pd.DataFrame({"x": [1]}))
+    report = ds.merge_csv(
+        _expanding_csv(tmp_path),
+        target_table="source", csv_key="participant_id", target_key="participant_id",
+    )
+    with pytest.raises(ValueError):
+        ds.confirm_merge(report, "chosen_name")
+
+
 def test_target_key_not_in_carry_columns_does_not_leak_into_the_new_table(tmp_path):
     # target_key ("match_key") is a measurement that is NOT carried; only
     # participant_id is. The join needs match_key's values to align rows,
@@ -403,11 +468,13 @@ def test_controller_confirm_merge_expand_emits_table_created(tmp_path, make_cont
 
 from ui.merge_report_dialog import (
     carried_columns_text,
+    expand_table_name_message,
     explain_text,
     header_text,
     is_expand_offer,
     issue_tab_sources,
     proceed_button_text,
+    resolved_default_expand_table_name,
 )
 
 
@@ -483,8 +550,80 @@ def test_proceed_button_text_is_generic_for_the_ordinary_path():
     assert proceed_button_text(_FakeReport()) == "Proceed with merge"
 
 
+def test_proceed_button_text_falls_back_on_a_blank_chosen_name():
+    # table-name-validation round 6: a blank or whitespace-only
+    # chosen_name must not be quoted verbatim -- "Create ''" is a
+    # confusing label sitting next to the disabled button's own "please
+    # enter a name" error text.
+    report = _FakeReport(would_expand=["p07"], expand_table_name="source_expanded")
+    assert proceed_button_text(report, "") == "Create the new table"
+    assert proceed_button_text(report, "   ") == "Create the new table"
+    # Would still pass if violated? No. A version that only checked
+    # `chosen_name is None` (the "no override" case) rather than blank
+    # text would still produce "Create ''" here.
+    assert "''" not in proceed_button_text(report, "")
+
+
+def test_proceed_button_text_still_names_a_non_blank_chosen_name():
+    report = _FakeReport(would_expand=["p07"], expand_table_name="source_expanded")
+    assert proceed_button_text(report, "renamed_table") == "Create 'renamed_table'"
+
+
 def test_issue_tab_sources_includes_the_would_expand_list():
     report = _FakeReport(would_expand=["p07", "p08"])
     sources = dict(issue_tab_sources(report))
     matching = [items for title, items in sources.items() if items == ["p07", "p08"]]
     assert matching, f"would_expand list not found in {sources!r}"
+
+
+# ---------------------------------------------------------------------------
+# table-name-validation round 3: resolved_default_expand_table_name and
+# expand_table_name_message, ui/merge_report_dialog.py's new Layer A.
+# ---------------------------------------------------------------------------
+
+def test_resolved_default_returns_the_reports_suggestion_when_free():
+    report = _FakeReport(would_expand=["p07"], expand_table_name="source_expanded")
+    assert (
+        resolved_default_expand_table_name(report, ["frames"])
+        == "source_expanded"
+    )
+
+
+def test_resolved_default_suffixes_when_the_reports_suggestion_is_taken():
+    # Would still pass if violated? No. resolve_table_name (controller.py)
+    # is the same helper the operator parameter dialog uses; if this
+    # called something else, or nothing, the default would stay
+    # "source_expanded" here even though it collides.
+    report = _FakeReport(would_expand=["p07"], expand_table_name="source_expanded")
+    existing = ["frames", "source_expanded", "source_expanded_1"]
+    assert (
+        resolved_default_expand_table_name(report, existing)
+        == "source_expanded_2"
+    )
+
+
+def test_expand_table_name_message_free_name_is_none():
+    assert expand_table_name_message("segments", ["frames"]) is None
+
+
+def test_expand_table_name_message_taken_name_names_the_table():
+    message = expand_table_name_message("segments", ["frames", "segments"])
+    assert message is not None
+    assert '"segments"' in message
+
+
+def test_expand_table_name_message_blank_is_refused_here_unlike_validate_new_table_name():
+    # Unlike ui/parameter_dialog.py's validate_new_table_name (which
+    # defers a blank name to its own required-field mechanism), this
+    # dialog has no equivalent check elsewhere, so a blank name must be
+    # refused HERE or Proceed could try to create a table named "".
+    assert expand_table_name_message("", ["frames"]) is not None
+    assert expand_table_name_message("   ", ["frames"]) is not None
+
+
+def test_expand_table_name_message_is_case_sensitive_and_strips_like_validate_new_table_name():
+    # Reused exactly as it is (never a second comparison): same
+    # case-sensitivity and stripping behaviour as
+    # ui/parameter_dialog.py's validate_new_table_name.
+    assert expand_table_name_message("Segments", ["segments"]) is None
+    assert expand_table_name_message("segments ", ["segments"]) is not None

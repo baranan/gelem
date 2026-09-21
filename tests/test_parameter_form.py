@@ -54,6 +54,7 @@ from ui.parameter_dialog import (
     build_field_specs,
     collect_parameters,
     resolve_form,
+    validate_new_table_name,
 )
 
 
@@ -579,3 +580,66 @@ def test_a_second_call_is_recomputed_from_the_declarations_not_accumulated():
     second = resolve_form(specs, advice, {"agg": "sum"})
     assert second.blocked is False
     assert second.messages == ()
+
+
+# ===========================================================================
+# validate_new_table_name -- must mirror models/dataset.py's
+# create_table_from_df EXACTLY: `if name in self._tables: raise ValueError`,
+# an exact, case-sensitive membership test with no normalisation, against
+# whatever "existing" set the caller hands in.
+# ===========================================================================
+
+def test_validate_new_table_name_free_name_is_none():
+    assert validate_new_table_name("segments", ["frames"]) is None
+
+
+def test_validate_new_table_name_taken_name_names_the_table():
+    message = validate_new_table_name("segments", ["frames", "segments"])
+    assert message is not None
+    assert "segments" in message
+    # Would still pass if violated? No. A version that only said "a table
+    # with that name already exists" without echoing the name back would
+    # still pass a bare "is not None" check but would leave the researcher
+    # unsure which name they are looking at.
+    assert '"segments"' in message
+
+
+def test_validate_new_table_name_is_case_sensitive_like_the_backstop():
+    # models/dataset.py's `name in self._tables` never lower-cases either
+    # side -- "Segments" and "segments" are different keys. Flagging this
+    # as taken would DISAGREE with the backstop, which is exactly what
+    # this function exists to prevent.
+    assert validate_new_table_name("Segments", ["segments"]) is None
+    assert validate_new_table_name("segments", ["Segments"]) is None
+
+
+def test_validate_new_table_name_compares_the_stripped_name():
+    # collect_parameters strips a new_table_name field's text before it
+    # ever reaches a run's parameters (and therefore create_table_from_df),
+    # so the live check must predict THAT comparison, not the raw,
+    # unstripped widget text.
+    assert validate_new_table_name("segments ", ["segments"]) is not None
+    assert validate_new_table_name("  segments", ["segments"]) is not None
+    # And the untaken case still clears once stripped.
+    assert validate_new_table_name(" free_name ", ["segments"]) is None
+
+
+def test_validate_new_table_name_reports_the_stripped_name_not_the_raw_one():
+    message = validate_new_table_name("segments  ", ["segments"])
+    assert '"segments"' in message
+    assert '"segments  "' not in message
+
+
+def test_validate_new_table_name_blank_is_none_not_flagged_here():
+    # A blank/whitespace-only name is a DIFFERENT, already-existing rule
+    # (collect_parameters' required-field check, surfaced through a
+    # QMessageBox on OK) -- this function must not duplicate or race it.
+    assert validate_new_table_name("", ["segments"]) is None
+    assert validate_new_table_name("   ", ["segments"]) is None
+    assert validate_new_table_name(None, ["segments"]) is None
+
+
+def test_validate_new_table_name_empty_existing_set_never_collides():
+    assert validate_new_table_name("anything", []) is None
+    assert validate_new_table_name("anything", ()) is None
+    assert validate_new_table_name("anything", set()) is None

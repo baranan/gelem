@@ -67,6 +67,7 @@ from operators.descriptor import (
     TextParameter,
 )
 from operators.form_advice import FormAdvice, FormAdviceError, FormMessage
+from table_names import validate_new_table_name
 
 
 # ---------------------------------------------------------------------------
@@ -640,6 +641,22 @@ class ParameterDialog(QDialog):
     When no ``advice_provider`` is given (or the operator's ``refine_form``
     returns the default empty ``FormAdvice()``), the form behaves exactly
     as it did before P1.12e-4b.
+
+    ``existing_table_names`` (table-name-validation) is the project's
+    current table names -- ``AppController.get_table_names()``, the same
+    set ``Dataset.list_tables()``/``create_table_from_df`` compare
+    against -- handed straight in by whoever builds this dialog, never
+    fetched by the dialog itself: this class must never reach ``Dataset``.
+    Every ``new_table_name`` field is checked against it, live, on every
+    edit (``validate_new_table_name``, above): a taken name shows a red
+    message under that field and blocks OK, in ADDITION to whatever
+    ``resolve_form`` already decided -- this check never lifts a block
+    ``resolve_form`` set, only adds its own. It NEVER goes through
+    ``advice_provider`` / ``refine_form``: an operator must never be given
+    a way to learn which tables exist. Defaults to ``()``, so a caller
+    that does not pass it gets a form that never flags a collision inline
+    -- the store-time refusal in ``Dataset`` is unaffected either way and
+    remains the actual guarantee; this is only ever a courtesy.
     """
 
     def __init__(
@@ -648,6 +665,7 @@ class ParameterDialog(QDialog):
         columns_by_input,
         parent=None,
         advice_provider=None,
+        existing_table_names=(),
     ):
         super().__init__(parent)
         self.setWindowTitle(f"{mode_descriptor.label} -- parameters")
@@ -665,6 +683,13 @@ class ParameterDialog(QDialog):
             lambda raw_values: FormAdvice()
         )
 
+        # table-name-validation: the project's current table names, handed
+        # in by the caller (AppController.get_table_names(), never fetched
+        # here -- see the class docstring). Copied to a tuple so later
+        # mutation of whatever the caller passed cannot change this
+        # dialog's answer mid-session.
+        self._existing_table_names = tuple(existing_table_names)
+
         # Re-entrancy guard. Applying advice changes widgets, which fires
         # their change signals, which would ask for advice again. While
         # this flag is set, _on_field_changed returns immediately.
@@ -674,6 +699,11 @@ class ParameterDialog(QDialog):
         # re-widening when a later advice lifts the restriction -- a field
         # that was never narrowed is already in its full state.
         self._narrowed_fields: set[str] = set()
+
+        # name -> the red, per-field label for a new_table_name field's
+        # live collision message (table-name-validation). Filled in by
+        # _build(), one entry per "new_table_name" field.
+        self._table_name_error_labels: dict = {}
 
         # Filled in by _build().
         self._message_label: Optional[QLabel] = None
@@ -698,6 +728,20 @@ class ParameterDialog(QDialog):
                 help_label = QLabel(spec.help_text)
                 help_label.setWordWrap(True)
                 layout.addWidget(help_label)
+
+            # table-name-validation: one red, hidden-until-needed label
+            # right under this field, for validate_new_table_name's
+            # message. Kept per-field (not folded into the shared
+            # _message_label below, which is the operator-advice
+            # channel) so it reads as "this field", the way the goal
+            # asks for -- a message under the field, not a form-wide one.
+            if spec.kind == "new_table_name":
+                error_label = QLabel()
+                error_label.setWordWrap(True)
+                error_label.setStyleSheet("color: #B00020;")
+                error_label.setVisible(False)
+                self._table_name_error_labels[spec.name] = error_label
+                layout.addWidget(error_label)
 
         # The one place operator FormMessages are shown. Rich text so a
         # warning and an error read in different colours; hidden until
@@ -933,6 +977,12 @@ class ParameterDialog(QDialog):
         self._applying_advice = True
         try:
             self._render_resolved(resolved)
+            # table-name-validation: a SEPARATE check, never folded into
+            # `advice` or `resolved` above -- it must never reach
+            # refine_form. Rendered after, so it can only ADD a block on
+            # top of whatever resolve_form already decided, never lift
+            # one (see _render_table_name_validation).
+            self._render_table_name_validation(raw_values)
         finally:
             self._applying_advice = False
 
@@ -985,6 +1035,48 @@ class ParameterDialog(QDialog):
         # 4. OK follows `blocked` exactly.
         if self._ok_button is not None:
             self._ok_button.setEnabled(not resolved.blocked)
+
+    def _render_table_name_validation(self, raw_values: dict) -> None:
+        """Live "this name is already taken" feedback for every
+        ``new_table_name`` field (table-name-validation).
+
+        Deliberately separate from ``_render_resolved`` / ``resolve_form``:
+        those exist to render an operator's ``FormAdvice``, and an
+        operator must never learn which tables exist, so this check is
+        never folded into that pipeline and never reaches
+        ``advice_provider`` / ``refine_form``. It reads only
+        ``self._existing_table_names``, handed in at construction by
+        whoever built this dialog (never fetched here -- see the class
+        docstring), and ``raw_values``, already computed by the caller
+        (``_apply_advice``).
+
+        ADDS a block on top of whatever ``_render_resolved`` (called
+        immediately before this, in ``_apply_advice``) already decided --
+        it only ever calls ``setEnabled(False)``, never ``setEnabled(True)``.
+        Re-enabling when a collision clears is therefore left entirely to
+        the NEXT ``_render_resolved`` call in the same ``_apply_advice``
+        pass, which sets OK from ``resolved.blocked`` alone; since that
+        call always runs first and this one can only tighten, not loosen,
+        the two together correctly enable OK exactly when NEITHER check
+        blocks.
+        """
+        blocked = False
+        for spec in self._field_specs:
+            if spec.kind != "new_table_name":
+                continue
+            label = self._table_name_error_labels[spec.name]
+            message = validate_new_table_name(
+                raw_values.get(spec.name), self._existing_table_names
+            )
+            if message is None:
+                label.clear()
+                label.setVisible(False)
+                continue
+            label.setText(message)
+            label.setVisible(True)
+            blocked = True
+        if blocked and self._ok_button is not None:
+            self._ok_button.setEnabled(False)
 
     def _widen_widget(self, spec: FieldSpec) -> None:
         """Re-enable every item of a dropdown field -- the state a field
