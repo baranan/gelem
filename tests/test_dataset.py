@@ -1531,20 +1531,27 @@ def test_save_load_relativizes_a_schema_tagged_media_column():
         avatar_file.touch()
 
         ds = Dataset()
+        # The table name is incidental to what this test checks -- a
+        # schema-tagged column named avatar_path, not full_path -- so it
+        # is a fresh name, "avatars", rather than "frames": Dataset()
+        # already pre-populates an empty "frames" table (see __init__),
+        # and create_table_from_df now refuses a name collision (P1.7-1
+        # fix round, item 2) rather than overwriting it.
+        #
         # The cell value is an absolute media path, so infer_type_tag tags
         # the column media_path in the schema the accept builds.
         ds.create_table_from_df(
-            "frames",
+            "avatars",
             pd.DataFrame({"avatar_path": [str(avatar_file)]}),
         )
         assert (
-            ds.schema_for("frames").spec_for("avatar_path").type_tag
+            ds.schema_for("avatars").spec_for("avatar_path").type_tag
             == "media_path"
         ), "sanity: avatar_path must be schema-tagged media_path"
         ds.save(project)
 
         # Stored avatar_path must be relative (schema tags it media_path).
-        stored = pd.read_parquet(project / "frames.parquet")["avatar_path"].iloc[0]
+        stored = pd.read_parquet(project / "avatars.parquet")["avatar_path"].iloc[0]
         assert not Path(stored).is_absolute(), (
             f"avatar_path (schema-tagged media_path) should be stored "
             f"relative; got {stored}"
@@ -1553,7 +1560,7 @@ def test_save_load_relativizes_a_schema_tagged_media_column():
         # Load must restore avatar_path back to absolute.
         ds2 = Dataset()
         ds2.load(project)
-        loaded = ds2.get_table("frames")["avatar_path"].iloc[0]
+        loaded = ds2.get_table("avatars")["avatar_path"].iloc[0]
         # Compare file identity, not string spelling. Since P0.2c, load()
         # returns the canonical POSIX form (media_architecture.md decision 9).
         assert Path(loaded).resolve() == Path(avatar_file).resolve(), (

@@ -22,6 +22,7 @@ This file is written centrally (not by a student).
 """
 
 from __future__ import annotations
+from dataclasses import replace as _dataclasses_replace
 from pathlib import Path
 import queue
 import threading
@@ -43,6 +44,7 @@ from operators.descriptor import (
     InputKind,
     MediaRequirement,
     ModelLifecycle,
+    NewTableNameParameter,
 )
 from operators.run_context import (
     CancellationToken,
@@ -291,6 +293,117 @@ def format_cancel_message(label: str) -> str:
     )
 
 
+def format_row_error_summary(
+    label: str,
+    errors: list[tuple[str, str, str]],
+    *,
+    mode_name: str,
+    result_stored: bool,
+) -> str:
+    """The plain-English summary shown for one run's row-error report
+    (fix round, items 2 and 3). Qt-free -- the two-layer pattern this
+    repo follows throughout (see format_cancel_message,
+    numbered_run_choices above): wording and arithmetic live here; the
+    caller in _on_operator_complete only gathers the three inputs and
+    passes them through error_occurred.emit().
+
+    `errors` is the (row_id, kind, message) list run.report_row_error()
+    and/or a caught per-row exception produced -- the same shape for
+    both COLUMNS and TABLE mode. The SAME row_id can appear more than
+    once (an operator that reports a row and then also raises for it
+    contributes two entries for one row), so the affected-row count is
+    the number of DISTINCT row_ids, never len(errors) -- item 3. Every
+    individual entry still contributes its own line to "Error types
+    seen", so no detail is lost to the distinct count.
+
+    The closing sentence is the one that must say the true thing for the
+    mode it is for (item 2):
+      - COLUMNS -- the per-row apply already happened during the run,
+        independently of this report; the affected rows simply never
+        got a value for the new columns.
+      - TABLE, result_stored=True -- create_table_from_df succeeded; the
+        reported rows were never in its input; NOT stored anywhere.
+      - TABLE, result_stored=False -- either the run was cancelled before
+        a table could be stored, or create_table() itself failed (raised,
+        or a declared column was missing) -- either way there IS no
+        table, so "left out of it" would be a false claim.
+    """
+    distinct_row_ids = {row_id for row_id, _kind, _msg in errors}
+    n = len(distinct_row_ids)
+
+    counts: dict[str, int] = {}
+    first_msg: dict[str, str] = {}
+    for _row_id, kind, msg in errors:
+        counts[kind] = counts.get(kind, 0) + 1
+        first_msg.setdefault(kind, msg)
+    lines = [
+        f'  - {t} (x{counts[t]}) - "{first_msg[t]}"'
+        for t in sorted(counts, key=lambda k: -counts[k])
+    ]
+
+    if mode_name != "TABLE":
+        tail = "The affected rows have no values for the new columns."
+    elif result_stored:
+        tail = "Those rows were left out of the stored table."
+    else:
+        tail = "No table was stored, so this affected nothing on screen."
+
+    return (
+        f'"{label}" finished, but {n} row(s) hit unexpected errors.\n\n'
+        f"Error types seen:\n" + "\n".join(lines) + "\n\n" + tail
+    )
+
+
+def resolve_table_name(suggested: str, existing) -> str:
+    """The name a TABLE-mode run's result should actually be stored under
+    (fix round, item 1): `suggested` itself if it is free, otherwise
+    `suggested` suffixed `_1`, `_2`, ... up to the first free one --
+    `existing` is checked with `in`, so a set is cheapest, though a list or
+    a dict's keys work too.
+
+    This is the ONE place that picks a fresh name; Dataset.create_table_from_df
+    (item 2) refuses a collision outright rather than working around it, so
+    every caller that wants a table to land under a name close to what it
+    asked for, rather than fail, resolves it through this function first.
+    Qt-free, per the two-layer pattern format_row_error_summary and
+    format_cancel_message above already use -- this is the arithmetic half;
+    format_table_name_changed_message below is the wording half, for when
+    the resolved name surprises the researcher.
+    """
+    if suggested not in existing:
+        return suggested
+    n = 1
+    while f"{suggested}_{n}" in existing:
+        n += 1
+    return f"{suggested}_{n}"
+
+
+def _new_table_name_param(mode_descriptor):
+    """The mode's NewTableNameParameter, or None if it declares none (fix
+    round, item 1). A mode declares at most one -- ModeDescriptor's own
+    __post_init__ already requires unique parameter names, so there is
+    nothing to disambiguate here."""
+    for spec in mode_descriptor.parameters:
+        if isinstance(spec, NewTableNameParameter):
+            return spec
+    return None
+
+
+def format_table_name_changed_message(shown_name: str, stored_name: str) -> str:
+    """The plain sentence shown to the researcher when a TABLE run's result
+    is stored under a different name than the one the parameter form showed
+    them (fix round, item 1) -- another run's table claimed `shown_name`
+    in the time between the dialog and the store, so resolve_table_name()
+    was applied a second time at store, this time producing `stored_name`.
+    Never called when the two names are equal.
+    """
+    return (
+        f'The table was stored as "{stored_name}" rather than '
+        f'"{shown_name}": another table named "{shown_name}" was created '
+        f"in the meantime."
+    )
+
+
 # ---------------------------------------------------------------------------
 # P1.9b-1: saving is refused outright while any operator run is live.
 #
@@ -347,6 +460,32 @@ def format_output_copy_conflict_message(
         f"({shown}). Choose a different folder, or remove the conflicting "
         f"files there, then save again."
     )
+
+
+class _ResolvedTableNameOperatorView:
+    """A thin, read-only stand-in for an operator, returned by
+    AppController.get_operator() in place of the real singleton (fix round,
+    item 1).
+
+    Its only job is to carry a `descriptor` whose NewTableNameParameter
+    default(s) have been resolved against the tables that exist right now
+    (resolve_table_name), so the parameter form ui/main_window.py builds
+    from it already shows the name the run would actually use, rather than
+    the operator's static declared default. Every other attribute --
+    refine_form, create_table, and anything else the caller reads off
+    get_operator()'s return value -- forwards straight to the real operator
+    through __getattr__, so nothing about the singleton itself changes and
+    the operator is never given any way to see which tables exist: this
+    substitution happens entirely on the controller side, after the
+    operator has already declared its (static) descriptor.
+    """
+
+    def __init__(self, operator, descriptor):
+        self._operator = operator
+        self.descriptor = descriptor
+
+    def __getattr__(self, name):
+        return getattr(self._operator, name)
 
 
 class AppController(QObject):
@@ -540,6 +679,25 @@ class AppController(QObject):
         # the shape a future cancellation will use.
         self._live_runs: dict[str, dict] = {}
 
+        # {operator_name: the last table-name suggestion get_operator()
+        # resolved for that operator's parameter form} -- fix round item 2
+        # (second pass). Primed by get_operator() the moment it builds a
+        # resolved descriptor for a mode's NewTableNameParameter, and
+        # popped by _attach_table_name_resolution when the matching run
+        # starts, so "was this the suggestion I showed" is answered by
+        # remembering the actual value, never by recomputing what the
+        # suggestion would be now. See _attach_table_name_resolution's
+        # docstring for what happens when nothing was primed.
+        #
+        # Keyed by (operator_name, ExecutionMode) rather than operator
+        # name alone (fix round item 3, third pass): nothing stops an
+        # operator declaring NewTableNameParameter on more than one mode
+        # -- _resolve_new_table_name_defaults already loops over every
+        # mode a descriptor has -- and an operator-name-only key would let
+        # one mode's suggestion silently answer a DIFFERENT mode's
+        # was_auto question for that same operator.
+        self._shown_table_name_suggestions: dict[tuple[str, object], str] = {}
+
         self._timer = QTimer(self)
         self._timer.setInterval(50)
         self._timer.timeout.connect(self._drain_queues)
@@ -656,6 +814,16 @@ class AppController(QObject):
         which arrive before this run's own completion and do not
         deregister it.
 
+        "pending_row_errors" (fix round, item 2) starts None. For a
+        TABLE-mode run whose "row_errors" completion arrives, it is set
+        to (label, errors) -- the wording that summary needs depends on
+        whether a table ends up stored, which the "row_errors" branch
+        itself does not yet know -- and popped back off (see
+        _emit_pending_row_errors) by whichever branch of
+        _on_operator_complete ends this run knowing that. A COLUMNS run
+        never sets this: its own "row_errors" branch emits immediately,
+        nothing later needing to know "was a table stored" for it.
+
         "message" (run-indicator-2) starts None and is overwritten by
         _apply_run_logs with this run's newest run.log() text, moved off
         self._latest_logs during the drain -- see get_live_runs().
@@ -678,6 +846,7 @@ class AppController(QObject):
             "superseded_latched": set(),
             "had_setup_error":    False,
             "had_row_errors":     False,
+            "pending_row_errors": None,
         }
         # A new operation_id is always a new entry (uuid-generated per
         # run), so this always changes the set -- see live_runs_changed.
@@ -851,6 +1020,102 @@ class AppController(QObject):
         run["rows_requested"] = rows_requested
         run["inputs"]         = dict(inputs)
 
+    def _attach_table_name_resolution(
+        self,
+        operation_id: str,
+        operator_name: str,
+        mode_descriptor,
+        parameters,
+    ) -> None:
+        """Records, for a just-started TABLE run, the table name it will
+        try to store under and whether that name is the controller's own
+        auto-suggestion (fix round, item 1).
+
+        `requested_name` is the mode's NewTableNameParameter value from
+        `parameters` if it declares one, else the pre-P1.7-1 fixed
+        f"{operator_name}_result" name -- unchanged for an operator that
+        declares no such parameter.
+
+        `was_auto` is unconditionally True when the mode declares no
+        NewTableNameParameter at all: there is no field for a researcher
+        to have edited, so a collision at store time can only be a race
+        against another run, never a deliberate choice.
+
+        When the mode DOES declare the parameter, `was_auto` compares
+        `requested_name` against the suggestion the parameter FORM
+        ACTUALLY SHOWED -- `self._shown_table_name_suggestions`, keyed by
+        `(operator_name, mode_descriptor.mode)` (fix round item 3, third
+        pass -- operator name alone would let one mode's suggestion
+        answer a different mode's question for the same operator, since
+        _resolve_new_table_name_defaults primes an entry for every mode
+        that declares the parameter). Primed by get_operator() (fix
+        round, item 2 of the second pass) the moment it built the
+        resolved descriptor ui/main_window.py's dialog reads from, and
+        popped here so it is read at most once, for the run it was shown
+        for. This is "is this the exact string I put in the box", not "is
+        this what I would suggest if asked again right now" -- the two
+        used to be conflated by recomputing the suggestion here instead
+        of remembering it, which meant a table created by another run
+        WHILE this run's own dialog was still open (a modal QDialog keeps
+        the drain timer running) could shift what "now" would suggest and
+        make an untouched suggestion look "edited", even though nothing
+        about what the researcher saw or typed had changed.
+
+        If get_operator() was never called for this operator before this
+        run started -- a run begun through the public API directly rather
+        than through the generated dialog, which is what every test in
+        this file below and every real path through ui/main_window.py
+        does not do -- there is nothing remembered to compare against, so
+        this falls back to resolving fresh against the tables that exist
+        right now, the pre-fix behaviour, rather than guessing was_auto
+        either way.
+
+        Read back by _on_operator_complete's create_table branch: True
+        means a later collision is resolved to a fresh name (the
+        collision arose from a race, not from the researcher), False
+        means it is refused instead (the researcher named an existing
+        table on purpose; matches Dataset.confirm_merge's own refusal
+        rather than silently storing under a name the researcher did not
+        choose).
+
+        Called immediately after _attach_run_provenance, before the worker
+        starts, so there is no window where a live TABLE run lacks this.
+        A no-op for a run that failed to register (mirrors
+        _attach_run_provenance).
+        """
+        run = self._live_runs.get(operation_id)
+        if run is None:
+            return
+        name_param = _new_table_name_param(mode_descriptor)
+        if name_param is None:
+            run["new_table_name_requested"] = f"{operator_name}_result"
+            run["new_table_name_was_auto"]  = True
+            return
+        # .get(), not [...]: the parameter happens to be required today
+        # (NewTableNameParameter inherits ParameterSpec.required's True
+        # default, and nothing overrides it), which is the only reason
+        # OperatorRunSpec's own validation already guarantees this key is
+        # present in run.spec.parameters before this method is ever
+        # called -- but nothing ties that guarantee to this line. A
+        # future NewTableNameParameter(required=False), or any caller of
+        # run_create_table supplying a parameters dict that omits it,
+        # would otherwise raise KeyError here -- OUTSIDE the try/except
+        # in run_create_table that deregisters on failure (see its own
+        # comment), leaving the run stuck in self._live_runs forever.
+        # Falling back to the declared default is exactly what an absent
+        # value already means everywhere else a parameter is read.
+        requested_name = parameters.get(name_param.name, name_param.default)
+        shown_suggestion = self._shown_table_name_suggestions.pop(
+            (operator_name, mode_descriptor.mode), None
+        )
+        if shown_suggestion is None:
+            shown_suggestion = resolve_table_name(
+                name_param.default, set(self._dataset.list_tables())
+            )
+        was_auto = requested_name == shown_suggestion
+        run["new_table_name_requested"] = requested_name
+        run["new_table_name_was_auto"]  = was_auto
+
     def _run_inputs_snapshot(self, run: OperatorRun) -> dict[str, dict]:
         """{declared input name: {"table": name, "version": n}} for every
         single-table input this run reads (P1.12f-1).
@@ -873,12 +1138,25 @@ class AppController(QObject):
             }
         return snapshot
 
-    def _run_outcome(self, mode: str, run: dict) -> str:
+    def _run_outcome(
+        self, mode: str, run: dict, *, result_stored: bool = True
+    ) -> str:
         """One of "complete", "partial" or "failed" for a run ending at
         this _on_operator_complete branch (P1.12f-1; cancellation folded
-        in by P1.12f-3, corrected by run-indicator-3-fix).
+        in by P1.12f-3, corrected by run-indicator-3-fix; result_stored
+        added by the fix round's item 3).
 
-        "failed" is exactly the "error" mode -- the run never finished.
+        "failed" is exactly the "error" mode, or a "create_table" mode
+        whose caller passes result_stored=False -- either way the run
+        never finished with anything to show for it. result_stored
+        defaults True and is only ever passed False by the create_table
+        branch of _on_operator_complete, for the one case "error" mode
+        does not cover: create_table() itself succeeded, but
+        Dataset.create_table_from_df then refused or failed to store its
+        result. Before this fix that branch called _finish_run_provenance
+        BEFORE attempting the store, so a store failure still recorded
+        "complete" even though the researcher was told nothing was
+        stored -- provenance and the on-screen message could disagree.
         Otherwise "partial" if a setup_error or row_errors landed for
         this run, or it left rows unplaceable -- unchanged, and true
         whether or not anyone cancelled.
@@ -939,7 +1217,7 @@ class AppController(QObject):
             and that case correctly reports cancellation_requested false,
             because the token was never touched.
         """
-        if mode == "error":
+        if mode == "error" or not result_stored:
             return "failed"
         if run["had_setup_error"] or run["had_row_errors"] or run["unplaceable"]:
             return "partial"
@@ -1018,15 +1296,32 @@ class AppController(QObject):
                 superseded.append(table_name)
         return superseded
 
-    def _finish_run_provenance(self, mode: str, run: dict) -> None:
+    def _finish_run_provenance(
+        self, mode: str, run: dict, *, result_stored: bool = True
+    ) -> None:
         """Records this run's provenance entry and, if any input table it
         read has moved under it, emits one plain-English notice (P1.12f-1).
 
-        Called for every run-ending branch of _on_operator_complete WHILE
-        the run is still in self._live_runs, and always before
-        _deregister_run -- a run no longer live at arrival is not
-        recorded (see the "arrived after the project changed" branches,
-        which already return before this would be reached).
+        Called for every run-ending branch of _on_operator_complete for a
+        run that was still live when its completion arrived -- a run no
+        longer live at arrival is not recorded (see the "arrived after the
+        project changed" branches, which already return before this would
+        be reached).
+
+        Every argument this method reads comes off the `run` dict itself,
+        never off self._live_runs by operation_id, so calling it before or
+        after _deregister_run makes no difference -- deregistering only
+        pops the entry from self._live_runs, and the caller's local `run`
+        reference stays a valid dict either way (every branch below relies
+        on this same fact to read `run` after deregistering). The
+        create_table branch (fix round, item 3) calls this AFTER its
+        store attempt, specifically so result_stored can reflect whether
+        Dataset.create_table_from_df actually succeeded -- every other
+        branch still calls it at the same point it always did.
+
+        result_stored (fix round, item 3) is passed straight to
+        _run_outcome -- see its own docstring for what False means and
+        the one caller that ever passes it.
 
         cancellation_requested (run-indicator-3-fix) records the FACT
         that cancel_run() was called for this run, independently of
@@ -1034,8 +1329,30 @@ class AppController(QObject):
         cancelled COLUMNS run that finished everything it was asked for
         is recorded "complete". Read straight off the same token
         _run_outcome() itself checks, so the two can never disagree.
+
+        Exactly-once is enforced here, not left as a consequence of every
+        caller's control flow getting the branching right (fix round,
+        item 1 of the third pass -- a reviewer found that the old
+        create_table branch could call this twice for one run: once on
+        the happy path, and again from its `except` if a notification
+        emitted AFTER that happy-path call raised). `run["_provenance_recorded"]`
+        is set the moment record_operator_run() above returns, and a
+        second call for the same run dict raises RuntimeError rather than
+        appending a second, contradictory "operator_run" entry -- silently
+        ignoring the second call was rejected in favour of failing loudly:
+        a duplicate call means a caller's control flow is wrong, and that
+        should surface as a test failure the first time it happens, not
+        get quietly absorbed and leave a real bug live in the codebase.
+        Tests: tests/test_result_delivery.py
+        (test_finish_run_provenance_raises_if_called_twice_for_the_same_run).
         """
-        outcome    = self._run_outcome(mode, run)
+        if run.get("_provenance_recorded"):
+            raise RuntimeError(
+                f"_finish_run_provenance called a second time for run "
+                f"{run.get('operator_name')!r} (label {run.get('label')!r}); "
+                f"provenance must be recorded exactly once per run."
+            )
+        outcome    = self._run_outcome(mode, run, result_stored=result_stored)
         superseded = self._superseded_input_tables(run)
         self._dataset.record_operator_run(
             operator_name=run["operator_name"],
@@ -1051,6 +1368,7 @@ class AppController(QObject):
             superseded_tables=superseded,
             cancellation_requested=self._run_was_cancelled(run),
         )
+        run["_provenance_recorded"] = True
         if superseded:
             tables_str = ", ".join(f'"{t}"' for t in superseded)
             self.error_occurred.emit(
@@ -1059,6 +1377,30 @@ class AppController(QObject):
                 f'match what is on screen. Re-running "{run["label"]}" '
                 f"would recompute it against the current data."
             )
+
+    def _emit_pending_row_errors(self, run: dict, *, result_stored: bool) -> None:
+        """Emit the row-error summary a TABLE run's own "row_errors"
+        completion stashed on run["pending_row_errors"] (fix round, item
+        2), now that the caller -- the create_table or error branch of
+        _on_operator_complete -- knows whether a table actually ended up
+        stored.
+
+        Pops the key rather than reading it, so this can only ever fire
+        once for a given run even if a future edit called it from more
+        than one branch by mistake: the second call would find nothing
+        pending and do nothing. A no-op (nothing to pop) is the ordinary
+        case for every run that reported no rows.
+        """
+        pending = run.pop("pending_row_errors", None)
+        if pending is None:
+            return
+        label, errors = pending
+        self.error_occurred.emit(
+            format_row_error_summary(
+                label, errors,
+                mode_name=run["mode_name"], result_stored=result_stored,
+            )
+        )
 
     def get_write_read_conflict_warnings(
         self, operator_name: str, mode_name: str,
@@ -1486,30 +1828,48 @@ class AppController(QObject):
             )
 
         elif mode == "row_errors":
-            # An additional end-of-run summary. Deregistration and the
-            # unplaceable report belong to the create_columns completion
-            # that still follows, so this branch does not deregister. As
-            # with setup_error, it records the flag on the still-live run
-            # (P1.12f-1) for that completion's outcome.
+            # An additional end-of-run summary. Deregistration belongs to
+            # the completion that still follows (create_columns,
+            # create_table, or error), so this branch does not
+            # deregister.
             operation_id, label, errors = payload
             run = self._live_runs.get(operation_id)
-            if run is not None:
-                run["had_row_errors"] = True
-            counts: dict[str, int] = {}
-            first_msg: dict[str, str] = {}
-            for _row_id, exc_type, msg in errors:
-                counts[exc_type] = counts.get(exc_type, 0) + 1
-                first_msg.setdefault(exc_type, msg)
-            lines = [
-                f'  - {t} (x{counts[t]}) - "{first_msg[t]}"'
-                for t in sorted(counts, key=lambda k: -counts[k])
-            ]
-            self.error_occurred.emit(
-                f'"{label}" finished, but {len(errors)} row(s) hit '
-                f"unexpected errors.\n\nError types seen:\n"
-                + "\n".join(lines)
-                + "\n\nThe affected rows have no values for the new columns."
-            )
+            if run is None:
+                # Fix round, item 4: chose to SUPPRESS rather than label.
+                # The project was replaced (or this run otherwise ended)
+                # between its own worker reporting these rows and the
+                # drain reaching them here. Its create_columns /
+                # create_table / error completion has already been (or
+                # will be) silently discarded the same way -- see those
+                # branches' own "arrived after the project changed"
+                # handling -- so a dialog about rows in a project the
+                # researcher is no longer looking at would be confusing,
+                # not merely mislabelled. Dropped entirely, exactly the
+                # way a dead run's other completions already are.
+                return
+            # Recorded on the still-live run (P1.12f-1) for that
+            # completion's outcome -- unchanged by this fix round.
+            run["had_row_errors"] = True
+
+            if run["mode_name"] == "TABLE":
+                # Item 2: a TABLE run's wording depends on whether a
+                # table ends up stored, which is not known yet here --
+                # the create_table / error completion that follows this
+                # one decides that and calls _emit_pending_row_errors()
+                # once it does. Stashed on the run dict, not emitted now.
+                run["pending_row_errors"] = (label, errors)
+            else:
+                # COLUMNS: nothing later decides "was a table stored" for
+                # this run, so there is nothing to wait for -- emit now,
+                # exactly as before this fix round. result_stored is
+                # irrelevant here; format_row_error_summary ignores it
+                # whenever mode_name != "TABLE".
+                self.error_occurred.emit(
+                    format_row_error_summary(
+                        label, errors,
+                        mode_name=run["mode_name"], result_stored=True,
+                    )
+                )
 
         elif mode == "create_table":
             operation_id, operator_name, result_df = payload
@@ -1523,8 +1883,15 @@ class AppController(QObject):
             # stays valid to read after that -- deregistering only removes
             # it from self._live_runs, not from this local reference.
             cancelled = was_live and self._run_was_cancelled(run)
-            if was_live:
-                self._finish_run_provenance(mode, run)
+            # Fix round, item 3: _finish_run_provenance moved out of this
+            # unconditional spot. It used to run here, before the store was
+            # even attempted, so a store failure below still recorded
+            # "complete" -- the researcher was told the store failed while
+            # provenance said otherwise. Each remaining path below now
+            # calls it itself, exactly once, once its own outcome is
+            # actually known: the cancelled branch immediately (nothing
+            # will be stored), the store attempt after it succeeds or
+            # raises.
             self._deregister_run(operation_id)
             if not was_live:
                 # Minutes of compute that arrived after the project
@@ -1536,26 +1903,111 @@ class AppController(QObject):
                 )
                 return
             if cancelled:
+                self._finish_run_provenance(mode, run)
                 self.error_occurred.emit(
                     f'"{run["label"]}" was cancelled. A table result '
                     f"cannot be produced partway through, so its finished "
                     f"result was discarded rather than stored."
                 )
+                # Item 2: no table exists, so any pending row-error
+                # summary must say so, not "left out of the table".
+                self._emit_pending_row_errors(run, result_stored=False)
                 self.operator_complete.emit(operator_name)
                 return
-            table_name = f"{operator_name}_result"
+
+            # Fix round, item 1: the name this run will try to store
+            # under. _attach_table_name_resolution recorded, at run
+            # start, the researcher's chosen NewTableNameParameter value
+            # (or the old fixed f"{operator_name}_result" name for an
+            # operator that declares no such parameter) and whether that
+            # value was the controller's own auto-suggestion.
+            #
+            #   * was_auto True  -- a collision now is a race, not a
+            #     researcher choice (see _attach_table_name_resolution's
+            #     docstring for exactly what this can and cannot tell
+            #     apart): resolve_table_name picks the next free name
+            #     here, before ever calling Dataset, so
+            #     create_table_from_df's own refusal (item 2) is never
+            #     hit on this path.
+            #   * was_auto False -- the researcher named this table on
+            #     purpose. Passed straight through unchanged: if it
+            #     collides, create_table_from_df refuses it (item 2) and
+            #     the except branch below reports that refusal naming the
+            #     table, rather than silently picking a different one.
+            requested_name = run.get(
+                "new_table_name_requested", f"{operator_name}_result"
+            )
+            was_auto = run.get("new_table_name_was_auto", True)
+            if was_auto:
+                final_name = resolve_table_name(
+                    requested_name, set(self._dataset.list_tables())
+                )
+            else:
+                final_name = requested_name
+
+            # Fix round, item 1 (third pass): a reviewer found that the
+            # PREVIOUS shape of this block -- one try wrapping the store
+            # call, every post-store notification, AND the success-path
+            # _finish_run_provenance itself -- was wrong in two ways. A
+            # notification raising (table_created.emit reaching a broken
+            # slot, say) AFTER a genuinely successful store fell into the
+            # except and was reported as a store failure; and if that
+            # notification raised AFTER _finish_run_provenance had already
+            # recorded "complete", the except's own call recorded "failed"
+            # a SECOND time for the same run. The try below now wraps only
+            # the two calls whose failure actually means nothing was
+            # stored -- building the hints and the store itself -- so
+            # try/except/else keeps the except from ever firing on
+            # anything that happens after a successful store: an
+            # exception raised inside the else clause is NOT caught by
+            # the except above it, so it propagates rather than being
+            # reinterpreted. In both branches _finish_run_provenance runs
+            # FIRST, before any notification, so it is recorded exactly
+            # once and durably before anything that could fail is even
+            # attempted -- restoring the property the OLD "record before
+            # the store" ordering got right (recorded exactly once)
+            # without reintroducing what it got wrong (recorded before
+            # the outcome was known). _finish_run_provenance's own
+            # `_provenance_recorded` guard (see its docstring) is the
+            # backstop that makes a second call for this run impossible
+            # to do silently, whatever future edit touches this block.
             try:
-                self._dataset.create_table_from_df(table_name, result_df)
+                # P1.7-1: role / carry_to_children hints for the columns
+                # this TABLE-mode operator declared on its descriptor.
+                # {} for an operator that declares none -- Dataset's own
+                # "no hints" default, unchanged from before this existed.
+                hints = self._op_registry.hints_for_table_output(operator_name)
+                self._dataset.create_table_from_df(
+                    final_name, result_df, hints=hints
+                )
+            except Exception as e:
+                # Item 3: nothing was stored -- record "failed", not
+                # whatever _run_outcome would otherwise have derived from
+                # row errors or cancellation alone. Recorded before either
+                # emit below, so a broken error_occurred/row-error
+                # subscriber cannot stop this from being recorded.
+                self._finish_run_provenance(mode, run, result_stored=False)
+                self.error_occurred.emit(
+                    f"Failed to store table from '{operator_name}': {e}"
+                )
+                self._emit_pending_row_errors(run, result_stored=False)
+            else:
+                self._finish_run_provenance(mode, run)
                 # No eager thumbnail pass here (P0.5b-3i): when the
                 # researcher switches to this table its tiles paint and
                 # render_column_value() queues each request on demand.
                 self.tables_updated.emit(self._dataset.list_tables())
-                self.table_created.emit(table_name)
+                self.table_created.emit(final_name)
+                if final_name != requested_name:
+                    # Item 1: never silently store under a different name
+                    # than what the researcher saw in the box.
+                    self.error_occurred.emit(
+                        format_table_name_changed_message(
+                            requested_name, final_name
+                        )
+                    )
+                self._emit_pending_row_errors(run, result_stored=True)
                 self.operator_complete.emit(operator_name)
-            except Exception as e:
-                self.error_occurred.emit(
-                    f"Failed to store table from '{operator_name}': {e}"
-                )
 
         elif mode == "create_display":
             operation_id, operator_name, result = payload
@@ -1592,6 +2044,16 @@ class AppController(QObject):
                 self._finish_run_provenance(mode, run)
             self._deregister_run(operation_id)
             self.error_occurred.emit(message)
+            # Item 1/2: a TABLE run that reported rows before create_table()
+            # itself raised (or the declared-column check raised) still
+            # has those reports delivered here -- the whole run failed, so
+            # no table exists either way. `run` is still a valid dict
+            # reference after _deregister_run (see the comment on the
+            # create_table branch above); None for a run already dead
+            # when this "error" completion arrived, which is exactly when
+            # there is nothing pending to emit.
+            if run is not None:
+                self._emit_pending_row_errors(run, result_stored=False)
             self.operator_complete.emit(operator_name)
 
     # ── Result refresh ───────────────────────────────────────────────
@@ -2406,16 +2868,34 @@ class AppController(QObject):
                 operation_id, run.spec.mode_descriptor.label, table_name,
                 token=token,
             )
-            self._attach_run_provenance(
-                operation_id,
-                operator_name=run.spec.operator_name,
-                mode_name=run.spec.mode.name,
-                target_table=run.spec.target_table,
-                parameters=dict(run.spec.parameters),
-                rows_requested=len(row_ids),
-                inputs=self._run_inputs_snapshot(run),
-            )
+            # Fix round, item 2 (third pass): everything from here down --
+            # not just the actual op_registry.run_create_table() call
+            # below -- is "run setup" for a run this _register_run() call
+            # has already made live. A reviewer found that
+            # _attach_table_name_resolution() sat OUTSIDE this protection:
+            # an exception there (a KeyError, before this same item's
+            # fallback fix, on a hypothetical non-required
+            # NewTableNameParameter) would propagate to the outer
+            # try/except below, which only emits an error message and
+            # never deregisters -- leaving the run stuck in
+            # self._live_runs forever, uncancellable and uncompletable.
+            # Widened rather than adding a second try, so every setup step
+            # between registration and the worker actually starting shares
+            # one deregister-on-failure guarantee.
             try:
+                self._attach_run_provenance(
+                    operation_id,
+                    operator_name=run.spec.operator_name,
+                    mode_name=run.spec.mode.name,
+                    target_table=run.spec.target_table,
+                    parameters=dict(run.spec.parameters),
+                    rows_requested=len(row_ids),
+                    inputs=self._run_inputs_snapshot(run),
+                )
+                self._attach_table_name_resolution(
+                    operation_id, operator.name, run.spec.mode_descriptor,
+                    run.spec.parameters,
+                )
                 started = self._op_registry.run_create_table(
                     operator_name,
                     selected_df,
@@ -2423,6 +2903,10 @@ class AppController(QObject):
                     run=run,
                     on_complete=self._on_create_table_complete,
                     on_error=self._on_operator_error,
+                    # P1.7-1: the exact same callback the COLUMNS path
+                    # uses (run_create_columns above) -- one channel, not
+                    # a second one for TABLE mode.
+                    on_row_errors=self._on_operator_row_errors,
                 )
             except Exception:
                 self._deregister_run(operation_id)
@@ -3292,13 +3776,85 @@ class AppController(QObject):
         Gives the UI access to operator objects without reaching into
         _op_registry directly.
 
+        Fix round, item 1: if the operator's descriptor declares a
+        NewTableNameParameter, the returned object's descriptor carries a
+        RESOLVED default for it (resolve_table_name against the tables
+        that exist right now) instead of the operator's static declared
+        default, so the parameter form ui/main_window.py builds already
+        shows the name a run started immediately after would actually use.
+        This is computed here, never in the operator's own refine_form,
+        which may only react to values already in the form and must never
+        write one back (operators/CLAUDE.md) -- and never by giving the
+        operator a way to see which tables exist, which it never gets.
+        Every other operator is returned unchanged.
+
+        Fix round item 2 (second pass): also PRIMES
+        self._shown_table_name_suggestions[(operator_name, mode)] with
+        whatever suggestion this call resolved, so the run that starts
+        right after this dialog closes can compare against what was
+        actually shown instead of recomputing it -- see
+        _attach_table_name_resolution.
+
         Args:
             operator_name: Name of the operator to retrieve.
 
         Returns:
-            The operator object, or None if not found.
+            The operator object (or a _ResolvedTableNameOperatorView over
+            it), or None if not found.
         """
-        return self._op_registry.get(operator_name)
+        operator = self._op_registry.get(operator_name)
+        if operator is None or operator.descriptor is None:
+            return operator
+        resolved = self._resolve_new_table_name_defaults(
+            operator_name, operator.descriptor
+        )
+        if resolved is operator.descriptor:
+            return operator
+        return _ResolvedTableNameOperatorView(operator, resolved)
+
+    def _resolve_new_table_name_defaults(self, operator_name, descriptor):
+        """Returns `descriptor` unchanged if none of its modes declare a
+        NewTableNameParameter; otherwise a fresh OperatorDescriptor with
+        each such parameter's `default` replaced by
+        resolve_table_name(default, current tables) -- see get_operator().
+
+        Every NewTableNameParameter found is also recorded into
+        self._shown_table_name_suggestions[(operator_name, mode)],
+        keyed by mode as well as operator name (fix round item 3, third
+        pass) so an operator declaring the parameter on more than one
+        mode never has one mode's suggestion answer another's
+        was_auto question. Recorded whether or not resolving it actually
+        changed anything -- "the suggestion shown" is the resolved value
+        either way, and that dict is the one thing this method exists to
+        prime (see get_operator() and _attach_table_name_resolution).
+        """
+        existing = set(self._dataset.list_tables())
+        changed = False
+        new_modes = []
+        for mode_descriptor in descriptor.modes:
+            name_param = _new_table_name_param(mode_descriptor)
+            if name_param is None:
+                new_modes.append(mode_descriptor)
+                continue
+            resolved_default = resolve_table_name(name_param.default, existing)
+            self._shown_table_name_suggestions[
+                (operator_name, mode_descriptor.mode)
+            ] = resolved_default
+            if resolved_default == name_param.default:
+                new_modes.append(mode_descriptor)
+                continue
+            new_params = tuple(
+                _dataclasses_replace(spec, default=resolved_default)
+                if spec is name_param else spec
+                for spec in mode_descriptor.parameters
+            )
+            new_modes.append(
+                _dataclasses_replace(mode_descriptor, parameters=new_params)
+            )
+            changed = True
+        if not changed:
+            return descriptor
+        return _dataclasses_replace(descriptor, modes=tuple(new_modes))
 
     # ── Settings pass-throughs ───────────────────────────────────────
     #

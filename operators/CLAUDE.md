@@ -105,6 +105,121 @@ list. Nothing else.
 `aggregate` inapplicable, histogram narrows it to count/sum/mean, and bar-with-none
 and histogram-with-count each raise a warning.
 
+### A `creates_table` mode declares its own output columns' role -- `OutputSpec.table_columns`
+
+`[NOW]` (P1.7-1) A mode whose `OutputSpec` has `creates_table=True` may also
+carry `table_columns`, a tuple of `OutputColumn` -- the same `OutputColumn`
+type a COLUMNS mode uses for `output.columns`, reused here for a different
+field so the two never collide with the "exactly one shape" rule below. Each
+entry declares:
+
+- `name`, `type_tag` -- required, exactly as for a COLUMNS output column.
+- `role` -- optional, one of the plain strings `"identifier"`, `"index"` or
+  `"measurement"` (`docs/architecture.md` §4.2's vocabulary,
+  `models.table_schema.ColumnRole`'s member names). `None` means "no
+  opinion" and leaves it to `infer_schema`'s dtype-only default -- a plain
+  int or float column defaults to `measurement`, which is wrong for a
+  lineage index. **This is how you declare `segment_index` or
+  `frame_index` as `role="index"`** instead of leaving it to default to
+  `measurement` -- see `operators/segment.py`.
+- `carry_to_children` -- optional `bool`. `None` means the same "no
+  opinion" default `infer_schema` already uses (`True`).
+
+Without a hint, `infer_schema` alone decides every one of these for a
+`create_table()` result -- there is no other way to influence it.
+
+**Why the string, not the enum.** `operators/descriptor.py` is
+standard-library only (see its own module docstring) and cannot import
+`models.table_schema.ColumnRole`, so `role` is carried as the enum
+member's plain string value. `OperatorRegistry.hints_for_table_output()`
+is what converts it: it walks a TABLE mode's `table_columns`, builds one
+`models.table_schema.ColumnHint` per column (carrying `type_tag`, `role`
+converted to a real `ColumnRole`, and `carry_to_children`), and
+`AppController` passes the result straight into
+`Dataset.create_table_from_df(name, df, hints=...)` -- the exact same
+`hints` argument every other caller of `_prepare_table` already uses,
+never a second mechanism. **The operator never calls `Dataset` itself**;
+this translation happens in `OperatorRegistry`, the one place both
+vocabularies are already in scope.
+
+**An invalid role is refused at registration**, in
+`OperatorRegistry.register()` -- before any run, not after one completes
+-- naming the operator, the column and the valid roles (read off
+`ColumnRole` itself, so the message can never drift from the enum).
+
+**A declared column your `create_table()` does not actually return is a
+run failure, not a silently dropped hint.** `OperatorRegistry` checks
+every `table_columns` name against the returned frame's columns right
+after `create_table()` returns; a name it does not find raises
+`OperatorRunError`, which surfaces through the same `on_error` path any
+other `create_table()` exception already takes.
+
+**Your `create_table()` input already carries `row_id`.** The `df`
+argument is built by `Dataset.snapshot_rows()`, called by
+`AppController.run_create_table()` before the run starts, with no
+`columns=` filter -- it returns every column of the source table, and
+`row_id` is one of them. You may read `row["row_id"]` as that row's
+identity (for `run.report_row_error()`, below); you still must not add a
+`row_id` column to what you *return* -- one is generated fresh when
+`Dataset` stores your result, exactly as before this rule existed.
+
+### Naming the output table -- `NewTableNameParameter`
+
+`[NOW]` A `creates_table` mode may declare a `NewTableNameParameter`
+(`operators/descriptor.py`) so the researcher can name the table your
+`create_table()` result is stored under, instead of the fixed
+`f"{operator_name}_result"` name every other `creates_table` mode still
+gets. `operators/segment.py` is the worked example.
+
+**You never see the name that actually gets used, and you must not try
+to.** `AppController` resolves it -- not `refine_form`, which may only
+react to what is already in the form and must never write a value back
+(see above), and not the operator, which has no way to see which tables
+exist. Concretely: the parameter form shows the researcher a suggestion
+already resolved against the tables that exist when the form is built
+(`resolve_table_name` in `controller.py`), and the controller resolves
+it again right before storing, because another run can claim that name
+in between. If the researcher edits the suggestion to a name that
+already exists, the store is refused rather than silently picking a
+different name or overwriting -- naming an existing table on purpose is
+answered the same way `Dataset.confirm_merge` already answers it.
+`CLAUDE.md`, "Data ownership", is the authority for the exact rule; not
+restated here. `create_table()` itself is unaffected either way -- it
+never reads or returns a table name.
+
+### Reporting a row you could not process -- `run.report_row_error`
+
+`[NOW]` (P1.7-1) `run.report_row_error(row_id, kind, message)` records one
+row your execution method could not, or chose not to, process -- available
+on every `OperatorRun`, in both `create_table()` and `create_columns()`.
+Unlike `run.log()`, this is **not** latest-wins: every call is kept, in the
+order you made it, and delivered as a batch once your execution method
+returns.
+
+Call it instead of silently dropping a row from your `create_table()`
+result, or instead of a `create_columns()` returning `None` values for a
+row when you actually know *why* that row failed and want the researcher
+told. `kind` is a short, stable label (a string you choose -- `"MissingMedia"`,
+`"InvalidTimeRange"`, whatever names the reason), not required to match any
+registered vocabulary.
+
+Every report reaches the researcher through the same channel a caught
+per-row exception already uses: `OperatorRegistry` reads every report back
+with `run.collected_row_errors()` after your method returns and hands them
+to `on_row_errors(operation_id, label, errors)`, each entry
+`(row_id, kind, message)`. In `create_columns()`, your reports are merged
+with whatever the per-row loop's own caught exceptions already collected --
+your reports appended after those, each source keeping its own order. The
+run's outcome is recorded `partial` rather than `complete` whenever this
+channel fired at all (`CLAUDE.md`, "Long-running work" -- not restated
+here).
+
+`report_row_error()` never raises and never blocks -- callable from the
+background thread your execution method runs on, the same way `log()` is.
+`operators/segment.py` is the worked example: it calls it once per row it
+excludes from its output, instead of the aggregate-count-only `run.log()`
+line the rule used to require.
+
 ---
 
 ## The execution methods

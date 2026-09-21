@@ -34,6 +34,7 @@ from operators.descriptor import (
     ModelLifecycle,
     NewTableNameParameter,
     OperatorDescriptor,
+    OutputColumn,
     OutputSpec,
 )
 
@@ -135,7 +136,23 @@ class SegmentOperator(BaseOperator):
                         default="segments",
                     ),
                 ),
-                output=OutputSpec(creates_table=True),
+                output=OutputSpec(
+                    creates_table=True,
+                    # P1.7-1: segment_index numbers each source video's
+                    # segments in order -- it is a lineage index, not a
+                    # measurement, and this is what makes
+                    # Dataset.columns_to_carry() always carry it down to
+                    # any operator that further splits a segment (a frame
+                    # operator, P1.7). Without this hint infer_schema's
+                    # plain int-column default (role=measurement) would
+                    # apply instead.
+                    table_columns=(
+                        OutputColumn(
+                            name="segment_index", type_tag="numeric",
+                            role="index",
+                        ),
+                    ),
+                ),
                 model_lifecycle=ModelLifecycle.NONE,
                 deterministic=True,
                 cacheable=True,
@@ -172,9 +189,14 @@ class SegmentOperator(BaseOperator):
         candidates: list[dict] = []
         dropped = 0
         for position, (_, source_row) in enumerate(df.iterrows()):
+            row_id = source_row["row_id"]
             media_value = source_row[media_column]
             if _is_blank_media_value(media_value):
                 dropped += 1
+                run.report_row_error(
+                    row_id, "MissingMedia",
+                    f"column {media_column!r} is missing or blank",
+                )
                 continue
 
             start_seconds = _as_finite_seconds(source_row[start_column])
@@ -187,6 +209,12 @@ class SegmentOperator(BaseOperator):
                 or end_seconds <= start_seconds
             ):
                 dropped += 1
+                run.report_row_error(
+                    row_id, "InvalidTimeRange",
+                    f"start ({source_row[start_column]!r}) and end "
+                    f"({source_row[end_column]!r}) must both be finite, "
+                    "non-negative numbers with end after start",
+                )
                 continue
 
             # decision 9 (docs/media_architecture.md §3.6): the source path
@@ -212,11 +240,11 @@ class SegmentOperator(BaseOperator):
             candidates.append(row)
 
         if dropped:
-            run.log(
-                f"segment: dropped {dropped} row(s) with a missing media "
-                "value, or a missing, non-numeric, negative, or "
-                "non-positive-duration time range"
-            )
+            # A quick-glance count for the status-bar run indicator; the
+            # per-row reason for each dropped row is now on the row-error
+            # channel above (P1.7-1), not folded into this one aggregate
+            # string the way it was before.
+            run.log(f"segment: dropped {dropped} row(s); see the row-error report for detail")
 
         # segment_index: 0-based position among the output rows that share
         # the same source path, ordered by segment_start and then by

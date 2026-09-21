@@ -45,10 +45,17 @@ import threading
 import pandas as pd
 
 from operators.base import BaseOperator, OperatorSetupError
-from operators.descriptor import ExecutionMode, MediaRequirement, ModelLifecycle
+from operators.descriptor import (
+    ExecutionMode,
+    MediaRequirement,
+    ModelLifecycle,
+    OperatorDescriptorError,
+)
+from operators.run_context import OperatorRunError
 from media.extensions import IMAGE_EXTENSIONS
 from media.media_address import MediaAddressError, parse as parse_address
 from media.resolver import MediaResolverError
+from models.table_schema import ColumnHint, ColumnRole
 
 
 def _is_bare_video_address(addr) -> bool:
@@ -157,9 +164,42 @@ class OperatorRegistry:
 
         Args:
             operator: An instance of a BaseOperator subclass.
+
+        Raises:
+            OperatorDescriptorError: a TABLE mode's OutputSpec.table_columns
+                names a role that is not a models.table_schema.ColumnRole
+                member (P1.7-1 fix round). Checked HERE rather than left to
+                surface later from hints_for_table_output()'s ColumnRole(...)
+                conversion, because registration is the first place both
+                operators.descriptor's plain-string vocabulary and
+                models.table_schema's ColumnRole are already in scope --
+                catching it here fails fast, before any run, rather than
+                after a completed TABLE run is silently discarded.
         """
+        self._validate_table_column_roles(operator)
         self._operators[operator.name] = operator
         print(f"[OperatorRegistry] Registered: {operator.name}")
+
+    def _validate_table_column_roles(self, operator: BaseOperator) -> None:
+        """Raise OperatorDescriptorError if any mode's OutputSpec.table_columns
+        declares a role string that names no ColumnRole member. The valid
+        set is read off the enum itself (``{r.value for r in ColumnRole}``),
+        never hand-written, so it cannot drift from ColumnRole as members
+        are added or renamed.
+        """
+        if operator.descriptor is None:
+            return
+        valid_roles = {role.value for role in ColumnRole}
+        for mode_descriptor in operator.descriptor.modes:
+            for column in mode_descriptor.output.table_columns:
+                if column.role is not None and column.role not in valid_roles:
+                    raise OperatorDescriptorError(
+                        f"operator {operator.name!r} declares "
+                        f"table_columns[{column.name!r}].role="
+                        f"{column.role!r}, which is not a valid "
+                        f"ColumnRole; valid roles are "
+                        f"{sorted(valid_roles)}"
+                    )
 
     def list_operators(self) -> list[str]:
         """
@@ -207,6 +247,55 @@ class OperatorRegistry:
             if mode_descriptor is not None:
                 listed.append((op.name, mode_descriptor.label))
         return listed
+
+    def hints_for_table_output(self, operator_name: str) -> dict[str, ColumnHint]:
+        """The ColumnHint (P1.7-1) each column a TABLE-mode operator
+        declares on its descriptor's OutputSpec.table_columns asks for --
+        type_tag, role and/or carry_to_children -- keyed by column name,
+        in exactly the shape Dataset.create_table_from_df's ``hints``
+        argument expects.
+
+        type_tag is always carried (OutputColumn.type_tag is a required,
+        non-empty field, so every declared table_columns entry has an
+        opinion about it -- unlike role and carry_to_children, which are
+        optional). This mirrors what a COLUMNS mode's own OutputColumn.type_tag
+        already does unconditionally (CLAUDE.md's "An operator's declared
+        output-column tag reaches its table's schema as a ColumnHint,
+        registered or not") -- P1.7-1 fixed a bug here: the first cut of
+        this method carried role/carry_to_children but silently dropped
+        type_tag, so a column declared media_path was stored as text.
+
+        AppController calls this once a create_table() result is ready to
+        store, and hands the result straight to create_table_from_df; the
+        operator itself never calls Dataset (CLAUDE.md, "Data ownership"),
+        so this translation from descriptor vocabulary (OutputColumn's
+        plain-string role) to Dataset's vocabulary (ColumnRole) happens
+        here, the one place both are already in scope. ColumnRole(...) is
+        never expected to raise here: register() already refused an
+        operator whose table_columns names an invalid role, before this
+        method can ever be reached for it.
+
+        Returns {} -- "no hints", exactly Dataset's own default -- for an
+        unknown operator, one with no descriptor, no TABLE mode, or a
+        TABLE mode that declares no table_columns. None of those are
+        errors: a TABLE operator that declares none (every one of them,
+        before P1.7-1) behaves exactly as before.
+        """
+        operator = self._operators.get(operator_name)
+        if operator is None or operator.descriptor is None:
+            return {}
+        mode_descriptor = operator.descriptor.mode_for(ExecutionMode.TABLE)
+        if mode_descriptor is None:
+            return {}
+
+        hints: dict[str, ColumnHint] = {}
+        for column in mode_descriptor.output.table_columns:
+            hints[column.name] = ColumnHint(
+                type_tag=column.type_tag,
+                role=ColumnRole(column.role) if column.role is not None else None,
+                carry_to_children=column.carry_to_children,
+            )
+        return hints
 
     # ── run_create_columns ────────────────────────────────────────────
 
@@ -288,11 +377,22 @@ class OperatorRegistry:
                               unexpected failures and deliberate refusals
                               are both visibly distinct from the normal
                               "no face detected" case, which returns None
-                              values rather than landing here.
+                              values rather than landing here. Also
+                              includes, appended after the above (P1.7-1
+                              fix round), every row create_columns()
+                              itself reported through
+                              run.report_row_error() -- the same channel
+                              a TABLE-mode create_table() uses; both
+                              sources keep their own report order, merged
+                              rather than interleaved.
                               Signature: (operation_id: str,
                                           label: str,
                                           errors: list[tuple[str, str, str]])
-                              Each tuple is (row_id, exc_type_name, message).
+                              Each tuple is (row_id, kind, message) --
+                              `kind` is an exception type name for a
+                              caught exception, or whatever string the
+                              operator itself passed to
+                              report_row_error().
 
         Raises:
             ValueError: If snapshot does not have exactly one row per
@@ -644,6 +744,15 @@ class OperatorRegistry:
                 percent = int((i + 1) / total * 100)
                 on_progress(percent)
 
+        # P1.7-1 fix round: run.report_row_error() is available on every
+        # OperatorRun, not just a TABLE run's -- a create_columns() that
+        # calls it (a reasonable thing to try, since the method makes no
+        # mode distinction) must not have that report silently dropped.
+        # Drained here and appended AFTER the exceptions this loop caught
+        # itself, preserving each source's own report order; nothing
+        # before this line is reordered by the merge.
+        row_errors = row_errors + run.collected_row_errors()
+
         if row_errors and on_row_errors is not None:
             on_row_errors(operation_id, label, row_errors)
 
@@ -660,6 +769,7 @@ class OperatorRegistry:
         run,
         on_complete=None,
         on_error=None,
+        on_row_errors=None,
     ) -> bool:
         """
         Runs create_table() in a background thread.
@@ -686,9 +796,24 @@ class OperatorRegistry:
                                        result_df: pd.DataFrame)
                            Called from background thread — AppController
                            routes to main thread.
-            on_error:      Called if create_table raises an exception.
+            on_error:      Called if create_table raises an exception, or
+                           if it declares an output column (descriptor
+                           OutputSpec.table_columns) its returned frame does
+                           not actually contain -- P1.7-1 treats that as a
+                           run failure, never a silently dropped hint.
                            Signature: (operation_id: str,
                                        operator_name: str, message: str)
+                           Called from background thread.
+            on_row_errors: P1.7-1. Called once, after create_table()
+                           returns and before on_complete, if the operator
+                           reported any row through run.report_row_error()
+                           -- the exact same channel and callback shape the
+                           COLUMNS path already uses (see run_create_columns
+                           above); there is no second channel.
+                           Signature: (operation_id: str,
+                                       label: str,
+                                       errors: list[tuple[str, str, str]])
+                           Each tuple is (row_id, kind, message).
                            Called from background thread.
         """
         # Returns True if a worker was started, False otherwise -- see
@@ -710,7 +835,10 @@ class OperatorRegistry:
 
         thread = threading.Thread(
             target=self._run_create_table_worker,
-            args=(operator, df, operation_id, run, on_complete, on_error),
+            args=(
+                operator, df, operation_id, run, on_complete, on_error,
+                on_row_errors,
+            ),
             daemon=True,
         )
         thread.start()
@@ -724,12 +852,40 @@ class OperatorRegistry:
         run,
         on_complete,
         on_error,
+        on_row_errors,
     ) -> None:
-        """Worker that runs create_table() in the background thread."""
+        """Worker that runs create_table() in the background thread.
+
+        Fix round, item 1: run.report_row_error() reports must reach
+        on_row_errors whichever way this method ends -- create_table()
+        succeeding, raising, or the declared-column check below raising.
+        `label` is computed up front, before either can happen, and
+        `_deliver_row_errors` is called exactly once, on every exit path,
+        immediately before that path's own terminal on_complete/on_error
+        call -- never in a `finally`, which would run AFTER the terminal
+        call and reorder it behind the wrong message.
+        """
+        label = run.spec.mode_descriptor.label
         try:
             result_df = operator.create_table(df, run)
-            if on_complete is not None:
-                on_complete(operation_id, operator.name, result_df)
+
+            # P1.7-1: a column the operator declared on its OutputSpec.
+            # table_columns but did not actually return is an error, not a
+            # silent no-op -- without this check, Dataset._prepare_table
+            # would simply drop the unmatched hint (it narrows hints to
+            # the columns the frame actually has) and the researcher would
+            # never learn the declaration and the result disagreed.
+            declared_columns = run.spec.mode_descriptor.output.table_columns
+            missing = [
+                column.name for column in declared_columns
+                if column.name not in result_df.columns
+            ]
+            if missing:
+                raise OperatorRunError(
+                    f"operator {operator.name!r} declares output column(s) "
+                    f"{missing} on its TABLE descriptor, but its "
+                    f"create_table() result does not contain them"
+                )
         except NotImplementedError:
             # Report it as an error so AppController deregisters the run
             # it registered before starting this worker -- a silent
@@ -738,19 +894,46 @@ class OperatorRegistry:
                 f"[OperatorRegistry] Operator '{operator.name}' "
                 f"does not implement create_table()."
             )
+            self._deliver_row_errors(operation_id, label, run, on_row_errors)
             if on_error is not None:
                 on_error(
                     operation_id, operator.name,
                     f"Operator '{operator.name}' does not implement "
                     f"create_table().",
                 )
+            return
         except Exception as e:
             print(
                 f"[OperatorRegistry] Error in create_table "
                 f"for '{operator.name}': {e}"
             )
+            self._deliver_row_errors(operation_id, label, run, on_row_errors)
             if on_error is not None:
                 on_error(operation_id, operator.name, str(e))
+            return
+
+        # Success path: same delivery, same "before the terminal call"
+        # ordering, exactly once -- this is the only other exit.
+        self._deliver_row_errors(operation_id, label, run, on_row_errors)
+        if on_complete is not None:
+            on_complete(operation_id, operator.name, result_df)
+
+    def _deliver_row_errors(self, operation_id, label, run, on_row_errors) -> None:
+        """Read back every row run.report_row_error() collected and hand
+        it to on_row_errors, if any were reported and a sink is wired.
+
+        Called exactly once per _run_create_table_worker invocation --
+        from every one of its three exit paths, never from more than one
+        -- so a report is never delivered twice. run.collected_row_errors()
+        itself is side-effect-free (it copies the list rather than
+        draining it), so calling this twice would be safe by construction
+        even if a future edit ever did; the "exactly once" guarantee here
+        is about correctness of INTENT (one on_row_errors call per run),
+        not a defence against a double call.
+        """
+        row_errors = run.collected_row_errors()
+        if row_errors and on_row_errors is not None:
+            on_row_errors(operation_id, label, row_errors)
 
     # ── run_create_display ────────────────────────────────────────────
 

@@ -636,6 +636,39 @@ class OperatorRun:
     # every concurrent run regardless of the declared lifecycle. See
     # operators/CLAUDE.md -> "Where a model lives".
     model: object = None
+    # P1.7-1: the rows this run's operator itself chose to flag, each
+    # (row_id, kind, message) -- report_row_error() appends here. A plain
+    # list mutated in place, not reassigned, so it stays reachable through
+    # this frozen dataclass's normal (non-__setattr__) field access;
+    # guarded by _row_errors_lock because create_table() and
+    # create_columns() both run on a background thread. OperatorRegistry
+    # reads it back through collected_row_errors() once the operator's
+    # execution method returns.
+    #
+    # compare=False on both fields (fix round, item 6): a frozen dataclass
+    # with the default eq=True auto-generates __hash__ from every field's
+    # value, and a plain list is not hashable -- hash(some_run) would
+    # raise TypeError once it reached _row_errors. Nothing in this repo
+    # hashes, dict-keys, set-includes or `==`-compares an OperatorRun (the
+    # one place that touches a live run object, operator_registry.py's
+    # `dataclasses.replace(run, model=...)` for a PER_WORKER/SHARED model,
+    # only reads and re-passes current field values -- it never hashes).
+    # RunData (this run's own `data` field) was ALREADY unhashable before
+    # this work item, because its MappingProxyType-wrapped tables are not
+    # hashable either -- confirmed by hand, `hash(RunData(tables={},
+    # projects={}))` already raised on main. So OperatorRun was never
+    # genuinely hashable, and this change is not what breaks that. Marking
+    # these two fields compare=False (which also excludes them from hash,
+    # per dataclasses' own rule that a field participates in hash only
+    # when compare=True and hash is not explicitly False) is a narrow,
+    # local guard so these two fields are never themselves an ADDITIONAL,
+    # avoidable reason hashing would fail if RunData's own unhashability
+    # were ever fixed later -- not a claim that OperatorRun is hashable
+    # now.
+    _row_errors: list = field(default_factory=list, compare=False)
+    _row_errors_lock: threading.Lock = field(
+        default_factory=threading.Lock, compare=False
+    )
 
     @property
     def parameters(self) -> "Mapping[str, object]":
@@ -705,3 +738,41 @@ class OperatorRun:
         if self._log_fn is None:
             return
         self._log_fn(self.spec.operation_id, text)
+
+    def report_row_error(self, row_id: str, kind: str, message: str) -> None:
+        """Record one row this run's operator could not process, so it
+        reaches the researcher instead of leaving no trace but an
+        aggregate run.log() count (P1.7-1).
+
+        Available on every OperatorRun, whichever mode it is for --
+        there is no mode check here, deliberately: a TABLE-mode
+        create_table() calls it for a row it chooses to skip, and a
+        COLUMNS-mode create_columns() (P1.7-1 fix round) may call it too,
+        for a row it wants to flag without raising. Matches the shape the
+        COLUMNS path already collects from a caught exception --
+        operators/operator_registry.py's row_errors list, each a
+        (row_id, kind, message) tuple: row identity, a short kind, and a
+        message. Callable from a worker thread -- both create_table() and
+        create_columns() run on one -- the same way log() is; the lock
+        only serialises this list's own append, it does not make the
+        caller itself thread-safe.
+
+        OperatorRegistry reads every row reported this way back with
+        collected_row_errors(), merges it with whatever it already
+        collected on its own side (a TABLE run has nothing else to merge
+        with; a COLUMNS run merges it after the exceptions its own loop
+        caught), and delivers the result through the exact same
+        on_row_errors(operation_id, label, errors) callback in both
+        modes -- there is no second channel. An operator never calls that
+        callback itself.
+        """
+        with self._row_errors_lock:
+            self._row_errors.append((row_id, kind, message))
+
+    def collected_row_errors(self) -> list:
+        """Every row error report_row_error() has recorded so far, in the
+        order they were reported. Read by OperatorRegistry after the
+        operator's execution method returns; an operator never calls this
+        itself."""
+        with self._row_errors_lock:
+            return list(self._row_errors)

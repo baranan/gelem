@@ -149,6 +149,48 @@ def test_wiring_create_table_from_df():
     assert ds.schema_for("built").column_names() == ("alpha", "beta")
 
 
+# ---------------------------------------------------------------------------
+# P1.7-1 fix round, item 2: create_table_from_df refuses a name collision
+# instead of silently keeping the old table's schema.
+# ---------------------------------------------------------------------------
+
+def test_create_table_from_df_hint_reaches_a_fresh_table():
+    # A declared role reaches storage cleanly when the destination did not
+    # already exist -- the case item 2 makes universal by refusing the
+    # other case (see the next test) rather than special-casing it.
+    ds = Dataset()
+    ds.create_table_from_df(
+        "built",
+        pd.DataFrame({"idx": [1, 2, 3]}),
+        hints={"idx": ColumnHint(role=ColumnRole.index)},
+    )
+    assert ds.schema_for("built").spec_for("idx").role is ColumnRole.index
+
+
+def test_create_table_from_df_refuses_an_existing_table_name():
+    ds = Dataset()
+    ds.create_table_from_df("built", pd.DataFrame({"x": [1, 2, 3]}))
+
+    # Before this fix round, a second call under the same name replaced
+    # the table -- and _prepare_table only applies a hint to a column
+    # ABSENT from the stored schema, so "x" (already named by the first
+    # table's schema) would keep its original role regardless of what
+    # this second call asked for. Refusing removes that path entirely: a
+    # collision is never reached far enough to matter.
+    with pytest.raises(ValueError, match="already exists"):
+        ds.create_table_from_df(
+            "built",
+            pd.DataFrame({"x": [4, 5, 6]}),
+            hints={"x": ColumnHint(role=ColumnRole.index)},
+        )
+
+    # The original table and schema are untouched, not partially
+    # overwritten.
+    schema = ds.schema_for("built")
+    assert schema.spec_for("x").role is ColumnRole.measurement
+    assert list(ds.get_table("built")["x"]) == [1, 2, 3]
+
+
 def test_wiring_load(tmp_path):
     ds = _ds_with_frames(tmp_path)
     proj = tmp_path / "proj"

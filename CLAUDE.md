@@ -164,6 +164,31 @@ state. This rule carries no violation list of its own -- it points at the three
   startup rather than silently changing what the researcher can do. Made true
   by P1.11a. `docs/architecture.md` §7 is the authority. Guarded by
   `tests/test_operator_config.py::test_yaml_keys_equal_factory_keys`.
+- **`[NOW]`** `Dataset.create_table_from_df` refuses a name that already
+  names a stored table (`ValueError`) rather than overwriting it -- the
+  same refusal `confirm_merge`'s expanding-merge branch already makes for
+  the same reason. Made true by the P1.7-1 fix round: overwriting is how a
+  re-run's declared column role used to go silently missing, because
+  `_prepare_table` only applies a hint to a column absent from the
+  destination's stored schema (see its own docstring), so a second run
+  under the same name kept the first run's schema unchanged. A caller that
+  wants a fresh name instead of a refusal picks one itself before calling
+  this -- see the next rule. Tests: `tests/test_dataset_schema.py`.
+- **`[NOW]`** A TABLE-mode operator's declared `NewTableNameParameter`
+  value is what the table is actually stored under, resolved against a
+  collision rather than the researcher's typed name being silently
+  discarded or silently changed. `AppController` (never the operator,
+  which has no way to see which tables exist) resolves the name in two
+  Qt-free functions, `resolve_table_name` and
+  `format_table_name_changed_message` (`controller.py`): a name already
+  taken is suffixed `_1`, `_2`, ... when the collision arose from a race
+  between the parameter form and the store (the shown suggestion, or an
+  operator with no such parameter's fixed `f"{operator}_result"` name);
+  a name the researcher typed over the suggestion with, that already
+  names an existing table, is refused rather than resolved to a different
+  one -- matching `confirm_merge`'s own refusal above rather than storing
+  under a name the researcher did not choose. Made true by the P1.7-1 fix
+  round. Tests: `tests/test_result_delivery.py`.
 
 ### Row identity and lineage
 
@@ -221,6 +246,11 @@ state. This rule carries no violation list of its own -- it points at the three
   and indices are always carried; everything else defaults to carried, because a
   trial-level covariate such as `reaction_time` is a measurement *and* is required
   on every frame row. Full rule in `docs/architecture.md` §4.2.
+- **`[NOW]`** A `creates_table` mode declares its own output columns' `role`
+  and `carry_to_children` (`OutputSpec.table_columns`), and an operator
+  reports a row it could not process through `run.report_row_error()`.
+  `operators/CLAUDE.md` is the authority for both -- not restated here. Made
+  true by P1.7-1. Tests: `tests/test_table_output_contract.py`.
 
 ### Threading
 

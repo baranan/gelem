@@ -450,14 +450,38 @@ class OutputColumn:
     ``type_tag`` is the column type tag (``numeric``, ``media_path``, ...)
     the display layer keys on; it need not be registered, but an
     unregistered tag costs the researcher a placeholder tile.
+
+    ``role`` and ``carry_to_children`` (P1.7-1) are optional and meaningful
+    only when this ``OutputColumn`` sits in ``OutputSpec.table_columns``
+    (the ``creates_table`` case's own hint list, not ``columns``): the
+    column-role vocabulary (``"identifier"`` / ``"index"`` /
+    ``"measurement"``) is ``models.table_schema.ColumnRole``, but this
+    module is standard-library only (see the module docstring), so
+    ``role`` is carried here as its plain string value -- OperatorRegistry,
+    which already depends on ``models.table_schema``, is what converts it
+    to a real ``ColumnRole`` and builds the ``ColumnHint`` Dataset
+    consults. ``None`` for either field means "no opinion, let
+    Dataset.create_table_from_df's caller (infer_schema) decide" --
+    exactly the behaviour before this field existed.
     """
 
     name: str
     type_tag: str
+    role: Optional[str] = None
+    carry_to_children: Optional[bool] = None
 
     def __post_init__(self) -> None:
         _require_non_empty(self.name, "OutputColumn.name")
         _require_non_empty(self.type_tag, "OutputColumn.type_tag")
+        if self.role is not None:
+            _require_non_empty(self.role, "OutputColumn.role")
+        if self.carry_to_children is not None and not isinstance(
+            self.carry_to_children, bool
+        ):
+            raise OperatorDescriptorError(
+                "OutputColumn.carry_to_children must be a bool or None, "
+                f"got {type(self.carry_to_children).__name__}."
+            )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -473,20 +497,35 @@ class OutputSpec:
         nothing.
 
     Any other combination is refused.
+
+    ``table_columns`` (P1.7-1) is a separate, optional field: role /
+    carry_to_children hints for columns a ``creates_table`` mode's own
+    ``create_table()`` returns. It is NOT a fourth shape and does not
+    interact with the ``columns`` invariant above -- kept as its own field,
+    rather than folded into ``columns``, because ``columns`` non-empty is
+    already the SIGNAL for the "adds columns to existing rows" shape
+    (guarded by ``tests/test_operator_descriptor.py``'s
+    ``test_output_spec_rejects_columns_and_creates_table_together``), and
+    overloading it to also mean "hints for a new table's columns" would
+    make that combination stop being an error precisely where the
+    existing test says it must stay one.
     """
 
     columns: tuple[OutputColumn, ...] = ()
     creates_table: bool = False
     is_display_only: bool = False
+    table_columns: tuple[OutputColumn, ...] = ()
 
     def __post_init__(self) -> None:
         _require_tuple(self.columns, "OutputSpec.columns")
+        _require_tuple(self.table_columns, "OutputSpec.table_columns")
         has_columns = len(self.columns) > 0
 
         # Exactly one of the three shapes must be declared. Each shape is a
         # boolean; count how many are on and insist the count is one. This
         # rejects every wrong combination at once -- zero declared, or two,
-        # or all three.
+        # or all three. Unchanged from before P1.7-1: table_columns plays
+        # no part in this check.
         shapes_declared = (has_columns, self.creates_table, self.is_display_only)
         if sum(shapes_declared) != 1:
             raise OperatorDescriptorError(
@@ -497,12 +536,26 @@ class OutputSpec:
                 f"is_display_only={self.is_display_only}."
             )
 
+        # table_columns declares hints for a creates_table mode's own
+        # output columns -- it means nothing for the other two shapes.
+        if self.table_columns and not self.creates_table:
+            raise OperatorDescriptorError(
+                "OutputSpec.table_columns may only be set when "
+                "creates_table is true -- it declares role / "
+                "carry_to_children hints for a creates_table mode's own "
+                "create_table() output columns."
+            )
+
         # Output column names form a namespace the schema layer keys on, so
         # they must be distinct -- the same discipline applied to input and
         # parameter names on ModeDescriptor.
         _require_unique(
             tuple(column.name for column in self.columns),
             "OutputSpec column names",
+        )
+        _require_unique(
+            tuple(column.name for column in self.table_columns),
+            "OutputSpec.table_columns column names",
         )
 
 

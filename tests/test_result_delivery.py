@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import ast
 import sys
+import threading
 from pathlib import Path
 
 project_root = Path(__file__).parent.parent
@@ -36,12 +37,14 @@ from models.query_engine import QueryEngine
 from models.notifications import RowsUpdated, ThumbnailsReady
 from artifacts.artifact_store import ArtifactStore
 from column_types.registry import ColumnTypeRegistry
+from operators.base import BaseOperator
 from operators.operator_registry import OperatorRegistry
 from operators.descriptor import (
     ExecutionMode,
     InputKind,
     InputSpec,
     ModeDescriptor,
+    NewTableNameParameter,
     OperatorDescriptor,
     OutputColumn,
     OutputSpec,
@@ -50,8 +53,11 @@ from operators.run_context import CancellationToken
 from controller import (
     AppController,
     format_cancel_message,
+    format_row_error_summary,
     format_run_indicator_text,
+    format_table_name_changed_message,
     numbered_run_choices,
+    resolve_table_name,
     write_read_conflict_warnings,
 )
 from media.resolver import MediaResolver
@@ -106,6 +112,32 @@ def _table_descriptor(name, label):
                 label=label,
                 inputs=_active_table_input(),
                 parameters=(),
+                output=OutputSpec(creates_table=True),
+            ),
+        ),
+    )
+
+
+def _table_descriptor_with_name_param(name, label, default_name):
+    """Same as _table_descriptor, but the mode also declares a
+    NewTableNameParameter -- fix round item 1's naming tests need an
+    operator that lets the researcher (or the test) supply a table name."""
+    return OperatorDescriptor(
+        name=name,
+        version="1.0",
+        description=f"Test double: {label}.",
+        modes=(
+            ModeDescriptor(
+                mode=ExecutionMode.TABLE,
+                label=label,
+                inputs=_active_table_input(),
+                parameters=(
+                    NewTableNameParameter(
+                        name="output_table",
+                        label="New table name",
+                        default=default_name,
+                    ),
+                ),
                 output=OutputSpec(creates_table=True),
             ),
         ),
@@ -1710,6 +1742,734 @@ def test_cancelled_create_display_result_is_discarded_and_recorded_partial(
     assert len(entries) == 1
     assert entries[0]["params"]["outcome"] == "partial"
     assert entries[0]["params"]["cancellation_requested"] is True
+
+
+# ---------------------------------------------------------------------------
+# P1.7-1 fix round, items 1-5: row-error reporting for a TABLE-mode run.
+#
+# format_row_error_summary() itself (items 2, 3) is tested directly, Qt-free,
+# with no controller. Item 4 (a discarded run's row-error report must not
+# reach the researcher) and item 5 (end-to-end: a real controller, a real
+# Dataset, checked by RECORDED outcome and by the table actually existing --
+# not by callback order) are tested against a real AppController below.
+# ---------------------------------------------------------------------------
+
+def test_format_row_error_summary_counts_distinct_rows_not_entries():
+    # Item 3: the same row_id reported twice (once via report_row_error,
+    # once via a caught exception, say) must count as ONE affected row,
+    # while still keeping both lines of detail.
+    errors = [
+        ("r1", "Flagged", "flagged first"),
+        ("r1", "ValueError", "then raised"),
+        ("r2", "Flagged", "flagged too"),
+    ]
+    message = format_row_error_summary(
+        "My op", errors, mode_name="COLUMNS", result_stored=True,
+    )
+    # Would still pass if violated? No. len(errors) is 3; if the count
+    # were len(errors) instead of distinct row_ids, this would read
+    # "3 row(s)" instead of "2 row(s)".
+    assert "2 row(s)" in message
+    assert "Flagged" in message and "ValueError" in message
+
+
+def test_format_row_error_summary_wording_by_mode_and_storage():
+    errors = [("r1", "Flagged", "msg")]
+
+    columns_msg = format_row_error_summary(
+        "Op", errors, mode_name="COLUMNS", result_stored=True,
+    )
+    table_stored_msg = format_row_error_summary(
+        "Op", errors, mode_name="TABLE", result_stored=True,
+    )
+    table_not_stored_msg = format_row_error_summary(
+        "Op", errors, mode_name="TABLE", result_stored=False,
+    )
+
+    # Would still pass if violated? No. Before this fix every mode used
+    # the COLUMNS wording ("no values for the new columns"), which is
+    # false for a TABLE operator -- those source rows were never columns
+    # of anything; they were left out of a table, or no table exists.
+    assert "no values for the new columns" in columns_msg
+    assert "no values for the new columns" not in table_stored_msg
+    assert "no values for the new columns" not in table_not_stored_msg
+
+    assert "left out of the stored table" in table_stored_msg
+    assert "No table was stored" in table_not_stored_msg
+    # The two TABLE messages must actually differ -- a wording bug that
+    # made both branches return the same string would still pass every
+    # assertion above on its own.
+    assert table_stored_msg != table_not_stored_msg
+
+
+# ---------------------------------------------------------------------------
+# Real-controller test doubles for items 4 and 5. Each create_table()
+# drops row_id from every row it returns (operators/CLAUDE.md: "Do not
+# add row_id -- it is generated when the table is stored") -- unlike the
+# registry-seam test double in tests/test_table_output_contract.py, these
+# actually go through Dataset.create_table_from_df's real row_id
+# insertion, which raises on a duplicate column if row_id survives.
+# ---------------------------------------------------------------------------
+
+class _SkipsEveryOtherRow(BaseOperator):
+    """A real TABLE operator: reports every even-position row through
+    run.report_row_error() and excludes it from the result."""
+
+    name = "skips_every_other_row_e2e"
+    descriptor = _table_descriptor(
+        "skips_every_other_row_e2e", "Skips every other row",
+    )
+
+    def create_table(self, df, run):
+        kept_rows = []
+        for position, (_, row) in enumerate(df.iterrows()):
+            if position % 2 == 0:
+                run.report_row_error(
+                    row["row_id"], "Flagged",
+                    f"row {row['row_id']} was flagged for skip",
+                )
+                continue
+            kept_rows.append({"file_name": row["file_name"]})
+        return pd.DataFrame(kept_rows)
+
+
+class _ReportsThenRaises(BaseOperator):
+    """Reports one row through run.report_row_error(), then raises --
+    item 1's exact failure-path scenario, driven end to end."""
+
+    name = "reports_then_raises_e2e"
+    descriptor = _table_descriptor(
+        "reports_then_raises_e2e", "Reports then raises",
+    )
+
+    def create_table(self, df, run):
+        first_row_id = df.iloc[0]["row_id"]
+        run.report_row_error(first_row_id, "Flagged", "reported before raising")
+        raise ValueError("boom")
+
+
+class _ReturnsARowIdColumn(BaseOperator):
+    """create_table() itself succeeds -- unlike _ReportsThenRaises above,
+    nothing here raises -- but the frame it returns already carries a
+    "row_id" column, which operators/CLAUDE.md forbids ("do not add row_id
+    -- it is generated when the table is stored"). Dataset.create_table_from_df
+    inserts its own fresh "row_id" regardless, producing a duplicate column
+    name that _prepare_table refuses. Fix round item 3's exact scenario: the
+    STORE fails after the run itself already succeeded."""
+
+    name = "returns_row_id_e2e"
+    descriptor = _table_descriptor(
+        "returns_row_id_e2e", "Returns a row_id column",
+    )
+
+    def create_table(self, df, run):
+        return pd.DataFrame({"row_id": ["bogus_a", "bogus_b"], "value": [1, 2]})
+
+
+class _NamesItsTable(BaseOperator):
+    """A real TABLE operator declaring a NewTableNameParameter -- fix round
+    item 1's get_operator() resolution test needs one whose descriptor
+    actually carries the parameter to check."""
+
+    name = "names_its_table_e2e"
+    descriptor = _table_descriptor_with_name_param(
+        "names_its_table_e2e", "Names its table", "segments",
+    )
+
+    def create_table(self, df, run):
+        return pd.DataFrame({"value": [1, 2, 3]})
+
+
+def _run_table_via_controller_and_join(controller, operator_name, row_ids, monkeypatch):
+    """Calls controller.run_create_table() through the real public API,
+    tracks and joins every background thread it spawns (the same pattern
+    test_unimplemented_mode_run_leaves_no_live_run above uses), and
+    returns the operation_id the controller assigned -- read off
+    get_live_runs() immediately after the call, since _register_run runs
+    synchronously on the calling thread before the worker starts."""
+    created: list[threading.Thread] = []
+    real_thread = threading.Thread
+
+    class _Tracked(real_thread):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            created.append(self)
+
+    monkeypatch.setattr(threading, "Thread", _Tracked)
+    try:
+        controller.run_create_table(operator_name, row_ids)
+        live = controller.get_live_runs()
+        assert len(live) == 1, "expected exactly one live run to have started"
+        operation_id = live[0]["operation_id"]
+    finally:
+        monkeypatch.setattr(threading, "Thread", real_thread)
+
+    for thread in created:
+        thread.join(timeout=10)
+        assert not thread.is_alive(), "worker thread did not finish in time"
+
+    return operation_id
+
+
+def _drain_until_run_ends(controller, operation_id, *, max_ticks=20):
+    """Repeatedly calls the SAME drain loop the real 50ms QTimer calls
+    (_drain_queues), so a small _drain_budget (item 5's ordering-cannot-
+    hide-behind-a-large-budget check) still gets everything through over
+    several ticks, the way it would in the running app."""
+    for _ in range(max_ticks):
+        controller._drain_queues()
+        if operation_id not in controller._live_runs:
+            return
+    raise AssertionError(
+        f"run {operation_id} was still live after {max_ticks} drain ticks"
+    )
+
+
+def test_e2e_table_operator_that_skips_rows_is_recorded_partial_and_stores_the_table(
+    tmp_path, monkeypatch,
+):
+    # Item 5, case 1: real controller, real Dataset. Proves the RECORDED
+    # outcome, not callback order, and that a real table is actually
+    # accepted through Dataset.create_table_from_df's row_id insertion
+    # (which a test double that kept row_id would never reach).
+    controller, dataset, op_registry = _make_controller(tmp_path)
+    op_registry.register(_SkipsEveryOtherRow())
+    row_ids = controller.get_visible_row_ids()
+
+    errors: list[str] = []
+    controller.error_occurred.connect(errors.append)
+
+    operation_id = _run_table_via_controller_and_join(
+        controller, "skips_every_other_row_e2e", row_ids, monkeypatch
+    )
+    _drain_until_run_ends(controller, operation_id)
+
+    # Would still pass if violated? No. If report_row_error() were lost,
+    # or never merged into the outcome check, this would read "complete".
+    entries = _operator_run_entries(dataset)
+    assert len(entries) == 1
+    assert entries[0]["params"]["outcome"] == "partial"
+
+    # The table must actually exist, with only the kept (odd-position)
+    # rows -- proving create_table_from_df really accepted this
+    # operator's real output (row_id dropped, as operators/CLAUDE.md
+    # requires -- a test double that kept it would have raised here
+    # instead, per this fix round's item 5 finding).
+    assert "skips_every_other_row_e2e_result" in dataset.list_tables()
+    stored = dataset.get_table("skips_every_other_row_e2e_result")
+    kept_expected = len([i for i in range(len(row_ids)) if i % 2 == 1])
+    assert len(stored) == kept_expected
+
+    assert any("row(s) hit unexpected errors" in e for e in errors)
+    assert any("left out of the stored table" in e for e in errors)
+
+
+def test_e2e_table_operator_skipped_rows_with_drain_budget_one(tmp_path, monkeypatch):
+    # Item 5, case 2: the same scenario, but with _drain_budget=1 so the
+    # "row_errors" and "create_table" queue messages are necessarily
+    # drained on SEPARATE ticks -- a small budget must not change the
+    # outcome or hide a wrong delivery order.
+    controller, dataset, op_registry = _make_controller(tmp_path, drain_budget=1)
+    op_registry.register(_SkipsEveryOtherRow())
+    row_ids = controller.get_visible_row_ids()
+
+    operation_id = _run_table_via_controller_and_join(
+        controller, "skips_every_other_row_e2e", row_ids, monkeypatch
+    )
+    _drain_until_run_ends(controller, operation_id, max_ticks=50)
+
+    entries = _operator_run_entries(dataset)
+    assert len(entries) == 1
+    assert entries[0]["params"]["outcome"] == "partial"
+    assert "skips_every_other_row_e2e_result" in dataset.list_tables()
+
+
+def test_e2e_table_operator_reports_then_raises_is_recorded_failed(
+    tmp_path, monkeypatch,
+):
+    # Item 5, case 3: reports a row, then raises. The report must still
+    # reach the researcher (item 1), and the RECORDED outcome must be
+    # "failed" -- never downgraded to "partial" just because a row-error
+    # report also arrived first.
+    controller, dataset, op_registry = _make_controller(tmp_path)
+    op_registry.register(_ReportsThenRaises())
+    row_ids = controller.get_visible_row_ids()
+
+    errors: list[str] = []
+    controller.error_occurred.connect(errors.append)
+
+    operation_id = _run_table_via_controller_and_join(
+        controller, "reports_then_raises_e2e", row_ids, monkeypatch
+    )
+    _drain_until_run_ends(controller, operation_id)
+
+    # Would still pass if violated? No. The bug this fix round's item 1
+    # describes drops the report entirely on this exact path -- before
+    # the fix, `errors` here would contain only the "boom" message, never
+    # one mentioning the reported row.
+    assert any("reported before raising" in e for e in errors)
+    assert any("boom" in e for e in errors)
+
+    entries = _operator_run_entries(dataset)
+    assert len(entries) == 1
+    assert entries[0]["params"]["outcome"] == "failed"
+    assert "reports_then_raises_e2e_result" not in dataset.list_tables()
+
+
+# ---------------------------------------------------------------------------
+# P1.7-1 fix round, item 3: the run's recorded outcome must reflect whether
+# the table was actually stored, not just whether create_table() itself
+# raised.
+# ---------------------------------------------------------------------------
+
+def test_e2e_store_failure_is_recorded_failed_not_complete(tmp_path, monkeypatch):
+    # create_table() itself succeeds here -- unlike
+    # test_e2e_table_operator_reports_then_raises_is_recorded_failed above,
+    # this run never goes through the "error" completion mode at all. The
+    # STORE fails afterwards, inside _on_operator_complete's "create_table"
+    # branch, when Dataset.create_table_from_df refuses the returned
+    # frame's duplicate "row_id" column. Before this fix round,
+    # _finish_run_provenance ran before this store was even attempted, so
+    # the provenance entry recorded "complete" while the researcher was
+    # separately told the store failed -- this proves the two now agree.
+    controller, dataset, op_registry = _make_controller(tmp_path)
+    op_registry.register(_ReturnsARowIdColumn())
+    row_ids = controller.get_visible_row_ids()
+    tables_before = dataset.list_tables()
+
+    errors: list[str] = []
+    controller.error_occurred.connect(errors.append)
+
+    operation_id = _run_table_via_controller_and_join(
+        controller, "returns_row_id_e2e", row_ids, monkeypatch
+    )
+    _drain_until_run_ends(controller, operation_id)
+
+    # Would still pass if violated? No. Before this fix, this same
+    # sequence still stored nothing (create_table_from_df's rejection is
+    # unaffected by this fix round) but recorded "complete" -- only the
+    # outcome value distinguishes the fixed behaviour from the broken one.
+    assert dataset.list_tables() == tables_before
+    assert any("Failed to store table" in e for e in errors)
+
+    entries = _operator_run_entries(dataset)
+    assert len(entries) == 1
+    assert entries[0]["params"]["outcome"] == "failed"
+
+
+def test_row_errors_from_a_dead_run_are_suppressed(tmp_path):
+    # Item 4: the project changed (or this run otherwise ended) between
+    # its worker reporting rows and the drain reaching that report. No
+    # dialog should reach the researcher about a run nobody is tracking
+    # any more -- the SAME suppression every other dead-run completion
+    # already gets (see test_result_from_dead_run_is_not_applied above).
+    controller, dataset, _ = _make_controller(tmp_path)
+
+    errors: list[str] = []
+    controller.error_occurred.connect(errors.append)
+
+    # Never registered -- stands in for a run whose entry is already gone
+    # by the time this message is drained.
+    controller._on_operator_complete(
+        "row_errors", ("dead-op", "Some op", [("r1", "Flagged", "msg")])
+    )
+
+    # Would still pass if violated? No. Before this fix the branch only
+    # skipped setting had_row_errors for a dead run; it still built and
+    # emitted the summary regardless of liveness.
+    assert errors == []
+
+
+# ---------------------------------------------------------------------------
+# P1.7-1 fix round (round 4), item 1: a TABLE operator's NewTableNameParameter
+# is resolved by the controller, never silently discarded, and never lets a
+# collision overwrite an existing table.
+# ---------------------------------------------------------------------------
+
+def test_resolve_table_name_returns_suggestion_when_free():
+    assert resolve_table_name("segments", set()) == "segments"
+
+
+def test_resolve_table_name_suffixes_on_collision():
+    assert resolve_table_name("segments", {"segments"}) == "segments_1"
+
+
+def test_resolve_table_name_finds_the_first_free_suffix():
+    # Would still pass if violated? No. A version that only ever tried
+    # "_1" and gave up, or that restarted numbering from "_1" regardless
+    # of what is already taken, would both return "segments_1" here even
+    # though it is taken too.
+    existing = {"segments", "segments_1"}
+    assert resolve_table_name("segments", existing) == "segments_2"
+
+
+def test_format_table_name_changed_message_names_both_names():
+    message = format_table_name_changed_message("segments", "segments_2")
+    assert "segments_2" in message
+    assert "segments" in message
+
+
+def test_get_operator_shows_the_resolved_suggestion_in_the_descriptor(tmp_path):
+    # Fix round item 1, bullet 3: the parameter form must be built from the
+    # REAL suggestion, not the operator's static declared default, so the
+    # box never shows a name that is about to be resolved out from under
+    # the researcher.
+    controller, dataset, op_registry = _make_controller(tmp_path)
+    op_registry.register(_NamesItsTable())
+    dataset.create_table_from_df("segments", pd.DataFrame({"a": [1]}))
+
+    operator = controller.get_operator("names_its_table_e2e")
+    mode_descriptor = operator.descriptor.mode_for(ExecutionMode.TABLE)
+    name_param = next(
+        p for p in mode_descriptor.parameters if p.name == "output_table"
+    )
+
+    # Would still pass if violated? No. The operator's own declared
+    # default is the plain string "segments"; if get_operator() returned
+    # it unchanged, this would read "segments", not "segments_1".
+    assert name_param.default == "segments_1"
+
+    # The substitution never touches the real singleton, and every other
+    # attribute -- in particular the execution method -- still reaches it:
+    # this must not become a dead end for actually running the operator.
+    assert op_registry.get("names_its_table_e2e").descriptor.mode_for(
+        ExecutionMode.TABLE
+    ).parameters[0].default == "segments"
+    result = operator.create_table(pd.DataFrame({"value": [1]}), None)
+    assert list(result["value"]) == [1, 2, 3]
+
+
+def test_get_operator_returns_the_operator_unchanged_when_nothing_collides(tmp_path):
+    controller, dataset, op_registry = _make_controller(tmp_path)
+    op_registry.register(_NamesItsTable())
+
+    operator = controller.get_operator("names_its_table_e2e")
+    assert operator is op_registry.get("names_its_table_e2e")
+
+
+def test_untouched_suggestion_still_resolves_when_the_dataset_moves_before_the_run_starts(
+    tmp_path,
+):
+    # Fix round item 2 (second pass): pins that was_auto is decided by
+    # REMEMBERING the suggestion the form showed, not by recomputing it at
+    # run start. get_operator() shows "segments" (nothing exists under
+    # that name yet); the set of existing tables then changes -- another
+    # table is created under exactly that name -- BEFORE run_create_table
+    # is ever called, standing in for a second live run's own dialog
+    # completing while this one was still open (a modal QDialog keeps the
+    # drain timer running). The researcher submits the suggestion
+    # UNCHANGED. This must still resolve automatically: nothing was
+    # edited, so a version that recomputed "what would I suggest now"
+    # instead of remembering "what did I show" would see the collision
+    # and wrongly refuse.
+    controller, dataset, op_registry = _make_controller(tmp_path)
+    op_registry.register(_NamesItsTable())
+
+    operator = controller.get_operator("names_its_table_e2e")
+    mode_descriptor = operator.descriptor.mode_for(ExecutionMode.TABLE)
+    shown_default = mode_descriptor.parameters[0].default
+    # Sanity: nothing collided yet, so the shown suggestion is the bare
+    # declared default -- the case this test needs to be meaningful.
+    assert shown_default == "segments"
+
+    # The set of existing tables changes AFTER the dialog was built but
+    # BEFORE run_create_table (and therefore _attach_table_name_resolution)
+    # is ever called.
+    dataset.create_table_from_df("segments", pd.DataFrame({"a": [1]}))
+
+    op_id = "op-shown-vs-now"
+    controller._register_run(
+        op_id, "Names its table", "frames",
+        operator_name="names_its_table_e2e", mode_name="TABLE", target_table="",
+    )
+    controller._attach_table_name_resolution(
+        op_id, "names_its_table_e2e", mode_descriptor,
+        {"output_table": shown_default},   # submitted exactly as shown
+    )
+
+    # Would still pass if violated? No. Recomputing instead of remembering
+    # would compare "segments" against resolve_table_name("segments",
+    # {"frames", "segments"}) == "segments_1" here -- unequal -- and read
+    # was_auto False.
+    run = controller._live_runs[op_id]
+    assert run["new_table_name_was_auto"] is True
+    assert run["new_table_name_requested"] == "segments"
+
+    # And the visible behaviour matches: the run resolves to a fresh name
+    # rather than being refused.
+    messages: list[str] = []
+    controller.error_occurred.connect(messages.append)
+    controller._on_operator_complete(
+        "create_table",
+        (op_id, "names_its_table_e2e", pd.DataFrame({"value": [1, 2]})),
+    )
+    assert "segments_1" in dataset.list_tables()
+    assert not any("already exists" in m for m in messages)
+
+    entries = _operator_run_entries(dataset)
+    assert len(entries) == 1
+    assert entries[0]["params"]["outcome"] == "complete"
+
+
+def test_auto_suggested_name_is_re_resolved_if_taken_before_the_store(tmp_path):
+    # Fix round item 1, bullet 4: another run can take the shown name
+    # between the dialog and the store. Simulated directly through the
+    # run-registration seam (the same pattern
+    # test_cancelled_create_table_result_is_discarded_and_recorded_partial
+    # above uses) rather than racing two real background threads.
+    controller, dataset, _ = _make_controller(tmp_path)
+
+    op_id = "op-name-race"
+    controller._register_run(
+        op_id, "Cut into segments", "frames",
+        operator_name="segment", mode_name="TABLE", target_table="",
+    )
+    controller._attach_table_name_resolution(
+        op_id, "segment",
+        _table_descriptor_with_name_param(
+            "segment", "Cut into segments", "segments",
+        ).mode_for(ExecutionMode.TABLE),
+        {"output_table": "segments"},
+    )
+
+    # The name the researcher saw ("segments") is taken by another table
+    # created AFTER this run started but BEFORE its result arrives.
+    dataset.create_table_from_df("segments", pd.DataFrame({"a": [1]}))
+
+    messages: list[str] = []
+    controller.error_occurred.connect(messages.append)
+
+    result_df = pd.DataFrame({"value": [1, 2]})
+    controller._on_operator_complete(
+        "create_table", (op_id, "segment", result_df)
+    )
+
+    # Would still pass if violated? No. If the collision were refused
+    # instead of re-resolved, "segments_1" would never be created.
+    assert "segments_1" in dataset.list_tables()
+    assert any("segments_1" in m and "segments" in m for m in messages)
+
+    entries = _operator_run_entries(dataset)
+    assert len(entries) == 1
+    assert entries[0]["params"]["outcome"] == "complete"
+
+
+def test_edited_name_that_already_exists_is_refused_not_overwritten(tmp_path):
+    # Fix round item 1, bullet 6: the researcher typed over the suggested
+    # default with the name of a table that already exists. This must be
+    # refused, matching Dataset.confirm_merge, never auto-suffixed and
+    # never overwritten.
+    controller, dataset, _ = _make_controller(tmp_path)
+    dataset.create_table_from_df("frames_copy", pd.DataFrame({"a": [1]}))
+    tables_before = dataset.list_tables()
+
+    op_id = "op-name-edited"
+    controller._register_run(
+        op_id, "Cut into segments", "frames",
+        operator_name="segment", mode_name="TABLE", target_table="",
+    )
+    controller._attach_table_name_resolution(
+        op_id, "segment",
+        _table_descriptor_with_name_param(
+            "segment", "Cut into segments", "segments",
+        ).mode_for(ExecutionMode.TABLE),
+        {"output_table": "frames_copy"},
+    )
+
+    errors: list[str] = []
+    controller.error_occurred.connect(errors.append)
+
+    result_df = pd.DataFrame({"value": [1, 2]})
+    controller._on_operator_complete(
+        "create_table", (op_id, "segment", result_df)
+    )
+
+    # Would still pass if violated? No. Auto-suffixing here instead of
+    # refusing would create "frames_copy_1", changing dataset.list_tables()
+    # from tables_before by more than nothing.
+    assert dataset.list_tables() == tables_before
+    assert any("already exists" in e for e in errors)
+
+    entries = _operator_run_entries(dataset)
+    assert len(entries) == 1
+    assert entries[0]["params"]["outcome"] == "failed"
+
+
+def test_operator_without_name_parameter_auto_suffixes_on_rerun(tmp_path):
+    # No NewTableNameParameter declared -- the old fixed
+    # f"{operator_name}_result" name is now just another auto suggestion
+    # (fix round item 1), so re-running the same TABLE operator no longer
+    # silently overwrites its own previous result the way it used to:
+    # item 2 refuses that collision outright, and this is what stops the
+    # refusal from ever being reached on this path.
+    controller, dataset, _ = _make_controller(tmp_path)
+
+    def _run_once(op_id):
+        controller._register_run(
+            op_id, "Mean face", "frames",
+            operator_name="mean_face", mode_name="TABLE", target_table="",
+        )
+        controller._attach_table_name_resolution(
+            op_id, "mean_face",
+            _table_descriptor("mean_face", "Mean face").mode_for(
+                ExecutionMode.TABLE
+            ),
+            {},
+        )
+        controller._on_operator_complete(
+            "create_table",
+            (op_id, "mean_face", pd.DataFrame({"value": [1]})),
+        )
+
+    _run_once("op-mean-face-1")
+    _run_once("op-mean-face-2")
+
+    # Would still pass if violated? No. If item 2's refusal reached this
+    # path, the second call would leave "mean_face_result" as the only
+    # stored table and report the run "failed" instead.
+    assert "mean_face_result" in dataset.list_tables()
+    assert "mean_face_result_1" in dataset.list_tables()
+    entries = _operator_run_entries(dataset)
+    assert [e["params"]["outcome"] for e in entries] == ["complete", "complete"]
+
+
+# ---------------------------------------------------------------------------
+# P1.7-1 fix round (third pass), item 1: a run's provenance is recorded
+# exactly once, enforced rather than left to control flow, and a failure in
+# a post-store notification is never reinterpreted as a store failure.
+# ---------------------------------------------------------------------------
+
+def test_finish_run_provenance_raises_if_called_twice_for_the_same_run(tmp_path):
+    # Pins the exactly-once guard itself, independent of any particular
+    # caller's control flow: whatever the reason, a second call for the
+    # same run dict must be impossible to do silently.
+    controller, dataset, _ = _make_controller(tmp_path)
+    op_id = "op-double-finish"
+    controller._register_run(
+        op_id, "Probe", "frames",
+        operator_name="probe", mode_name="COLUMNS", target_table="frames",
+    )
+    run = controller._live_runs[op_id]
+    controller._finish_run_provenance("create_columns", run)
+
+    # Would still pass if violated? No. Without the guard, this second
+    # call would silently append a second, contradictory "operator_run"
+    # provenance entry for the same run.
+    with pytest.raises(RuntimeError):
+        controller._finish_run_provenance("create_columns", run)
+
+    entries = _operator_run_entries(dataset)
+    assert len(entries) == 1
+
+
+def test_a_failure_after_a_successful_store_does_not_reinterpret_or_duplicate_the_outcome(
+    tmp_path, monkeypatch,
+):
+    # Fix round item 1 (third pass): something plain-Python AFTER the
+    # store succeeds -- here, building the "stored under a different
+    # name" notice -- raises. (A raising Qt *signal subscriber* was tried
+    # first and turned out not to exercise this: PySide6 catches an
+    # exception raised inside a connected slot and reports it through
+    # sys.excepthook rather than letting it propagate back through
+    # .emit(), so a broken subscriber can never reach this branch's own
+    # except either way. A plain function call in the success path is
+    # what a real bug here looks like.)
+    #
+    # This must not be caught and reported as "Failed to store table"
+    # (the OLD shape of this branch wrapped this call in the same try as
+    # the store itself), and the provenance entry it produces must be
+    # exactly the one the NEW ordering writes before attempting this call
+    # at all -- "complete", once.
+    import controller as controller_module
+
+    controller, dataset, _ = _make_controller(tmp_path)
+
+    op_id = "op-post-store-boom"
+    controller._register_run(
+        op_id, "Cut into segments", "frames",
+        operator_name="segment", mode_name="TABLE", target_table="",
+    )
+    # "segments" is free when the run starts, so the submitted, untouched
+    # suggestion is recorded as auto.
+    controller._attach_table_name_resolution(
+        op_id, "segment",
+        _table_descriptor_with_name_param(
+            "segment", "Cut into segments", "segments",
+        ).mode_for(ExecutionMode.TABLE),
+        {"output_table": "segments"},
+    )
+    # It is taken AFTER the run starts but BEFORE its result arrives --
+    # the same race test_auto_suggested_name_is_re_resolved_if_taken_before_the_store
+    # above drives -- so the store resolves to "segments_1" and the
+    # rename-notice code path (the one this test breaks) actually runs.
+    dataset.create_table_from_df("segments", pd.DataFrame({"a": [1]}))
+
+    def _boom(shown_name, stored_name):
+        raise RuntimeError("wording bug")
+
+    monkeypatch.setattr(
+        controller_module, "format_table_name_changed_message", _boom
+    )
+
+    # Would still pass if violated? No. Under the OLD ordering, this
+    # exception would land in the except clause, which would report
+    # "Failed to store table from 'segment'" and record the run "failed"
+    # -- even though the table was genuinely, successfully stored.
+    with pytest.raises(RuntimeError, match="wording bug"):
+        controller._on_operator_complete(
+            "create_table",
+            (op_id, "segment", pd.DataFrame({"value": [1, 2]})),
+        )
+
+    # The store itself genuinely succeeded, under the resolved name --
+    # and provenance was recorded before the wording bug ever ran.
+    assert "segments_1" in dataset.list_tables()
+
+    entries = _operator_run_entries(dataset)
+    assert len(entries) == 1
+    assert entries[0]["params"]["outcome"] == "complete"
+
+
+# ---------------------------------------------------------------------------
+# P1.7-1 fix round (third pass), item 2: a run that fails during setup --
+# after _register_run() but before its worker actually starts -- must not
+# remain stuck in the live-run list.
+# ---------------------------------------------------------------------------
+
+def test_a_run_that_fails_during_setup_does_not_remain_live(tmp_path, monkeypatch):
+    # A reviewer found that _attach_table_name_resolution() sat OUTSIDE
+    # run_create_table()'s deregister-on-failure try/except: an exception
+    # there left the run permanently stuck in self._live_runs --
+    # uncancellable and uncompletable. Broken generically here (any setup
+    # step raising, not only the one KeyError this item's fallback fix
+    # already prevents), so the guarantee covers every step between
+    # registration and the worker starting, not just this one method.
+    controller, dataset, op_registry = _make_controller(tmp_path)
+    op_registry.register(_NamesItsTable())
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("setup bug")
+
+    monkeypatch.setattr(controller, "_attach_table_name_resolution", _boom)
+
+    errors: list[str] = []
+    controller.error_occurred.connect(errors.append)
+
+    controller.run_create_table(
+        "names_its_table_e2e", controller.get_visible_row_ids(),
+        # output_table is required, so a run must actually get past
+        # _build_operator_run() and _register_run() to reach the
+        # monkeypatched setup step below -- an empty/missing parameters
+        # dict would be refused earlier and never register a live run at
+        # all, which would make this test pass vacuously.
+        {"output_table": "segments"},
+    )
+
+    # Would still pass if violated? No. Before this fix, this run would
+    # still be live here -- get_live_runs() would return one entry, not
+    # zero, and no future cancel_run() or completion could ever remove it.
+    assert controller.get_live_runs() == []
+    assert any("setup bug" in e for e in errors)
 
 
 # ---------------------------------------------------------------------------

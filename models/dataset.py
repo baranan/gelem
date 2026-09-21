@@ -1909,6 +1909,7 @@ class Dataset:
         self,
         name: str,
         df: pd.DataFrame,
+        hints: dict[str, ColumnHint] | None = None,
     ) -> None:
         """
         Creates a new table from a pre-built DataFrame returned by an
@@ -1916,10 +1917,44 @@ class Dataset:
         each row and stores the result as a named table.
 
         Args:
-            name: Name for the new table.
-            df:   The DataFrame returned by the operator. Must not
-                  already contain a row_id column.
+            name:  Name for the new table. Must not already name a stored
+                   table -- see Raises below.
+            df:    The DataFrame returned by the operator. Must not
+                   already contain a row_id column.
+            hints: Optional column hints (role, carry_to_children, ...)
+                   for the new table's columns -- P1.7-1. Applied through
+                   the exact same `_accept_table` / `_prepare_table`
+                   mechanism every other hint (e.g. load()'s restored
+                   media columns) already goes through; there is no
+                   second hint path. None means no hints, exactly as
+                   before this parameter existed. AppController builds
+                   this from a TABLE-mode operator's descriptor-declared
+                   OutputColumns via OperatorRegistry -- an operator
+                   never calls Dataset itself.
+
+        Raises:
+            ValueError: `name` already names a stored table. Fix round,
+                item 2: this used to overwrite the existing table
+                instead, which is how a re-run's declared column role
+                was silently lost -- _prepare_table only applies a hint
+                to a column ABSENT from the stored schema (see its own
+                docstring), so a second create_table_from_df under the
+                same name kept the first run's schema, hint and all,
+                unchanged. Refusing removes that path entirely rather
+                than adding a precedence rule to reconcile the two
+                schemas. Matches confirm_merge's own refusal for the
+                same reason (models/dataset.py, "would_expand" branch)
+                rather than picking a different name -- silently storing
+                under a name the caller did not ask for is exactly what
+                that rule exists to prevent. The caller that wants a
+                fresh name instead (AppController, fix round item 1) must
+                pick one before calling this.
         """
+        if name in self._tables:
+            raise ValueError(
+                f"Cannot create table {name!r}: a table with that name "
+                f"already exists."
+            )
         result = df.copy().reset_index(drop=True)
         result.insert(
             0,
@@ -1928,7 +1963,9 @@ class Dataset:
         )
         # P1.8d-2b-1: no ColumnTypeRegistry write -- the schema the accept
         # built carries every column's display tag.
-        self._accept_table(name, result, source="create_table_from_df")
+        self._accept_table(
+            name, result, hints=hints, source="create_table_from_df"
+        )
 
         self.provenance.record("create_table_from_df", {
             "name":    name,

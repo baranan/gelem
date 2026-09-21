@@ -367,22 +367,6 @@ to P1.8d, and the two OS-native / non-parsing media-cell entries to P1.8e.
   designed against pandas 3.0.2, numpy 2.4.4, pyarrow 23.0.1, Python 3.13.2. On
   pandas 2 a bare text column is `object`, not `str`, so a fresh clone can
   behave differently.
-- **A TABLE-mode operator that declares `creates_table` cannot declare the
-  role of a column it creates.** `OutputSpec.creates_table=True` requires
-  `columns` to be empty (`operators/descriptor.py`'s `OutputSpec`), and
-  `OutputColumn` carries only a name and a type tag, no `role` --
-  `docs/architecture.md` §4.2's `role` / `carry_to_children` vocabulary has
-  no way to reach a TABLE mode's own new columns. `operators/segment.py`
-  (P1.6b) is the concrete case: `segment_index` is plainly an `index`
-  column by §4.2's own definition, but the schema Dataset infers on accept
-  has no declared role to read, so it falls back to `measurement`. Harmless
-  today because every `measurement` column defaults `carry_to_children` to
-  true (§4.2), so `segment_index` is still carried down to a later frame
-  split -- but it would be silently dropped the moment carry narrowing
-  exists (a `carry_columns` parameter on the frame operator, explicitly out
-  of scope for P1.6b), since narrowing only ever touches `measurement`
-  columns and an `index` column is supposed to be exempt from it. No item
-  assigned.
 - **A FRAME-requirement COLUMNS run reads only the `full_path` metadata key**
   (`operators/operator_registry.py`'s `_run_create_columns_worker`), never a
   column the researcher picked or a differently-named media_path column type
