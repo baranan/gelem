@@ -17,6 +17,8 @@ layer is free to depend on it.
 
 from __future__ import annotations
 
+import pathlib
+
 # Lowercase and dot-prefixed. Callers compare with
 # `value.lower().endswith(ext)`, so a file whose extension differs only in
 # case still matches. To support a new format, add its extension to
@@ -92,6 +94,26 @@ def looks_like_video_extension(cell: str) -> str | None:
     own decode failures instead of the gate's "not a video" skip.
     """
     return _looks_like_extension_in(cell, VIDEO_EXTENSIONS)
+
+
+def is_image_path(path: str) -> bool:
+    """True when `path` -- an already-parsed PATH PORTION (never a raw,
+    possibly-fragmented cell) -- names a still image, by its extension
+    alone.
+
+    This is the single authority for that specific test (P1.7-2 round 4):
+    before it existed, media/resolver.py and operators/frame_operator.py
+    each carried their own identical private copy, and column_types/
+    renderers.py and operators/operator_registry.py each carry a further
+    inline copy of the same check -- see those modules' own history for
+    why unifying every one of them is a separate decision from this one.
+
+    Unlike looks_like_video_extension / looks_like_media_extension above,
+    this takes a bare path with no '#' fragment to strip -- a caller
+    holding a raw, possibly-fragmented cell parses it first (through
+    media/media_address.py) and passes the parsed address's own `.path`.
+    """
+    return pathlib.PurePosixPath(path).suffix.lower() in IMAGE_EXTENSIONS
 
 
 def looks_like_media_extension(cell: str) -> str | None:

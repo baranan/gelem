@@ -131,6 +131,12 @@ def _build_segment():
     return SegmentOperator()
 
 
+def _build_frame():
+    # FrameOperator takes no constructor arguments -- it writes no files.
+    from operators.frame_operator import FrameOperator
+    return FrameOperator()
+
+
 # OPERATOR_FACTORIES: operator name -> callable() -> instance.
 # The set of keys here must equal the set of entry keys in
 # operators_config.yaml. Order does not matter -- build order comes from
@@ -145,6 +151,7 @@ OPERATOR_FACTORIES: dict[str, Callable[[], object]] = {
     "stats": _build_stats,
     "video_frames": _build_video_frames,
     "segment": _build_segment,
+    "frame": _build_frame,
 }
 
 

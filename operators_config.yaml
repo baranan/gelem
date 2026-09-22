@@ -54,3 +54,7 @@ operators:
   segment:
     enabled: true
     description: "Cuts each row into a time-range segment of its source media, using two researcher-chosen start/end columns in seconds. Adds a canonical #t=<start>-<end> address, a per-source segment index, start, end and duration, and carries the source table's identifier, index and carry-flagged columns down. Decodes no media and writes no files."
+
+  frame:
+    enabled: true
+    description: "Splits each row into one row per frame of its source media -- a segment row's #t=<start>-<end> range, or a whole-video row's bare path. Adds a canonical #f=<n> address, the frame's ordinal in the source stream, its absolute time on the source clock, its time within the segment, and the segment index, and carries the source table's identifier, index and carry-flagged columns down. Decodes no pixels and writes no files."

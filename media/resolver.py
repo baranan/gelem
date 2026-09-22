@@ -42,6 +42,15 @@ the middle, so it never decodes to the true end of file to find it.
 The one deliberate exception is #f=: decision 8's consequence for P1.2
 is that resolving a frame ordinal against a file's real (possibly
 variable) frame timings needs the per-file index, built on first use.
+get_frame_times() is a second deliberate exception, by the same
+reasoning: it demuxes the whole file, on purpose, the first time it is
+asked for a given file -- which is exactly why it has its own name
+rather than being folded into resolve_frame or decode_video_span's
+default (implicit) behaviour. The cost rule constrains what those two
+calls do without being asked; it does not forbid a caller from asking
+for the index outright, by name, aware of what that costs --
+decode_video_span's own with_ordinals=True already establishes that
+this explicit-and-named shape is acceptable.
 
 Frame-time index: for one (absolute path, video stream index), the
 sorted presentation times of every frame the decoder actually presents.
@@ -110,7 +119,7 @@ import numpy as np
 from av.sidedata.sidedata import Type as _SideDataType
 from PIL import Image, ImageOps
 
-from media.extensions import IMAGE_EXTENSIONS
+from media.extensions import is_image_path
 from media.media_address import (
     MediaAddress,
     MediaAddressError,
@@ -148,10 +157,6 @@ def _is_absolute(path: str) -> bool:
     if path.startswith("/"):
         return True
     return bool(_DRIVE_LETTER_PATH.match(path))
-
-
-def _is_image_path(path: str) -> bool:
-    return pathlib.PurePosixPath(path).suffix.lower() in IMAGE_EXTENSIONS
 
 
 # ---------------------------------------------------------------------------
@@ -561,7 +566,7 @@ class MediaResolver:
                 f"path: {addr.path!r}"
             )
 
-        if _is_image_path(addr.path):
+        if is_image_path(addr.path):
             return self._resolve_still_image(addr, purpose)
         return self._resolve_video_frame(addr, purpose, policy)
 
@@ -636,13 +641,74 @@ class MediaResolver:
                 "single frame ordinal or time point -- use resolve_frame "
                 "for those"
             )
-        if _is_image_path(addr.path):
+        if is_image_path(addr.path):
             raise MediaAddressError(
                 f"decode_video_span resolves a video stream; {addr.path!r} "
                 f"looks like a still image"
             )
 
         return self._decode_video_span_frames(addr, purpose, with_ordinals)
+
+    def get_frame_times(self, address: Union[str, MediaAddress]) -> List[int]:
+        """Return the sorted presentation times, in microseconds, of every
+        frame the decoder presents for the video stream `address` names --
+        the same per-file frame-time index the module docstring's "Frame-
+        time index" section describes, handed to the caller instead of
+        being kept purely internal.
+
+        This costs one full demux pass (no decode) over the whole file the
+        first time it is called for a given (path, stream index, file
+        size, mtime) -- exactly the cost a #f= resolve_frame() call, or a
+        decode_video_span(with_ordinals=True) call, already pays. That is
+        why it is a separate, explicitly-named call rather than something
+        resolve_frame or decode_video_span does for the caller on its own:
+        the cost rule in the module docstring forbids those two calls from
+        paying this cost *implicitly* for a #t= or bare-path address; it
+        does not forbid a caller from asking for the full index outright,
+        aware of what it costs. A later call for the same file -- from
+        here, from a #f= resolve, or from a with_ordinals=True span --
+        reuses the cached index and pays nothing further.
+
+        Decodes no pixels: the index is built by demuxing packets only
+        (see _build_frame_index).
+
+        Accepts the same address forms resolve_frame does -- a string or
+        an already-parsed MediaAddress -- and raises MediaAddressError the
+        same way for a relative address. Any fragment the address carries
+        (#f=, #t=, a region) is accepted but ignored beyond parsing: the
+        returned index describes the whole selected stream, never a slice
+        of it. The stream selector (decision 7) IS honoured, since it
+        picks which stream's index this returns.
+
+        Raises MediaResolverError for a still image: a still image has
+        exactly one frame and no timeline of its own (see FramePayload's
+        presentation_time_us docstring), so it has no frame-time index to
+        report -- the same refusal decode_video_span already makes for an
+        image path.
+
+        Returns a fresh list, not the cached one, so a caller mutating its
+        result cannot corrupt what later calls reuse.
+        """
+        addr = address if isinstance(address, MediaAddress) else parse_address(address)
+
+        if not _is_absolute(addr.path):
+            raise MediaAddressError(
+                f"get_frame_times requires an absolute address, got a "
+                f"relative path: {addr.path!r}"
+            )
+        if is_image_path(addr.path):
+            raise MediaResolverError(
+                f"{addr.path!r} looks like a still image -- it has exactly "
+                f"one frame and no timeline, so it has no frame-time index"
+            )
+
+        container = self._pool.acquire(addr.path)
+        try:
+            stream = self._select_video_stream(container, addr)
+            epoch_us = self._get_epoch_us(container, stream)
+            return list(self._get_frame_index(container, stream, epoch_us))
+        finally:
+            self._pool.release(container)
 
     def _decode_video_span_frames(
         self, addr: MediaAddress, purpose: str, with_ordinals: bool

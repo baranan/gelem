@@ -19,6 +19,7 @@ same file directly with PyAV or reading it back with an unrelated tool
 Run with: python -m pytest tests/test_media_resolver.py
 """
 
+import ast
 import dataclasses
 import gc
 import os
@@ -874,6 +875,250 @@ def test_span_with_ordinals_false_never_builds_the_index(tmp_path, monkeypatch):
             "with_ordinals=False (the default) must never build the "
             "per-file frame-time index"
         )
+    finally:
+        resolver.close()
+
+
+# ---------------------------------------------------------------------------
+# CC-17 -- get_frame_times(): the public frame-time-index call. Written
+# from the work item text, not from the implementation: enumerating a
+# file's frame times without decoding pixels, reusing the same cache and
+# demux machinery #f= and with_ordinals=True already share, is the whole
+# point, so every test here checks one of those properties directly rather
+# than merely pinning the method's return shape.
+# ---------------------------------------------------------------------------
+
+def test_get_frame_times_sorted_and_matches_frame_count(tmp_path):
+    video_path = _generate_known_frame_video(tmp_path, fps=25, duration_s=2)  # 50 frames
+    resolver = MediaResolver(max_open_decoders=2)
+    try:
+        times = resolver.get_frame_times(str(video_path))
+        assert times == sorted(times)
+        assert len(times) == 50
+        assert times == [n * 40_000 for n in range(50)]  # 1/25s frame period
+    finally:
+        resolver.close()
+
+
+def test_get_frame_times_matches_full_decode_with_b_frames(tmp_path):
+    """The same case test_frame_index_matches_a_full_decode_with_b_frames
+    uses for #f=: demux (decode) order is not presentation order on this
+    fixture, so getting the sort right is not a no-op here the way it
+    would be on a fixture with no B-frames.
+    """
+    from media.resolver import _ticks_to_us
+
+    video_path = _generate_bframe_video(tmp_path, fps=25, duration_s=2)
+    ground_truth = _full_decode(video_path)
+    n_frames = len(ground_truth)
+    assert n_frames > 1
+
+    container = av.open(str(video_path))
+    time_base = container.streams.video[0].time_base
+    container.close()
+    sorted_pts = sorted(pts for pts, _pixels in ground_truth)
+    epoch_us = _ticks_to_us(sorted_pts[0], time_base)
+    expected = [_ticks_to_us(pts, time_base) - epoch_us for pts in sorted_pts]
+
+    resolver = MediaResolver(max_open_decoders=2)
+    try:
+        times = resolver.get_frame_times(str(video_path))
+        assert times == expected
+        assert len(times) == n_frames
+    finally:
+        resolver.close()
+
+
+def test_get_frame_times_decodes_no_pixels(tmp_path, monkeypatch):
+    video_path = _generate_known_frame_video(tmp_path, fps=25, duration_s=2)
+    resolver = MediaResolver(max_open_decoders=2)
+
+    def _fail_if_called(*args, **kwargs):
+        pytest.fail("get_frame_times must not decode any pixels")
+
+    monkeypatch.setattr("media.resolver._decoded_frame_to_pixels", _fail_if_called)
+    try:
+        times = resolver.get_frame_times(str(video_path))
+        assert len(times) == 50
+    finally:
+        resolver.close()
+
+
+def test_get_frame_times_second_call_reuses_cache_no_second_demux(tmp_path, monkeypatch):
+    video_path = _generate_known_frame_video(tmp_path, fps=25, duration_s=2)
+    resolver = MediaResolver(max_open_decoders=2)
+    build_calls = []
+    original_build = MediaResolver._build_frame_index
+
+    def _counting_build(self, container, stream, epoch_us):
+        build_calls.append(1)
+        return original_build(self, container, stream, epoch_us)
+
+    monkeypatch.setattr(MediaResolver, "_build_frame_index", _counting_build)
+    try:
+        first = resolver.get_frame_times(str(video_path))
+        assert len(build_calls) == 1
+
+        second = resolver.get_frame_times(str(video_path))
+        assert len(build_calls) == 1, "a second call must reuse the cache, not demux again"
+        assert second == first
+    finally:
+        resolver.close()
+
+
+def test_get_frame_times_reuses_the_index_an_earlier_f_resolve_built(tmp_path, monkeypatch):
+    """Proof there is no second index-building path: an earlier #f=
+    resolve_frame() call already paid the demux cost, so get_frame_times()
+    must reuse that result rather than building its own.
+    """
+    video_path = _generate_known_frame_video(tmp_path, fps=25, duration_s=2)
+    resolver = MediaResolver(max_open_decoders=2)
+    try:
+        frame_addr = dataclasses.replace(from_path(str(video_path)), frame=0)
+        resolver.resolve_frame(frame_addr, purpose="display")  # builds the index
+
+        build_calls = []
+        original_build = MediaResolver._build_frame_index
+
+        def _counting_build(self, container, stream, epoch_us):
+            build_calls.append(1)
+            return original_build(self, container, stream, epoch_us)
+
+        monkeypatch.setattr(MediaResolver, "_build_frame_index", _counting_build)
+
+        times = resolver.get_frame_times(str(video_path))
+        assert build_calls == [], (
+            "get_frame_times must reuse the index #f= already built, not "
+            "demux the file a second time"
+        )
+        assert len(times) == 50
+    finally:
+        resolver.close()
+
+
+def test_get_frame_times_builds_an_index_later_reused_by_an_f_resolve(tmp_path, monkeypatch):
+    """The other direction of cache-sharing: an index get_frame_times()
+    built must be reused by a later #f= resolve_frame() call, not rebuilt.
+    """
+    video_path = _generate_known_frame_video(tmp_path, fps=25, duration_s=2)
+    resolver = MediaResolver(max_open_decoders=2)
+    try:
+        resolver.get_frame_times(str(video_path))  # builds the index
+
+        build_calls = []
+        original_build = MediaResolver._build_frame_index
+
+        def _counting_build(self, container, stream, epoch_us):
+            build_calls.append(1)
+            return original_build(self, container, stream, epoch_us)
+
+        monkeypatch.setattr(MediaResolver, "_build_frame_index", _counting_build)
+
+        frame_addr = dataclasses.replace(from_path(str(video_path)), frame=10)
+        payload = resolver.resolve_frame(frame_addr, purpose="display")
+        assert payload.frame_ordinal == 10
+        assert build_calls == [], (
+            "resolve_frame(#f=) must reuse the index get_frame_times() "
+            "already built, not demux the file a second time"
+        )
+    finally:
+        resolver.close()
+
+
+def test_get_frame_times_returns_a_copy_not_the_cached_list(tmp_path):
+    video_path = _generate_known_frame_video(tmp_path, fps=25, duration_s=2)
+    resolver = MediaResolver(max_open_decoders=2)
+    try:
+        times = resolver.get_frame_times(str(video_path))
+        times.append(999_999)  # mutate the caller's copy
+
+        times_again = resolver.get_frame_times(str(video_path))
+        assert 999_999 not in times_again
+        assert len(times_again) == 50
+    finally:
+        resolver.close()
+
+
+def test_get_frame_times_stream_selector_picks_the_right_stream(tmp_path):
+    out_path = tmp_path / "multi_stream.mp4"
+    _run_ffmpeg([
+        "-f", "lavfi", "-i", "color=c=red:s=32x32:r=5:d=1",
+        "-f", "lavfi", "-i", "color=c=blue:s=32x32:r=10:d=1",
+        "-map", "0:v", "-map", "1:v",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "0",
+        str(out_path),
+    ])
+    resolver = MediaResolver(max_open_decoders=2)
+    try:
+        default_times = resolver.get_frame_times(str(out_path))
+        assert len(default_times) == 5  # stream 0 (default), 5fps, 1s
+
+        from media.media_address import StreamSelector
+
+        addr_v1 = dataclasses.replace(
+            from_path(str(out_path)), stream=StreamSelector(kind="v", index=1)
+        )
+        v1_times = resolver.get_frame_times(addr_v1)
+        assert len(v1_times) == 10  # stream 1, 10fps, 1s
+    finally:
+        resolver.close()
+
+
+def test_get_frame_times_ignores_region_in_the_address(tmp_path):
+    video_path = _generate_quad_video(tmp_path)  # 5fps, 1s -> 5 frames
+    resolver = MediaResolver(max_open_decoders=2)
+    try:
+        from media.media_address import Region
+
+        plain_times = resolver.get_frame_times(str(video_path))
+
+        region_addr = dataclasses.replace(
+            from_path(str(video_path)),
+            region=Region(x=0, y=0, w=500_000, h=500_000),
+        )
+        region_times = resolver.get_frame_times(region_addr)
+        assert region_times == plain_times
+    finally:
+        resolver.close()
+
+
+def test_get_frame_times_accepts_a_frame_or_time_fragment(tmp_path):
+    # The fragment is accepted (not rejected) even though it is ignored
+    # beyond parsing -- the returned index always describes the whole
+    # stream, never a slice named by #f= or #t=.
+    video_path = _generate_known_frame_video(tmp_path, fps=25, duration_s=2)
+    resolver = MediaResolver(max_open_decoders=2)
+    try:
+        plain_times = resolver.get_frame_times(str(video_path))
+
+        frame_addr = dataclasses.replace(from_path(str(video_path)), frame=10)
+        assert resolver.get_frame_times(frame_addr) == plain_times
+
+        point_addr = dataclasses.replace(from_path(str(video_path)), time_us=50_000)
+        assert resolver.get_frame_times(point_addr) == plain_times
+    finally:
+        resolver.close()
+
+
+def test_get_frame_times_relative_address_raises():
+    resolver = MediaResolver(max_open_decoders=2)
+    try:
+        addr = from_path("relative/clip.mp4")
+        with pytest.raises(MediaAddressError):
+            resolver.get_frame_times(addr)
+    finally:
+        resolver.close()
+
+
+def test_get_frame_times_still_image_raises(tmp_path):
+    image = Image.new("RGB", (10, 10), color=(255, 0, 0))
+    jpeg_path = tmp_path / "solid.jpg"
+    image.save(jpeg_path, format="JPEG", quality=100)
+
+    resolver = MediaResolver(max_open_decoders=2)
+    try:
+        with pytest.raises(MediaResolverError):
+            resolver.get_frame_times(str(jpeg_path))
     finally:
         resolver.close()
 
@@ -1964,3 +2209,72 @@ def test_address_run_resolves_a_relative_cell_in_a_non_full_path_media_column(
         assert dataset.get_row(row_id, "frames")["clip"] == stored_cell
     finally:
         resolver.close()
+
+
+# ---------------------------------------------------------------------------
+# P1.7-2 round 4: media/resolver.py must not hold its own copy of the
+# still-image-path test. media/extensions.py::is_image_path is the single
+# authority (moved there because two independent copies -- this module's
+# former private _is_image_path and operators/frame_operator.py's own
+# identical private copy -- will eventually disagree; sharing the
+# IMAGE_EXTENSIONS constant while duplicating the test that reads it does
+# not prevent that).
+#
+# Scoped to media/resolver.py only -- this file is that module's own test
+# module. It is NOT a repo-wide sweep: column_types/renderers.py and
+# operators/operator_registry.py each still carry a further inline copy of
+# this same test, reported (not fixed) this round, so a repo-wide guard
+# would fail on files this round does not touch.
+# ---------------------------------------------------------------------------
+
+def _module_ast(path: pathlib.Path):
+    return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+
+def _names_referenced(tree) -> set[str]:
+    return {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+
+
+def _imports_is_image_path_from_media_extensions(tree) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "media.extensions":
+            if any(alias.name == "is_image_path" for alias in node.names):
+                return True
+    return False
+
+
+def test_resolver_does_not_reference_image_extensions_directly():
+    # Would still pass if a future edit renamed the old private helper but
+    # kept its body? No -- this checks for ANY reference to the
+    # IMAGE_EXTENSIONS name in the module, not for a function called
+    # "_is_image_path" -- so a reintroduced copy under a different name is
+    # still caught.
+    tree = _module_ast(pathlib.Path(__file__).parent.parent / "media" / "resolver.py")
+    assert "IMAGE_EXTENSIONS" not in _names_referenced(tree), (
+        "media/resolver.py references IMAGE_EXTENSIONS directly -- it "
+        "should call media.extensions.is_image_path() instead of "
+        "re-implementing the still-image test"
+    )
+
+
+def test_resolver_imports_the_shared_image_path_predicate():
+    tree = _module_ast(pathlib.Path(__file__).parent.parent / "media" / "resolver.py")
+    assert _imports_is_image_path_from_media_extensions(tree), (
+        "media/resolver.py must import is_image_path from media.extensions"
+    )
+
+
+def test_the_image_extensions_reference_guard_catches_a_planted_violation(tmp_path):
+    # Proves the guard is not vacuous: a module that reintroduces the old
+    # inline check (even under a fresh name) fails it.
+    planted = tmp_path / "planted_duplicate.py"
+    planted.write_text(
+        "import pathlib\n"
+        "from media.extensions import IMAGE_EXTENSIONS\n"
+        "\n"
+        "def _looks_like_a_still_image(path):\n"
+        "    return pathlib.PurePosixPath(path).suffix.lower() in IMAGE_EXTENSIONS\n",
+        encoding="utf-8",
+    )
+    tree = _module_ast(planted)
+    assert "IMAGE_EXTENSIONS" in _names_referenced(tree)

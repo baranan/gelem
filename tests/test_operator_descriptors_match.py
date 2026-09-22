@@ -48,6 +48,7 @@ from operators.operator_config import OPERATOR_FACTORIES
 
 from operators.blendshapes import BLENDSHAPE_NAMES, BlendshapeOperator
 from operators.blendshape_avatar import BlendshapeAvatarOperator
+from operators.frame_operator import FrameOperator
 from operators.mean_face import MeanFaceOperator
 from operators.plot_operator import PlotOperator
 from operators.plot_advanced import PlotAdvancedOperator
@@ -65,6 +66,7 @@ from operators.video_frames import VideoFramesOperator
 OPERATORS_UNDER_TEST = {
     "blendshapes": BlendshapeOperator,
     "blendshape_avatar": BlendshapeAvatarOperator,
+    "frame": FrameOperator,
     "mean_face": MeanFaceOperator,
     "plot": PlotOperator,
     "plot_advanced": PlotAdvancedOperator,
@@ -88,6 +90,10 @@ EXPECTED = {
     "blendshape_avatar": {
         "modes": {ExecutionMode.COLUMNS},
         "columns": [("avatar_path", "media_path")],
+    },
+    "frame": {
+        "modes": {ExecutionMode.TABLE},
+        "columns": None,
     },
     "mean_face": {
         "modes": {ExecutionMode.TABLE, ExecutionMode.DISPLAY},
@@ -175,6 +181,10 @@ def test_blendshapes_descriptor_matches_expected():
 
 def test_blendshape_avatar_descriptor_matches_expected():
     _assert_descriptor_matches_expected("blendshape_avatar")
+
+
+def test_frame_descriptor_matches_expected():
+    _assert_descriptor_matches_expected("frame")
 
 
 def test_mean_face_descriptor_matches_expected():
