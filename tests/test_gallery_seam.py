@@ -36,6 +36,7 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
+import pandas as pd
 import pytest
 
 from PySide6.QtCore import QEvent, QPoint, QRect
@@ -490,6 +491,80 @@ def test_defect_b_no_visual_column_reports_zero_width_range_grouped(make_control
 
     assert reports, "no-visual-column gallery never reported its range"
     assert reports[-1] == (section.start, section.start, layout.result_id)
+
+
+# ===========================================================================
+# PART 3b, CC-24 -- the gallery renders exactly what it is given and
+# guesses nothing on its own. Before this item GalleryWidget._relayout()
+# had its own hardcoded "full_path" fallback for the None state, a second
+# authority on a question AppController.get_effective_visible_columns()
+# is documented to own.
+# ===========================================================================
+
+def test_media_path_tagged_column_without_full_path_name_reaches_the_gallery(
+    make_controller, realize_widget, qapp, tmp_path
+):
+    """
+    A table whose only visual column is tagged media_path but is not
+    literally named "full_path", with no visible-columns preference set:
+    what MainWindow hands the gallery must equal exactly what
+    controller.get_effective_visible_columns() resolves. Before CC-24
+    the gallery was left in its None state here and fell back to its own
+    hardcoded "full_path" check, which is not in this table's visual
+    columns -- so it painted nothing.
+    """
+    controller, dataset, _ = make_controller(tmp_path)
+    dataset.create_table_from_df(
+        "clips",
+        pd.DataFrame({"clip": ["media/a.mp4", "media/b.mov#f=10"]}),
+    )
+    window = MainWindow(controller)
+    realize_widget(window, width=1100, height=800)
+
+    controller.set_active_table("clips")
+    qapp.processEvents()
+
+    assert controller.has_visible_columns_preference() is False
+    effective = controller.get_effective_visible_columns()
+    assert effective == ["clip"], (
+        "sanity: 'clip' must actually be the resolved default for this "
+        "test to exercise the rule it claims to"
+    )
+
+    gallery = _sole_flat_gallery(window, qapp)
+    assert gallery._visible_cols == effective, (
+        "the gallery was not handed exactly what "
+        "get_effective_visible_columns() resolved -- GalleryWidget has "
+        "no public getter for its own visible-columns state, so this is "
+        "the direct way to check the wiring contract"
+    )
+    assert gallery.findChildren(TileWidget), (
+        "the gallery painted no tiles for a table whose default visual "
+        "column is media_path-tagged but not named full_path"
+    )
+
+
+def test_empty_visible_columns_shows_placeholder_not_a_full_path_guess(
+    make_controller, realize_widget, tmp_path
+):
+    """
+    An explicit empty visible-columns list must show the placeholder --
+    never a full_path guess of the gallery's own -- even on a table
+    whose visual column genuinely is named full_path.
+    """
+    controller, _, _ = make_controller(tmp_path)  # "frames" has full_path
+    controller.set_filters([])
+    layout = controller.get_result_layout()
+
+    gallery = GalleryWidget(controller)
+    gallery.set_visible_columns([])
+    gallery.set_range(0, layout.total, layout.result_id)
+    realize_widget(gallery, width=420, height=300)
+
+    assert gallery.findChildren(TileWidget) == [], (
+        "gallery painted tiles for an empty visible-columns list -- it "
+        "must show the placeholder, never guess full_path on its own"
+    )
 
 
 # ===========================================================================

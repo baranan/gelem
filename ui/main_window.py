@@ -1027,21 +1027,17 @@ class MainWindow(QMainWindow):
             # the flat gallery: a columns change or a preference reset
             # made during grouping would otherwise leave it painting a
             # stale local choice until the Columns combo was next
-            # touched. Mirror both directions --
-            #   * a real preference (including an explicit empty list)
-            #     is pushed, exactly as _build_group_section does;
-            #   * no preference clears the gallery's local choice back to
-            #     None so it falls back to full_path, rather than being
-            #     handed [] which would wrongly show the placeholder.
-            # None vs [] is a [NOW] rule in CLAUDE.md. Both gallery calls
-            # are no-ops when the value is unchanged, so the common
-            # filter-tick path still does a single relayout.
-            if self._controller.has_visible_columns_preference():
-                self._main_gallery.set_visible_columns(
-                    self._controller.get_effective_visible_columns()
-                )
-            else:
-                self._main_gallery.clear_visible_columns_preference()
+            # touched. Always push the controller's resolved columns --
+            # the gallery is never left in the None state, because
+            # get_effective_visible_columns() is the single source of
+            # truth for which columns are visible, whether that came
+            # from an explicit preference or its own default resolution
+            # (CC-24). set_visible_columns() is a no-op when the value is
+            # unchanged, so the common filter-tick path still does a
+            # single relayout.
+            self._main_gallery.set_visible_columns(
+                self._controller.get_effective_visible_columns()
+            )
             self._gallery_stack.setCurrentWidget(self._main_gallery)
         else:
             self._rebuild_grouped_galleries(layout)
@@ -1113,14 +1109,14 @@ class MainWindow(QMainWindow):
 
         gallery = GalleryWidget(self._controller)
         gallery.setFixedHeight(self._group_gallery_height)
-        # Match the flat gallery's current display settings. Only push a
-        # selection if the researcher has actually made one; otherwise we
-        # would clobber the new gallery's "no preference" default and
-        # show the placeholder where the fallback to full_path is wanted.
-        if self._controller.has_visible_columns_preference():
-            gallery.set_visible_columns(
-                self._controller.get_effective_visible_columns()
-            )
+        # Match the flat gallery's current display settings. Always push
+        # the controller's resolved columns -- get_effective_visible_columns()
+        # is the single source of truth whether or not the researcher has
+        # made an explicit choice, and the gallery itself no longer
+        # resolves a default of its own (CC-24).
+        gallery.set_visible_columns(
+            self._controller.get_effective_visible_columns()
+        )
         gallery.set_tile_size(self._tile_size)
         gallery.tile_double_clicked.connect(
             lambda ids, g=gallery: self._on_tile_double_clicked(ids, g)
@@ -1188,13 +1184,13 @@ class MainWindow(QMainWindow):
         """Refreshes filter panel and columns combo when columns change."""
         self._filter_panel.refresh_columns(column_names)
         self._refresh_columns_combo()
-        # If the controller has no explicit preference (fresh load or
-        # table switch), reset every existing gallery's own local
-        # visible-columns state too, so it doesn't keep showing
-        # columns chosen on a previous table.
-        if not self._controller.has_visible_columns_preference():
-            for gallery in self._galleries:
-                gallery.clear_visible_columns_preference()
+        # Re-sync every existing gallery's own local visible-columns state
+        # with the controller's resolved columns for the (possibly new)
+        # active table, so none of them keeps showing a previous table's
+        # columns or falls back to guessing one of its own (CC-24).
+        effective = self._controller.get_effective_visible_columns()
+        for gallery in self._galleries:
+            gallery.set_visible_columns(effective)
 
     def _on_tables_updated(self, table_names: list[str]) -> None:
         """Updates the table selector combo when tables change."""

@@ -103,7 +103,7 @@ class VideoFramesOperator(BaseOperator):
         modes=(
             ModeDescriptor(
                 mode=ExecutionMode.TABLE,
-                label="Extract frames from videos",
+                label="Export frames as files",
                 inputs=(
                     InputSpec(
                         name="active_table",

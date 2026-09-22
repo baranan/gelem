@@ -55,6 +55,7 @@ from operators.run_context import (
     TableSnapshot,
 )
 from table_names import resolve_table_name
+from table_display import TableDisplayState, resolve_default_visible_columns
 
 DEFAULT_MEDIA_COLUMN_NAME = "full_path"
 
@@ -711,9 +712,12 @@ class AppController(QObject):
         self._randomise:      bool       = False
         self._seed:           int | None = None
         self._group_by:       str | None = None
-        # None means the researcher has not made a choice yet; an empty
-        # list means the researcher explicitly unchecked every column.
-        self._visible_cols:   list[str] | None = None
+        # Which columns the gallery shows, remembered per table name so
+        # switching tables and back does not lose the choice (CC-23).
+        # No table entry means the researcher has not made a choice for
+        # that table yet; an entry that is an empty list means the
+        # researcher explicitly unchecked every column for it.
+        self._display_state:  TableDisplayState = TableDisplayState()
 
         # The dirty-flag reference point for has_unsaved_changes(): a
         # snapshot of Dataset.table_versions() taken right here at
@@ -2316,7 +2320,7 @@ class AppController(QObject):
                 self.live_runs_changed.emit()
             self._active_filters = []
             self._group_by       = None
-            self._visible_cols   = None
+            self._display_state.forget_all()
             self._project_root   = Path(folder_path)
 
             self._dataset.load_folder(folder_path)
@@ -2350,7 +2354,7 @@ class AppController(QObject):
                 self.live_runs_changed.emit()
             self._active_filters = []
             self._group_by       = None
-            self._visible_cols   = None
+            self._display_state.forget_all()
             # Relative image paths in the CSV are relative to the CSV's
             # own folder, not the process working directory.
             self._project_root   = Path(csv_path).parent
@@ -2470,20 +2474,25 @@ class AppController(QObject):
 
     def set_visible_columns(self, column_names: list[str]) -> None:
         """
-        Sets which columns the gallery displays in each tile. An empty
-        list records that the researcher explicitly unchecked every
-        column; pass through clear_visible_columns_preference() instead
-        to return to the unset/default state.
+        Sets which columns the gallery displays in each tile, remembered
+        under the currently active table so switching away and back
+        restores it (CC-23). An empty list records that the researcher
+        explicitly unchecked every column; pass through
+        clear_visible_columns_preference() instead to return to the
+        unset/default state.
 
         Args:
             column_names: Ordered list of column names to display.
         """
-        self._visible_cols = column_names
+        self._display_state.remember(self._active_table, column_names)
         self._refresh_result()
 
     def clear_visible_columns_preference(self) -> None:
-        """Clears the visible-column preference back to its unset state."""
-        self._visible_cols = None
+        """
+        Clears the active table's visible-column preference back to its
+        unset state. Other tables' remembered choices are untouched.
+        """
+        self._display_state.remember(self._active_table, None)
         self._refresh_result()
 
     def get_effective_visible_columns(self) -> list[str]:
@@ -2493,25 +2502,27 @@ class AppController(QObject):
         checkbox, so they can never show two different states.
 
         Returns:
-            - The stored preference, if one has been explicitly set
-            (including an explicit empty list).
-            - Otherwise, [DEFAULT_MEDIA_COLUMN_NAME] if that column exists
-            and is visual in the current table.
-            - Otherwise, an empty list.
+            - The active table's remembered preference, if one has been
+            explicitly set (including an explicit empty list).
+            - Otherwise, resolve_default_visible_columns() over the
+            active table's own visual columns -- DEFAULT_MEDIA_COLUMN_NAME
+            when it is among them, otherwise the table's first visual
+            column, otherwise an empty list.
         """
         if self.has_visible_columns_preference():
-            return list(self._visible_cols)
-        if DEFAULT_MEDIA_COLUMN_NAME in self.get_visual_column_names():
-            return [DEFAULT_MEDIA_COLUMN_NAME]
-        return []
+            return self._display_state.recall(self._active_table)
+        return resolve_default_visible_columns(
+            self.get_visual_column_names(), DEFAULT_MEDIA_COLUMN_NAME
+        )
 
     def has_visible_columns_preference(self) -> bool:
         """
-        True iff the researcher has explicitly set the visible-column
-        list (including unchecking everything). False before any choice
-        has been made or after a project reset.
+        True iff the researcher has explicitly set the active table's
+        visible-column list (including unchecking everything). False
+        before any choice has been made for it, or after a project
+        reset.
         """
-        return self._visible_cols is not None
+        return self._display_state.recall(self._active_table) is not None
 
     def select_row(self, row_id: str) -> None:
         """
@@ -3049,7 +3060,11 @@ class AppController(QObject):
             self._active_table   = name
             self._active_filters = []
             self._group_by       = None
-            self._visible_cols   = None
+            # No explicit reset for visible columns here: get_effective_
+            # visible_columns() and has_visible_columns_preference() read
+            # self._display_state keyed on self._active_table, already
+            # reassigned above, so they recall this table's own remembered
+            # choice (or fall back to its default) on their own.
             self.active_table_changed.emit(name)
             self.columns_updated.emit(self.get_column_names())
             self._refresh_result()
@@ -3289,6 +3304,13 @@ class AppController(QObject):
             if self._live_runs:
                 self._live_runs.clear()
                 self.live_runs_changed.emit()
+            # The dataset is a different project's now: a remembered
+            # visible-columns choice keyed by table name (e.g. "frames",
+            # which every load_folder() and every project alike can name)
+            # must not leak into it -- see load_folder() and
+            # load_csv_as_primary() for the same call, and
+            # table_display.py's own module docstring for why (CC-27).
+            self._display_state.forget_all()
             self._project_root = Path(project_path)
             # reset() BEFORE load_index(): otherwise the new project's
             # index lands on top of the previous project's live image
@@ -3336,7 +3358,24 @@ class AppController(QObject):
             # JPEG as an orphan over a recoverable error.
             if index_is_authoritative:
                 self._store.reconcile_and_evict()
-            self.tables_updated.emit(self._dataset.list_tables())
+            # The active table may be a name only the PREVIOUS project
+            # had (e.g. an operator-created "frame_rows"). Nothing about
+            # which table a project considers "active" is persisted by
+            # save()/load() (CC-28) -- neither Dataset nor schemas.json
+            # carries such a field -- so the rule is: keep the current
+            # active table when this project also has a table by that
+            # name, otherwise fall back to the project's first table
+            # (list_tables() always puts "frames" first when it is
+            # present). A project with zero tables would leave no active
+            # table at all, but Dataset.load() itself refuses to load
+            # one (its own FileNotFoundError for "no .parquet files"),
+            # so that branch cannot be reached through this method today
+            # -- handled defensively rather than left to raise if that
+            # guarantee ever changes.
+            loaded_tables = self._dataset.list_tables()
+            if self._active_table not in loaded_tables:
+                self._active_table = loaded_tables[0] if loaded_tables else ""
+            self.tables_updated.emit(loaded_tables)
             self.columns_updated.emit(self.get_column_names())
             self._refresh_result()
             # Re-baseline the dirty flag against what was just loaded --

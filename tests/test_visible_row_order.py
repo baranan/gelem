@@ -343,3 +343,93 @@ def test_visible_columns_none_versus_empty(make_controller, tmp_path):
     controller.clear_visible_columns_preference()
     assert controller.has_visible_columns_preference() is False
     assert controller.get_effective_visible_columns() == ["full_path"]
+
+
+# ---------------------------------------------------------------------------
+# CC-23: a chosen visible-columns list is remembered per table name, not one
+# global choice reset on every set_active_table -- so leaving a table and
+# coming back restores the researcher's pick instead of losing it.
+# ---------------------------------------------------------------------------
+
+def test_visible_columns_choice_survives_switching_away_and_back(
+    make_controller, tmp_path
+):
+    controller, dataset, _ = make_controller(tmp_path)
+
+    # A second table to switch away to and back from.
+    dataset.create_table_from_df(
+        "clips",
+        pd.DataFrame({"clip": ["media/a.mp4", "media/b.mov#f=10"]}),
+    )
+
+    controller.set_active_table("frames")
+    controller.set_visible_columns(["full_path"])
+    assert controller.get_effective_visible_columns() == ["full_path"]
+
+    controller.set_active_table("clips")
+    assert controller.has_visible_columns_preference() is False, (
+        "switching to a table with no choice of its own must not carry "
+        "over another table's preference"
+    )
+
+    controller.set_active_table("frames")
+    assert controller.has_visible_columns_preference() is True
+    assert controller.get_effective_visible_columns() == ["full_path"], (
+        "the earlier choice for 'frames' must survive the round trip "
+        "through another table"
+    )
+
+
+def test_default_visible_column_uses_the_schemas_media_path_tag_not_the_name(
+    make_controller, tmp_path
+):
+    # An operator-produced table whose only media column is tagged
+    # media_path in the schema but is NOT literally named "full_path" --
+    # THE PROBLEM this work item fixes: it must still get a default
+    # visible column, not an empty gallery.
+    controller, dataset, _ = make_controller(tmp_path)
+
+    dataset.create_table_from_df(
+        "clips",
+        pd.DataFrame({"clip": ["media/a.mp4", "media/b.mov#f=10"]}),
+    )
+    assert dataset.schema_for("clips").spec_for("clip").type_tag == "media_path", (
+        "sanity: 'clip' must actually be tagged media_path for this test "
+        "to exercise the rule it claims to"
+    )
+
+    controller.set_active_table("clips")
+    assert controller.has_visible_columns_preference() is False
+    assert controller.get_effective_visible_columns() == ["clip"]
+
+
+def test_folder_table_with_full_path_still_defaults_to_full_path(
+    make_controller, tmp_path
+):
+    controller, dataset, _ = make_controller(tmp_path)
+
+    controller.set_active_table("frames")
+    assert controller.has_visible_columns_preference() is False
+    assert controller.get_effective_visible_columns() == ["full_path"]
+
+    # The real load_folder() "frames" table has exactly one visual
+    # column, so the assertion above alone cannot tell "chosen because
+    # it is named full_path" apart from "chosen because it is the only
+    # (therefore first) visual column" -- a reversal that drops the
+    # name preference and falls straight to the first column would
+    # still pass it. A second table with more than one visual column,
+    # full_path deliberately NOT first, closes that gap: it pins that
+    # full_path is preferred BY NAME, not merely by position.
+    dataset.create_table_from_df(
+        "frames_multi",
+        pd.DataFrame({
+            "clip": ["media/a.mp4", "media/b.mov#f=10"],
+            "full_path": ["media/a.mp4", "media/b.mov#f=10"],
+        }),
+    )
+    controller.set_active_table("frames_multi")
+    assert controller.get_visual_column_names() == ["clip", "full_path"], (
+        "sanity: full_path must NOT be first for this assertion to prove "
+        "anything beyond position"
+    )
+    assert controller.get_effective_visible_columns() == ["full_path"]

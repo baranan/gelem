@@ -519,6 +519,94 @@ def test_a_failing_load_project_leaves_the_controller_root_unchanged(tmp_path, m
 
 
 # ---------------------------------------------------------------------------
+# CC-27: load_project() must forget the previous project's remembered
+# visible-columns choices, the same way load_folder() and
+# load_csv_as_primary() already do -- table_display.py's own module
+# docstring promises this for "when the whole dataset is being replaced".
+# ---------------------------------------------------------------------------
+
+def test_load_project_forgets_the_previous_projects_visible_columns_choice(
+    tmp_path, make_controller
+):
+    # Project A: the controller's own current dataset (make_controller's
+    # load_folder(), which names its table "frames"), with an explicit
+    # visible-columns choice made on "frames".
+    controller, _, _ = make_controller(tmp_path)
+    controller.set_active_table("frames")
+    controller.set_visible_columns(["file_name"])
+    assert controller.get_effective_visible_columns() == ["file_name"]
+
+    proj_a = tmp_path / "A"
+    controller.save_project(proj_a)
+
+    # Project B: an entirely different dataset that also names its table
+    # "frames" (load_csv_as_primary() always does) -- the realistic
+    # collision case, built and saved independently of the controller.
+    csv_b = tmp_path / "b.csv"
+    csv_b.write_text("temperature,val\n20,1\n21,2\n")
+    ds_b = Dataset()
+    ds_b.load_csv_as_primary(csv_b)
+    proj_b = tmp_path / "B"
+    ds_b.save(proj_b)
+
+    controller.load_project(proj_b)
+
+    assert controller.has_visible_columns_preference() is False, (
+        "project B's 'frames' table inherited project A's remembered "
+        "visible-columns choice for a table of the same name"
+    )
+
+
+# ---------------------------------------------------------------------------
+# CC-28: load_project() must not leave the controller pointing at a table
+# name that only the PREVIOUS project had. Observed defect: open a folder,
+# run an operator that creates "frame_rows", then Open Project a different
+# saved project -- the app showed "Could not compute the visible rows:
+# Table 'frame_rows' does not exist in this project."
+# ---------------------------------------------------------------------------
+
+def test_load_project_moves_off_a_table_name_the_new_project_does_not_have(
+    tmp_path, make_controller
+):
+    controller, dataset, _ = make_controller(tmp_path)
+
+    # Simulates an operator-created table becoming the active one, exactly
+    # as running video_frames/frame would leave "frame_rows" or similar
+    # active -- make_controller's own load_folder() table is "frames".
+    dataset.create_table_from_df(
+        "frame_rows", pd.DataFrame({"clip": ["media/a.mp4", "media/b.mp4"]})
+    )
+    controller.set_active_table("frame_rows")
+    assert controller.get_active_table() == "frame_rows"
+
+    # A different saved project that has no "frame_rows" table at all.
+    csv_b = tmp_path / "b.csv"
+    csv_b.write_text("temperature,val\n20,1\n21,2\n")
+    ds_b = Dataset()
+    ds_b.load_csv_as_primary(csv_b)
+    proj_b = tmp_path / "B"
+    ds_b.save(proj_b)
+
+    errors: list[str] = []
+    controller.error_occurred.connect(errors.append)
+
+    controller.load_project(proj_b)
+
+    assert errors == [], (
+        f"load_project() emitted an error instead of moving off the "
+        f"stale active table: {errors}"
+    )
+    assert controller.get_active_table() in dataset.list_tables(), (
+        "the active table after load_project() must exist in the loaded "
+        "project"
+    )
+    # Computing the visible rows must not raise and must actually reflect
+    # project B's data, not an empty result from a silently-caught failure.
+    assert controller.get_visible_row_ids() != []
+    assert controller.get_result_layout().table_name == controller.get_active_table()
+
+
+# ---------------------------------------------------------------------------
 # P1.8d-2b-1: column_types.json retired; a project with neither sidecar opens
 # ---------------------------------------------------------------------------
 

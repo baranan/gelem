@@ -217,11 +217,12 @@ class GalleryWidget(QWidget):
         # does not re-emit an identical report.
         self._last_reported_range: tuple[int, int, str] | None = None
         self._tile_size:    int       = 150
-        # None  -> researcher hasn't set a preference; fall back to the
-        #          dataset's default visual column (full_path) when present.
-        # []    -> researcher explicitly unchecked every visible column;
-        #          show the "No visual column selected" placeholder.
-        # [...] -> use the listed columns.
+        # None or [] -> show the "No visual column selected" placeholder.
+        #               The gallery never guesses a column of its own --
+        #               MainWindow always pushes a real list through
+        #               set_visible_columns(), resolved by
+        #               AppController.get_effective_visible_columns().
+        # [...]      -> use the listed columns.
         self._visible_cols: list[str] | None = None
         self._selected_ids: set[str]  = set()
 
@@ -349,9 +350,10 @@ class GalleryWidget(QWidget):
         Updates which columns are shown in each tile.
         One column -> ImageTile per item.
         Multiple columns -> GridTile per item.
-        An empty list is treated as an explicit "no visible column"
-        choice and shows the placeholder rather than falling back to
-        full_path; pass None to clear the preference instead.
+        An empty list shows the "No visual column selected" placeholder.
+        The caller is expected to always pass the columns
+        AppController.get_effective_visible_columns() resolves -- this
+        gallery does not pick a default column of its own.
 
         Args:
             column_names: Ordered list of column names to display.
@@ -367,9 +369,13 @@ class GalleryWidget(QWidget):
 
     def clear_visible_columns_preference(self) -> None:
         """
-        Clears the visible-column preference so the gallery returns to
-        its default-fallback behaviour (full_path when registered as
-        visual, placeholder otherwise). Use this on project reset.
+        Clears this gallery's local visible-column list back to None,
+        which renders the same "No visual column selected" placeholder
+        as an empty list (CC-24: the gallery resolves no default of its
+        own). MainWindow no longer calls this in the running application
+        -- it always pushes AppController.get_effective_visible_columns()
+        instead -- but the method stays as a direct way to put a gallery
+        back in its unset state.
         """
         if self._visible_cols is None:
             return
@@ -449,16 +455,18 @@ class GalleryWidget(QWidget):
         tiles that fall inside the viewport. Called whenever the data
         set, tile size, visible columns, or viewport size change.
 
-        Also resolves which columns each tile will display.
-        Three states for self._visible_cols:
+        Also resolves which columns each tile will display. The gallery
+        decides nothing about which column is visual -- it renders
+        exactly what it was given. Two states for self._visible_cols:
           * a non-empty list -> use those columns.
-          * an empty list    -> researcher explicitly unchecked every
-            column; show the "No visual column selected" placeholder
-            regardless of whether full_path is registered as visual.
-          * None             -> no preference set yet; fall back to
-            "full_path" when Dataset has registered it as visual, or
-            to the placeholder when it has not (e.g. a CSV-only
-            project where the researcher picked "(none)").
+          * None or an empty list -> show the "No visual column
+            selected" placeholder. The caller (MainWindow) is the one
+            that resolves a default -- see
+            AppController.get_effective_visible_columns() -- and is
+            expected to always push a real list through
+            set_visible_columns() rather than leave this gallery in the
+            None state; None is handled the same as [] here only as a
+            safe fallback, never as a hint to guess a column itself.
         """
         for tw in self._mounted.values():
             self._grid_layout.removeWidget(tw)
@@ -469,16 +477,7 @@ class GalleryWidget(QWidget):
         self._clear_placeholder()
 
         # Resolve which columns each tile will display.
-        if self._visible_cols == []:
-            # Researcher explicitly chose "no visible column".
-            columns: list[str] | None = None
-        elif self._visible_cols is None:
-            # No preference yet — fall back to full_path if it is
-            # registered as visual.
-            visual = self._controller.get_visual_column_names()
-            columns = ["full_path"] if "full_path" in visual else None
-        else:
-            columns = self._visible_cols
+        columns: list[str] | None = self._visible_cols if self._visible_cols else None
 
         if columns is None:
             self._tile_columns = None

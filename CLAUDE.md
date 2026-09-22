@@ -327,11 +327,22 @@ state. This rule carries no violation list of its own -- it points at the three
 - **`[NOW]`** Shared display components go in `shared_widgets/`, not inside `ui/`.
 - **`[NOW]`** `None` and `[]` are different. For visible columns, `None` means "no
   preference set" and `[]` means "the user chose zero columns".
-  `GalleryWidget._relayout()` (`ui/gallery_widget.py:453-463`) distinguishes the
-  two explicitly, and `AppController.get_effective_visible_columns()` /
-  `has_visible_columns_preference()` carry the same distinction on the controller
-  side. Guarded by
-  `tests/test_visible_row_order.py::test_visible_columns_none_versus_empty`.
+  `AppController.get_effective_visible_columns()` / `has_visible_columns_preference()`
+  carry the distinction, backed by `TableDisplayState` (`table_display.py`),
+  which remembers a choice per table and tells an explicit empty choice apart
+  from no choice at all. `GalleryWidget` makes no such distinction itself --
+  it renders exactly the columns it is given (CC-24), treating `None` and `[]`
+  identically: the "no visual column selected" placeholder either way. Guarded
+  by `tests/test_visible_row_order.py::test_visible_columns_none_versus_empty`.
+- **`[MIGRATING]`** No file under `ui/` decides which column is visual --
+  `AppController.get_effective_visible_columns()` resolves that, and `ui/` is
+  told. Known violation, one site: `ui/detail_widget.py:186-189` and
+  `ui/detail_widget.py:299-302` hardcode the literal column name
+  `"full_path"` in the `render_column_value()` call for both the single-item
+  and multi-item detail views, rather than being told which column to show --
+  so a table whose media column is tagged `media_path` under a different name
+  shows nothing in the detail view. Not fixed this round (CC-25). No
+  guardrail test yet.
 
 ### Media
 
@@ -620,7 +631,7 @@ remember this procedure. Claude Code is responsible for reminding him. End every
 completed work item with exactly this block, filled in:
 
 ```
-## Work item complete: <ID>
+## The prompt's title, Work item complete: <ID>
 
 **What changed**
 - three bullets, maximum
