@@ -15,8 +15,8 @@ file. The generation request is queued by the controller, not here.
 
 In 'detail' mode (used by DetailWidget), the function returns a QWidget
 suitable for full-size display — a ZoomableImageView for images, a
-QVideoWidget+QMediaPlayer for videos, a QLabel for text values. Detail
-mode is the deliberate exception that still opens the source.
+PlaybackAdapter for videos, a QLabel for text values. Detail mode is the
+deliberate exception that still opens the source.
 
 Student A is responsible for this file. For each new operator that
 produces a new kind of output, Student A adds a render function here.
@@ -95,7 +95,9 @@ def make_media_path_renderer(artifact_store):
         'detail':    Returns a QWidget for full-size display, opening the
                      source directly.
                      For images: returns a ZoomableImageView.
-                     For videos: returns a QVideoWidget with QMediaPlayer.
+                     For videos: returns a PlaybackAdapter -- a #t=A-B
+                     RANGE address plays only that range; a bare path
+                     plays the whole file (P1.10).
 
     Args:
         artifact_store: The ArtifactStore instance for thumbnail caching.
@@ -153,8 +155,9 @@ def make_media_path_renderer(artifact_store):
             # into the context, because deciding this from the extension
             # alone (the bug this fixes) cannot see the fragment. A bare
             # path or a #t= RANGE never sets this flag, so it falls
-            # through to the ordinary image/video dispatch below
-            # unchanged (range playback is P1.10, not this item).
+            # through to the ordinary image/video dispatch below, where a
+            # RANGE reaches _render_video() and plays only that span
+            # (P1.10).
             if ctx.get("media_selects_single_frame"):
                 pixels = ctx.get("detail_frame_pixels")
                 if pixels is None:
@@ -167,7 +170,7 @@ def make_media_path_renderer(artifact_store):
             if _is_image(path):
                 return _render_image(path)
             elif _is_video(path):
-                return _render_video(path)
+                return _render_video(ctx, source_path)
             else:
                 # Unknown extension — return None so placeholder shows.
                 print(f"[Renderer] Unsupported media extension: {path.suffix}")
@@ -291,56 +294,36 @@ def _render_still_from_pixels(pixels):
     return widget
 
 
-def _render_video(path: Path):
+def _render_video(ctx: dict, source_path: str):
     """
-    Renders a video file for detail mode: a QWidget containing a
-    QMediaPlayer and QVideoWidget so the researcher can play the video.
+    Renders a video file for detail mode: a PlaybackAdapter widget that
+    plays a #t=A-B RANGE address as only that range, or a bare path as the
+    whole file (P1.10). Deciding the span is media/playback.py's job; this
+    only reads its result and hands it to the widget.
 
     Thumbnail mode never reaches here -- render() serves it
-    cache-or-placeholder and never runs cv2 (P0.5b-3i). The first-frame
-    extraction that used to live here is now only in
-    ArtifactStore._run_job, off the main thread.
+    cache-or-placeholder and never opens a source (P0.5b-3i).
 
     Args:
-        path: Path to the video file.
+        ctx:         The render context. Its 'canonical_address' (set by
+                     controller.py's render_column_value) decides the
+                     span; when absent -- the cell did not parse as a
+                     media address -- the whole file plays, from source_path.
+        source_path: Absolute path to the video file.
 
     Returns:
-        A QWidget with a video player.
+        A PlaybackAdapter widget.
     """
-    from PySide6.QtWidgets import QWidget, QVBoxLayout, QPushButton, QHBoxLayout
-    from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
-    from PySide6.QtMultimediaWidgets import QVideoWidget
-    from PySide6.QtCore import QUrl
+    from column_types.playback_adapter import PlaybackAdapter
+    from media.playback import PlaybackSpan, playback_span
 
-    container = QWidget()
-    layout = QVBoxLayout(container)
-    layout.setContentsMargins(0, 0, 0, 0)
+    canonical_address = ctx.get("canonical_address")
+    if canonical_address:
+        span = playback_span(canonical_address)
+    else:
+        span = PlaybackSpan(source_path=source_path, start_ms=0, end_ms=None)
 
-    # Video display widget.
-    video_widget = QVideoWidget()
-    layout.addWidget(video_widget)
-
-    # Playback controls.
-    controls = QHBoxLayout()
-    play_btn = QPushButton("▶ Play")
-    pause_btn = QPushButton("⏸ Pause")
-    controls.addWidget(play_btn)
-    controls.addWidget(pause_btn)
-    controls.addStretch()
-    layout.addLayout(controls)
-
-    # Wire up the media player.
-    # QAudioOutput is required in Qt6 to route audio.
-    player = QMediaPlayer(container)
-    audio  = QAudioOutput(container)
-    player.setAudioOutput(audio)
-    player.setVideoOutput(video_widget)
-    player.setSource(QUrl.fromLocalFile(str(path)))
-
-    play_btn.clicked.connect(player.play)
-    pause_btn.clicked.connect(player.pause)
-
-    return container
+    return PlaybackAdapter(span)
 
 
 # ---------------------------------------------------------------------------

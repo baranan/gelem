@@ -409,9 +409,12 @@ state. This rule carries no violation list of its own -- it points at the three
   project showing a permanent grey tile for a cached-but-absent picture. Made
   true by P0.5b-2ii-a, -b1 and -b2. Tests: `tests/test_artifact_cache_location.py`,
   `tests/test_cache_sweep.py`.
-- **`[TARGET -> P1.10]`** Native playback is the explicit exception. `QMediaPlayer`
+- **`[NOW]`** Native playback is the explicit exception. `QMediaPlayer`
   receives a file path and a time range directly. It shares the address **parser**
-  with the resolver but not the decoding path.
+  with the resolver but not the decoding path. The range-to-player conversion
+  lives only in `media/playback.py`; `QMediaPlayer` is built only in
+  `column_types/playback_adapter.py`. Made true by P1.10. Tests:
+  `tests/test_playback_span.py`.
 - **`[NOW]`** No media is opened or decoded during a paint. In thumbnail mode
   `make_media_path_renderer`'s `render()` is cache-or-placeholder for **both**
   image and video tiles: a hit returns the cached picture touching no

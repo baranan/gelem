@@ -136,6 +136,22 @@ to P1.8d, and the two OS-native / non-parsing media-cell entries to P1.8e.
   is the realistic case. Probably no such project exists: no current import path
   parses dates, so nothing writes a datetime column. Nobody has produced or
   opened one to check.
+- **`QMediaPlayer`'s time zero is not verified against decision 10's file
+  clock.** `media/playback.py::address_us_to_player_ms()` converts an
+  address's microseconds to the milliseconds `QMediaPlayer.setPosition()`
+  expects with a plain unit conversion, on the assumption that the
+  player's own position-zero is the same instant as decision 10's file
+  clock zero (the first presented frame of the primary video stream,
+  `docs/media_architecture.md` section 3.6). This has not been checked
+  against a real file, and matters most for a file whose first *video*
+  frame is not at container time zero -- exactly the edit-list case
+  decision 10 exists for. Added P1.10; no item assigned to verify it.
+- **Range playback ignores a region crop and a stream selector in the
+  address.** `media/playback.py::playback_span()` reads only a
+  `MediaAddress`'s path and `time_range_us`; `addr.region` and
+  `addr.stream` are silently dropped, so a #r=... crop or a #v=/#a=
+  stream selector on a playable address has no effect on what
+  `PlaybackAdapter` shows or plays. Added P1.10; no item assigned.
 
 - **Double-clicking a tile opens the detail view on the wrong column.** After
   an operator adds a media column (for example the per-row plot images), the
