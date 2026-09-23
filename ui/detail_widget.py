@@ -154,6 +154,19 @@ class DetailWidget(QWidget):
         self._splitter.setChildrenCollapsible(False)
         layout.addWidget(self._splitter, stretch=1)
 
+    def clear(self) -> None:
+        """
+        Resets the detail view to its empty "no item selected" state.
+
+        Public wrapper around _clear() -- called by MainWindow when the
+        active table changes, so a row from the table just left
+        does not keep showing here after the switch. The close button
+        keeps calling _clear() directly; this exists so a caller outside
+        this widget has a public method to call instead of reaching for
+        a private one.
+        """
+        self._clear()
+
     def show_rows(self, row_ids: list[str]) -> None:
         """
         Shows the content for the given row_ids.

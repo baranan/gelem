@@ -334,6 +334,22 @@ state. This rule carries no violation list of its own -- it points at the three
   it renders exactly the columns it is given (CC-24), treating `None` and `[]`
   identically: the "no visual column selected" placeholder either way. Guarded
   by `tests/test_visible_row_order.py::test_visible_columns_none_versus_empty`.
+- **`[NOW]`** A table remembers its own filters, sort and grouping, the same
+  pattern as the visible-columns rule above: `TableQueryState`
+  (`table_display.py`) is the single per-table home for that state, and
+  `AppController` keeps no separate `_active_filters` / `_sort_by` / `_group_by`
+  fields that could drift out of sync with it. `set_active_table()` recalls the
+  target table's own remembered state; a filter, sort or group-by naming a
+  column that table does not have is dropped and reported once through
+  `error_occurred` rather than refusing the switch. `load_folder()`,
+  `load_csv_as_primary()` and `load_project()` all forget every table's query
+  state, the same places and same reason they already forget the
+  visible-columns choice. `AppController.get_query_state()` returns the active
+  table's state as a plain `QueryState` value; `ui/filter_panel.py` reads it
+  back after `refresh_columns()` rebuilds its controls (signals blocked, so
+  restoring does not trigger a second query) instead of keeping its own
+  `_active_filters` as an independent record that never re-syncs. Tests:
+  `tests/test_query_state.py`, `tests/test_filter_panel_query_state.py`.
 - **`[NOW]`** No file under `ui/` decides which column is visual --
   `AppController.get_effective_visible_columns()` resolves that, and `ui/` is
   told. For the detail view specifically, `AppController.get_detail_media_column()`

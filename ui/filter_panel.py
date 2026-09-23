@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Signal, Qt
 
 from models.query_engine import Filter
+from table_display import QueryState
 
 
 # Number of unique values below which toggle buttons are shown.
@@ -75,11 +76,29 @@ class FilterPanel(QWidget):
         self._controller     = controller
         self._active_filters: dict[str, Filter] = {}
         # Key: column name. Value: active Filter or None.
+        #
+        # This is not an independent choice the researcher made here --
+        # refresh_columns() rebuilds it from scratch every time (clearing
+        # it, then either resetting a column's entry as its control is
+        # rebuilt, or restoring it from the controller in
+        # _restore_query_state()). Nothing in this file sets it from a
+        # control without also calling filters_changed.emit(), and
+        # nothing reads it as a value the controller does not already
+        # have -- see _restore_query_state()'s docstring for the drift
+        # this used to allow.
         self._toggle_values: dict[str, set] = {}
         # Key: column name. Value: set of currently-checked toggle values.
         self._numeric_spins: dict[str, tuple] = {}
         # Key: column name. Value: (min_spin, max_spin, col_min, col_max)
         # for the numeric range controls, so both ends can be read together.
+        self._toggle_buttons: dict[str, dict] = {}
+        # Key: column name. Value: {toggle value: its QPushButton} -- so
+        # _restore_query_state() can check the right buttons back on
+        # without rebuilding them.
+        self._text_searches: dict[str, QLineEdit] = {}
+        # Key: column name. Value: its QLineEdit, for the same reason.
+        self._boolean_combos: dict[str, QComboBox] = {}
+        # Key: column name. Value: its QComboBox, for the same reason.
 
         self.setMinimumWidth(180)
         self.setMaximumWidth(180)
@@ -182,9 +201,18 @@ class FilterPanel(QWidget):
             if item.widget():
                 item.widget().deleteLater()
 
-        # The numeric range widgets are about to be destroyed and rebuilt,
-        # so drop the references to the old ones.
+        # Every control referenced below is about to be destroyed and
+        # rebuilt (or dropped, if its column is gone), so drop every
+        # reference to the old ones -- including self._active_filters
+        # itself: a column no longer in column_names would otherwise
+        # keep a stale entry here forever, since no add_*_filter call
+        # ever runs for it again to clear it.
         self._numeric_spins.clear()
+        self._toggle_buttons.clear()
+        self._text_searches.clear()
+        self._boolean_combos.clear()
+        self._toggle_values.clear()
+        self._active_filters.clear()
 
         # Update group-by combo.
         self._group_combo.blockSignals(True)
@@ -217,6 +245,12 @@ class FilterPanel(QWidget):
                 self._layout.insertWidget(
                     self._layout.count() - 1, label
                 )
+
+        # Controls now exist for every filterable column -- show whatever
+        # the controller is actually holding for the (possibly just
+        # switched-to) active table, rather than leaving every control at
+        # its just-built default of "no filter".
+        self._restore_query_state()
 
     def _add_text_filter(self, column: str) -> None:
         """
@@ -252,6 +286,7 @@ class FilterPanel(QWidget):
             # Buttons are recreated unchecked, so reset state to match.
             self._toggle_values[column] = set()
             self._active_filters.pop(column, None)
+            self._toggle_buttons[column] = {}
 
             for val in values:
                 btn = QPushButton(str(val))
@@ -262,6 +297,7 @@ class FilterPanel(QWidget):
                     self._on_text_toggle(c, v, checked)
                 )
                 layout.addWidget(btn)
+                self._toggle_buttons[column][val] = btn
 
         else:
             # High cardinality — show text search input.
@@ -282,6 +318,7 @@ class FilterPanel(QWidget):
                 self._on_text_search(c, text)
             )
             layout.addWidget(search)
+            self._text_searches[column] = search
 
         self._layout.insertWidget(self._layout.count() - 1, group)
 
@@ -412,6 +449,44 @@ class FilterPanel(QWidget):
         spin.setPrefix(prefix)
         return spin
 
+    def _cap_numeric_range_spins(
+        self,
+        min_spin: QDoubleSpinBox,
+        max_spin: QDoubleSpinBox,
+        col_min: float,
+        col_max: float,
+        lo: float,
+        hi: float,
+    ) -> None:
+        """
+        Stops the two handles of a numeric range control crossing each
+        other: resets each spin's own Qt range to the full column range,
+        then tightens min_spin's maximum to hi and max_spin's minimum to
+        lo, so neither can be dragged or typed past the other. Signals
+        are blocked around this so tightening one bound doesn't recurse
+        back into the control's own valueChanged handler.
+
+        Shared by _on_numeric_changed() (after a live edit) and
+        _restore_one_filter() (after setValue() restores a remembered
+        filter) -- both need the same invariant re-established, or the
+        control that just had its value set programmatically accepts an
+        edit past its intended bound as though no filter were active.
+        """
+        min_spin.blockSignals(True)
+        max_spin.blockSignals(True)
+
+        min_spin.setMinimum(col_min)
+        min_spin.setMaximum(col_max)
+
+        max_spin.setMinimum(col_min)
+        max_spin.setMaximum(col_max)
+
+        min_spin.setMaximum(hi)
+        max_spin.setMinimum(lo)
+
+        min_spin.blockSignals(False)
+        max_spin.blockSignals(False)
+
     def _on_numeric_changed(self, column: str) -> None:
         """
         Called when either bound of a numeric range control changes.
@@ -429,26 +504,7 @@ class FilterPanel(QWidget):
         min_spin, max_spin, col_min, col_max = entry
 
         lo, hi = min_spin.value(), max_spin.value()
-
-        # Stop the two handles crossing over each other. We first restore
-        # each spin's full column range, then re-tighten only the crossing
-        # bound — otherwise repeated drags would progressively shrink the
-        # allowed range and lock the filter. Block signals so tightening
-        # one bound doesn't recurse back into this handler.
-        min_spin.blockSignals(True)
-        max_spin.blockSignals(True)
-
-        min_spin.setMinimum(col_min)
-        min_spin.setMaximum(col_max)
-
-        max_spin.setMinimum(col_min)
-        max_spin.setMaximum(col_max)
-
-        min_spin.setMaximum(hi)
-        max_spin.setMinimum(lo)
-
-        min_spin.blockSignals(False)
-        max_spin.blockSignals(False)
+        self._cap_numeric_range_spins(min_spin, max_spin, col_min, col_max, lo, hi)
 
         if lo <= col_min and hi >= col_max:
             # Full range selected — no constraint.
@@ -485,6 +541,7 @@ class FilterPanel(QWidget):
             self._on_boolean_changed(c, cb.itemData(idx))
         )
         layout.addWidget(combo)
+        self._boolean_combos[column] = combo
 
         self._layout.insertWidget(self._layout.count() - 1, group)
 
@@ -502,6 +559,110 @@ class FilterPanel(QWidget):
             self._active_filters[column] = Filter(column, "eq", value)
 
         self.filters_changed.emit(list(self._active_filters.values()))
+
+    def _restore_query_state(self) -> None:
+        """
+        Re-syncs every control -- and self._active_filters -- to what
+        the controller is actually holding for the active table.
+
+        Called once, at the end of refresh_columns(), after every
+        control has been rebuilt fresh (and so is showing "no filter").
+        Before this existed, a table switch or a load left every control
+        showing that just-rebuilt blank state even though the controller
+        had already restored or forgotten a real filter set --
+        self._active_filters was a second record of "what is filtered"
+        that only ever moved forward from a click here, never back from
+        the controller, so the two silently disagreed until the
+        researcher next touched a control by hand.
+
+        Every control is set with its signals blocked: restoring a
+        filter must not re-emit filters_changed/group_by_changed and
+        trigger a second, redundant query on top of the one that already
+        produced the gallery on screen.
+        """
+        state: QueryState = self._controller.get_query_state()
+        self._active_filters = {f.column: f for f in state.filters}
+
+        for column, filter_ in self._active_filters.items():
+            self._restore_one_filter(column, filter_)
+
+        self._group_combo.blockSignals(True)
+        index = self._index_for_data(self._group_combo, state.group_by)
+        self._group_combo.setCurrentIndex(index if index != -1 else 0)
+        self._group_combo.blockSignals(False)
+        # Read back what the combo actually landed on, not the raw
+        # state.group_by value it was asked to match -- a remembered
+        # group_by absent from this table's columns falls back to the
+        # combo's "None" entry (index -1 above), and the slider must
+        # agree with what the combo is showing, not with a value the
+        # combo could not select.
+        self._set_group_height_enabled(
+            self._group_combo.currentData() is not None
+        )
+
+    def _index_for_data(self, combo: QComboBox, data) -> int:
+        """
+        The index of the item in *combo* whose userData equals *data*, or
+        -1 if none does. Not QComboBox.findData(): its Qt-level equality
+        check is not guaranteed to treat two ``None`` payloads (the
+        "None"/"All" entry every combo here carries at index 0) as
+        equal, and this only ever needs a plain Python comparison.
+        """
+        for i in range(combo.count()):
+            if combo.itemData(i) == data:
+                return i
+        return -1
+
+    def _restore_one_filter(self, column: str, filter_: Filter) -> None:
+        """
+        Sets the one control built for *column* to match *filter_*,
+        signals blocked. A column whose remembered filter's operator
+        does not match the kind of control built for it (e.g. the
+        column's cardinality changed since the filter was set, so it now
+        has a text search box instead of toggle buttons) is left at its
+        default -- self._active_filters still carries the filter, so it
+        is not lost, only not shown as checked/typed/dragged here.
+        """
+        if column in self._toggle_buttons:
+            checked = set(filter_.value) if filter_.comparison == "isin" else set()
+            self._toggle_values[column] = checked
+            for value, btn in self._toggle_buttons[column].items():
+                btn.blockSignals(True)
+                btn.setChecked(value in checked)
+                btn.blockSignals(False)
+
+        elif column in self._text_searches:
+            text = filter_.value if filter_.comparison == "contains" else ""
+            search = self._text_searches[column]
+            search.blockSignals(True)
+            search.setText(text)
+            search.blockSignals(False)
+
+        elif column in self._numeric_spins:
+            min_spin, max_spin, col_min, col_max = self._numeric_spins[column]
+            lo, hi = filter_.value if filter_.comparison == "between" else (col_min, col_max)
+            min_spin.blockSignals(True)
+            max_spin.blockSignals(True)
+            min_spin.setValue(lo)
+            max_spin.setValue(hi)
+            min_spin.blockSignals(False)
+            max_spin.blockSignals(False)
+            # Without this, the rebuilt spins keep the full column range
+            # as their own Qt bounds instead of being mutually capped at
+            # [lo, hi] the way a live edit leaves them -- so the very
+            # next edit on either spin is free to cross the other and
+            # produce an inverted (lo > hi) 'between' filter, which the
+            # QueryEngine then applies as an always-empty mask.
+            self._cap_numeric_range_spins(min_spin, max_spin, col_min, col_max, lo, hi)
+
+        elif column in self._boolean_combos:
+            combo = self._boolean_combos[column]
+            value = filter_.value if filter_.comparison == "eq" else None
+            index = self._index_for_data(combo, value)
+            if index != -1:
+                combo.blockSignals(True)
+                combo.setCurrentIndex(index)
+                combo.blockSignals(False)
 
     def _on_group_by_changed(self, index: int) -> None:
         """

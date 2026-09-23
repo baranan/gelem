@@ -1205,7 +1205,12 @@ class MainWindow(QMainWindow):
         self._table_combo.blockSignals(False)
 
     def _on_active_table_changed(self, name: str) -> None:
-        """Keeps the table combo in sync with the controller's active table."""
+        """
+        Keeps the table combo in sync with the controller's active
+        table, and clears the detail panel so a row from the
+        table just left does not keep showing after the switch.
+        """
+        self._detail_widget.clear()
         if self._table_combo.currentText() == name:
             return
         self._table_combo.blockSignals(True)

@@ -57,7 +57,12 @@ from operators.run_context import (
     TableSnapshot,
 )
 from table_names import resolve_table_name
-from table_display import TableDisplayState, resolve_default_visible_columns
+from table_display import (
+    TableDisplayState,
+    resolve_default_visible_columns,
+    QueryState,
+    TableQueryState,
+)
 
 DEFAULT_MEDIA_COLUMN_NAME = "full_path"
 
@@ -710,18 +715,21 @@ class AppController(QObject):
         self._project_root:   Path       = Path.cwd()
 
         self._active_table:   str        = "frames"
-        self._active_filters: list       = []
-        self._sort_by:        str | None = None
-        self._ascending:      bool       = True
-        self._randomise:      bool       = False
-        self._seed:           int | None = None
-        self._group_by:       str | None = None
         # Which columns the gallery shows, remembered per table name so
         # switching tables and back does not lose the choice (CC-23).
         # No table entry means the researcher has not made a choice for
         # that table yet; an entry that is an empty list means the
         # researcher explicitly unchecked every column for it.
         self._display_state:  TableDisplayState = TableDisplayState()
+        # Each table's own filters, sort, grouping and randomise/seed
+        # state, remembered per table name the same way. This is
+        # the single home for that state -- no separate _active_filters /
+        # _sort_by / _group_by fields alongside it that could drift out
+        # of sync with what is remembered here. set_active_table() reads
+        # the target table's entry back in through
+        # _recall_and_validate_query_state(); _refresh_result() always
+        # reads the active table's entry fresh rather than caching it.
+        self._query_state:    TableQueryState = TableQueryState()
 
         # The dirty-flag reference point for has_unsaved_changes(): a
         # snapshot of Dataset.table_versions() taken right here at
@@ -2060,7 +2068,12 @@ class AppController(QObject):
             # ([NOW] rule), so this does not need Dataset's own copy.
             df = self._dataset.read_only_view(self._active_table)
 
-            if self._group_by:
+            # Read the active table's own query state fresh every time,
+            # rather than caching it in instance fields -- the single
+            # home for it is self._query_state, kept per table.
+            state = self._query_state.recall(self._active_table)
+
+            if state.group_by:
                 # Grouped mode: run the grouped query, then build the
                 # flat order by concatenating the groups in the order
                 # apply_grouped() returns them, recording each group's
@@ -2070,12 +2083,12 @@ class AppController(QObject):
                 # arguments, the exact defect P0.4 removes.
                 grouped = self._query.apply_grouped(
                     df,
-                    group_by=self._group_by,
-                    filters=self._active_filters,
-                    sort_by=self._sort_by,
-                    ascending=self._ascending,
-                    randomise=self._randomise,
-                    seed=self._seed,
+                    group_by=state.group_by,
+                    filters=state.filters,
+                    sort_by=state.sort_by,
+                    ascending=state.ascending,
+                    randomise=state.randomise,
+                    seed=state.seed,
                 )
                 flat_order: list[str] = []
                 sections: list[GroupSection] = []
@@ -2090,11 +2103,11 @@ class AppController(QObject):
                 # Flat mode: the query result is already the flat order.
                 row_ids = self._query.apply(
                     df,
-                    filters=self._active_filters,
-                    sort_by=self._sort_by,
-                    ascending=self._ascending,
-                    randomise=self._randomise,
-                    seed=self._seed,
+                    filters=state.filters,
+                    sort_by=state.sort_by,
+                    ascending=state.ascending,
+                    randomise=state.randomise,
+                    seed=state.seed,
                 )
                 groups = None
 
@@ -2322,8 +2335,7 @@ class AppController(QObject):
             if self._live_runs:
                 self._live_runs.clear()
                 self.live_runs_changed.emit()
-            self._active_filters = []
-            self._group_by       = None
+            self._query_state.forget_all()
             self._display_state.forget_all()
             self._project_root   = Path(folder_path)
 
@@ -2356,8 +2368,7 @@ class AppController(QObject):
             if self._live_runs:
                 self._live_runs.clear()
                 self.live_runs_changed.emit()
-            self._active_filters = []
-            self._group_by       = None
+            self._query_state.forget_all()
             self._display_state.forget_all()
             # Relative image paths in the CSV are relative to the CSV's
             # own folder, not the process working directory.
@@ -2450,7 +2461,10 @@ class AppController(QObject):
         seed: int | None = None,
     ) -> None:
         """
-        Updates the current filter and sort state and refreshes the gallery.
+        Updates the current filter and sort state and refreshes the
+        gallery. Recorded under the active table, so switching
+        away and back restores it -- group_by is left untouched, since
+        this call carries no opinion about it.
 
         Args:
             filters:   List of Filter objects.
@@ -2459,21 +2473,40 @@ class AppController(QObject):
             randomise: If True, shuffle results.
             seed:      Random seed for reproducibility.
         """
-        self._active_filters = filters or []
-        self._sort_by        = sort_by
-        self._ascending      = ascending
-        self._randomise      = randomise
-        self._seed           = seed
+        current = self._query_state.recall(self._active_table)
+        self._query_state.remember(
+            self._active_table,
+            QueryState(
+                filters=filters or [],
+                sort_by=sort_by,
+                ascending=ascending,
+                randomise=randomise,
+                seed=seed,
+                group_by=current.group_by,
+            ),
+        )
         self._refresh_result()
 
     def set_group_by(self, column_name: str | None) -> None:
         """
-        Sets or clears the group-by column.
+        Sets or clears the group-by column. Recorded under the active
+        table, so switching away and back restores it.
 
         Args:
             column_name: Column to group by, or None to clear.
         """
-        self._group_by = column_name
+        current = self._query_state.recall(self._active_table)
+        self._query_state.remember(
+            self._active_table,
+            QueryState(
+                filters=current.filters,
+                sort_by=current.sort_by,
+                ascending=current.ascending,
+                randomise=current.randomise,
+                seed=current.seed,
+                group_by=column_name,
+            ),
+        )
         self._refresh_result()
 
     def set_visible_columns(self, column_names: list[str]) -> None:
@@ -2498,6 +2531,20 @@ class AppController(QObject):
         """
         self._display_state.remember(self._active_table, None)
         self._refresh_result()
+
+    def get_query_state(self) -> QueryState:
+        """
+        Returns the active table's remembered filters, sort, grouping
+        and randomise/seed state as a plain value -- what
+        FilterPanel reads back after a table switch or a load so its
+        controls show what is actually driving the gallery, instead of
+        keeping its own separate record of what the researcher chose.
+
+        A table that has never been filtered, or that just had its
+        state forgotten by a load, returns an empty QueryState: no
+        filters, no sort, no grouping.
+        """
+        return self._query_state.recall(self._active_table)
 
     def get_effective_visible_columns(self) -> list[str]:
         """
@@ -3072,14 +3119,18 @@ class AppController(QObject):
         whatever is on screen. Staleness is keyed on run liveness, never
         on the active table.
 
+        The target table's own filters, sort and grouping are
+        restored here, not cleared -- _recall_and_validate_query_state()
+        drops (and reports) anything naming a column this table does not
+        have, but never refuses the switch itself.
+
         Args:
             name: Table name to activate.
         """
         try:
             self._dataset.get_table(name)
             self._active_table   = name
-            self._active_filters = []
-            self._group_by       = None
+            self._recall_and_validate_query_state(name)
             # No explicit reset for visible columns here: get_effective_
             # visible_columns() and has_visible_columns_preference() read
             # self._display_state keyed on self._active_table, already
@@ -3090,6 +3141,64 @@ class AppController(QObject):
             self._refresh_result()
         except KeyError as e:
             self.error_occurred.emit(f"Table not found: {e}")
+
+    def _recall_and_validate_query_state(self, table_name: str) -> QueryState:
+        """
+        Recalls table_name's remembered QueryState and drops any filter,
+        sort_by or group_by that names a column table_name does not
+        have -- its schema may have changed, or diverged from whatever
+        table last had this name, since the state was remembered.
+
+        When anything is dropped, the healed (narrowed) state is written
+        back to self._query_state so a later recall of the same table
+        does not re-discover and re-report the same stale entry, and
+        error_occurred fires exactly once naming every dropped column.
+        Nothing is dropped -> nothing is emitted, and the state is
+        returned unchanged.
+
+        Never refuses the switch -- the rule is "drop and report",
+        not "refuse".
+        """
+        state          = self._query_state.recall(table_name)
+        valid_columns  = set(self.get_column_names(table_name))
+        dropped: list[str] = []
+
+        kept_filters = []
+        for f in state.filters:
+            if f.column in valid_columns:
+                kept_filters.append(f)
+            else:
+                dropped.append(f.column)
+
+        sort_by = state.sort_by
+        if sort_by is not None and sort_by not in valid_columns:
+            dropped.append(sort_by)
+            sort_by = None
+
+        group_by = state.group_by
+        if group_by is not None and group_by not in valid_columns:
+            dropped.append(group_by)
+            group_by = None
+
+        if not dropped:
+            return state
+
+        healed = QueryState(
+            filters=kept_filters,
+            sort_by=sort_by,
+            ascending=state.ascending,
+            randomise=state.randomise,
+            seed=state.seed,
+            group_by=group_by,
+        )
+        self._query_state.remember(table_name, healed)
+        column_list = ", ".join(sorted(set(dropped)))
+        self.error_occurred.emit(
+            f"Table {table_name!r}: the remembered filter, sort or "
+            f"group-by on column(s) {column_list} no longer applies -- "
+            f"that table has no such column any more."
+        )
+        return healed
 
     def save_filtered_as_table(self, name: str) -> None:
         """
@@ -3347,7 +3456,11 @@ class AppController(QObject):
             # must not leak into it -- see load_folder() and
             # load_csv_as_primary() for the same call, and
             # table_display.py's own module docstring for why (CC-27).
+            # A remembered filter is the same risk -- without
+            # this, a filter set in one project could survive into an
+            # unrelated one and silently show zero rows.
             self._display_state.forget_all()
+            self._query_state.forget_all()
             self._project_root = Path(project_path)
             # reset() BEFORE load_index(): otherwise the new project's
             # index lands on top of the previous project's live image

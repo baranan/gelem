@@ -33,6 +33,7 @@ from PySide6.QtGui import QImage, QPixmap
 from models.query_result import GroupSection, QueryResult
 from models.notifications import ThumbnailsReady
 from models.output_copy import OutputCopyPlan
+from table_display import QueryState
 
 
 def _pixels_to_pixmap(pixels, max_side: int) -> QPixmap:
@@ -394,6 +395,16 @@ class FakeController(QObject):
                 "neutral":  self._visible_ids[2*third:],
             }
             self._emit_grouped_result(grouped)
+
+    def get_query_state(self) -> QueryState:
+        """
+        Mirrors AppController.get_query_state() -- forced by
+        tests/test_fake_controller_contract.py's public-method parity
+        check. --fake-data mode does not remember per-table filters (its
+        set_filters()/set_group_by() only fake a plausible re-query), so
+        this always returns an empty QueryState.
+        """
+        return QueryState()
 
     def set_visible_columns(self, column_names: list[str]) -> None:
         self._visual_columns = column_names
