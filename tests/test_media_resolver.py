@@ -2278,3 +2278,146 @@ def test_the_image_extensions_reference_guard_catches_a_planted_violation(tmp_pa
     )
     tree = _module_ast(planted)
     assert "IMAGE_EXTENSIONS" in _names_referenced(tree)
+
+
+# ---------------------------------------------------------------------------
+# CC-36: resolve_frame() must never leak a bare StopIteration (or PyAV's
+# own av.error.EOFError) from next(container.decode(stream)) running dry
+# -- both are internal iterator-protocol signals, not part of
+# resolve_frame's documented (MediaResolverError, MediaAddressError)
+# contract. _get_epoch_us and _resolve_range_or_bare's "policy=first on a
+# bare path" branch are the two next(...) call sites in media/resolver.py.
+#
+# A NOTE ON WHY THESE TESTS USE A FAKE CONTAINER, NOT A REAL CORRUPT FILE.
+# The natural way to trigger this is a real zero-frame or truncated video,
+# and that was tried first and extensively: ffmpeg's own "-frames:v 0"
+# produces a file so minimal that av.open() itself fails before either
+# next() call is reached (a real gap, noted below, but a different one);
+# truncating a valid fixture at every 5-byte offset from just past the
+# header to well past the first frame found only three outcomes -- the
+# container fails to open, container.seek(0, ...) itself fails (a THIRD
+# exception type, also outside next()'s scope), or the file decodes fine
+# -- with no byte offset in between where seek() succeeds and decode()
+# then yields nothing. For this resolver's own seek(0, backward=True,
+# any_frame=False) call, seek and decode appear to share the same
+# keyframe data, so they fail or succeed together for a truncated MKV/
+# FFV1 fixture. Since the two next() sites are what this finding is
+# about, a minimal fake container/stream isolates exactly those two
+# lines instead of fighting ffmpeg/PyAV internals for an artifact that
+# may not be constructible at all for every container/codec pairing.
+# ---------------------------------------------------------------------------
+
+class _DryDecodeContainer:
+    """A stand-in for an av.InputContainer whose .seek() succeeds (as a
+    real one's does at the very start of a real file) but whose
+    .decode() yields nothing -- next() on it raises StopIteration, the
+    ordinary empty-iterator case."""
+
+    def __init__(self, name="fake.mkv"):
+        self.name = name
+
+    def seek(self, *args, **kwargs):
+        pass
+
+    def decode(self, stream):
+        return iter(())
+
+
+class _EOFErrorIterator:
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        raise EOFError("synthetic PyAV end-of-file (av.error.EOFError shape)")
+
+
+class _EOFErrorDecodeContainer(_DryDecodeContainer):
+    """Like _DryDecodeContainer, but decode() raises EOFError from
+    inside next() rather than exhausting cleanly -- what PyAV itself was
+    confirmed (empirically, against a truncated fixture) to do for this
+    exact situation, via av.error.EOFError, a subclass of the builtin
+    EOFError."""
+
+    def decode(self, stream):
+        return _EOFErrorIterator()
+
+
+class _DryDecodeStream:
+    """A distinct name from the existing _FakeStream above (line ~1630,
+    a different fixture's fake with a required time_base argument) --
+    reusing that name would silently shadow it at module scope. index is
+    read by _media_cache_key's stat-based cache key; nothing else about
+    the stream is touched in either failure path -- the exception fires
+    at next() itself, before stream.pts or stream.time_base would be
+    read."""
+
+    index = 0
+
+
+def _real_file(tmp_path) -> str:
+    # _get_epoch_us's cache-key lookup stats container.name before it
+    # ever reaches seek()/decode(), so the fake container must still
+    # name a real file on disk -- its content is irrelevant, only that
+    # it exists.
+    path = tmp_path / "fake.mkv"
+    path.write_bytes(b"")
+    return str(path)
+
+
+@pytest.mark.parametrize(
+    "container_cls", [_DryDecodeContainer, _EOFErrorDecodeContainer]
+)
+def test_get_epoch_us_converts_a_dry_decode_to_media_resolver_error(
+    container_cls, tmp_path
+):
+    resolver = MediaResolver(max_open_decoders=2)
+    try:
+        with pytest.raises(MediaResolverError, match="no decodable frames"):
+            resolver._get_epoch_us(
+                container_cls(_real_file(tmp_path)), _DryDecodeStream()
+            )
+    finally:
+        resolver.close()
+
+
+@pytest.mark.parametrize(
+    "container_cls", [_DryDecodeContainer, _EOFErrorDecodeContainer]
+)
+def test_resolve_range_or_bare_first_policy_converts_a_dry_decode_to_media_resolver_error(
+    container_cls, tmp_path
+):
+    resolver = MediaResolver(max_open_decoders=2)
+    try:
+        real_path = _real_file(tmp_path)
+        addr = from_path(real_path)  # bare path: is_bare and policy == "first"
+        with pytest.raises(MediaResolverError, match="no decodable frames"):
+            resolver._resolve_range_or_bare(
+                container_cls(real_path), _DryDecodeStream(),
+                epoch_us=0, addr=addr, policy="first",
+            )
+    finally:
+        resolver.close()
+
+
+def test_neither_dry_decode_conversion_raises_stop_iteration(tmp_path):
+    # The exact regression this item fixes: pytest.raises(MediaResolverError)
+    # above would also "pass" in a confusing way if the call raised
+    # StopIteration inside a generator-based test helper (PEP 479 turns
+    # that into a RuntimeError), so this checks the un-wrapped call
+    # directly and explicitly names what must NOT come out.
+    resolver = MediaResolver(max_open_decoders=2)
+    try:
+        try:
+            resolver._get_epoch_us(
+                _DryDecodeContainer(_real_file(tmp_path)), _DryDecodeStream()
+            )
+            pytest.fail("expected MediaResolverError")
+        except StopIteration:
+            pytest.fail(
+                "_get_epoch_us leaked a bare StopIteration instead of "
+                "raising MediaResolverError (CC-36)"
+            )
+        except MediaResolverError:
+            pass  # expected
+    finally:
+        resolver.close()

@@ -4,7 +4,10 @@ ui/detail_widget.py
 DetailWidget shows a full-size view of one or more items when the
 researcher double-clicks a tile in the gallery.
 
-The content displayed depends on the column type of full_path:
+The column shown as media is whichever one
+controller.get_detail_media_column() names -- DetailWidget does not
+decide this itself. The content displayed then depends on that
+column's type:
     - Images: a ZoomableImageView with zoom and pan.
     - Videos: a video player with play/pause controls.
     - Other column types: whatever QWidget the renderer returns.
@@ -31,10 +34,11 @@ class DetailWidget(QWidget):
     Shows full-size content for a selected row, plus metadata.
 
     On double-click, MainWindow calls show_rows([row_id]). DetailWidget
-    asks the controller to render the 'full_path' column in 'detail'
-    mode, and displays whatever widget comes back — a ZoomableImageView
-    for images, a video player for videos, or a placeholder for anything
-    unrecognised.
+    asks the controller which column is the media column
+    (get_detail_media_column()) and renders it in 'detail' mode, and
+    displays whatever widget comes back — a ZoomableImageView for
+    images, a video player for videos, or a placeholder for anything
+    unrecognised (including a table with no media column at all).
 
     Supports:
         - Single item view (one media widget + metadata table)
@@ -183,11 +187,15 @@ class DetailWidget(QWidget):
 
         metadata = self._controller.get_row(row_id)
 
-        full_path = metadata.get("full_path", "")
-        widget    = self._controller.render_column_value(
-            "full_path", full_path, size=600, mode="detail",
-            context={"row_id": row_id, "column_name": "full_path"},
-        )
+        media_column = self._controller.get_detail_media_column()
+        if media_column is not None:
+            media_value = metadata.get(media_column, "")
+            widget = self._controller.render_column_value(
+                media_column, media_value, size=600, mode="detail",
+                context={"row_id": row_id, "column_name": media_column},
+            )
+        else:
+            widget = None
 
         self._swap_media_widget(widget)
 
@@ -198,10 +206,10 @@ class DetailWidget(QWidget):
         self._bottom_stack.setVisible(True)
 
         # Update the title and populate the metadata table. We hide
-        # full_path and row_id — full_path is shown as media above,
-        # row_id is internal.
+        # the media column and row_id — the media column is shown
+        # above (if there is one), row_id is internal.
         self._label.setText(metadata.get("file_name", row_id))
-        self._populate_meta_table(metadata)
+        self._populate_meta_table(metadata, media_column)
 
         # Store pixmap if the widget is a ZoomableImageView (for Save PNG).
         if isinstance(widget, ZoomableImageView):
@@ -228,11 +236,13 @@ class DetailWidget(QWidget):
         # can rebuild the splitter with the survivors.
         self._current_row_ids = list(row_ids)
 
+        media_column = self._controller.get_detail_media_column()
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
 
         for row_id in row_ids:
-            panel = self._build_item_panel(row_id)
+            panel = self._build_item_panel(row_id, media_column)
             splitter.addWidget(panel)
 
         # Equal split between panels by default.
@@ -284,23 +294,32 @@ class DetailWidget(QWidget):
         self._save_btn.setEnabled(False)
         self._close_btn.setEnabled(False)
 
-    def _build_item_panel(self, row_id: str) -> QWidget:
+    def _build_item_panel(
+        self, row_id: str, media_column: str | None
+    ) -> QWidget:
         """
         Builds one column of the multi-item view: file-name header,
         rendered media widget, and a compact metadata label.
 
         Args:
-            row_id: The row to render.
+            row_id:       The row to render.
+            media_column: The column to render as media, or None when
+                          the table has no visual column -- shared
+                          across every panel in the comparison so they
+                          all agree on which column is media.
 
         Returns:
             A QWidget ready to be added to the side-by-side splitter.
         """
-        metadata  = self._controller.get_row(row_id)
-        full_path = metadata.get("full_path", "")
-        media     = self._controller.render_column_value(
-            "full_path", full_path, size=400, mode="detail",
-            context={"row_id": row_id, "column_name": "full_path"},
-        )
+        metadata = self._controller.get_row(row_id)
+        if media_column is not None:
+            media_value = metadata.get(media_column, "")
+            media = self._controller.render_column_value(
+                media_column, media_value, size=400, mode="detail",
+                context={"row_id": row_id, "column_name": media_column},
+            )
+        else:
+            media = None
 
         panel  = QWidget()
         layout = QVBoxLayout(panel)
@@ -332,7 +351,7 @@ class DetailWidget(QWidget):
         if media is not None:
             layout.addWidget(media, stretch=1)
 
-        meta = QLabel(self._format_meta_text(metadata))
+        meta = QLabel(self._format_meta_text(metadata, media_column))
         meta.setWordWrap(True)
         meta.setStyleSheet(
             "font-size: 11px; color: #444444; padding: 4px;"
@@ -341,16 +360,21 @@ class DetailWidget(QWidget):
 
         return panel
 
-    def _format_meta_text(self, metadata: dict) -> str:
+    def _format_meta_text(
+        self, metadata: dict, media_column: str | None
+    ) -> str:
         """
         Renders metadata as `key: value` lines, skipping the columns
-        that aren't useful in the detail view (full_path is the media
-        itself, row_id is internal). Floats are formatted with 4
-        significant digits to keep the panel narrow.
+        that aren't useful in the detail view (media_column is shown
+        as media itself, row_id is internal). Floats are formatted
+        with 4 significant digits to keep the panel narrow.
         """
+        hidden = {"row_id"}
+        if media_column is not None:
+            hidden.add(media_column)
         lines: list[str] = []
         for key, value in metadata.items():
-            if key in ("full_path", "row_id"):
+            if key in hidden:
                 continue
             if isinstance(value, float):
                 lines.append(f"{key}: {value:.4g}")
@@ -567,18 +591,23 @@ class DetailWidget(QWidget):
         else:
             self._placeholder.show()
 
-    def _populate_meta_table(self, metadata: dict) -> None:
+    def _populate_meta_table(
+        self, metadata: dict, media_column: str | None
+    ) -> None:
         """
         Fills the metadata table with one row per property in metadata,
-        skipping fields that aren't useful to show ('full_path' is the
+        skipping fields that aren't useful to show (media_column is the
         media itself, 'row_id' is internal).
 
         Floats are formatted with 4 significant digits to keep the
         column compact; everything else is rendered with str().
         """
+        hidden = {"row_id"}
+        if media_column is not None:
+            hidden.add(media_column)
         rows = [
             (k, v) for k, v in metadata.items()
-            if k not in ("full_path", "row_id")
+            if k not in hidden
         ]
 
         self._meta_table.setRowCount(len(rows))

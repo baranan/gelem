@@ -39,6 +39,8 @@ from models.output_copy import execute_output_copy as _execute_output_copy
 from models.output_copy import plan_output_copy as _plan_output_copy
 from media.media_address import from_path as _media_address_from_path
 from media.media_address import resolve_source, MediaAddressError
+from media.media_address import parse as _parse_media_address
+from media.resolver import MediaResolverError
 from operators.descriptor import (
     ExecutionMode,
     InputKind,
@@ -556,7 +558,9 @@ class AppController(QObject):
         # default, no None fallback (docs/architecture.md section 9).
         # _build_operator_run hands it to every OperatorRun as run.resolver;
         # the per-row COLUMNS runner reads it to decode a FRAME requirement.
-        # The controller never decodes anything with it itself.
+        # render_column_value() also reads it directly (CC-35), to decode
+        # a single-frame detail-mode address to a still -- the same shared
+        # instance ArtifactStore uses, never a second decoder.
         self._resolver          = resolver
 
         # This project's directories (models/project_paths.py::ProjectPaths).
@@ -2524,6 +2528,22 @@ class AppController(QObject):
         """
         return self._display_state.recall(self._active_table) is not None
 
+    def get_detail_media_column(self) -> str | None:
+        """
+        Returns the name of the column the detail view should render as
+        media for the active table, or None when there is no visual
+        column to show.
+
+        This is the single place that decides which column is "the"
+        media column for detail display -- the first entry of
+        get_effective_visible_columns(), or None when that list is
+        empty (an explicit empty preference, or a table with no visual
+        columns at all). ui/detail_widget.py must not take [0] of that
+        list itself.
+        """
+        visible = self.get_effective_visible_columns()
+        return visible[0] if visible else None
+
     def select_row(self, row_id: str) -> None:
         """
         Retrieves full metadata for a row and emits row_selected.
@@ -3628,7 +3648,14 @@ class AppController(QObject):
                          it names the table the calling tile is showing,
                          and a demand thumbnail request is queued under
                          it rather than under the controller's active
-                         table.
+                         table. For a media_path column in 'detail' mode,
+                         this method adds 'media_selects_single_frame' and
+                         (on a successful decode) 'detail_frame_pixels' --
+                         CC-35: an address that names exactly one frame
+                         (#f=N or a #t= point) is decoded here, through
+                         the shared MediaResolver, so the renderer can
+                         show that still instead of opening the whole
+                         video in a player.
 
         Returns:
             A QPixmap (thumbnail mode), QWidget (detail mode), or None.
@@ -3699,6 +3726,47 @@ class AppController(QObject):
                     ctx["source_path"],
                     request_table,
                 )
+
+            # CC-35: in detail mode, an address that selects exactly one
+            # frame (#f=N, or a #t= time POINT) must render as a still of
+            # that frame, not the whole video in a player -- the renderer
+            # dispatches on file extension alone and cannot see the
+            # fragment. Decode it here, through the SAME shared
+            # MediaResolver ArtifactStore uses (self._resolver, injected
+            # once at construction -- P1.2c-1), never a second decoder.
+            # A bare path or a #t= RANGE is left untouched: those keep
+            # today's whole-video player (range playback is P1.10, not
+            # this item). thumbnail mode never reaches here -- it already
+            # honours the fragment correctly via ArtifactStore's own
+            # resolver call, which is what makes tiles correct today.
+            if mode == "detail" and "canonical_address" in ctx:
+                try:
+                    parsed_address = _parse_media_address(
+                        ctx["canonical_address"]
+                    )
+                except MediaAddressError:
+                    parsed_address = None
+                if (
+                    parsed_address is not None
+                    and parsed_address.selects_single_frame
+                ):
+                    ctx["media_selects_single_frame"] = True
+                    try:
+                        payload = self._resolver.resolve_frame(
+                            ctx["canonical_address"], "display", policy="first"
+                        )
+                        ctx["detail_frame_pixels"] = payload.pixels
+                    except (MediaResolverError, MediaAddressError, OSError) as e:
+                        # Decode failed -- leave detail_frame_pixels unset.
+                        # media_selects_single_frame stays True, so the
+                        # renderer shows nothing rather than silently
+                        # falling back to the whole-video player and
+                        # showing an unrelated frame. Tell the researcher
+                        # why the panel is empty (CC-36) -- otherwise a
+                        # blank detail view gives no clue at all.
+                        self.error_occurred.emit(
+                            f"Could not show {ctx['canonical_address']}: {e}"
+                        )
 
         return self._registry.render_by_tag(
             tag, value, size, mode, ctx, label=column_name

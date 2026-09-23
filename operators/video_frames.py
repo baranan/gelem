@@ -293,7 +293,7 @@ class VideoFramesOperator(BaseOperator):
             video_path = Path(addr.path)
             video_stem = video_path.stem
             video_filename = video_path.name
-            is_point_address = addr.frame is not None or addr.time_us is not None
+            is_point_address = addr.selects_single_frame
 
             # An 8-hex-character digest of this row's own canonical
             # address string -- computed once per row, since every frame

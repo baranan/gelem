@@ -36,6 +36,15 @@ Note on media type detection:
     alone determines whether to treat the file as an image or video.
     This means a single column (e.g. full_path) can hold a mix of
     image and video paths and each will be rendered correctly.
+
+    The one exception (CC-35): in detail mode, render_column_value()
+    (controller.py) already decoded a #f=N or #t= point address through
+    the shared MediaResolver, because a single-frame address on a video
+    file needs to show that exact frame as a still, not the whole file
+    in a player -- extension alone cannot see the fragment. It signals
+    this through context['media_selects_single_frame'] and hands the
+    already-decoded pixels in context['detail_frame_pixels'], so this
+    file still does no address parsing and no second decode.
 """
 
 from __future__ import annotations
@@ -136,6 +145,25 @@ def make_media_path_renderer(artifact_store):
             if not path.exists():
                 return None
 
+            # CC-35: an address that selects exactly one frame (#f=N, or
+            # a #t= time POINT) renders as a still of that frame, even
+            # when the file extension is a video one -- render_column_
+            # value() (controller.py) already decoded it through the
+            # shared MediaResolver and dropped the upright RGB pixels
+            # into the context, because deciding this from the extension
+            # alone (the bug this fixes) cannot see the fragment. A bare
+            # path or a #t= RANGE never sets this flag, so it falls
+            # through to the ordinary image/video dispatch below
+            # unchanged (range playback is P1.10, not this item).
+            if ctx.get("media_selects_single_frame"):
+                pixels = ctx.get("detail_frame_pixels")
+                if pixels is None:
+                    # The resolver failed to decode the requested frame --
+                    # show nothing rather than silently opening the whole
+                    # video and displaying an unrelated frame.
+                    return None
+                return _render_still_from_pixels(pixels)
+
             if _is_image(path):
                 return _render_image(path)
             elif _is_video(path):
@@ -233,6 +261,33 @@ def _render_image(path: Path):
     image = reader.read()
     if not image.isNull():
         widget.show_pixmap(QPixmap.fromImage(image))
+    return widget
+
+
+def _render_still_from_pixels(pixels):
+    """
+    CC-35: renders an already-decoded frame (a #f=N or #t= point address)
+    as a still, in the same ZoomableImageView widget an image column uses
+    -- so zoom/pan and Save as PNG (DetailWidget checks
+    isinstance(widget, ZoomableImageView)) work exactly as they do for an
+    ordinary image.
+
+    `pixels` is the upright RGB uint8 numpy array render_column_value()
+    (controller.py) already decoded through the shared MediaResolver --
+    this function does no decoding and opens no file itself.
+
+    Args:
+        pixels: RGB uint8 numpy array, shape (height, width, 3).
+
+    Returns:
+        A ZoomableImageView widget.
+    """
+    from shared_widgets.zoomable_image_view import ZoomableImageView
+
+    widget = ZoomableImageView()
+    pixmap = _pil_to_pixmap(Image.fromarray(pixels))
+    if pixmap is not None:
+        widget.show_pixmap(pixmap)
     return widget
 
 

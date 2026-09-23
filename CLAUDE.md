@@ -334,15 +334,16 @@ state. This rule carries no violation list of its own -- it points at the three
   it renders exactly the columns it is given (CC-24), treating `None` and `[]`
   identically: the "no visual column selected" placeholder either way. Guarded
   by `tests/test_visible_row_order.py::test_visible_columns_none_versus_empty`.
-- **`[MIGRATING]`** No file under `ui/` decides which column is visual --
+- **`[NOW]`** No file under `ui/` decides which column is visual --
   `AppController.get_effective_visible_columns()` resolves that, and `ui/` is
-  told. Known violation, one site: `ui/detail_widget.py:186-189` and
-  `ui/detail_widget.py:299-302` hardcode the literal column name
-  `"full_path"` in the `render_column_value()` call for both the single-item
-  and multi-item detail views, rather than being told which column to show --
-  so a table whose media column is tagged `media_path` under a different name
-  shows nothing in the detail view. Not fixed this round (CC-25). No
-  guardrail test yet.
+  told. For the detail view specifically, `AppController.get_detail_media_column()`
+  names the column to render as media -- the first entry of
+  `get_effective_visible_columns()`, or `None` when that list is empty --
+  and `ui/detail_widget.py` asks for it rather than taking `[0]` of the list
+  itself or naming a column literally. Made true by CC-34. Guarded by
+  `tests/test_detail_media_column.py::test_no_ui_file_hardcodes_the_media_column_in_render_column_value`
+  (an AST walk over every file under `ui/` for a string literal passed as
+  `render_column_value()`'s first argument).
 
 ### Media
 

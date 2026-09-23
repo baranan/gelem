@@ -635,7 +635,7 @@ class MediaResolver:
                 f"decode_video_span requires an absolute address, got a "
                 f"relative path: {addr.path!r}"
             )
-        if addr.frame is not None or addr.time_us is not None:
+        if addr.selects_single_frame:
             raise MediaAddressError(
                 "decode_video_span resolves a range or a bare path, not a "
                 "single frame ordinal or time point -- use resolve_frame "
@@ -896,7 +896,21 @@ class MediaResolver:
             return cached
 
         container.seek(0, backward=True, any_frame=False, stream=stream)
-        first_frame = next(container.decode(stream))
+        try:
+            first_frame = next(container.decode(stream))
+        except (StopIteration, EOFError):
+            # StopIteration: the generator ran dry with no error of its
+            # own -- an ordinary empty iterator. EOFError: PyAV's own
+            # signal for the same situation (av.error.EOFError, raised
+            # from inside decode() rather than a clean StopIteration --
+            # confirmed empirically against a zero-frame fixture, CC-36).
+            # Either way this is the FILE having nothing to decode, which
+            # is MediaResolverError's documented territory, not a leak of
+            # an internal iterator-protocol exception to the caller.
+            raise MediaResolverError(
+                f"{self._container_path(container)!r} has no decodable "
+                f"frames on this stream"
+            ) from None
         epoch_us = _ticks_to_us(first_frame.pts, stream.time_base)
 
         with self._stream_info_lock:
@@ -1082,7 +1096,17 @@ class MediaResolver:
             # Decision 4's default case for a bare path: just the first
             # frame. No seek needed beyond the start; no duration lookup.
             container.seek(0, backward=True, any_frame=False, stream=stream)
-            frame = next(container.decode(stream))
+            try:
+                frame = next(container.decode(stream))
+            except (StopIteration, EOFError):
+                # See _get_epoch_us's identical except clause: PyAV
+                # raises its own av.error.EOFError here rather than a
+                # clean StopIteration (confirmed empirically, CC-36),
+                # so both are caught and turned into the documented
+                # MediaResolverError.
+                raise MediaResolverError(
+                    f"{addr.path!r} has no decodable frames"
+                ) from None
             pts_us = _ticks_to_us(frame.pts, stream.time_base) - epoch_us
             local_index = select_frame(addr, [pts_us], policy=policy)
             return frame, local_index, pts_us

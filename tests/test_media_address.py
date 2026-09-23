@@ -381,6 +381,32 @@ def test_decision8_select_frame_never_recomputes_a_frame_ordinal_from_timing():
 
 
 # ---------------------------------------------------------------------------
+# CC-36: MediaAddress.selects_single_frame -- the one named place "does
+# this address pick out exactly one frame" is decided (decision 4:
+# a bare path is the range covering the whole file; decision 8: a frame
+# ordinal and a time point are both single-frame selections, a time
+# range is not). Written so a caller (controller.py's detail-mode still
+# vs. player branch, operators/video_frames.py's point-vs-span split)
+# never re-derives this boolean itself.
+# ---------------------------------------------------------------------------
+
+def test_selects_single_frame_true_for_a_frame_ordinal():
+    assert parse("clip.mp4#f=22").selects_single_frame is True
+
+
+def test_selects_single_frame_true_for_a_time_point():
+    assert parse("clip.mp4#t=4.000000").selects_single_frame is True
+
+
+def test_selects_single_frame_false_for_a_time_range():
+    assert parse("clip.mp4#t=1.000000-2.000000").selects_single_frame is False
+
+
+def test_selects_single_frame_false_for_a_bare_path():
+    assert parse("clip.mp4").selects_single_frame is False
+
+
+# ---------------------------------------------------------------------------
 # Decisions 10, 11 -- time origin (non-negative) and degenerate values.
 # ---------------------------------------------------------------------------
 

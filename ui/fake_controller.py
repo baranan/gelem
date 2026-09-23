@@ -412,6 +412,12 @@ class FakeController(QObject):
     def has_visible_columns_preference(self) -> bool:
         return True
 
+    def get_detail_media_column(self) -> str | None:
+        """Mirrors AppController.get_detail_media_column() -- forced by
+        tests/test_fake_controller_contract.py's public-method parity check."""
+        visible = self._visual_columns
+        return visible[0] if visible else None
+
     def clear_visible_columns_preference(self) -> None:
         self._visual_columns = ["full_path"]
         self._emit_result(self._visible_ids)

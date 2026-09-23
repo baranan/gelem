@@ -183,6 +183,20 @@ class MediaAddress:
     def __hash__(self):
         return hash(format(self))
 
+    @property
+    def selects_single_frame(self) -> bool:
+        """True for an address that names exactly one frame -- a frame
+        ordinal (#f=N) or a time POINT (#t=T) -- and False for a time
+        RANGE or a bare path, both of which name a span of frames
+        (decision 4, decision 8). The one named place this decision is
+        made, so a caller (a renderer choosing a still vs. a player, an
+        operator choosing how to read a cell) never re-derives the same
+        boolean expression on its own -- CLAUDE.md's media-architecture
+        authority for what a fragment means lives here, not copied at
+        each call site.
+        """
+        return self.frame is not None or self.time_us is not None
+
 
 # ---------------------------------------------------------------------------
 # Path escaping (decision 1).
@@ -715,7 +729,7 @@ def _range_bounds_us(
     if addr.time_range_us is not None:
         # An explicit range already carries its own end.
         return addr.time_range_us
-    if addr.frame is not None or addr.time_us is not None:
+    if addr.selects_single_frame:
         raise MediaAddressError("this address is a point, not a range")
     # A bare path is the range covering the whole file (decision 4), whose
     # end is the same estimate select_frame()/frames_in_range() already
