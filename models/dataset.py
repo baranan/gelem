@@ -954,6 +954,26 @@ class Dataset:
                 "schema_adjustments", prepared.provenance_params
             )
 
+    def _refuse_if_table_name_taken(self, table_name: str) -> None:
+        """The one comparison every table-CREATING path makes before it
+        builds or stores a frame under a new name (CC-29): refuse outright
+        rather than silently replace an existing table's data and schema
+        under its own name. Every caller here calls this BEFORE
+        _accept_table, not instead of it -- this is not folded into
+        _accept_table itself, which is also the legitimate path for
+        updating a table that is already stored under its own name (e.g.
+        add_column, apply_row_updates, confirm_merge's in-place branch);
+        putting the refusal there would block every ordinary update too.
+
+        Raises:
+            ValueError: table_name already names a stored table.
+        """
+        if table_name in self._tables:
+            raise ValueError(
+                f"Cannot create table {table_name!r}: a table with that "
+                f"name already exists."
+            )
+
     def _accept_table(
         self,
         table_name: str,
@@ -1533,11 +1553,7 @@ class Dataset:
                 expand_table_name if expand_table_name is not None
                 else report.expand_table_name
             )
-            if table_name in self._tables:
-                raise ValueError(
-                    f"Cannot create table {table_name!r}: a "
-                    f"table with that name already exists."
-                )
+            self._refuse_if_table_name_taken(table_name)
             hints = {report._csv_key: ColumnHint(role=ColumnRole.identifier)}
             target_schema = self.schema_for(report.target_table)
             if target_schema is not None:
@@ -1868,7 +1884,14 @@ class Dataset:
             source_table: Name of the table to aggregate from.
             group_by:     Column or list of columns to group by.
             aggregations: Dict mapping column names to aggregation functions.
+
+        Raises:
+            ValueError: `name` already names a stored table (CC-29) -- the
+                same refusal create_table_from_df makes for the same
+                reason, checked before anything is grouped so a taken
+                name never touches the existing table under it.
         """
+        self._refuse_if_table_name_taken(name)
         # Step 1: Group the source table and apply the aggregation functions.
         source_df = self.get_table(source_table)
         agg_df    = source_df.groupby(group_by).agg(aggregations)
@@ -1912,7 +1935,14 @@ class Dataset:
             name:         Name for the new table.
             row_ids:      List of row_ids to include.
             source_table: Name of the source table.
+
+        Raises:
+            ValueError: `name` already names a stored table (CC-29) -- the
+                same refusal create_table_from_df makes for the same
+                reason, checked before any row is copied so a taken name
+                never touches the existing table under it.
         """
+        self._refuse_if_table_name_taken(name)
         # Read-only access to the stored table, then one copy of just
         # the subset -- not a full-table copy (P0.2a / P0.4). The rows
         # are returned in the caller's order, because the controller now
@@ -1974,11 +2004,7 @@ class Dataset:
                 fresh name instead (AppController, fix round item 1) must
                 pick one before calling this.
         """
-        if name in self._tables:
-            raise ValueError(
-                f"Cannot create table {name!r}: a table with that name "
-                f"already exists."
-            )
+        self._refuse_if_table_name_taken(name)
         result = df.copy().reset_index(drop=True)
         result.insert(
             0,

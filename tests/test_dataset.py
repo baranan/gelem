@@ -1028,6 +1028,100 @@ else:
 
 
 # ---------------------------------------------------------------------------
+# Section 5b: CC-29 -- every table-creating path refuses a taken name
+# ---------------------------------------------------------------------------
+
+section("5b. CC-29: table creation refuses a taken name")
+
+def test_aggregate_refuses_a_taken_table_name():
+    # Dataset.aggregate() used to call _accept_table with no collision
+    # check, so aggregating under an existing table's own name silently
+    # replaced its data and schema (CC-29). This pins the refusal.
+    from models.dataset import Dataset
+    ds = Dataset()
+    ds.load_folder(TEST_IMAGES)
+    before_df     = ds.get_table("frames").copy()
+    before_schema = ds.schema_for("frames")
+    try:
+        ds.aggregate(
+            name="frames",
+            source_table="frames",
+            group_by="file_name",
+            aggregations={"full_path": "count"},
+        )
+        assert False, "expected a ValueError: 'frames' already exists"
+    except ValueError as e:
+        # type(e) is ValueError, not just isinstance: _prepare_table's own
+        # SchemaRejection (models/dataset.py) is ALSO a ValueError
+        # subclass, and this aggregation's result frame happens to
+        # collide with the stored "frames" schema on dtype ("full_path"
+        # goes from a path column to a count column) -- a bare
+        # isinstance check would let that unrelated rejection masquerade
+        # as the CC-29 refusal being tested here.
+        assert type(e) is ValueError, (
+            f"expected the CC-29 refusal itself, a plain ValueError, not "
+            f"{type(e).__name__}: {e}"
+        )
+        assert "already exists" in str(e) and "frames" in str(e), (
+            f"error should name the taken table 'frames'; got: {e}"
+        )
+    after_df = ds.get_table("frames")
+    assert after_df.equals(before_df), (
+        "aggregate() must leave the existing table's data untouched "
+        "when it refuses a taken name"
+    )
+    assert ds.schema_for("frames") is before_schema, (
+        "aggregate() must leave the existing table's schema untouched "
+        "when it refuses a taken name"
+    )
+
+def test_create_table_from_rows_refuses_a_taken_table_name():
+    # Dataset.create_table_from_rows() used to call _accept_table with no
+    # collision check, so "Save filtered set as a new table" under an
+    # existing table's own name silently replaced its data and schema
+    # (CC-29). This pins the refusal.
+    from models.dataset import Dataset
+    ds = Dataset()
+    ds.load_folder(TEST_IMAGES)
+    before_df     = ds.get_table("frames").copy()
+    before_schema = ds.schema_for("frames")
+    row_ids = list(before_df["row_id"])
+    try:
+        ds.create_table_from_rows(
+            name="frames", row_ids=row_ids, source_table="frames",
+        )
+        assert False, "expected a ValueError: 'frames' already exists"
+    except ValueError as e:
+        # type(e) is ValueError, not just isinstance -- see the matching
+        # comment in test_aggregate_refuses_a_taken_table_name above for
+        # why a bare isinstance check is not tight enough here.
+        assert type(e) is ValueError, (
+            f"expected the CC-29 refusal itself, a plain ValueError, not "
+            f"{type(e).__name__}: {e}"
+        )
+        assert "already exists" in str(e) and "frames" in str(e), (
+            f"error should name the taken table 'frames'; got: {e}"
+        )
+    after_df = ds.get_table("frames")
+    assert after_df.equals(before_df), (
+        "create_table_from_rows() must leave the existing table's data "
+        "untouched when it refuses a taken name"
+    )
+    assert ds.schema_for("frames") is before_schema, (
+        "create_table_from_rows() must leave the existing table's schema "
+        "untouched when it refuses a taken name"
+    )
+
+run_test(
+    "aggregate() refuses a taken table name", test_aggregate_refuses_a_taken_table_name
+)
+run_test(
+    "create_table_from_rows() refuses a taken table name",
+    test_create_table_from_rows_refuses_a_taken_table_name,
+)
+
+
+# ---------------------------------------------------------------------------
 # Section 6: QueryEngine.apply()
 # ---------------------------------------------------------------------------
 

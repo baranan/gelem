@@ -1459,7 +1459,18 @@ class MainWindow(QMainWindow):
             )
             return
 
-        dialog = SaveTableDialog(n_rows=len(visible_ids), parent=self)
+        # existing_table_names (CC-29): fetched from the controller right
+        # here, at the moment the dialog is built, never cached earlier
+        # and never read from Dataset directly -- this widget must never
+        # reach Dataset. Another run can still claim a name while this
+        # dialog stays open; that is exactly why create_table_from_rows's
+        # own refusal at store time remains the real guarantee and this
+        # is only ever a courtesy.
+        dialog = SaveTableDialog(
+            n_rows=len(visible_ids),
+            parent=self,
+            existing_table_names=self._controller.get_table_names(),
+        )
         if dialog.exec() == 0:
             return
 

@@ -3082,6 +3082,21 @@ class AppController(QObject):
         whole table to do it. Now it uses the flat order the controller
         already owns -- no second query, no full-table copy.
 
+        CC-30: on success, switches the active table to the new one
+        through set_active_table -- not by reassigning self._active_table
+        by hand -- so filters, sort and grouping are cleared and every
+        signal set_active_table emits fires exactly as it would on any
+        other table switch. Without this the view stayed on the old
+        filtered table, which looks identical to the new one and misled
+        the researcher into thinking they were looking at what they just
+        saved. CC-33: the switch runs in an else clause, not the try
+        above it, so it is reached only when create_table_from_rows and
+        the tables_updated emit that follows it did not raise -- and so
+        that if the switch itself raises, that is not swallowed and
+        misreported as "Failed to save filtered set" for a save that
+        actually succeeded. A failed save (e.g. a taken name, CC-29)
+        leaves the active table unchanged either way.
+
         Args:
             name: Name for the new table.
         """
@@ -3099,6 +3114,8 @@ class AppController(QObject):
             self.tables_updated.emit(self._dataset.list_tables())
         except Exception as e:
             self.error_occurred.emit(f"Failed to save filtered set: {e}")
+        else:
+            self.set_active_table(name)
 
     def export_csv(
         self,

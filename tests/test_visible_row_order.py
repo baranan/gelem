@@ -149,23 +149,50 @@ def test_randomised_order_is_the_same_everywhere(make_controller, tmp_path, monk
 
 
 # ---------------------------------------------------------------------------
-# 2. save_filtered_as_table() runs no second query and copies no table.
+# 2. save_filtered_as_table() itself runs no query and copies no table --
+#    it reuses the flat order the controller already owns. CC-30 then
+#    makes it switch the active table on success (see section 8 below),
+#    which legitimately queries the NEW table exactly once as part of
+#    that switch; this test pins that the save step contributes no
+#    query of its own, on the OLD table or otherwise, by requiring the
+#    one query() call that does happen to have run against the new
+#    table, not the one that was active when the save started.
 # ---------------------------------------------------------------------------
 
-def test_save_filtered_set_does_not_requery_or_copy(make_controller, tmp_path, monkeypatch):
+def test_save_filtered_set_queries_the_new_table_once_not_the_old_and_copies_no_table(
+    make_controller, tmp_path, monkeypatch
+):
     controller, dataset, _ = make_controller(tmp_path)
-    controller.set_filters([], randomise=True, seed=7)
+    # A filter that narrows "frames" (20 rows) down to 2 rows, so the
+    # table save_filtered_as_table() creates from it ("saved") has a row
+    # count that cannot be confused with "frames"'s own -- the two are
+    # distinguishable by the length of the DataFrame a query is run
+    # against, with no need to read any private controller state.
+    controller.set_filters(
+        [Filter("file_name", "isin", ["001_03.jpg", "001_08.jpg"])],
+        randomise=True, seed=7,
+    )
+    assert len(controller.get_visible_row_ids()) == 2, (
+        "sanity: the filter must actually narrow the visible set for this "
+        "test's row-count signal to mean anything"
+    )
+    table_before_save = controller.get_active_table()
 
     counts = {"apply": 0, "get_table": 0}
+    queried_row_counts: list[int] = []
+    get_table_calls: list[str] = []
     original_apply     = QueryEngine.apply
     original_get_table = Dataset.get_table
 
-    def _spy_apply(self, *args, **kwargs):
+    def _spy_apply(self, df, *args, **kwargs):
         counts["apply"] += 1
-        return original_apply(self, *args, **kwargs)
+        queried_row_counts.append(len(df))
+        return original_apply(self, df, *args, **kwargs)
 
     def _spy_get_table(self, *args, **kwargs):
         counts["get_table"] += 1
+        called_name = args[0] if args else kwargs.get("name", "frames")
+        get_table_calls.append(called_name)
         return original_get_table(self, *args, **kwargs)
 
     monkeypatch.setattr(QueryEngine, "apply", _spy_apply)
@@ -173,13 +200,33 @@ def test_save_filtered_set_does_not_requery_or_copy(make_controller, tmp_path, m
 
     controller.save_filtered_as_table("saved")
 
-    assert counts["apply"] == 0, (
-        f"save_filtered_as_table() called QueryEngine.apply() {counts['apply']} "
-        f"times; it must reuse the flat order the controller already owns"
+    assert counts["apply"] == 1, (
+        f"expected exactly one QueryEngine.apply() call -- the post-save "
+        f"active-table switch querying the new table -- got "
+        f"{counts['apply']}; the save step itself must contribute none of "
+        f"its own"
     )
-    assert counts["get_table"] == 0, (
-        f"save_filtered_as_table() called Dataset.get_table() {counts['get_table']} "
-        f"times; it must not copy the whole table"
+    assert queried_row_counts == [2], (
+        f"the one query() call after a successful save must run against "
+        f"the NEWLY created table ('saved', 2 rows), not the table that "
+        f"was active when the save started ('frames', 20 rows); rows "
+        f"queried: {queried_row_counts}"
+    )
+    # At most one get_table() call is expected here: the post-save switch
+    # goes through set_active_table, whose existence check calls
+    # get_table(name), which returns a copy by contract. A call naming the
+    # table that was active when the save started would be a DIFFERENT
+    # thing -- the whole-table copy this test exists to forbid -- so that
+    # call name is checked on its own, not folded into the count above.
+    assert counts["get_table"] <= 1, (
+        f"save_filtered_as_table() called Dataset.get_table() "
+        f"{counts['get_table']} times; it must copy the whole table at "
+        f"most once"
+    )
+    assert table_before_save not in get_table_calls, (
+        f"save_filtered_as_table() must never copy the table that was "
+        f"active when the save started ({table_before_save!r}); "
+        f"get_table() was called with: {get_table_calls}"
     )
 
 
@@ -433,3 +480,50 @@ def test_folder_table_with_full_path_still_defaults_to_full_path(
         "anything beyond position"
     )
     assert controller.get_effective_visible_columns() == ["full_path"]
+
+
+# ---------------------------------------------------------------------------
+# 8. CC-30: save_filtered_as_table() switches the active table to the new
+#    one on success, through set_active_table -- and leaves it unchanged
+#    when the save fails (e.g. a taken name, CC-29).
+# ---------------------------------------------------------------------------
+
+def test_save_filtered_as_table_switches_to_the_new_table_on_success(
+    make_controller, tmp_path
+):
+    controller, dataset, _ = make_controller(tmp_path)
+    controller.set_filters([])
+    assert controller.get_active_table() == "frames"
+
+    controller.save_filtered_as_table("saved")
+
+    assert controller.get_active_table() == "saved", (
+        "a successful save must switch the active table to the new one -- "
+        "otherwise the view stays on the old filtered table, which looks "
+        "identical to the new one and misleads the researcher into "
+        "thinking they are looking at what they just saved"
+    )
+
+
+def test_save_filtered_as_table_leaves_active_table_unchanged_on_failure(
+    make_controller, tmp_path
+):
+    controller, dataset, _ = make_controller(tmp_path)
+    controller.set_filters([])
+    assert controller.get_active_table() == "frames"
+
+    errors: list[str] = []
+    controller.error_occurred.connect(errors.append)
+
+    # "frames" already names the active table itself -- create_table_from_rows
+    # refuses it (CC-29) -- so this call must fail without switching the
+    # active table anywhere.
+    controller.save_filtered_as_table("frames")
+
+    assert errors, (
+        "expected an error_occurred signal for a taken table name; "
+        "the save must have failed for this test to mean anything"
+    )
+    assert controller.get_active_table() == "frames", (
+        "a FAILED save must leave the active table unchanged"
+    )
