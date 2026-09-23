@@ -371,6 +371,14 @@ state. This rule carries no violation list of its own -- it points at the three
   decodes nothing, and detail mode loads through Qt's `QImageReader(path)`,
   not PIL or cv2.) Guarded by an AST walk over every non-test module in the
   repository: `tests/test_source_decode_guard.py`.
+- **`[NOW]`** MediaResolver's public entry points raise only
+  MediaResolverError, MediaAddressError, or ValueError for a bad argument;
+  no PyAV, PIL or OS exception escapes. Tests:
+  `tests/test_media_resolver.py::test_resolve_frame_wraps_a_bad_video_file`,
+  `::test_resolve_frame_wraps_a_bad_image_file`,
+  `::test_get_frame_times_wraps_a_bad_video_file`,
+  `::test_decode_video_span_wraps_a_bad_video_file_on_first_next`,
+  `::test_resolve_frame_after_a_failed_open_leaves_no_leaked_pool_slot`.
 - **`[NOW]`** **Reading and writing Gelem's own derived artifacts is a different
   operation and is not covered by that rule.** `ArtifactStore` reads back the JPEGs
   it wrote, and must keep being able to. P0.5b-1 built the narrow `ArtifactCodec`

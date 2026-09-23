@@ -105,6 +105,7 @@ shut down.
 from __future__ import annotations
 
 import bisect
+import contextlib
 import dataclasses
 import pathlib
 import re
@@ -135,11 +136,38 @@ class MediaResolverError(ValueError):
     """Raised when the FILE, not the address, cannot be resolved as asked --
     an unsupported display matrix, a missing video stream, or (for a
     bare-path midpoint request) no duration the container will report
-    without decoding to the true end. A problem with what the address
-    itself asks for, given the file, is raised as MediaAddressError
-    instead -- see decision 11's own resolve-time refusals, which this
-    module reaches by calling select_frame().
+    without decoding to the true end. Also covers a file that is missing,
+    unreadable or damaged: a public entry point never lets a raw PyAV,
+    PIL or OS-level exception escape (see _translate_file_errors below).
+    A problem with what the address itself asks for, given the file, is
+    raised as MediaAddressError instead -- see decision 11's own
+    resolve-time refusals, which this module reaches by calling
+    select_frame().
     """
+
+
+@contextlib.contextmanager
+def _translate_file_errors(path: str):
+    """Turn a raw PyAV or OS-level failure touching `path` into
+    MediaResolverError, so none of the following ever escapes a public
+    entry point: av.error.InvalidDataError (a ValueError subclass no
+    caller expects, raised for a damaged or unrecognised file),
+    av.error.EOFError (a bare builtin EOFError, not an OSError, raised
+    by av.open on some truncated files), or a plain FileNotFoundError,
+    PermissionError or PIL.UnidentifiedImageError. av.error.FFmpegError
+    is PyAV's common base for every such decode failure, so catching it
+    alongside OSError and EOFError covers all of the above without
+    needing to name each PyAV subclass.
+
+    MediaAddressError and MediaResolverError are themselves ValueError
+    subclasses, not members of the caught tuple, so both pass through
+    this unchanged -- a caller's own address-shape or file-content
+    refusal is never relabelled as a raw-error translation.
+    """
+    try:
+        yield
+    except (av.error.FFmpegError, OSError, EOFError) as exc:
+        raise MediaResolverError(f"{path!r}: {exc}") from exc
 
 
 _PURPOSES = ("display", "analysis")
@@ -567,8 +595,10 @@ class MediaResolver:
             )
 
         if is_image_path(addr.path):
-            return self._resolve_still_image(addr, purpose)
-        return self._resolve_video_frame(addr, purpose, policy)
+            with _translate_file_errors(addr.path):
+                return self._resolve_still_image(addr, purpose)
+        with _translate_file_errors(addr.path):
+            return self._resolve_video_frame(addr, purpose, policy)
 
     def decode_video_span(
         self, address: Union[str, MediaAddress], purpose: str,
@@ -702,13 +732,14 @@ class MediaResolver:
                 f"one frame and no timeline, so it has no frame-time index"
             )
 
-        container = self._pool.acquire(addr.path)
-        try:
-            stream = self._select_video_stream(container, addr)
-            epoch_us = self._get_epoch_us(container, stream)
-            return list(self._get_frame_index(container, stream, epoch_us))
-        finally:
-            self._pool.release(container)
+        with _translate_file_errors(addr.path):
+            container = self._pool.acquire(addr.path)
+            try:
+                stream = self._select_video_stream(container, addr)
+                epoch_us = self._get_epoch_us(container, stream)
+                return list(self._get_frame_index(container, stream, epoch_us))
+            finally:
+                self._pool.release(container)
 
     def _decode_video_span_frames(
         self, addr: MediaAddress, purpose: str, with_ordinals: bool
@@ -719,64 +750,70 @@ class MediaResolver:
         # `finally` below runs on exhaustion, on an explicit close(), and
         # on garbage collection of an abandoned iterator (all three drive
         # a generator's own close() under the hood).
-        container = self._pool.acquire(addr.path)
-        try:
-            stream = self._select_video_stream(container, addr)
-            epoch_us = self._get_epoch_us(container, stream)
-            if with_ordinals:
-                # Builds the index if it does not already exist -- the
-                # one extra demux pass with_ordinals=True's docstring
-                # promises, paid at most once per (path, stream, size,
-                # mtime).
-                frame_times = self._get_frame_index(container, stream, epoch_us)
-            else:
-                # Never builds the index (rule 3, extended to spans) --
-                # only reused if an earlier #f= resolve, or an earlier
-                # with_ordinals=True call, already built it.
-                frame_times = self._peek_frame_index(container, stream)
+        # The whole body, including the acquire, is inside the translation
+        # context: an error raised while iterating (mid-decode, mid-seek)
+        # must be translated exactly as one raised before the first yield,
+        # and a context manager stays entered across a generator's yield
+        # points, so this one `with` covers both.
+        with _translate_file_errors(addr.path):
+            container = self._pool.acquire(addr.path)
+            try:
+                stream = self._select_video_stream(container, addr)
+                epoch_us = self._get_epoch_us(container, stream)
+                if with_ordinals:
+                    # Builds the index if it does not already exist -- the
+                    # one extra demux pass with_ordinals=True's docstring
+                    # promises, paid at most once per (path, stream, size,
+                    # mtime).
+                    frame_times = self._get_frame_index(container, stream, epoch_us)
+                else:
+                    # Never builds the index (rule 3, extended to spans) --
+                    # only reused if an earlier #f= resolve, or an earlier
+                    # with_ordinals=True call, already built it.
+                    frame_times = self._peek_frame_index(container, stream)
 
-            is_bare = addr.time_range_us is None
-            if is_bare:
-                start_us, end_us = 0, None
-            else:
-                start_us, end_us = addr.time_range_us
+                is_bare = addr.time_range_us is None
+                if is_bare:
+                    start_us, end_us = 0, None
+                else:
+                    start_us, end_us = addr.time_range_us
 
-            raw_start_ticks = _us_to_ticks(start_us + epoch_us, stream.time_base)
-            container.seek(raw_start_ticks, backward=True, any_frame=False, stream=stream)
+                raw_start_ticks = _us_to_ticks(start_us + epoch_us, stream.time_base)
+                container.seek(raw_start_ticks, backward=True, any_frame=False, stream=stream)
 
-            yielded_any = False
-            for frame in container.decode(stream):
-                pts_us = _ticks_to_us(frame.pts, stream.time_base) - epoch_us
-                if pts_us < start_us:
-                    continue
-                if end_us is not None and pts_us >= end_us:
-                    break
+                yielded_any = False
+                for frame in container.decode(stream):
+                    pts_us = _ticks_to_us(frame.pts, stream.time_base) - epoch_us
+                    if pts_us < start_us:
+                        continue
+                    if end_us is not None and pts_us >= end_us:
+                        break
 
-                pixels, width, height = _decoded_frame_to_pixels(frame, addr.region)
+                    pixels, width, height = _decoded_frame_to_pixels(frame, addr.region)
 
-                ordinal = None
-                if frame_times is not None:
-                    index = bisect.bisect_left(frame_times, pts_us)
-                    if index < len(frame_times) and frame_times[index] == pts_us:
-                        ordinal = index
+                    ordinal = None
+                    if frame_times is not None:
+                        index = bisect.bisect_left(frame_times, pts_us)
+                        if index < len(frame_times) and frame_times[index] == pts_us:
+                            ordinal = index
 
-                yielded_any = True
-                yield FramePayload(
-                    pixels=pixels,
-                    frame_ordinal=ordinal,
-                    presentation_time_us=pts_us,
-                    width=width,
-                    height=height,
-                    purpose=purpose,
-                )
+                    yielded_any = True
+                    yield FramePayload(
+                        pixels=pixels,
+                        frame_ordinal=ordinal,
+                        presentation_time_us=pts_us,
+                        width=width,
+                        height=height,
+                        purpose=purpose,
+                    )
 
-            if not yielded_any:
-                raise MediaAddressError(
-                    f"the range {start_us} to {end_us} microseconds "
-                    f"contains no frames in {addr.path!r}"
-                )
-        finally:
-            self._pool.release(container)
+                if not yielded_any:
+                    raise MediaAddressError(
+                        f"the range {start_us} to {end_us} microseconds "
+                        f"contains no frames in {addr.path!r}"
+                    )
+            finally:
+                self._pool.release(container)
 
     # -- still images ------------------------------------------------------
 

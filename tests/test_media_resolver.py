@@ -2421,3 +2421,152 @@ def test_neither_dry_decode_conversion_raises_stop_iteration(tmp_path):
             pass  # expected
     finally:
         resolver.close()
+
+
+# ---------------------------------------------------------------------------
+# Wrapping a raw PyAV, PIL or OS-level failure as MediaResolverError: none
+# of the three public entry points may let a damaged, missing or unreadable
+# file escape as av.error.InvalidDataError (a ValueError subclass no caller
+# expects), av.error.EOFError (a bare builtin EOFError, not an OSError), or
+# a plain FileNotFoundError / PermissionError / PIL.UnidentifiedImageError.
+# ---------------------------------------------------------------------------
+
+def _garbage_bytes_video(tmp_path) -> str:
+    """A file with a video extension but no real container inside it --
+    av.open() raises av.error.InvalidDataError (a ValueError subclass) on
+    this, confirmed empirically against this exact fixture shape.
+    """
+    path = tmp_path / "garbage.mp4"
+    path.write_bytes(bytes(range(256)) * 8)
+    return str(path)
+
+
+def _truncated_real_video(tmp_path) -> str:
+    """A genuine, valid video cut down to its first 64 bytes: enough of a
+    header to look plausible, not enough for av.open() to parse.
+    """
+    full_path = _generate_known_frame_video(tmp_path, fps=25, duration_s=1)
+    truncated_path = tmp_path / "truncated.mkv"
+    truncated_path.write_bytes(full_path.read_bytes()[:64])
+    return str(truncated_path)
+
+
+def _missing_video_path(tmp_path) -> str:
+    return str(tmp_path / "does_not_exist.mp4")
+
+
+def _text_masquerading_as_jpg(tmp_path) -> str:
+    """A .jpg extension on a file that is not an image at all --
+    PIL.Image.open() raises UnidentifiedImageError, an OSError subclass,
+    on this.
+    """
+    path = tmp_path / "not_a_photo.jpg"
+    path.write_text("this is not a jpeg")
+    return str(path)
+
+
+def _missing_image_path(tmp_path) -> str:
+    return str(tmp_path / "does_not_exist.jpg")
+
+
+_bad_video_file = pytest.mark.parametrize(
+    "make_bad_path",
+    [_garbage_bytes_video, _truncated_real_video, _missing_video_path],
+    ids=["garbage_bytes", "truncated_header", "missing_file"],
+)
+
+
+@_bad_video_file
+def test_resolve_frame_wraps_a_bad_video_file(tmp_path, make_bad_path):
+    bad_path = make_bad_path(tmp_path)
+    resolver = MediaResolver(max_open_decoders=2)
+    try:
+        with pytest.raises(MediaResolverError) as excinfo:
+            resolver.resolve_frame(bad_path, purpose="display")
+        # media_address.py normalises a path to forward slashes (decision
+        # 9) before this module ever sees it, so the message -- built from
+        # addr.path, not the raw OS path string -- carries the normalised
+        # form on Windows.
+        assert bad_path.replace("\\", "/") in str(excinfo.value)
+        assert excinfo.value.__cause__ is not None
+    finally:
+        resolver.close()
+
+
+@pytest.mark.parametrize(
+    "make_bad_path",
+    [_text_masquerading_as_jpg, _missing_image_path],
+    ids=["text_as_jpg", "missing_file"],
+)
+def test_resolve_frame_wraps_a_bad_image_file(tmp_path, make_bad_path):
+    bad_path = make_bad_path(tmp_path)
+    resolver = MediaResolver(max_open_decoders=2)
+    try:
+        with pytest.raises(MediaResolverError) as excinfo:
+            resolver.resolve_frame(bad_path, purpose="display")
+        # media_address.py normalises a path to forward slashes (decision
+        # 9) before this module ever sees it, so the message -- built from
+        # addr.path, not the raw OS path string -- carries the normalised
+        # form on Windows.
+        assert bad_path.replace("\\", "/") in str(excinfo.value)
+        assert excinfo.value.__cause__ is not None
+    finally:
+        resolver.close()
+
+
+@_bad_video_file
+def test_get_frame_times_wraps_a_bad_video_file(tmp_path, make_bad_path):
+    bad_path = make_bad_path(tmp_path)
+    resolver = MediaResolver(max_open_decoders=2)
+    try:
+        with pytest.raises(MediaResolverError) as excinfo:
+            resolver.get_frame_times(bad_path)
+        # media_address.py normalises a path to forward slashes (decision
+        # 9) before this module ever sees it, so the message -- built from
+        # addr.path, not the raw OS path string -- carries the normalised
+        # form on Windows.
+        assert bad_path.replace("\\", "/") in str(excinfo.value)
+        assert excinfo.value.__cause__ is not None
+    finally:
+        resolver.close()
+
+
+@_bad_video_file
+def test_decode_video_span_wraps_a_bad_video_file_on_first_next(tmp_path, make_bad_path):
+    bad_path = make_bad_path(tmp_path)
+    resolver = MediaResolver(max_open_decoders=2)
+    try:
+        span = resolver.decode_video_span(bad_path, purpose="display")
+        with pytest.raises(MediaResolverError) as excinfo:
+            next(span)
+        # media_address.py normalises a path to forward slashes (decision
+        # 9) before this module ever sees it, so the message -- built from
+        # addr.path, not the raw OS path string -- carries the normalised
+        # form on Windows.
+        assert bad_path.replace("\\", "/") in str(excinfo.value)
+        assert excinfo.value.__cause__ is not None
+    finally:
+        resolver.close()
+
+
+def test_resolve_frame_after_a_failed_open_leaves_no_leaked_pool_slot(tmp_path):
+    """_DecoderPool.acquire restores its reservation and re-raises when
+    av.open() itself fails (see the module docstring); the translation
+    this adds happens one level above and must not disturb that. At
+    max_open_decoders=1, resolving a good video right after a failed one
+    proves the failed attempt left no slot reserved -- a leak here would
+    make this call hang, or raise the pool's own deadlock-guard error,
+    instead of succeeding.
+    """
+    bad_path = _garbage_bytes_video(tmp_path)
+    good_path = str(_generate_known_frame_video(tmp_path, fps=25, duration_s=1))
+
+    resolver = MediaResolver(max_open_decoders=1)
+    try:
+        with pytest.raises(MediaResolverError):
+            resolver.resolve_frame(bad_path, purpose="display")
+
+        payload = resolver.resolve_frame(good_path, purpose="display")
+        assert (payload.width, payload.height) == (64, 64)
+    finally:
+        resolver.close()
