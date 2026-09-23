@@ -8,9 +8,6 @@ event loop.
 
 Run with:
     python main.py
-
-Run with fake data (no real images needed):
-    python main.py --fake-data
 """
 
 import sys
@@ -19,48 +16,17 @@ from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import QTimer
 
 
-def create_app(fake_data: bool = False):
+def create_app():
     """
     Creates and wires all application components.
 
-    Args:
-        fake_data: If True, uses FakeController with test images.
-                   No real data components are created. This mode
-                   is intended for Student A to develop and test
-                   UI widgets independently.
-
     Returns:
-        (MainWindow instance (already visible), MediaResolver). Every
-        mode builds a real MediaResolver now -- --fake-data has no
-        Dataset/ArtifactStore/OperatorRegistry, but FakeController still
-        decodes real thumbnails from test_images/ through one, the same
-        "only the media resolver decodes source media" rule the real
-        components follow. The caller (main()) closes the resolver after
-        the Qt event loop returns.
+        (MainWindow instance (already visible), MediaResolver). The
+        caller (main()) closes the resolver after the Qt event loop
+        returns.
     """
     from ui.main_window import MainWindow
 
-    if fake_data:
-        # Use FakeController -- no real Dataset/ArtifactStore/OperatorRegistry
-        # needed, but real thumbnail decoding still goes through a real
-        # MediaResolver (CLAUDE.md's media rule; docs/architecture.md
-        # section 9 is the authority for max_open_decoders in real mode --
-        # fake mode has no settings store at all, so this is a small,
-        # fake-mode-only constant, not a setting).
-        from ui.fake_controller import FakeController
-        from media.resolver import MediaResolver
-        test_folder = Path("test_images")
-        if not test_folder.exists():
-            test_folder = Path(".")
-        resolver = MediaResolver(max_open_decoders=2)
-        controller = FakeController(test_folder, resolver=resolver)
-        window = MainWindow(controller)
-        window.show()
-        # Start emitting signals after the window has connected them.
-        QTimer.singleShot(100, controller.start)
-        return window, resolver
-
-    # Real mode — create all components.
     from models.dataset import Dataset
     from models.query_engine import QueryEngine
     from models.project_paths import create_workspace, default_workspaces_root
@@ -163,20 +129,18 @@ def create_app(fake_data: bool = False):
 
 def main():
     """Application entry point."""
-    fake_data = "--fake-data" in sys.argv
-
     app = QApplication(sys.argv)
     app.setApplicationName("Gelem")
     app.setOrganizationName("ResearchLab")
 
-    window, resolver = create_app(fake_data=fake_data)
+    window, resolver = create_app()
 
     try:
         exit_code = app.exec()
     finally:
         # Closes every idle pooled decoder now; one a live decode is still
         # using closes itself once that use ends (media/resolver.py's
-        # MediaResolver.close() docstring). None in --fake-data mode.
+        # MediaResolver.close() docstring).
         if resolver is not None:
             resolver.close()
 

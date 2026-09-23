@@ -41,10 +41,6 @@ import pathlib
 ROOT = pathlib.Path(__file__).parent.parent
 UI_DIR = ROOT / "ui"
 
-# fake_controller.py stands in for AppController, not a widget, so it is
-# excluded here exactly as it is from the import guardrail.
-EXCLUDED_FILES = {"fake_controller.py"}
-
 # Private attribute names that a UI file is still allowed to read off
 # another object, because migrating them is explicitly someone else's
 # work item (P1.13). This list is closed.
@@ -123,8 +119,6 @@ def _row_ids_assignments_in_file(path: pathlib.Path) -> list[str]:
 def test_ui_files_do_not_read_foreign_private_attributes():
     violations: dict[str, list[str]] = {}
     for py_file in sorted(UI_DIR.rglob("*.py")):
-        if py_file.name in EXCLUDED_FILES:
-            continue
         hits = _violations_in_file(py_file)
         if hits:
             violations[str(py_file.relative_to(ROOT))] = hits
@@ -147,14 +141,8 @@ def test_no_widget_reintroduces_row_ids_state():
     # regression the document names -- `GalleryWidget._row_ids` coming
     # back, filled from get_row_ids_in_range() -- which every other
     # check in this file and in test_visible_row_order.py would miss.
-    #
-    # fake_controller.py is excluded exactly as above: it stands in for
-    # AppController, so its own _row_ids (the full row set, like the
-    # controller's) is legitimate.
     violations: dict[str, list[str]] = {}
     for py_file in sorted(UI_DIR.rglob("*.py")):
-        if py_file.name in EXCLUDED_FILES:
-            continue
         hits = _row_ids_assignments_in_file(py_file)
         if hits:
             violations[str(py_file.relative_to(ROOT))] = hits

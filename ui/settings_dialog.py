@@ -57,7 +57,7 @@ BUTTON_CANCEL = "Cancel"
 # Heading of the box that reports settings the store adjusted after a save.
 ADJUSTED_HEADING = "Gelem adjusted some settings"
 
-# The single sentence shown when there are no editable settings (--fake-data).
+# The single sentence shown when there are no editable settings.
 NO_SETTINGS_SENTENCE = "Settings are not available in this mode."
 
 
@@ -198,7 +198,7 @@ class SettingsDialog(QDialog):
         # Ask the controller once for the editable fields.
         fields = controller.get_settings_fields()
 
-        # --fake-data mode has no settings store, so the list is empty.
+        # An empty list means there is nothing to edit.
         # Show one sentence and a Close button, and build nothing else.
         self._empty = not fields
         if self._empty:

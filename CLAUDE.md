@@ -221,9 +221,7 @@ state. This rule carries no violation list of its own -- it points at the three
   that checks the payload's table against `AppController.get_active_table()`.
   Tests: `tests/test_result_delivery.py`
   (`test_rows_updated_is_a_batched_payload_with_table_name`,
-  `test_live_result_lands_in_its_own_table_after_table_switch`),
-  `tests/test_fake_controller_contract.py`
-  (`test_signal_signatures_match_between_real_and_fake_controller`).
+  `test_live_result_lands_in_its_own_table_after_table_switch`).
 - **`[MIGRATING]`** The same `(table_name, row_id)` discipline for **controller
   methods** that take a bare `row_id`. Known remaining set, closed:
   `select_row(row_id)`, `get_result_index(row_id)` and
@@ -305,8 +303,8 @@ state. This rule carries no violation list of its own -- it points at the three
 - **`[NOW]`** UI files never import pandas, PIL, numpy, mediapipe, or cv2.
 - **`[MIGRATING]`** UI never reads a DataFrame. Known violation, one site:
   `ui/main_window.py:415` (`columns=list(df.columns)`), which belongs to P1.13.
-  It is the only `.columns`/`.iloc`/`.loc`/`DataFrame` site under `ui/` outside
-  `ui/fake_controller.py`. *(Re-verified 27 Aug 2026, P0.4.)*
+  It is the only `.columns`/`.iloc`/`.loc`/`DataFrame` site under `ui/`.
+  *(Re-verified 27 Aug 2026, P0.4.)*
 - **`[MIGRATING]`** UI never touches private controller attributes. Known
   violations, one occurrence each: `ui/main_window.py:290-292` (`_op_registry`)
   and `ui/main_window.py:410-411` (`_dataset`, `_active_table`). Public
@@ -538,20 +536,13 @@ state. This rule carries no violation list of its own -- it points at the three
   stated per mode; see `operators/CLAUDE.md`. A generator gives progressive output
   and a cancellation point. It does not by itself give resumability.
 
-### Contract mirroring
-
-- **`[NOW]`** When a public method is added to `AppController`,
-  `ui/fake_controller.py` must mirror it immediately.
-  `tests/test_fake_controller_contract.py` guards this, and drift here is a
-  recurring problem.
-
 ---
 
 ## Testing
 
 Guardrail tests enforce the architecture: `tests/test_architecture_imports.py`,
 `test_controller_async_contracts.py`, `test_operator_registry_boundaries.py`,
-`test_fake_controller_contract.py`, `test_ui_private_access.py`.
+`test_ui_private_access.py`.
 
 A failing guardrail test almost always means something reached across a component
 boundary. **Fix the violation, never work around the test.**
@@ -660,11 +651,7 @@ completed work item with exactly this block, filled in:
 - the exact commands for Y B to re-run, and what a pass looks like
 - if there is something to check by eye in the app, an exact click list:
   which screen, which controls, and for each step what a pass looks like --
-  cover every path that no automated test covers. **A by-eye check must not
-  exercise a stubbed `FakeController` method -- name real data instead.**
-  Several `FakeController` methods (`set_active_table`, `save_filtered_as_table`,
-  ...) only print or return canned rows, so a click list that runs through them
-  proves nothing.
+  cover every path that no automated test covers.
 
 **Diff**
 git diff main > docs/review/<id>.diff

@@ -1189,8 +1189,7 @@ lookups are gone -- the worker computes the run's user-facing label once from
 Supersession
 of one run by another is deliberately not detected (that is P1.12). Tests:
 `tests/test_result_delivery.py`, rewritten
-`tests/test_controller_async_contracts.py`, and a signal-signature check added
-to `tests/test_fake_controller_contract.py`.
+`tests/test_controller_async_contracts.py`.
 
 **P0.2 therefore runs after P0.3** -- item 10 needs `MediaAddress` to exist.
 

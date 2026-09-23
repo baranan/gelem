@@ -573,10 +573,6 @@ main.py          Entry point
 operators_config.yaml
 ```
 
-`ui/fake_controller.py` is a stand-in returning realistic hardcoded data, so the UI
-can run without a real data layer: `python main.py --fake-data`. It must mirror
-every public method of `AppController`.
-
 `[NOW]` `operators_config.yaml` is the single authority for **which** operators
 the application offers, and its entry order is the Operators menu order.
 `operators/operator_config.py` reads the file and constructs the enabled
@@ -733,5 +729,3 @@ changed, that confirmation also warns that every existing thumbnail and preview
 becomes unreachable and regenerates from source. After the save it re-reads the
 fields and shows any messages `apply_settings()` returned, including the
 sentence about swept picture files, before quitting if quit was chosen.
-`--fake-data` mode returns no fields and the dialog shows a single
-"Settings are not available in this mode." line.

@@ -663,7 +663,7 @@ def test_main_create_app_wires_one_resolver_into_store_and_controller(
 
     monkeypatch.setattr("media.resolver.MediaResolver", _CountingMediaResolver)
 
-    window, resolver = main_module.create_app(fake_data=False)
+    window, resolver = main_module.create_app()
     try:
         assert len(constructed) == 1, (
             f"expected exactly one MediaResolver constructed by "

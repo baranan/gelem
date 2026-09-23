@@ -14,10 +14,9 @@ Written from the work-item spec, not from the implementation:
   3. a remembered multi-column preference picks the FIRST entry, not
      just "whatever is visual" -- [b, a] returns "b".
 
-Plus the AST guardrail: no file under ui/ (other than fake_controller.py,
-which stands in for AppController) may pass a string literal as the first
-argument of a render_column_value(...) call -- that is exactly the shape
-of the CC-34 bug (a hardcoded "full_path").
+Plus the AST guardrail: no file under ui/ may pass a string literal as the
+first argument of a render_column_value(...) call -- that is exactly the
+shape of the CC-34 bug (a hardcoded "full_path").
 
 Run with:
     python -m pytest tests/test_detail_media_column.py
@@ -90,12 +89,9 @@ def test_detail_media_column_is_the_first_remembered_column(
 
 
 # ---------------------------------------------------------------------------
-# 4. AST guardrail: no ui/ file (other than fake_controller.py) passes a
-#    string literal as render_column_value(...)'s first argument.
+# 4. AST guardrail: no ui/ file passes a string literal as
+#    render_column_value(...)'s first argument.
 # ---------------------------------------------------------------------------
-
-EXCLUDED_FILES = {"fake_controller.py"}
-
 
 def _literal_first_arg_calls(path: pathlib.Path) -> list[str]:
     """Lines where render_column_value(...) is called with a string
@@ -129,8 +125,6 @@ def test_no_ui_file_hardcodes_the_media_column_in_render_column_value():
     total_calls_seen = 0
 
     for py_file in sorted(UI_DIR.rglob("*.py")):
-        if py_file.name in EXCLUDED_FILES:
-            continue
         hits, calls_seen = _literal_first_arg_calls(py_file)
         total_calls_seen += calls_seen
         if hits:

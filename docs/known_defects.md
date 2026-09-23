@@ -217,11 +217,6 @@ to P1.8d, and the two OS-native / non-parsing media-cell entries to P1.8e.
   original wording implied, but a real duplication -- one shared
   implementation plus three separate ones would remove it. No item is
   assigned.
-- **`FakeController._drain_thumb_queue` is unbounded and uses `pop(0)`**, so it
-  behaves differently from the real controller. More broadly, `FakeController`'s
-  table switching and filtered-set saving are not plausible:
-  `set_active_table()` emits the same five rows whatever table is picked, and
-  `save_filtered_as_table()` only prints. Both predate P0.4.
 - **The Defect A tests call `MainWindow._apply_visible_columns`, a private slot**,
   because the Columns combo's handler has no public equivalent. The honest fix is
   a public method.
@@ -289,11 +284,11 @@ to P1.8d, and the two OS-native / non-parsing media-cell entries to P1.8e.
   None`, and the dialog does not catch it. No shipped path hits this -- `main.py`
   always wires the gateway and the `None` default exists only for test
   construction -- but nothing defends the menu action.
-- **In `--fake-data` mode `SettingsDialog` never assigns `_fields`, `_spin_boxes`
-  or `_initial_native`.** `__init__` returns after `_build_empty()` when there are
-  no fields, so any later call into `_current_native()` or `_on_ok()` would be an
-  `AttributeError`. `_on_ok` is unreachable in that mode today (only a Close
-  button is wired), so this is robustness only.
+- **When `SettingsDialog` is built with no fields, it never assigns `_fields`,
+  `_spin_boxes` or `_initial_native`.** `__init__` returns after `_build_empty()`
+  when there are no fields, so any later call into `_current_native()` or
+  `_on_ok()` would be an `AttributeError`. `_on_ok` is unreachable in that state
+  today (only a Close button is wired), so this is robustness only.
 - **The settings wiring guardrail does not pin that the gateway's store is the
   one `.load()` was called on.**
   `tests/test_settings.py::test_main_passes_a_settings_gateway_into_app_controller`
