@@ -3878,6 +3878,7 @@ class AppController(QObject):
             # honours the fragment correctly via ArtifactStore's own
             # resolver call, which is what makes tiles correct today.
             if mode == "detail" and "canonical_address" in ctx:
+                ctx["clip_frames_ready"] = self.clip_frames_ready
                 try:
                     parsed_address = _parse_media_address(
                         ctx["canonical_address"]

@@ -1532,6 +1532,29 @@ class ArtifactStore:
             )
         return duration_us
 
+    def clip_is_steppable(self, canonical_address: str) -> bool:
+        """True if `canonical_address` names a clip the frame stepper can
+        offer: a video whose length fits clip_fits_frame_cache().
+
+        The ONE place this eligibility check lives -- column_types/
+        renderers.py's detail-mode video dispatch calls this rather than
+        comparing lengths itself, so the toggle it shows and
+        request_clip_frames()'s own refusal always agree.
+
+        False, never a raised exception, for anything that is not a
+        steppable clip: a still image or a relative path
+        (MediaAddressError from _clip_length_us's address parsing or the
+        resolver's own absolute-path check), a file whose duration
+        cannot be read (MediaResolverError), or a clip over the
+        frame_stepper_max_seconds limit (no exception at all -- just a
+        False from clip_fits_frame_cache).
+        """
+        try:
+            length_us = self._clip_length_us(str(canonical_address))
+        except (MediaResolverError, MediaAddressError, ValueError):
+            return False
+        return self.clip_fits_frame_cache(length_us)
+
     def _decode_clip_span(self, address: str):
         """The clip decode's only entry into the resolver: every frame of
         `address`, in presentation order, with real frame ordinals.

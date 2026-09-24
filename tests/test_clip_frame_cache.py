@@ -35,6 +35,7 @@ project_root = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 import pytest
+from PIL import Image
 
 from artifacts.artifact_store import ArtifactStore
 from media.media_address import from_path, format as format_address, parse as parse_address
@@ -364,5 +365,56 @@ def test_an_uncaught_decode_error_still_frees_the_slot_for_a_retry(tmp_path):
 
         assert store.clip_frames(address) is not None
         assert attempts["count"] == 2
+    finally:
+        resolver.close()
+
+
+# ===========================================================================
+# clip_is_steppable -- the ONE home for stepper eligibility (P1.4b part 2).
+# ===========================================================================
+
+def test_clip_is_steppable_true_for_a_short_vids_file(tmp_path):
+    resolver = MediaResolver(max_open_decoders=4)
+    store = ArtifactStore(tmp_path / "artifacts", resolver=resolver)
+    try:
+        address = _bare_address(VIDEO_PATHS[0])
+        assert store.clip_is_steppable(address)
+    finally:
+        resolver.close()
+
+
+def test_clip_is_steppable_false_over_the_length_limit(tmp_path):
+    resolver = MediaResolver(max_open_decoders=4)
+    # Every vids/ fixture is a few seconds long -- 1 second is comfortably
+    # under all of them, the same ceiling test_clip_over_the_length_limit_
+    # is_refused above uses.
+    store = ArtifactStore(
+        tmp_path / "artifacts", resolver=resolver, frame_stepper_max_seconds=1,
+    )
+    try:
+        address = _bare_address(VIDEO_PATHS[0])
+        assert not store.clip_is_steppable(address)
+    finally:
+        resolver.close()
+
+
+def test_clip_is_steppable_false_for_a_still_image(tmp_path):
+    resolver = MediaResolver(max_open_decoders=4)
+    store = ArtifactStore(tmp_path / "artifacts", resolver=resolver)
+    try:
+        image = Image.new("RGB", (10, 10), color=(255, 0, 0))
+        jpeg_path = tmp_path / "solid.jpg"
+        image.save(jpeg_path, format="JPEG", quality=100)
+        address = _bare_address(jpeg_path)
+        assert not store.clip_is_steppable(address)
+    finally:
+        resolver.close()
+
+
+def test_clip_is_steppable_false_for_a_relative_path(tmp_path):
+    resolver = MediaResolver(max_open_decoders=4)
+    store = ArtifactStore(tmp_path / "artifacts", resolver=resolver)
+    try:
+        assert not store.clip_is_steppable("relative/clip.mp4")
     finally:
         resolver.close()

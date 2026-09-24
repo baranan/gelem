@@ -417,6 +417,9 @@ state. This rule carries no violation list of its own -- it points at the three
   `tests/test_playback_span.py`. The detail-view player's position slider
   (P1.4a) computes its range, value and seek target the same way --
   `span_length_ms`, `slider_value_for_position`, `position_for_slider_value`.
+- **`[NOW]`** Frame stepping: time conversion via `address_us_to_player_ms`,
+  stepping arithmetic only in `media/frame_stepping.py`; eligibility only via
+  `ArtifactStore.clip_is_steppable`.
 - **`[NOW]`** No media is opened or decoded during a paint. In thumbnail mode
   `make_media_path_renderer`'s `render()` is cache-or-placeholder for **both**
   image and video tiles: a hit returns the cached picture touching no

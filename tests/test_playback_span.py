@@ -365,19 +365,26 @@ def test_qmediaplayer_is_referenced_in_exactly_one_non_test_file():
     )
 
 
-def test_playback_module_imports_no_qt_binding():
-    playback_path = project_root / "media" / "playback.py"
-    tree = ast.parse(playback_path.read_text(encoding="utf-8"), filename=str(playback_path))
+@pytest.mark.parametrize(
+    "relative_path",
+    ["media/playback.py", "media/frame_stepping.py"],
+)
+def test_playback_module_imports_no_qt_binding(relative_path):
+    """Layer A behind range playback (media/playback.py) and behind the
+    frame stepper (media/frame_stepping.py, P1.4b part 2) both import no
+    Qt binding -- neither ever calls Qt itself."""
+    module_path = project_root / relative_path
+    tree = ast.parse(module_path.read_text(encoding="utf-8"), filename=str(module_path))
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 assert not alias.name.startswith("PySide6"), (
-                    f"media/playback.py must not import a Qt binding, "
+                    f"{relative_path} must not import a Qt binding, "
                     f"found: import {alias.name}"
                 )
         elif isinstance(node, ast.ImportFrom):
             if node.module is not None:
                 assert not node.module.startswith("PySide6"), (
-                    f"media/playback.py must not import a Qt binding, "
+                    f"{relative_path} must not import a Qt binding, "
                     f"found: from {node.module} import ..."
                 )

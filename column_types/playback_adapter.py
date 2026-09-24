@@ -204,6 +204,22 @@ class PlaybackAdapter(QWidget):
             self._player.setPosition(restart_ms)
         self._player.play()
 
+    def pause(self) -> None:
+        """Pauses playback. Used by the frame stepper (P1.4b part 2) to
+        stop the player before it swaps in the still-frame view."""
+        self._player.pause()
+
+    def position_ms(self) -> int:
+        """The player's current position in milliseconds -- what the
+        frame stepper's toggle reads to find the nearest cached frame."""
+        return self._player.position()
+
+    def seek_to_ms(self, position_ms: int) -> None:
+        """Seeks to an absolute player position, in milliseconds -- what
+        the frame stepper's toggle uses to hand playback back to the
+        player at the frame it was showing."""
+        self._player.setPosition(position_ms)
+
     def _format_elapsed(self, position_ms: int) -> str:
         """'elapsed / length' in seconds, relative to the span's start."""
         elapsed_s = max(0, position_ms - self._span.start_ms) / 1000

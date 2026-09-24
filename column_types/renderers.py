@@ -170,7 +170,7 @@ def make_media_path_renderer(artifact_store):
             if _is_image(path):
                 return _render_image(path)
             elif _is_video(path):
-                return _render_video(ctx, source_path)
+                return _render_video(ctx, source_path, artifact_store)
             else:
                 # Unknown extension — return None so placeholder shows.
                 print(f"[Renderer] Unsupported media extension: {path.suffix}")
@@ -294,25 +294,42 @@ def _render_still_from_pixels(pixels):
     return widget
 
 
-def _render_video(ctx: dict, source_path: str):
+def _render_video(ctx: dict, source_path: str, artifact_store):
     """
     Renders a video file for detail mode: a PlaybackAdapter widget that
     plays a #t=A-B RANGE address as only that range, or a bare path as the
     whole file (P1.10). Deciding the span is media/playback.py's job; this
     only reads its result and hands it to the widget.
 
+    P1.4b part 2: when the clip is short enough for the frame-by-frame
+    stepper (ArtifactStore.clip_is_steppable -- the ONE place that
+    eligibility is decided), this returns column_types/frame_stepper.py's
+    wrapper widget instead of the bare PlaybackAdapter. That wrapper holds
+    a PlaybackAdapter itself, so this stays the only site deciding which
+    widget the detail view gets.
+
     Thumbnail mode never reaches here -- render() serves it
     cache-or-placeholder and never opens a source (P0.5b-3i).
 
     Args:
-        ctx:         The render context. Its 'canonical_address' (set by
-                     controller.py's render_column_value) decides the
-                     span; when absent -- the cell did not parse as a
-                     media address -- the whole file plays, from source_path.
-        source_path: Absolute path to the video file.
+        ctx:            The render context. Its 'canonical_address' (set
+                        by controller.py's render_column_value) decides
+                        the span; when absent -- the cell did not parse
+                        as a media address -- the whole file plays, from
+                        source_path, and the stepper is never offered
+                        (clip_is_steppable needs a canonical address).
+                        Its 'clip_frames_ready' (also set by
+                        render_column_value in detail mode) is the
+                        controller signal the stepper wrapper watches for
+                        its clip's frames finishing decode.
+        source_path:    Absolute path to the video file.
+        artifact_store: The ArtifactStore instance -- for clip
+                        eligibility and, inside the stepper wrapper, the
+                        frame cache itself.
 
     Returns:
-        A PlaybackAdapter widget.
+        A FrameStepperWidget for a steppable clip, otherwise a bare
+        PlaybackAdapter.
     """
     from column_types.playback_adapter import PlaybackAdapter
     from media.playback import PlaybackSpan, playback_span
@@ -322,6 +339,20 @@ def _render_video(ctx: dict, source_path: str):
         span = playback_span(canonical_address)
     else:
         span = PlaybackSpan(source_path=source_path, start_ms=0, end_ms=None)
+
+    if (
+        canonical_address
+        and artifact_store is not None
+        and artifact_store.clip_is_steppable(canonical_address)
+    ):
+        from column_types.frame_stepper import FrameStepperWidget
+
+        return FrameStepperWidget(
+            span,
+            canonical_address,
+            artifact_store,
+            ctx.get("clip_frames_ready"),
+        )
 
     return PlaybackAdapter(span)
 

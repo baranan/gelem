@@ -41,10 +41,40 @@ class ZoomableImageView(QGraphicsView):
         """
         self._scene.clear()
         self._pixmap_item = self._scene.addPixmap(pixmap)
+        self.fit_to_view()
+
+    def fit_to_view(self) -> None:
+        """
+        Scales and centers the current picture to fill the viewport --
+        the same fit show_pixmap always performs. Public so a caller that
+        set the picture through set_pixmap_keeping_view (which
+        deliberately does not fit) can still ask for this fit once, e.g.
+        the frame stepper (P1.4b part 2) fitting only on its first entry
+        into frame view, after the page holding this view has its real
+        on-screen size.
+
+        No-op if no picture has been shown yet.
+        """
+        if self._pixmap_item is None:
+            return
         self.fitInView(
             self._scene.sceneRect(),
             Qt.AspectRatioMode.KeepAspectRatio,
         )
+
+    def set_pixmap_keeping_view(self, pixmap: QPixmap) -> None:
+        """
+        Swaps the displayed QPixmap for a new one without resetting zoom
+        or pan -- unlike show_pixmap's fitInView, which recenters and
+        rescales every time. For the frame stepper (P1.4b part 2), which
+        wants each stepped frame to appear at whatever zoom the
+        researcher already chose.
+
+        Args:
+            pixmap: The QPixmap to display in place of the current one.
+        """
+        self._scene.clear()
+        self._pixmap_item = self._scene.addPixmap(pixmap)
 
     def current_pixmap(self) -> QPixmap | None:
         """
