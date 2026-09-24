@@ -469,6 +469,16 @@ state. This rule carries no violation list of its own -- it points at the three
   The ready notification carries `(table_name, row_id)`, not the column that
   asked -- a deliberate simplification, not yet worth changing. See
   `docs/known_defects.md`.
+- **`[NOW]`** A segment's (`#t=` range) thumbnail comes from inside that
+  segment's own time range: the representative frame is the range's own
+  member nearest its middle, not the first frame of the source video. Made
+  true by P1.7a. `ArtifactStore._policy_for_address` is the one place that
+  decides an address's representative-frame policy -- `midpoint` for a `#t=`
+  range, `first` for everything else -- and every thumbnail/preview site
+  (key building, cache lookup, decode) goes through it, so a range's cached
+  key and its decoded pixels can never disagree. `docs/media_architecture.md`
+  §4.1b is the authority for the per-tile demand-path mechanism and its
+  measured cost. Tests: `tests/test_segment_thumbnails.py`.
 - **`[NOW]`** `media/media_address.py` gives the address grammar exact,
   guarded-by-test meaning: escaping, canonical form, frame/time-point and
   range semantics, region validation and pixel arithmetic, and which

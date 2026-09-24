@@ -197,6 +197,31 @@ to P1.8d, and the two OS-native / non-parsing media-cell entries to P1.8e.
   exposed to being cleaned up by something else on the machine as it always
   was. No item assigned; nothing currently migrates a pre-P1.9 project's
   scratch-folder outputs into its `outputs_dir`.
+- **A `#t=` range that genuinely contains no frame gets no thumbnail, ever,
+  and nothing tells the researcher.** Possible on a variable-frame-rate
+  source with a long gap between decoded frames -- `docs/fixtures.md`'s
+  `h264_vfr_longgop.mp4` has gaps up to 49.4 s, and the P1.7a measurement
+  pass hit this for real: 2 of 30 evenly-spread 3-second segments on that
+  file landed entirely inside a gap
+  (`docs/review/p1_7a_measure.md`). `MediaResolver.resolve_frame` correctly
+  refuses such a range (`MediaAddressError`, decision 11), but
+  `ArtifactStore._run_job` sends no callback for a failed decode by design
+  (a dropped job notifies nobody) -- so the tile never repaints out of its
+  placeholder state, and because `is_cached()` keeps reporting the address
+  as not cached, every later repaint queues the exact same doomed request
+  again. No item assigned; not fixed by P1.7a, which built the middle-frame
+  representative-frame policy but left this failure mode as it already was.
+- **Thumbnail generation cost scales with the source file's keyframe
+  spacing, not with what the researcher asked for.** Measured by the P1.7a
+  pass (`docs/review/p1_7a_measure.md`): filling one screen of 30 tiles
+  costs roughly 2.5-4 s, even under the plain first-frame policy unchanged
+  by this item, on files with keyframes roughly 10 s apart -- against well
+  under a second on the same fixture set's dense-keyframe files. Gelem has
+  no way to warn a researcher, or an operator, that a particular source
+  file's encoding will make its gallery slow to fill; nothing measures or
+  surfaces keyframe spacing today. No item assigned; not addressed by
+  P1.7a, whose own middle-frame policy makes this same file-dependence more
+  pronounced, not less (§4.1b).
 
 ## Open -- smells, no item assigned
 

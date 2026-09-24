@@ -35,10 +35,18 @@ demuxes or decodes the whole file. The container is seeked to the
 nearest keyframe at or before the point of interest, and frames are
 decoded forward only until enough is known to answer the query --
 one frame past the target for a time point, or through the end of the
-requested range for a range or bare path. A bare path's default
-('first') policy needs only its first frame; 'midpoint' on a bare path
-uses the container's own duration metadata to find a seek target near
-the middle, so it never decodes to the true end of file to find it.
+requested range for a range or bare path under its default ('first')
+policy. A bare path's default policy needs only its first frame;
+'midpoint' on a bare path uses the container's own duration metadata to
+find a seek target near the middle, so it never decodes to the true end
+of file to find it. 'midpoint' on a genuine #t= RANGE (P1.7a, a
+segment's own representative frame -- docs/media_architecture.md section
+4.1b) works the same way, seeked to the RANGE's own midpoint instead of
+the range's start: this is what makes its cost independent of the
+segment's length, but NOT independent of the source file's keyframe
+spacing -- a backward seek lands on the nearest keyframe at or before
+the target, so a GOP longer than the segment degrades toward decoding
+the whole segment anyway (measured in docs/review/p1_7a_measure.md).
 The one deliberate exception is #f=: decision 8's consequence for P1.2
 is that resolving a frame ordinal against a file's real (possibly
 variable) frame timings needs the per-file index, built on first use.
@@ -1203,9 +1211,27 @@ class MediaResolver:
             return self._resolve_bare_midpoint(container, stream, epoch_us, addr)
 
         start_us, end_us = addr.time_range_us
-        raw_start_ticks = _us_to_ticks(start_us + epoch_us, stream.time_base)
-        container.seek(raw_start_ticks, backward=True, any_frame=False, stream=stream)
 
+        if policy == "midpoint":
+            # P1.7a: seek near the RANGE's OWN midpoint first, instead of
+            # decoding from the range's start -- the same reasoning
+            # _resolve_bare_midpoint above uses for a bare path's true
+            # midpoint, applied to the range's midpoint instead. This is
+            # what keeps a segment thumbnail's cost independent of the
+            # segment's length (docs/media_architecture.md section 4.1b;
+            # measured in docs/review/p1_7a_measure.md). It is NOT
+            # independent of the source file's keyframe spacing: a
+            # backward seek lands on the nearest keyframe at or before
+            # the target, and every frame between there and the midpoint
+            # still has to be decoded, so a GOP longer than the segment
+            # degrades toward the cost of decoding the whole segment.
+            seek_target_us = start_us + (end_us - start_us) // 2
+        else:
+            seek_target_us = start_us
+        raw_seek_ticks = _us_to_ticks(seek_target_us + epoch_us, stream.time_base)
+        container.seek(raw_seek_ticks, backward=True, any_frame=False, stream=stream)
+
+        midpoint_us = start_us + (end_us - start_us) // 2
         frame_times: List[int] = []
         frames: List = []
         for frame in container.decode(stream):
@@ -1216,6 +1242,12 @@ class MediaResolver:
             if policy == "first" and start_us <= pts_us < end_us:
                 # The earliest member has been found; no need to decode
                 # any further to answer a 'first' query.
+                break
+            if policy == "midpoint" and pts_us >= midpoint_us:
+                # Bracketed the range's own midpoint: select_frame below
+                # only needs the member nearest it, and nothing decoded
+                # past this point can be nearer than what is already
+                # bracketed here (frame times are monotonic).
                 break
             if pts_us >= end_us:
                 # We now know everything decision 3's membership test

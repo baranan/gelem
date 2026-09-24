@@ -7,12 +7,17 @@ for fast display. It handles both image and video source files.
 Source decoding (P1.2c-1). A picture is decoded through the shared
 `MediaResolver` (media/resolver.py), injected as a required constructor
 argument -- this file itself opens no source image or video any more.
-`resolve_frame(address, "display", policy="first")` returns upright RGB
+`resolve_frame(address, "display", policy=...)` returns upright RGB
 pixels (still images EXIF-transposed, video frames display-matrix
-rotated) for whatever the address selects -- the first frame for a bare
-path, or the address's own `#t=`/`#f=` selector when one is present, which
-the pre-resolver decode ignored. The result is wrapped in a PIL Image and
-the existing PIL-based resizing pipeline runs unchanged.
+rotated) for whatever the address selects -- the address's own `#t=`/`#f=`
+selector when one names a single frame, which the pre-resolver decode
+ignored, or otherwise the representative frame `policy` names: the first
+frame for a bare path, the frame nearest the middle of a `#t=` RANGE
+(P1.7a -- a segment's own middle frame represents it, docs/media_
+architecture.md section 4.1b). `_policy_for_address` is the one place
+that decides which of the two a given address gets when nothing
+overrides it explicitly. The result is wrapped in a PIL Image and the
+existing PIL-based resizing pipeline runs unchanged.
 
 Identity (P0.5b-1, docs/media_architecture.md section 4.5). A derived
 image is identified by an `ArtifactKey` -- canonical media address, source
@@ -435,6 +440,35 @@ class ArtifactStore:
             # it returns None here too rather than raising out of get().
             return None
 
+    def _policy_for_address(self, canonical_address: str) -> str:
+        """The ONE decision of which representative-frame policy an
+        address gets when nothing overrides it explicitly (P1.7a):
+        'midpoint' for a #t= RANGE address -- a segment's own middle
+        frame represents it -- REPRESENTATIVE_FRAME_POLICY ('first') for
+        everything else: a bare path, or an address that already names a
+        single frame (#f=N or a #t= time point), for which the resolver
+        ignores this argument entirely (MediaResolver.resolve_frame's own
+        docstring).
+
+        Every thumbnail/preview site that is not handed an explicit
+        policy goes through this: get(), get_pixmap() and is_cached()
+        default to it for their external callers (controller.py,
+        column_types/renderers.py, neither of which passes a policy), and
+        _run_job() computes it once per job and hands the SAME value to
+        both its key-building and its decode (_decode_source) -- so a
+        range's cached key and the pixels behind it can never disagree
+        about which frame the address means (the failure this function
+        exists to prevent: is_cached() and the decode landing on
+        different policies, and a tile re-requesting forever).
+        """
+        try:
+            addr = parse_media_address(canonical_address)
+        except MediaAddressError:
+            return REPRESENTATIVE_FRAME_POLICY
+        if addr.time_range_us is not None:
+            return "midpoint"
+        return REPRESENTATIVE_FRAME_POLICY
+
     # ------------------------------------------------------------------
     # Fingerprint memo
     # ------------------------------------------------------------------
@@ -464,7 +498,7 @@ class ArtifactStore:
         canonical_address: str,
         purpose: str,
         resolution: int | None = None,
-        policy: str = REPRESENTATIVE_FRAME_POLICY,
+        policy: str | None = None,
     ) -> Path | None:
         """
         Returns the file path of a stored artifact, or None.
@@ -475,10 +509,15 @@ class ArtifactStore:
             purpose:           'thumbnail' or 'preview'.
             resolution:        Requested max side in pixels. Defaults to
                                the standard resolution for the purpose.
-            policy:            Representative-frame policy.
+            policy:            Representative-frame policy. Defaults to
+                               _policy_for_address(canonical_address) --
+                               'midpoint' for a #t= range, 'first'
+                               otherwise (P1.7a).
         """
         if resolution is None:
             resolution = self.resolution_for(purpose)
+        if policy is None:
+            policy = self._policy_for_address(canonical_address)
         key = self._complete_key(canonical_address, purpose, resolution, policy)
         if key is None:
             return None
@@ -488,16 +527,17 @@ class ArtifactStore:
     # There is no public `put()`. The only writer is `_run_job`, which
     # encodes JPEGs into local variables and then writes `_index` inside
     # one generation-checked lock hold, so a job reset() raced past
-    # indexes nothing. A future writer (P1.7a's segment-thumbnail batch
-    # job) adds what it needs against that same generation gate rather
-    # than through an unguarded helper.
+    # indexes nothing. P1.7a's segment thumbnails go through this same
+    # `_run_job` -- there is no separate batch job (docs/media_
+    # architecture.md section 4.1b); only which policy `_run_job` decodes
+    # and keys under differs, per `_policy_for_address`.
 
     def get_pixmap(
         self,
         canonical_address: str,
         purpose: str,
         resolution: int | None = None,
-        policy: str = REPRESENTATIVE_FRAME_POLICY,
+        policy: str | None = None,
     ):
         """
         Returns a PIL Image ready for conversion to QPixmap in the UI,
@@ -508,9 +548,16 @@ class ArtifactStore:
         On a memory-cache hit this touches no filesystem at all -- no
         stat, no exists, no open. A memory miss that hits the disk index
         reads the JPEG back through ArtifactCodec.
+
+        policy defaults to _policy_for_address(canonical_address) -- the
+        paint path (column_types/renderers.py) never passes one
+        explicitly, so this is what makes a segment tile's paint-time
+        lookup agree with what _run_job cached it under (P1.7a).
         """
         if resolution is None:
             resolution = self.resolution_for(purpose)
+        if policy is None:
+            policy = self._policy_for_address(canonical_address)
         key = self._complete_key(canonical_address, purpose, resolution, policy)
         if key is None:
             return None
@@ -605,7 +652,9 @@ class ArtifactStore:
             short_circuit = (
                 verified
                 and fingerprint is not None
-                and self._both_present_locked(address, fingerprint)
+                and self._both_present_locked(
+                    address, fingerprint, self._policy_for_address(address)
+                )
             )
         if short_circuit:
             self._notify_ready(table_name, row_id)
@@ -636,7 +685,7 @@ class ArtifactStore:
     def is_cached(
         self,
         canonical_address: str,
-        policy: str = REPRESENTATIVE_FRAME_POLICY,
+        policy: str | None = None,
     ) -> bool:
         """True if BOTH derived pictures for this address -- thumbnail and
         preview, at the standard resolutions -- are already in the index.
@@ -659,9 +708,16 @@ class ArtifactStore:
         treats an unverified fingerprint differently, is `load_index()`'s
         docstring to state -- not this one.
 
+        policy defaults to _policy_for_address(canonical_address) --
+        `render_column_value()` never passes one explicitly, so this is
+        what makes a range address checked under the same policy
+        _run_job cached it under (P1.7a) rather than the module default.
+
         Single lock hold. The two `get()` calls this replaced cost four
         `_lock` acquisitions per tile.
         """
+        if policy is None:
+            policy = self._policy_for_address(canonical_address)
         with self._lock:
             fingerprint = self._fingerprints.get(canonical_address)
             if fingerprint is None:
@@ -1705,8 +1761,18 @@ class ArtifactStore:
         The source-media decode -- image or video, still image EXIF
         orientation or video display-matrix orientation -- goes through
         the shared MediaResolver, behind `_decode_source`.
+
+        The representative-frame policy for the key below, and the one
+        `_decode_source` resolves for the decode, both come from
+        `_policy_for_address(address)` -- the SAME pure function of the
+        SAME address, so they cannot disagree even though each calls it
+        separately (`_decode_source` keeps its original one-argument
+        shape on purpose: tests/test_request_queue.py and
+        tests/test_artifact_cache_location.py override it and must keep
+        working unchanged).
         """
         generation, address = job_key
+        policy = self._policy_for_address(address)
 
         # Cancelled before we even started (job picked up after reset()).
         if self._is_stale(generation):
@@ -1724,11 +1790,11 @@ class ArtifactStore:
 
             thumb_key = self._key(
                 address, fingerprint, "thumbnail",
-                self.resolution_for("thumbnail"),
+                self.resolution_for("thumbnail"), policy,
             )
             preview_key = self._key(
                 address, fingerprint, "preview",
-                self.resolution_for("preview"),
+                self.resolution_for("preview"), policy,
             )
 
             # A concurrent job for the same address (same generation) may
@@ -1823,8 +1889,17 @@ class ArtifactStore:
         (CLAUDE.md's media rule). `address` is the job's canonical media
         address (already absolute -- see the note on request_thumbnail's
         `address` argument), so a video address's own `#t=`/`#f=`
-        selector is honoured; a bare path resolves its first frame, per
-        REPRESENTATIVE_FRAME_POLICY.
+        selector is honoured. The representative-frame policy for a bare
+        path or a #t= range (decision 4; ignored for anything else) comes
+        from `_policy_for_address(address)` -- the SAME pure function
+        `_run_job` calls to build this job's key, so this can never
+        decode a different frame than the key it is about to be indexed
+        under, even though the two calls are independent (P1.7a).
+
+        Kept to this one argument (not handed the policy `_run_job` already
+        computed) so its signature stays the one
+        tests/test_request_queue.py and tests/test_artifact_cache_location.py
+        already override.
 
         Raises (MediaResolverError, MediaAddressError, an OSError from a
         vanished file) rather than returning None on failure -- the
@@ -1832,9 +1907,8 @@ class ArtifactStore:
         path (discard subscribers, log, no crash) and needs no new
         swallowing here.
         """
-        payload = self._resolver.resolve_frame(
-            address, "display", policy=REPRESENTATIVE_FRAME_POLICY
-        )
+        policy = self._policy_for_address(address)
+        payload = self._resolver.resolve_frame(address, "display", policy=policy)
         return Image.fromarray(payload.pixels)
 
     def _is_stale(self, generation: int) -> bool:

@@ -613,15 +613,44 @@ roughly seventeen thousand trials in a single hour of recording -- a trial every
 fifth of a second. No study drives anywhere near that. Full numbers:
 `%USERPROFILE%\Documents\gelem.measure\section11_table.md`.
 
-So exact segment thumbnails are an **ArtifactStore batch job**: collect the
-outstanding segments, sort by source file and start time, and **seek to each
-representative frame**. No full sequential pass.
+**Rewritten again, P1.7a: there is no separate batch job at all.** The existing
+per-tile demand path (`AppController.render_column_value` ->
+`_queue_thumbnail_request` -> `ArtifactStore.request_thumbnail` -> `_run_job` ->
+`_decode_source` -> `MediaResolver.resolve_frame`) already seeks to each segment
+separately, on demand, as its tile is painted -- exactly the access pattern the 26
+Aug measurement above already favoured. A dedicated batch job would only be sorting
+work this path already does one request at a time; nothing needed collecting or
+sorting up front.
+
+What the batch-job idea above got right, and what survives, is the representative
+frame itself: a range address (`#t=START-END`, as `operators/segment.py` produces)
+is represented by the member frame nearest the **MIDDLE** of the range, not its
+first frame -- a mid-trial frame is far less likely to be a blank pre-roll or a
+transition than the very first one. A bare path (a whole video) keeps the **FIRST**
+frame, unchanged; a `#f=` or `#t=` point address is unchanged too, since the
+resolver ignores the representative-frame policy for an address that already names
+a single frame. `ArtifactStore._policy_for_address` is the one place that decides
+which of the two policies a given address gets, and every thumbnail/preview site --
+key building, cache lookup, decode -- goes through it, so a range's cached key and
+its decoded pixels can never disagree about which frame the address means.
+
+The middle frame costs more than the first, and the extra cost tracks the source
+file's **keyframe spacing, not the segment's length**: `media/resolver.py` seeks to
+the range's own midpoint (the way it already did for a bare path's true midpoint)
+rather than decoding from the range's start, so a backward seek lands on the
+nearest keyframe at or before the midpoint and only the frames after that must
+still be decoded. On the three real recordings measured, this adds roughly 0.5-1.1
+s to a 30-tile screen's first paint over the first-frame baseline; on synthetic
+files with ~10 s keyframe gaps it adds 1.5-4 s, because seeking to a keyframe up
+to a GOP length before the target erodes most of the saving over decoding the
+whole segment. Accepted (Y B, 24 Sep 2026) as a one-time cost per segment, paid
+once and then served from cache. Full numbers: `docs/review/p1_7a_measure.md`.
 
 An operator that *is* decoding anyway may offer a decoded representative frame as
 a hint. It never writes into ArtifactStore itself.
 
 The guardrail test is unchanged: **a segment's thumbnail comes from inside that
-segment's own time range.**
+segment's own time range.** Guarded by `tests/test_segment_thumbnails.py`.
 
 **(c) Short-span decode -- for frame-level browsing inside a clip.**
 Neither of the sources above suits browsing individual frames of a 3 s trial: (a)
@@ -1300,11 +1329,14 @@ record. This ID is retired, not reassigned.
 **P1.4 Short-span decode cache** for frame-level browsing inside clips, with
 prefetch on selection.
 
-**P1.7a Segment thumbnail batch job** in ArtifactStore: collect outstanding
-segments, sort by source file and start time, **seek to each representative
-frame** (§4.1b). *Rewritten 26 Aug 2026 -- was one full sequential decode pass per
-video; measurement showed sorted seeking cheaper by two to three orders of
-magnitude at any realistic trial density. See §4.1b and §10.*
+**P1.7a Segment thumbnails.** No separate batch job: the existing per-tile demand
+path already seeks to each segment as its tile is painted. A `#t=` range address
+is represented by the member frame nearest the middle of the range; a bare path
+keeps the first frame (§4.1b). *Rewritten 26 Aug 2026 -- was one full sequential
+decode pass per video; measurement showed sorted seeking cheaper by two to three
+orders of magnitude at any realistic trial density. Rewritten again 24 Sep 2026 --
+was a sorted batch job of seeks; the per-tile demand path already does this one
+request at a time, so no dedicated job was needed at all. See §4.1b and §10.*
 
 **P1.5 Generalise merging.** `Dataset.merge_csv` hardcodes a join onto `frames`
 against `file_name` and rejects one-to-many joins. Trial data is inherently
