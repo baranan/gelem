@@ -226,8 +226,8 @@ line the rule used to require.
 
 `[NOW]` **Every execution method that exists takes the same final argument,
 `run`.** It is the only channel by which parameters and runtime services reach
-an operator. `iter_column_updates` is declared here for shape but is not
-implemented yet -- see its own `[TARGET -> P2.1]` below.
+an operator. `iter_column_updates` is implemented (P2.1) -- see its own
+section below.
 
 ```python
 create_columns(row_id, media, metadata, run) -> dict
@@ -303,13 +303,15 @@ def build_model(self):
     return load_landmarker()
 ```
 
-`[TARGET -> P2.1]` **`PER_SEQUENCE` is declared but refused today.** The per-row
+`[TARGET -> P2.4]` **`PER_SEQUENCE` is declared but refused today.** The per-row
 COLUMNS runner sees one row at a time and has no sequence boundary to reset a
 tracking model at, so `AppController.run_create_columns` refuses a run whose mode
 declares it -- before any worker starts, in a message naming the operator and the
-lifecycle -- and the worker keeps a defensive guard for one that slips through. An
-operator that needs tracking state waits on the ordered-group runner
-(`iter_column_updates`).
+lifecycle -- and the worker keeps a defensive guard for one that slips through.
+`iter_column_updates` exists and is used (P2.1), but only as the SERIAL REFERENCE
+over an already-decoded, already-ordered group of frames -- it does not yet give a
+model a per-sequence reset point. An operator that needs tracking state waits on
+P2.4.
 
 Building the model before the row loop also means a missing prerequisite is
 reported before any work starts. The old lazy load inside `create_columns` only
@@ -367,21 +369,50 @@ Declare what you need as the mode descriptor's `media_requirement`
 Inside this method, use **only** the arguments given. Never touch `Dataset`, the
 controller, or any Qt object. Never modify `metadata`.
 
-### `iter_column_updates(rows, run) -> yields updates`
+### `iter_column_updates(rows, run) -> yields (row_id, dict)`
 
-`[TARGET -> P2.1]` (run context from P1.12) Runs **once over an ordered group of
-rows**, in a background
-thread, yielding results progressively.
+`[NOW]` Runs **once over an ordered group of rows**, in a background thread,
+yielding results progressively. `rows` is an iterable of `(row_id, media,
+metadata)` tuples for **one sequence** -- every `#f=` row of one source (same
+path and stream), in presentation order -- decoded **before** this method ever
+sees a row: `OperatorRegistry` groups a FRAME-mode COLUMNS run's rows by source
+and decodes each group in one sequential pass through
+`MediaResolver.decode_frames_in_order()`, then hands the decoded
+`(row_id, media, metadata)` triples to this method. `media` is the same
+full-resolution frame `create_columns()` would have received for that row under
+a per-row `FRAME` requirement -- this method changes only **how** the frames
+were decoded, never what an operator computes from one.
 
-Use this when the work must walk media in order: sequential decoding is roughly an
-order of magnitude faster than seeking to individual frames, and tracking modes
-require frames in increasing-timestamp order. This cannot be expressed as repeated
-independent calls to `create_columns`.
+`BaseOperator.iter_column_updates` provides the **SERIAL REFERENCE**
+implementation: it yields `(row_id, create_columns(row_id, media, metadata,
+run))` for each row of `rows`, checking `run.cancelled()` between rows and
+stopping (results already yielded are kept) once it is true. An operator that
+does not override this gets exactly the same per-row computation
+`create_columns()` already gives it -- P2.1 changes decode order and cost, not
+results. Override this instead of `create_columns()` only when the work must
+walk media in order for its OWN sake: a tracking model that carries state
+across frames (P2.4's `PER_SEQUENCE` lifecycle) needs it; a stateless per-frame
+computation does not, and the default already gives it the ordered-decode
+speedup for free.
 
-The serial implementation is the reference and must always be present and correct.
-Parallelism is a strategy wrapped around this same contract, with automatic
-fallback to serial if a worker fails. A user on an unusual machine gets slow but
-correct results, never a broken application.
+`[TARGET]` Parallelism, when it arrives, is a strategy wrapped around this same
+contract -- the serial reference above must always stay present and correct, with
+automatic fallback to it if a parallel worker fails, so a user on an unusual
+machine gets slow but correct results, never a broken application.
+
+A row whose media is NOT a `#f=` address on a video -- a still image, or a `#t=`
+time point -- never reaches this method: `OperatorRegistry` keeps it on the
+original per-row `create_columns()` path, since grouping and ordered decoding
+gain it nothing. For an operator that does not override this method (every
+operator today), an exception `create_columns()` raises on one row is isolated
+to that row -- exactly as the per-row path already isolates it -- and the group
+continues with the next frame; an operator that DOES override it has no such
+isolation, since its own cross-frame state may be unreliable after a failure
+partway through. A decode failure partway through one source's group (a damaged
+file, a stale frame-time index) reports every row of THAT group not yet
+delivered through the same row-error channel `report_row_error()` uses, with one
+shared reason, and the run continues with the next group -- it does not abort
+the whole run. Guarded by `tests/test_ordered_frame_runner.py`.
 
 ### `create_table(df, run) -> pd.DataFrame`
 

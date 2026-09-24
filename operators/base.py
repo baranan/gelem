@@ -229,6 +229,45 @@ class BaseOperator:
             f"Operator '{self.name}' does not implement create_columns()."
         )
 
+    def iter_column_updates(self, rows, run):
+        """
+        SERIAL REFERENCE implementation of the ordered COLUMNS path
+        (operators/CLAUDE.md, P2.1). Runs once over an ORDERED GROUP of
+        rows -- every #f= row of one source, in presentation order --
+        instead of the per-row create_columns() path.
+
+        Args:
+            rows: An iterable of (row_id, media, metadata) tuples for
+                  ONE sequence, in presentation order. The runner
+                  (operators/operator_registry.py) has already decoded
+                  each row's frame through
+                  MediaResolver.decode_frames_in_order() -- one
+                  sequential pass over the source -- before this method
+                  ever sees a row; `media` is the same full-resolution
+                  RGB frame create_columns() would have received for
+                  that row under a per-row FRAME requirement.
+            run:  The OperatorRun for this run. Check run.cancelled()
+                  between rows and stop yielding once it is true --
+                  every result already yielded is kept.
+
+        Yields:
+            (row_id, result_dict) pairs, one per row of `rows`, in the
+            SAME order `rows` was given.
+
+        The default implementation is the reference behaviour: it calls
+        create_columns() once per row, unchanged, and is exactly
+        equivalent to what the per-row runner already does -- this
+        method only changes HOW the frames were decoded (one sequential
+        pass instead of one seek per row), never what the operator
+        computes from one. An operator that tracks state ACROSS frames
+        (P2.4's PER_SEQUENCE model lifecycle) overrides this instead of
+        create_columns(); no operator does yet.
+        """
+        for row_id, media, metadata in rows:
+            if run.cancelled():
+                return
+            yield row_id, self.create_columns(row_id, media, metadata, run)
+
     def create_table(
         self,
         df: pd.DataFrame,

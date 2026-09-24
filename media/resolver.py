@@ -60,6 +60,21 @@ for the index outright, by name, aware of what that costs --
 decode_video_span's own with_ordinals=True already establishes that
 this explicit-and-named shape is acceptable.
 
+decode_frames_in_order() (P2.1) is a third #f= consumer with the same
+index cost, but it decodes for a LIST of #f= addresses on one source
+in ONE sequential pass rather than one seek per address -- this is
+what makes a FRAME-mode COLUMNS run over an ordered group of frames an
+order of magnitude cheaper than resolve_frame() called once per row
+(operators/CLAUDE.md's "sequential pass" rule,
+operators/operator_registry.py's ordered runner). It seeks once, to at
+or before the EARLIEST requested ordinal's presentation time, and
+decodes forward only until every requested ordinal has been yielded --
+it never decodes a frame before the first one requested, and never
+decodes past the last one, even when the requested ordinals are sparse
+(frame_step > 1): an intervening, unrequested frame is still decoded
+(there is no way to skip it without losing sequential-walk order) but
+never yielded.
+
 Frame-time index: for one (absolute path, video stream index), the
 sorted presentation times of every frame the decoder actually presents.
 Built by demuxing packets only -- no decode -- because a packet's pts
@@ -121,7 +136,7 @@ import struct
 import threading
 from collections import OrderedDict
 from fractions import Fraction
-from typing import Dict, Iterator, List, Optional, Tuple, Union
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import av
 import numpy as np
@@ -132,6 +147,7 @@ from media.extensions import is_image_path
 from media.media_address import (
     MediaAddress,
     MediaAddressError,
+    format as format_address,
     parse as parse_address,
     region_to_pixels,
     select_frame,
@@ -686,6 +702,169 @@ class MediaResolver:
             )
 
         return self._decode_video_span_frames(addr, purpose, with_ordinals)
+
+    def decode_frames_in_order(
+        self,
+        addresses: Sequence[Union[str, MediaAddress]],
+        purpose: str,
+    ) -> Iterator[Tuple[Union[str, MediaAddress], FramePayload]]:
+        """Decode a list of #f=<n> addresses naming the SAME source (same
+        absolute path and stream selector) in ONE sequential pass, from
+        the earliest requested ordinal's presentation time through the
+        latest -- never one seek per address. See the module docstring's
+        cost-rule paragraph on this method for why.
+
+        Yields (address, FramePayload) pairs in ASCENDING ORDINAL order,
+        not input order. `address` is exactly the corresponding element
+        of `addresses` (by identity), so a caller matching results back
+        to whatever asked for them (a row id, say) does not need address
+        VALUES to be unique -- two equal-valued addresses (or the very
+        same value listed twice) are each answered once, one yield per
+        list element, ties at the same ordinal yielded in their relative
+        input order.
+
+        Every element must be a #f=<n> address (`addr.frame is not
+        None`) -- use resolve_frame for a time point or a range. Every
+        element must share one absolute path and stream selector; this
+        method does not group by source itself, that is the caller's
+        job (see operators/operator_registry.py). Raises immediately,
+        before any file is touched: ValueError for an empty list or a
+        malformed purpose, MediaAddressError for a relative address, a
+        non-#f= address, an image path (a still has no sequential
+        stream to walk -- use resolve_frame instead), or addresses that
+        do not all name the same (path, stream).
+
+        Raises MediaAddressError lazily, on the first `next()`, for a
+        frame ordinal beyond the last frame of the stream (mirrors
+        resolve_frame's own #f= bound check -- decision 11), and
+        MediaResolverError if the frame-time index promises a frame that
+        decoding never actually presents (the index may be stale -- see
+        the module docstring's "Frame-time index").
+
+        Raises only MediaResolverError, MediaAddressError or ValueError,
+        per this module's [NOW] rule on public entry points.
+        """
+        if purpose not in _PURPOSES:
+            raise ValueError(f"purpose must be one of {_PURPOSES}, got {purpose!r}")
+        if not addresses:
+            raise ValueError(
+                "decode_frames_in_order requires at least one address"
+            )
+
+        parsed: List[MediaAddress] = [
+            addr if isinstance(addr, MediaAddress) else parse_address(addr)
+            for addr in addresses
+        ]
+
+        first = parsed[0]
+        if not _is_absolute(first.path):
+            raise MediaAddressError(
+                f"decode_frames_in_order requires an absolute address, got "
+                f"a relative path: {first.path!r}"
+            )
+        if is_image_path(first.path):
+            raise MediaAddressError(
+                f"decode_frames_in_order resolves a video stream; "
+                f"{first.path!r} looks like a still image"
+            )
+        for addr in parsed:
+            if addr.frame is None:
+                raise MediaAddressError(
+                    f"decode_frames_in_order resolves #f= addresses only; "
+                    f"got {format_address(addr)!r}"
+                )
+            if addr.path != first.path or addr.stream != first.stream:
+                raise MediaAddressError(
+                    "decode_frames_in_order requires every address to name "
+                    "the same source (same path and stream); got "
+                    f"{format_address(first)!r} and {format_address(addr)!r}"
+                )
+
+        return self._decode_frames_in_order(parsed, purpose)
+
+    def _decode_frames_in_order(
+        self, parsed: List[MediaAddress], purpose: str,
+    ) -> Iterator[Tuple[MediaAddress, FramePayload]]:
+        # Generator: nothing below runs until the first next() -- the pool
+        # acquire is the lazy acquisition decode_frames_in_order's
+        # docstring promises, exactly as _decode_video_span_frames does
+        # for decode_video_span.
+        first = parsed[0]
+        with _translate_file_errors(first.path):
+            container = self._pool.acquire(first.path)
+            try:
+                stream = self._select_video_stream(container, first)
+                epoch_us = self._get_epoch_us(container, stream)
+                # #f= always builds or reuses the frame-time index -- the
+                # one deliberate cost-rule exception (module docstring).
+                frame_times = self._get_frame_index(container, stream, epoch_us)
+
+                # One (ordinal, target_us, input_index, address) entry per
+                # INPUT element, in input order. select_frame() bound-
+                # checks addr.frame against frame_times (decision 11) and
+                # returns it unconverted (decision 8).
+                requests: List[Tuple[int, int, int, MediaAddress]] = []
+                for index, addr in enumerate(parsed):
+                    ordinal = select_frame(addr, frame_times)
+                    requests.append(
+                        (ordinal, frame_times[ordinal], index, addr)
+                    )
+
+                # Stable sort by ordinal: frame_times is strictly
+                # increasing (built_frame_index refuses a tie), so
+                # sorting by target_us and by ordinal agree, and ties
+                # (duplicate ordinals) keep their original input order --
+                # this is what "yields once per requested address, in
+                # their relative input order" means for a duplicate.
+                requests.sort(key=lambda item: item[0])
+
+                min_target_us = requests[0][1]
+                raw_start_ticks = _us_to_ticks(
+                    min_target_us + epoch_us, stream.time_base
+                )
+                container.seek(
+                    raw_start_ticks, backward=True, any_frame=False, stream=stream
+                )
+
+                pending = list(requests)
+                for frame in container.decode(stream):
+                    if not pending:
+                        break
+                    pts_us = _ticks_to_us(frame.pts, stream.time_base) - epoch_us
+                    if pts_us < pending[0][1]:
+                        # Either the keyframe seek landed before the
+                        # earliest requested time, or (frame_step > 1)
+                        # this is an intervening, unrequested frame --
+                        # decoded (there is no way to skip it and stay
+                        # sequential) but never yielded.
+                        continue
+                    # Yield every pending request sharing this exact
+                    # presentation time before moving on to the next
+                    # decoded frame -- a duplicate ordinal decodes once
+                    # but is answered once per requesting address.
+                    while pending and pending[0][1] == pts_us:
+                        ordinal, target_us, _index, addr = pending.pop(0)
+                        pixels, width, height = _decoded_frame_to_pixels(
+                            frame, addr.region
+                        )
+                        yield addr, FramePayload(
+                            pixels=pixels,
+                            frame_ordinal=ordinal,
+                            presentation_time_us=pts_us,
+                            width=width,
+                            height=height,
+                            purpose=purpose,
+                        )
+
+                if pending:
+                    raise MediaResolverError(
+                        f"reached the end of {first.path!r} before "
+                        f"decoding frame ordinal {pending[0][0]} (indexed "
+                        f"at {pending[0][1]} microseconds) -- the "
+                        f"frame-time index may be stale"
+                    )
+            finally:
+                self._pool.release(container)
 
     def get_frame_times(self, address: Union[str, MediaAddress]) -> List[int]:
         """Return the sorted presentation times, in microseconds, of every

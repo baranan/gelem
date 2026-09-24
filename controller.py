@@ -2851,9 +2851,31 @@ class AppController(QObject):
             # DEFAULT_MEDIA_COLUMN_NAME: an ADDRESS operator's metadata may
             # hold its media reference under any column the researcher
             # picked, or one type inference tagged on its own.
+            # Which column holds a FRAME (or ADDRESS) row's media cell is
+            # decided HERE, not by the worker: the active table's current
+            # display column -- get_detail_media_column(), the same
+            # column the detail view renders as media, the first entry
+            # of get_effective_visible_columns(). Reusing it rather than
+            # deciding this again fixes docs/known_defects.md's "A
+            # FRAME-requirement COLUMNS run reads only the full_path
+            # metadata key" -- the worker no longer hardcodes that
+            # literal name; it reads whatever column this resolves to.
+            # A table with no visual column to show has no column to
+            # read a FRAME/ADDRESS run's media from either, so the run
+            # is refused before it starts, the same place VIDEO_SPAN /
+            # AUDIO_SPAN and PER_SEQUENCE are refused below.
+            media_column: str | None = None
             if media_requirement in (
                 MediaRequirement.FRAME, MediaRequirement.ADDRESS,
             ):
+                media_column = self.get_detail_media_column()
+                if media_column is None:
+                    self.error_occurred.emit(
+                        f'Cannot start "{mode_label}": table '
+                        f'{table_name!r} has no visual column to read '
+                        f'media from.'
+                    )
+                    return
                 self._absolutise_media_columns(table_name, snapshot)
 
             # The runner builds this operator's model once per worker
@@ -2901,6 +2923,7 @@ class AppController(QObject):
                     on_complete=self._on_create_columns_complete,
                     on_setup_error=self._on_operator_setup_error,
                     on_row_errors=self._on_operator_row_errors,
+                    media_column=media_column,
                 )
             except Exception:
                 # The run never started, so no callback will ever

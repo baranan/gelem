@@ -52,7 +52,7 @@ from operators.descriptor import (
     OperatorDescriptorError,
 )
 from operators.run_context import OperatorRunError
-from media.extensions import IMAGE_EXTENSIONS
+from media.extensions import IMAGE_EXTENSIONS, is_image_path
 from media.media_address import MediaAddressError, parse as parse_address
 from media.resolver import MediaResolverError
 from models.table_schema import ColumnHint, ColumnRole
@@ -75,6 +75,26 @@ def _is_bare_video_address(addr) -> bool:
     if not is_bare:
         return False
     return Path(addr.path).suffix.lower() not in IMAGE_EXTENSIONS
+
+
+def _iter_group_rows(run, addresses, media_by_address_id):
+    """(row_id, media, metadata) for one per-source group, in ASCENDING
+    ORDINAL order -- the `rows` iterable operators.base.BaseOperator.
+    iter_column_updates() declares (P2.1). `addresses` are every #f=
+    address of this group, in the order they were classified (not
+    necessarily ordinal order); `run.resolver.decode_frames_in_order()`
+    does the one sequential decode and re-orders them by presentation
+    time. `media_by_address_id` maps `id(address)` (object identity,
+    not value equality -- decode_frames_in_order's own docstring: this
+    is what tells two rows naming the exact same frame apart) back to
+    the (row_id, metadata) that address was classified under, in
+    _run_create_columns_worker's per-row loop above.
+    """
+    for addr, payload in run.resolver.decode_frames_in_order(
+        addresses, "analysis"
+    ):
+        row_id, metadata = media_by_address_id[id(addr)]
+        yield row_id, payload.pixels, metadata
 
 
 class OperatorRegistry:
@@ -312,6 +332,7 @@ class OperatorRegistry:
         on_complete=None,
         on_setup_error=None,
         on_row_errors=None,
+        media_column: str | None = None,
     ) -> bool:
         """
         Runs create_columns() over an ordered group of rows in a
@@ -343,6 +364,17 @@ class OperatorRegistry:
                            by AppController. Passed straight through as the
                            final argument to operator.create_columns();
                            the registry does not read run.parameters.
+            media_column:  The active table's column name to read a FRAME
+                           (or ADDRESS) row's media cell from -- decided by
+                           AppController (AppController.get_detail_media_
+                           column(), CLAUDE.md's media rule), never
+                           hardcoded here. None for a run whose
+                           media_requirement never reads a media cell
+                           (METADATA), or for a direct call that bypasses
+                           AppController (a FRAME-requirement run then
+                           treats every row as having no media cell, the
+                           same outcome an unresolved column name always
+                           produced).
             operation_id:  Unique ID for this run. Travels through every
                            callback below so AppController can reject a
                            result from a run that is no longer live.
@@ -440,7 +472,7 @@ class OperatorRegistry:
             args=(
                 operator, snapshot, row_ids, table_name, run, operation_id,
                 on_item_complete, on_progress, on_complete,
-                on_setup_error, on_row_errors,
+                on_setup_error, on_row_errors, media_column,
             ),
             daemon=True,
         )
@@ -460,12 +492,23 @@ class OperatorRegistry:
         on_complete,
         on_setup_error,
         on_row_errors,
+        media_column: str | None = None,
     ) -> None:
         """
         Worker that runs create_columns() in the background thread.
         Builds each row's metadata dict from the pre-snapshotted
         DataFrame as it reaches that row — never reads Dataset, and
         never receives 530,000 dicts built in advance.
+
+        A FRAME row whose media names a single frame of a VIDEO (a #f=
+        address, decision 8) is not decoded here directly -- it is
+        collected into a per-source group and decoded further down, in
+        ONE ordered pass per source through
+        MediaResolver.decode_frames_in_order(), fed to
+        operator.iter_column_updates() (P2.1, operators/CLAUDE.md's
+        "sequential pass" rule). Every other FRAME row -- a still image,
+        or a #t= time point -- keeps the ORIGINAL per-row resolve_frame()
+        path immediately below, unchanged.
         """
         total = len(row_ids)
         row_errors: list[tuple[str, str, str]] = []
@@ -482,16 +525,98 @@ class OperatorRegistry:
         # applied this many, so the completion never races ahead of the
         # last results into the bounded main-thread drain.
         emitted = 0
+        # How many rows have reached a progress-worthy outcome so far --
+        # a successful delivery, or an unexpected create_columns()
+        # exception caught and reported (the two cases that, in the
+        # per-row loop below, fall through to a progress update; a row
+        # refused before decode, or whose decode failed, does not). A
+        # row deferred into a per-source group (below) advances this
+        # when IT is delivered, not when it is merely classified into a
+        # group -- `total` still means "how many rows this run covers",
+        # only a deferred row's share of it lands later than its
+        # position in row_ids would suggest.
+        progress_count = 0
+        # Every #f= row on a video, deferred out of the loop below and
+        # decoded afterwards in one ordered pass per (path, stream)
+        # source -- see the FRAME branch's own note.
+        frame_groups: "dict[tuple, list[tuple[str, object, dict]]]" = {}
+        # Set by _deliver() returning False (NotImplementedError /
+        # OperatorSetupError): the run is aborted, and no row after the
+        # one that raised -- in the per-row loop or in a later group --
+        # is ever processed, exactly as the original single loop's own
+        # `break` stopped it outright.
+        aborted = False
+
+        def _report_progress() -> None:
+            nonlocal progress_count
+            progress_count += 1
+            if on_progress is not None:
+                on_progress(int(progress_count / total * 100))
+
+        def _deliver(row_id: str, media, metadata: dict) -> bool:
+            """Calls operator.create_columns() for one row and delivers
+            the result through on_item_complete -- the exact exception
+            handling the per-row loop below had inline before P2.1,
+            factored out so the grouped (ordered) path can share it.
+            Returns False to ABORT THE ENTIRE RUN (NotImplementedError,
+            OperatorSetupError), True otherwise -- whether the row
+            succeeded or the operator raised an unexpected exception
+            (reported as a row error, not an abort)."""
+            nonlocal emitted
+            try:
+                result = operator.create_columns(row_id, media, metadata, run)
+            except NotImplementedError:
+                print(
+                    f"[OperatorRegistry] Operator '{operator.name}' "
+                    f"does not implement create_columns()."
+                )
+                return False
+            except OperatorSetupError as e:
+                # Setup-level failure (e.g. required model file missing).
+                # Abort the run rather than spamming the same error per row.
+                print(
+                    f"[OperatorRegistry] Setup error in '{operator.name}': {e}"
+                )
+                if on_setup_error is not None:
+                    # Pass the operator's own display label so the
+                    # controller never rebuilds it from a worker thread.
+                    on_setup_error(operation_id, label, str(e))
+                return False
+            except Exception as e:
+                # Unexpected per-row failure (mediapipe crash, bug, malformed
+                # image, etc.). Mark the row as missing for consistency with
+                # the operator's no-face path, and remember it so we can
+                # surface a single summary at the end of the run.
+                print(
+                    f"[OperatorRegistry] Unexpected error in '{operator.name}' "
+                    f"on {row_id}: {type(e).__name__}: {e}"
+                )
+                row_errors.append((row_id, type(e).__name__, str(e)))
+                if on_item_complete is not None:
+                    all_none = {
+                        column.name: None
+                        for column
+                        in run.spec.mode_descriptor.output.columns
+                    }
+                    on_item_complete(operation_id, table_name, row_id, all_none)
+                    emitted += 1
+                return True
+            if on_item_complete is not None:
+                on_item_complete(operation_id, table_name, row_id, result)
+                emitted += 1
+            return True
 
         # What the runner decodes for each row is decided by this run's
         # declared media_requirement (operators/descriptor.py ->
         # MediaRequirement), read off the run's mode descriptor -- not by a
         # boolean flag on the operator. The five declared values and what
-        # each one means for this per-row COLUMNS runner:
+        # each one means for this COLUMNS runner:
         #
-        #   FRAME    -- the operator needs one decoded frame. The runner
-        #               decodes the row's image below, exactly as before,
-        #               and skips the row if it cannot be loaded.
+        #   FRAME    -- the operator needs one decoded frame. A still image
+        #               or a #t= time point is decoded per-row, below,
+        #               exactly as before; a #f= address on a video is
+        #               grouped by source and decoded in order, further
+        #               down (P2.1).
         #   METADATA -- the operator works purely from the row's ordinary
         #               columns. The runner decodes nothing and hands it
         #               media=None.
@@ -624,125 +749,244 @@ class OperatorRegistry:
             if run.cancelled():
                 break
             metadata = snapshot.iloc[i].to_dict()
-            try:
-                full_path = metadata.get("full_path", "")
 
-                # FRAME: decode one frame through the shared resolver and
-                # skip the row if it will not load. METADATA / ADDRESS:
-                # hand the operator None. `full_path` arrives here ALREADY
-                # ABSOLUTE: AppController.run_create_columns resolves every
-                # FRAME run's media column with the same method the display
-                # path uses (_resolve_media_cell) before this worker ever
-                # starts -- this registry has no controller access and
-                # cannot do that resolution itself, and run.paths (project
-                # directories, for output-writing operators) is the WRONG
-                # base for a stored media cell: after Save As it re-roots
-                # to the new folder while cell resolution deliberately does
-                # not (AppController.save_project's note on _project_root).
-                # resolve_frame refuses a still-relative address with
-                # MediaAddressError, caught below like any other decode
-                # failure.
-                if needs_frame:
-                    # A missing/blank cell and an unparseable one are, like
-                    # the whole-video refusal below, not decode failures --
-                    # there is no address to even try resolving yet -- but
-                    # they are just as invisible to the researcher as a
-                    # bare print() would leave them. Routed through the
-                    # same row_errors channel, each under its own reason,
-                    # rather than folded into "WholeVideoRow" (an empty
-                    # path also satisfies decision 4's "whole file" shape,
-                    # but telling the researcher their row is missing
-                    # media is a different, more accurate answer than
-                    # telling them it names a whole video).
-                    if not full_path or pd.isna(full_path):
-                        row_errors.append((
-                            row_id, "MissingMedia",
-                            "this row has no media value to read",
-                        ))
-                        continue
+            # FRAME: decode one frame through the shared resolver and
+            # skip the row if it will not load -- or, for a #f= address
+            # on a video, defer it into a per-source group, decoded
+            # further down in one ordered pass (P2.1). METADATA /
+            # ADDRESS: hand the operator None. `media_column` names
+            # which of this table's columns holds the media cell --
+            # AppController.run_create_columns decides it
+            # (AppController.get_detail_media_column(); never a literal
+            # "full_path" -- that hardcoding was docs/known_defects.md's
+            # "A FRAME-requirement COLUMNS run reads only the full_path
+            # metadata key", fixed by this same item) and the cell
+            # arrives here ALREADY ABSOLUTE: AppController resolves
+            # every FRAME/ADDRESS run's media-tagged columns with the
+            # same method the display path uses (_resolve_media_cell)
+            # before this worker ever starts -- this registry has no
+            # controller access and cannot do that resolution itself,
+            # and run.paths (project directories, for output-writing
+            # operators) is the WRONG base for a stored media cell:
+            # after Save As it re-roots to the new folder while cell
+            # resolution deliberately does not (AppController.
+            # save_project's note on _project_root). resolve_frame
+            # refuses a still-relative address with MediaAddressError,
+            # caught below like any other decode failure.
+            if needs_frame:
+                full_path = metadata.get(media_column, "")
+
+                # A missing/blank cell and an unparseable one are, like
+                # the whole-video refusal below, not decode failures --
+                # there is no address to even try resolving yet -- but
+                # they are just as invisible to the researcher as a
+                # bare print() would leave them. Routed through the
+                # same row_errors channel, each under its own reason,
+                # rather than folded into "WholeVideoRow" (an empty
+                # path also satisfies decision 4's "whole file" shape,
+                # but telling the researcher their row is missing
+                # media is a different, more accurate answer than
+                # telling them it names a whole video).
+                if not full_path or pd.isna(full_path):
+                    row_errors.append((
+                        row_id, "MissingMedia",
+                        "this row has no media value to read",
+                    ))
+                    continue
+                try:
+                    addr = parse_address(full_path)
+                except MediaAddressError as e:
+                    row_errors.append((
+                        row_id, "UnparseableMedia",
+                        f"could not parse the media value {full_path!r}: {e}",
+                    ))
+                    continue
+                if _is_bare_video_address(addr):
+                    # Not a decode failure -- a deliberate refusal, but
+                    # the researcher must still be told: routed through
+                    # the same row_errors channel an unexpected
+                    # create_columns() exception uses below, so the
+                    # end-of-run summary (AppController._on_operator_
+                    # complete's "row_errors" branch) reports the count
+                    # and this exact reason, and the run's provenance
+                    # records outcome "partial" rather than "complete"
+                    # -- a print() alone reaches nobody but a developer
+                    # watching the console.
+                    message = (
+                        "this operator reads single frames; this row "
+                        "is a whole video"
+                    )
+                    row_errors.append((row_id, "WholeVideoRow", message))
+                    continue
+
+                # A #f=<n> address on a VIDEO is the ordered path's case
+                # (P2.1): grouped by source (path, stream) and decoded
+                # in one sequential pass below, instead of a seek per
+                # row. A still image's own #f=0 (FrameOperator emits one
+                # for every image row) and a #t= time point keep the
+                # ORIGINAL per-row resolve_frame() path immediately
+                # below -- a still has no sequential stream to walk, and
+                # a lone time point gains nothing from grouping.
+                if addr.frame is not None and not is_image_path(addr.path):
+                    group_key = (addr.path, addr.stream)
+                    frame_groups.setdefault(group_key, []).append(
+                        (row_id, addr, metadata)
+                    )
+                    continue
+
+                try:
+                    media = run.resolver.resolve_frame(
+                        addr, "analysis"
+                    ).pixels
+                except (MediaResolverError, MediaAddressError, OSError) as e:
+                    print(
+                        f"[OperatorRegistry] Could not load image "
+                        f"for {row_id}: {full_path} ({e})"
+                    )
+                    continue
+            else:
+                media = None
+
+            if not _deliver(row_id, media, metadata):
+                aborted = True
+                break
+            _report_progress()
+
+        # Whether the operator overrides iter_column_updates() decides how
+        # a per-row exception inside a group is handled, not just how the
+        # rows are iterated:
+        #
+        #   NOT overridden (every operator today) -- the runner iterates
+        #   the decoded rows itself and calls _deliver() per row, exactly
+        #   as the per-row loop above does. A row's own exception is then
+        #   _deliver's problem, not the group's: that ONE row gets a row
+        #   error and an all-None result, and the NEXT FRAME of the same
+        #   source is still attempted -- a review finding on a real
+        #   10-minute clip found the group-level catch below turning one
+        #   bad frame into every later frame of that source lost, which
+        #   is not what the per-row path ever did for the same exception.
+        #   This is safe specifically because BaseOperator's own
+        #   iter_column_updates carries no state across the rows it
+        #   yields (operators/base.py's own docstring) -- there is
+        #   nothing an exception could leave corrupted for the next row.
+        #
+        #   Overridden -- an operator that tracks something across
+        #   frames (P2.4) may have left that state unreliable after a
+        #   failure partway through its own generator, so the whole
+        #   group still ends on any exception, the pre-this-fix
+        #   behaviour, kept only for this case.
+        uses_default_iter_column_updates = (
+            type(operator).iter_column_updates is BaseOperator.iter_column_updates
+        )
+
+        # The ordered path (P2.1): every #f= row on a video, grouped by
+        # source above, decoded here in ONE sequential pass per source
+        # through MediaResolver.decode_frames_in_order() -- never one
+        # seek per row. Skipped entirely once `aborted` already ended the
+        # run above, exactly as the original loop's own `break` would
+        # have skipped every row after the one that aborted it.
+        if not aborted:
+            for (_source_path, _stream), entries in frame_groups.items():
+                if run.cancelled():
+                    break
+                addresses = [addr for (_rid, addr, _md) in entries]
+                media_by_address_id = {
+                    id(addr): (row_id, metadata)
+                    for (row_id, addr, metadata) in entries
+                }
+                pending_row_ids = {row_id for (row_id, _a, _m) in entries}
+
+                if uses_default_iter_column_updates:
                     try:
-                        addr = parse_address(full_path)
-                    except MediaAddressError as e:
-                        row_errors.append((
-                            row_id, "UnparseableMedia",
-                            f"could not parse the media value {full_path!r}: {e}",
-                        ))
-                        continue
-                    if _is_bare_video_address(addr):
-                        # Not a decode failure -- a deliberate refusal, but
-                        # the researcher must still be told: routed through
-                        # the same row_errors channel an unexpected
-                        # create_columns() exception uses below, so the
-                        # end-of-run summary (AppController._on_operator_
-                        # complete's "row_errors" branch) reports the count
-                        # and this exact reason, and the run's provenance
-                        # records outcome "partial" rather than "complete"
-                        # -- a print() alone reaches nobody but a developer
-                        # watching the console.
-                        message = (
-                            "this operator reads single frames; this row "
-                            "is a whole video"
-                        )
-                        row_errors.append((row_id, "WholeVideoRow", message))
-                        continue
-                    try:
-                        media = run.resolver.resolve_frame(
-                            addr, "analysis"
-                        ).pixels
-                    except (MediaResolverError, MediaAddressError, OSError) as e:
+                        for row_id, media, metadata in _iter_group_rows(
+                            run, addresses, media_by_address_id
+                        ):
+                            if run.cancelled():
+                                break
+                            pending_row_ids.discard(row_id)
+                            if not _deliver(row_id, media, metadata):
+                                aborted = True
+                                break
+                            _report_progress()
+                    except Exception as e:
+                        # A DECODE failure partway through this source (a
+                        # damaged file, a stale frame-time index) -- an
+                        # operator's OWN per-row exception never reaches
+                        # here, _deliver() already handled it above and
+                        # moved on to the next frame. Reports every row
+                        # of THIS group not yet delivered, with one
+                        # shared reason, and the run continues with the
+                        # next group. Results already delivered for this
+                        # group (and every earlier one) are kept.
                         print(
-                            f"[OperatorRegistry] Could not load image "
-                            f"for {row_id}: {full_path} ({e})"
+                            f"[OperatorRegistry] Ordered decode failed for "
+                            f"'{operator.name}' on {_source_path!r}: "
+                            f"{type(e).__name__}: {e}"
                         )
+                        for row_id in pending_row_ids:
+                            row_errors.append((row_id, type(e).__name__, str(e)))
                         continue
+                    if aborted:
+                        break
+
                 else:
-                    media = None
-
-                result = operator.create_columns(row_id, media, metadata, run)
-
-                if on_item_complete is not None:
-                    on_item_complete(operation_id, table_name, row_id, result)
-                    emitted += 1
-
-            except NotImplementedError:
-                print(
-                    f"[OperatorRegistry] Operator '{operator.name}' "
-                    f"does not implement create_columns()."
-                )
-                break
-            except OperatorSetupError as e:
-                # Setup-level failure (e.g. required model file missing).
-                # Abort the run rather than spamming the same error per row.
-                print(
-                    f"[OperatorRegistry] Setup error in '{operator.name}': {e}"
-                )
-                if on_setup_error is not None:
-                    # Pass the operator's own display label so the
-                    # controller never rebuilds it from a worker thread.
-                    on_setup_error(operation_id, label, str(e))
-                break
-            except Exception as e:
-                # Unexpected per-row failure (mediapipe crash, bug, malformed
-                # image, etc.). Mark the row as missing for consistency with
-                # the operator's no-face path, and remember it so we can
-                # surface a single summary at the end of the run.
-                print(
-                    f"[OperatorRegistry] Unexpected error in '{operator.name}' "
-                    f"on {row_id}: {type(e).__name__}: {e}"
-                )
-                row_errors.append((row_id, type(e).__name__, str(e)))
-                if on_item_complete is not None:
-                    all_none = {
-                        column.name: None
-                        for column
-                        in run.spec.mode_descriptor.output.columns
-                    }
-                    on_item_complete(operation_id, table_name, row_id, all_none)
-                    emitted += 1
-
-            if on_progress is not None:
-                percent = int((i + 1) / total * 100)
-                on_progress(percent)
+                    # Overridden iter_column_updates(): unchanged from
+                    # before this fix -- any exception, from decode or
+                    # from the operator's own cross-frame state, ends
+                    # the whole group.
+                    try:
+                        updates = operator.iter_column_updates(
+                            _iter_group_rows(run, addresses, media_by_address_id),
+                            run,
+                        )
+                        for row_id, result in updates:
+                            pending_row_ids.discard(row_id)
+                            if on_item_complete is not None:
+                                on_item_complete(
+                                    operation_id, table_name, row_id, result
+                                )
+                                emitted += 1
+                            _report_progress()
+                    except NotImplementedError:
+                        print(
+                            f"[OperatorRegistry] Operator '{operator.name}' "
+                            f"does not implement iter_column_updates() (or "
+                            f"create_columns())."
+                        )
+                        aborted = True
+                        break
+                    except OperatorSetupError as e:
+                        print(
+                            f"[OperatorRegistry] Setup error in "
+                            f"'{operator.name}': {e}"
+                        )
+                        if on_setup_error is not None:
+                            on_setup_error(operation_id, label, str(e))
+                        aborted = True
+                        break
+                    except Exception as e:
+                        # A failure anywhere in this group's ordered
+                        # decode or processing -- a damaged file, a
+                        # stale frame-time index, an unexpected operator
+                        # error -- reports every row of THIS group not
+                        # yet delivered, with one shared reason
+                        # (CLAUDE.md: "one bad row must not kill a run",
+                        # extended here to one bad source), and the run
+                        # continues with the next group. Results already
+                        # delivered for this group (and every earlier
+                        # one) are kept. This override case cannot
+                        # narrow the failure to one row the way the
+                        # non-overridden branch above does -- its own
+                        # cross-frame state may no longer be
+                        # trustworthy.
+                        print(
+                            f"[OperatorRegistry] Ordered decode failed for "
+                            f"'{operator.name}' on {_source_path!r}: "
+                            f"{type(e).__name__}: {e}"
+                        )
+                        for row_id in pending_row_ids:
+                            row_errors.append((row_id, type(e).__name__, str(e)))
+                        continue
 
         # P1.7-1 fix round: run.report_row_error() is available on every
         # OperatorRun, not just a TABLE run's -- a create_columns() that

@@ -564,6 +564,16 @@ state. This rule carries no violation list of its own -- it points at the three
 - **`[TARGET -> P2.2]`** Resumability is narrower than cancellability and must be
   stated per mode; see `operators/CLAUDE.md`. A generator gives progressive output
   and a cancellation point. It does not by itself give resumability.
+- **`[NOW]`** A FRAME-mode COLUMNS run's rows whose media is a `#f=` address on a
+  video decode each source ONCE, IN ORDER, through
+  `MediaResolver.decode_frames_in_order()` -- never one seek per row. Made true by
+  P2.1: `OperatorRegistry._run_create_columns_worker` groups such rows by source
+  (path and stream) and feeds each group, in ascending presentation order, to
+  `operator.iter_column_updates()` (`operators/base.py`'s serial reference calls
+  `create_columns()` unchanged; `operators/CLAUDE.md` is the authority for the
+  method's contract). A still image row or a `#t=` time-point row is unaffected --
+  it keeps the original per-row `resolve_frame()` path. Tests:
+  `tests/test_ordered_frame_runner.py`.
 
 ---
 

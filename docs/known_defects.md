@@ -402,20 +402,6 @@ to P1.8d, and the two OS-native / non-parsing media-cell entries to P1.8e.
   designed against pandas 3.0.2, numpy 2.4.4, pyarrow 23.0.1, Python 3.13.2. On
   pandas 2 a bare text column is `object`, not `str`, so a fresh clone can
   behave differently.
-- **A FRAME-requirement COLUMNS run reads only the `full_path` metadata key**
-  (`operators/operator_registry.py`'s `_run_create_columns_worker`), never a
-  column the researcher picked or a differently-named media_path column type
-  inference tagged. This is narrower than `AppController._absolutise_media_columns`
-  (P1.2c-2), which pre-resolves every column the active table's schema tags
-  `media_path`, not only one named `full_path` -- an ADDRESS-requirement run
-  already benefits from that (an operator can read any such column itself,
-  as `tests/test_media_resolver.py::test_address_run_resolves_a_relative_cell_in_a_non_full_path_media_column`
-  exercises), but a FRAME run's fixed key means a table whose media lives
-  under another column name gets no decoded frame at all, silently, however
-  the pre-resolution step improves. Which column a FRAME operator reads is a
-  contract question -- letting an operator or its descriptor name the column,
-  the same way `frame_operator.py`'s `media_column` parameter does for a
-  TABLE operator -- not a patch to this file. No item assigned.
 - **The per-file frame-time index (`media/resolver.py`'s `_build_frame_index`)
   identifies a frame by its presentation time rounded to the nearest
   microsecond, not by its exact timestamp.** It refuses two presented frames
@@ -531,6 +517,20 @@ to P1.8d, and the two OS-native / non-parsing media-cell entries to P1.8e.
 
 ## Fixed
 
+- **A FRAME-requirement COLUMNS run read only the `full_path` metadata key**
+  (`operators/operator_registry.py`'s `_run_create_columns_worker`), never a
+  column the researcher picked or a differently-named media_path column type
+  inference tagged -- narrower than `AppController._absolutise_media_columns`
+  (P1.2c-2), which pre-resolves every column the active table's schema tags
+  `media_path`, not only one named `full_path`; a FRAME run's fixed key meant
+  a table whose media lived under another column name got no decoded frame
+  at all, silently. *(P2.1: `AppController.run_create_columns` now decides
+  the media column once, reusing `get_detail_media_column()` (the active
+  table's own display column) rather than a second decision, refuses the run
+  before it starts if that is `None`, and passes the column name to
+  `OperatorRegistry.run_create_columns` as `media_column`; the worker reads
+  `metadata[media_column]` and no longer hardcodes `"full_path"`. Tests:
+  `tests/test_ordered_frame_runner.py`.)*
 - **`operators_config.yaml` claimed to control which operators are enabled but
   `main.py` registered them by hand and never read the file** (`StatsOperator`
   was registered in code and absent from the YAML). *(P1.11a:

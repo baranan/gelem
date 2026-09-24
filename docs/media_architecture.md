@@ -1412,10 +1412,10 @@ Design settled; three parameters decided **by measurement**, not by argument.
   A user with an unusual machine gets slow but correct results, never a broken
   application.
 
-**P2.1 Ordered execution interface.** `iter_column_updates` over a clip, with the
-serial path as the reference implementation. `OperatorRunContext` arrives earlier,
-in P1.12, with the minimal payload; `run.cache` and `run.log` are added by **P2.2**,
-not here.
+**P2.1 Ordered execution interface -- done.** `iter_column_updates` over a clip,
+with the serial path as the reference implementation. `OperatorRunContext` arrives
+earlier, in P1.12, with the minimal payload; `run.cache` and `run.log` are added by
+**P2.2**, not here.
 
 **P2.2 Result cache identity and resumption.**
 
