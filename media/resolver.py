@@ -741,6 +741,47 @@ class MediaResolver:
             finally:
                 self._pool.release(container)
 
+    def get_duration_us(self, address: Union[str, MediaAddress]) -> Optional[int]:
+        """Return the selected video stream's length, in microseconds, from
+        container metadata alone -- None if the container reports no
+        duration.
+
+        Any fragment the address carries (#f=, #t=, a region) is parsed but
+        ignored beyond selecting the stream (decision 7): this reports the
+        whole stream's length, never a slice of it, the same convention
+        get_frame_times() uses for its own fragment handling.
+
+        MUST NOT decode a frame or build the per-file frame-time index --
+        the cost rule in the module docstring. This reads only
+        stream.duration / container.duration through the existing
+        _stream_span_us, exactly as _resolve_bare_midpoint already does to
+        find a bare path's midpoint without decoding to the true end.
+
+        Raises MediaResolverError for a still image (no stream duration to
+        report) and MediaAddressError for a relative address, matching
+        get_frame_times().
+        """
+        addr = address if isinstance(address, MediaAddress) else parse_address(address)
+
+        if not _is_absolute(addr.path):
+            raise MediaAddressError(
+                f"get_duration_us requires an absolute address, got a "
+                f"relative path: {addr.path!r}"
+            )
+        if is_image_path(addr.path):
+            raise MediaResolverError(
+                f"{addr.path!r} looks like a still image -- it has no "
+                f"stream duration to report"
+            )
+
+        with _translate_file_errors(addr.path):
+            container = self._pool.acquire(addr.path)
+            try:
+                stream = self._select_video_stream(container, addr)
+                return self._stream_span_us(container, stream)
+            finally:
+                self._pool.release(container)
+
     def _decode_video_span_frames(
         self, addr: MediaAddress, purpose: str, with_ordinals: bool
     ) -> Iterator[FramePayload]:

@@ -180,6 +180,7 @@ def confirmation_text(fields, changed: dict) -> str:
 _SUFFIX_BY_UNIT = {
     "pixels": " px",
     "count": "",
+    "seconds": " s",
 }
 
 

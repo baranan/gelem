@@ -88,6 +88,7 @@ def create_app():
         memory_cache_max_bytes=gelem_settings.picture_memory_max_bytes,
         thumbnail_max_side=gelem_settings.thumbnail_max_side,
         preview_max_side=gelem_settings.preview_max_side,
+        frame_stepper_max_seconds=gelem_settings.frame_stepper_max_seconds,
     )
     registry          = ColumnTypeRegistry()
     operator_registry = OperatorRegistry()

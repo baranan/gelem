@@ -493,6 +493,10 @@ class AppController(QObject):
         thumbnails_ready:        ThumbnailsReady payload -- a table name
                                  and the tuple of row_ids whose
                                  thumbnail is now available.
+        clip_frames_ready:       The canonical address of a clip whose
+                                 frame-by-frame cache (ArtifactStore's
+                                 request_clip_frames) has just finished
+                                 decoding.
         rows_updated:            RowsUpdated payload -- a table name and
                                  the tuple of row_ids whose data changed
                                  in this drain tick.
@@ -527,6 +531,7 @@ class AppController(QObject):
     tables_updated           = Signal(list)
     active_table_changed     = Signal(str)
     thumbnails_ready         = Signal(object)
+    clip_frames_ready        = Signal(str)
     rows_updated             = Signal(object)
     operator_progress        = Signal(int)
     operator_complete        = Signal(str)
@@ -596,6 +601,7 @@ class AppController(QObject):
         # a renderer and nothing else (see column_types/registry.py). A
         # column's type tag comes from that table's TableSchema.
         self._store.on_thumbnail_ready = self._on_thumbnail_ready
+        self._store.on_clip_frames_ready = self._on_clip_frames_ready
 
         # Result queues. Each is drained by at most self._drain_budget
         # items per timer tick (see _drain_queues), so a large operator
@@ -606,6 +612,7 @@ class AppController(QObject):
         # queue.SimpleQueue is used rather than a list so there is no
         # list.pop(0) (linear in queue length) anywhere on the path.
         self._thumbnail_queue:   queue.SimpleQueue = queue.SimpleQueue()
+        self._clip_frames_queue: queue.SimpleQueue = queue.SimpleQueue()
         self._item_result_queue: queue.SimpleQueue = queue.SimpleQueue()
         # Completions, setup errors, per-row-error summaries and
         # create_table/display errors all share one queue so they are
@@ -1469,6 +1476,7 @@ class AppController(QObject):
         instead of stalling one.
         """
         self._drain_thumbnails()
+        self._drain_clip_frames()
         self._drain_item_results()
         self._emit_progress_if_changed()
         self._apply_run_logs()
@@ -1492,6 +1500,20 @@ class AppController(QObject):
             self.thumbnails_ready.emit(
                 ThumbnailsReady(table_name=table_name, row_ids=tuple(row_ids))
             )
+
+    def _drain_clip_frames(self) -> None:
+        """
+        Emits one clip_frames_ready per queued clip decode, up to
+        _drain_budget per tick -- the same bounded-drain shape as
+        _drain_thumbnails, for a queue that never holds more than
+        ArtifactStore's own two-clip cache can produce at once.
+        """
+        for _ in range(self._drain_budget):
+            try:
+                canonical_address = self._clip_frames_queue.get_nowait()
+            except queue.Empty:
+                break
+            self.clip_frames_ready.emit(canonical_address)
 
     def _drain_item_results(self) -> None:
         """
@@ -1676,6 +1698,9 @@ class AppController(QObject):
 
     def _on_thumbnail_ready(self, table_name: str, row_id: str) -> None:
         self._thumbnail_queue.put((table_name, row_id))
+
+    def _on_clip_frames_ready(self, canonical_address: str) -> None:
+        self._clip_frames_queue.put(canonical_address)
 
     def _on_item_complete(
         self,

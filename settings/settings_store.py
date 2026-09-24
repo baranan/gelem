@@ -54,6 +54,10 @@ class SettingsStore:
     # ArtifactStore five -- its own "artifacts/" key, same namespace as the
     # other decode-side numbers, alongside worker_count.
     _KEY_MAX_OPEN_DECODERS = "artifacts/max_open_decoders"
+    # frame_stepper_max_seconds (P1.4b part 1) bounds the in-memory clip-
+    # frame cache -- same "artifacts/" namespace as the other ArtifactStore-
+    # bound numbers above.
+    _KEY_FRAME_STEPPER_MAX_SECONDS = "artifacts/frame_stepper_max_seconds"
 
     def __init__(self, backend: SettingsBackend):
         self._backend = backend
@@ -83,6 +87,9 @@ class SettingsStore:
             "max_open_decoders": self._backend.get(
                 self._KEY_MAX_OPEN_DECODERS
             ),
+            "frame_stepper_max_seconds": self._backend.get(
+                self._KEY_FRAME_STEPPER_MAX_SECONDS
+            ),
         }
         return GelemSettings.from_values(raw)
 
@@ -109,4 +116,8 @@ class SettingsStore:
         )
         self._backend.set(
             self._KEY_MAX_OPEN_DECODERS, str(settings.max_open_decoders)
+        )
+        self._backend.set(
+            self._KEY_FRAME_STEPPER_MAX_SECONDS,
+            str(settings.frame_stepper_max_seconds),
         )

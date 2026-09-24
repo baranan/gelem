@@ -190,6 +190,7 @@ def test_no_drain_method_uses_list_pop_zero():
 # would be a data race.
 _WORKER_CALLBACKS = {
     "_on_thumbnail_ready",
+    "_on_clip_frames_ready",
     "_on_item_complete",
     "_on_progress",
     "_on_run_log",

@@ -74,6 +74,15 @@ PREVIEW_MAX_SIDE_RANGE = (64, 4096)
 DEFAULT_OUTPUT_COPY_WARNING_THRESHOLD_BYTES = 1024 * 1024 * 1024
 OUTPUT_COPY_WARNING_THRESHOLD_BYTES_RANGE = (0, 1024 * 1024 * 1024 * 1024)
 
+# The longest clip, in seconds, that the in-memory frame-by-frame stepper
+# cache (ArtifactStore.request_clip_frames) will decode and hold whole.
+# A clip over this length is refused rather than cached. 10 default; 1 to
+# 120 -- not a machine-dependent number in the same sense as the others
+# above, but still a settings-editable ceiling rather than a bare
+# constant, per CLAUDE.md's generality rule.
+DEFAULT_FRAME_STEPPER_MAX_SECONDS = 10
+FRAME_STEPPER_MAX_SECONDS_RANGE = (1, 120)
+
 
 # ---------------------------------------------------------------------------
 # Tolerant parsing helpers. Each appends at most one problem message and
@@ -144,6 +153,7 @@ class GelemSettings:
         DEFAULT_OUTPUT_COPY_WARNING_THRESHOLD_BYTES
     )
     max_open_decoders: int = DEFAULT_MAX_OPEN_DECODERS
+    frame_stepper_max_seconds: int = DEFAULT_FRAME_STEPPER_MAX_SECONDS
 
     @classmethod
     def from_values(
@@ -212,6 +222,13 @@ class GelemSettings:
             "maximum open decoders",
             problems,
         )
+        frame_stepper_max_seconds = _parse_int_field(
+            mapping.get("frame_stepper_max_seconds"),
+            DEFAULT_FRAME_STEPPER_MAX_SECONDS,
+            FRAME_STEPPER_MAX_SECONDS_RANGE,
+            "frame stepper clip length limit",
+            problems,
+        )
 
         # Cross-field rule: a preview must not be smaller than a thumbnail.
         # Both are now the largest side directly, so this is a plain compare.
@@ -234,6 +251,7 @@ class GelemSettings:
                     output_copy_warning_threshold_bytes
                 ),
                 max_open_decoders=max_open_decoders,
+                frame_stepper_max_seconds=frame_stepper_max_seconds,
             ),
             problems,
         )

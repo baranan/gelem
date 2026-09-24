@@ -478,6 +478,9 @@ state. This rule carries no violation list of its own -- it points at the three
   ordinal is resolved against a file's real per-frame timings, never a nominal
   frame rate (decision 8). `MediaAddress` only carries the address; nothing
   today decodes one.
+- **`[NOW]`** Clip frames for frame stepping are cached in memory only, in
+  `ArtifactStore`, decoded through `MediaResolver.decode_video_span` with
+  ordinals; never written to disk. Tests: `tests/test_clip_frame_cache.py`.
 
 ### Generality
 

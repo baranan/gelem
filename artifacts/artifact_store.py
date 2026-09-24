@@ -71,6 +71,7 @@ This file is written centrally (not by a student).
 """
 
 from __future__ import annotations
+from dataclasses import dataclass
 from pathlib import Path
 from collections import OrderedDict
 from typing import NamedTuple
@@ -87,7 +88,8 @@ from artifacts.artifact_codec import ArtifactCodec, ArtifactCodecError
 from artifacts.cache_sweep import SweepFile, plan_sweep
 from artifacts.worker_pool import WorkerPool
 from media.artifact_key import ArtifactKey, SourceFingerprint
-from media.resolver import MediaResolver
+from media.media_address import MediaAddressError, parse as parse_media_address
+from media.resolver import MediaResolver, MediaResolverError
 
 # Fallback thumbnail / preview target sizes: the largest side, in pixels.
 # DEFAULTS ONLY: the real values come from settings/ via main.py and are
@@ -142,6 +144,19 @@ _ARTIFACT_FILENAME_RE = re.compile(r"\A[0-9a-f]{32}\.jpg\Z")
 # a project reopened after this change regenerates its pictures on demand.
 INDEX_FORMAT_VERSION = 3
 
+# Default clip-length ceiling for the in-memory frame-by-frame stepper
+# cache, in seconds. DEFAULT ONLY: the real value comes from settings/ via
+# main.py and is passed to the constructor as frame_stepper_max_seconds
+# (docs/architecture.md section 9).
+DEFAULT_FRAME_STEPPER_MAX_SECONDS = 10
+
+# The clip-frame cache (request_clip_frames / clip_frames) holds at most
+# this many clips' decoded frames at once -- the current clip and one
+# more. A structural constant, not a machine- or dataset-dependent number,
+# so CLAUDE.md's "no hardcoded machine-dependent number" rule does not
+# apply to it the way it does to the sizes and counts above.
+_MAX_CACHED_CLIPS = 2
+
 
 class SweepResult(NamedTuple):
     """Counts from one `reconcile_and_evict()` call, for the log line and
@@ -153,6 +168,30 @@ class SweepResult(NamedTuple):
     delete_failures: int        # planned deletes that raised OSError
     bytes_before: int
     bytes_after: int
+
+
+@dataclass(frozen=True)
+class ClipFrame:
+    """One decoded, resized frame from request_clip_frames()'s in-memory
+    clip cache -- never written to disk.
+
+    pixels:                RGB uint8 numpy array, resized (PIL, LANCZOS,
+                            aspect kept) so its longest side is at most
+                            this store's preview resolution
+                            (resolution_for("preview")).
+    frame_ordinal:          this frame's zero-based position in the whole
+                            video's presentation order (decision 8),
+                            from MediaResolver.decode_video_span's own
+                            with_ordinals=True -- the same numbering
+                            operators/frame_operator.py's "Split into
+                            frames" produces for the same file.
+    presentation_time_us:   this frame's presentation time in
+                            microseconds on the file's own clock.
+    """
+
+    pixels: np.ndarray
+    frame_ordinal: int
+    presentation_time_us: int
 
 
 class ArtifactStore:
@@ -173,6 +212,7 @@ class ArtifactStore:
         memory_cache_max_bytes: int = DEFAULT_CACHE_MAX_BYTES,
         thumbnail_max_side: int = DEFAULT_THUMBNAIL_MAX_SIDE,
         preview_max_side: int = DEFAULT_PREVIEW_MAX_SIDE,
+        frame_stepper_max_seconds: int = DEFAULT_FRAME_STEPPER_MAX_SECONDS,
     ):
         # `resolver` is REQUIRED -- no default, no None fallback. It is the
         # one shared MediaResolver main.py builds and also injects into
@@ -203,6 +243,11 @@ class ArtifactStore:
         memory_cache_max_bytes = int(memory_cache_max_bytes)
         thumbnail_max_side = int(thumbnail_max_side)
         preview_max_side = int(preview_max_side)
+
+        # frame_stepper_max_seconds (P1.4b part 1) is not one of the five
+        # above -- it never enters an ArtifactKey -- but it comes from the
+        # same settings store as a string, so it is coerced the same way.
+        frame_stepper_max_seconds = int(frame_stepper_max_seconds)
 
         self._dir = artifacts_dir
         self._dir.mkdir(parents=True, exist_ok=True)
@@ -280,7 +325,40 @@ class ArtifactStore:
         # (P0.5b-2ii-c1, docs/architecture.md section 9).
         self._disk_cache_max_bytes: int = disk_cache_max_bytes
 
+        # The frame-by-frame stepper's in-memory clip cache (P1.4b part 1).
+        # A clip over this many seconds is refused by clip_fits_frame_cache().
+        # Constructor parameter, not a bare constant -- settings-editable
+        # like the values above, even though it never enters an ArtifactKey.
+        self._frame_stepper_max_seconds: int = frame_stepper_max_seconds
+
+        # Completed clips: canonical address -> its decoded ClipFrame tuple.
+        # Written only by _run_clip_job's generation-checked commit; read on
+        # the main thread by clip_frames(). Guarded by _lock, unlike the
+        # thumbnail image _cache above, because a worker writes into this
+        # one directly rather than through a disk round-trip.
+        self._clip_cache: "OrderedDict[str, tuple[ClipFrame, ...]]" = OrderedDict()
+        # LRU of the (at most _MAX_CACHED_CLIPS) addresses currently
+        # occupying a clip-cache slot, whether their decode has finished or
+        # is still running -- request_clip_frames() moves an address to the
+        # end on every request, cached or not, and evicts from the front
+        # when a new address needs a slot. Guarded by _lock.
+        self._clip_slots: "OrderedDict[str, None]" = OrderedDict()
+        # address -> the job_key of the decode currently "owning" that
+        # address's slot. A running _run_clip_job checks this before
+        # committing (and between frames): if it no longer matches its own
+        # job_key -- because reset() cleared the whole dict, or an LRU
+        # eviction popped just this address's entry -- the job is
+        # superseded and stops without storing anything or notifying
+        # anyone. Guarded by _lock.
+        self._clip_active_job: dict[str, tuple[int, str, int]] = {}
+        # Disambiguates two decodes of the SAME address from each other (an
+        # eviction immediately followed by a fresh request for the address
+        # just evicted): (generation, address) alone would collide. Guarded
+        # by _lock like the job map above.
+        self._clip_job_counter: int = 0
+
         self.on_thumbnail_ready = None
+        self.on_clip_frames_ready = None
 
     # ------------------------------------------------------------------
     # Key construction
@@ -1275,9 +1353,9 @@ class ArtifactStore:
         return True
 
     def reset(self) -> None:
-        """Clears the index, the memory cache, the fingerprint memo and
-        the in-flight subscriber map, bumps the worker generation, and
-        marks the (now empty) index authoritative.
+        """Clears the index, the memory cache, the fingerprint memo, the
+        in-flight subscriber map and the clip-frame cache, bumps the
+        worker generation, and marks the (now empty) index authoritative.
 
         load_project() must call this BEFORE load_index(): otherwise a new
         project's index lands on top of the previous project's live image
@@ -1292,6 +1370,14 @@ class ArtifactStore:
         fingerprint-memo entry, no notification. A JPEG it had already
         encoded to disk can linger (the append-only disk cache is
         P0.5b-2ii); no index entry points at it.
+
+        Clip frames (P1.4b part 1) are memory only, so there is no on-disk
+        remnant to worry about: clearing _clip_active_job outright makes
+        every in-flight clip decode's job_key check fail (its address's
+        entry is simply gone), so it stops at its next frame -- or before
+        decoding one at all, if it was still queued -- storing nothing and
+        notifying nobody, the same guarantee the thumbnail generation gate
+        gives.
         """
         with self._lock:
             self._generation += 1
@@ -1299,19 +1385,271 @@ class ArtifactStore:
             self._fingerprints.clear()
             self._verified.clear()
             self._inflight.clear()
+            self._clip_cache.clear()
+            self._clip_slots.clear()
+            self._clip_active_job.clear()
             # An empty index right after reset() IS the truth -- clear
             # any not-authoritative state a previous failed load left, so
             # the flag does not latch across projects.
             self._index_authoritative = True
-            # Drop jobs still sitting in the pool queue. Inside the lock so
-            # no request_thumbnail can slip a current-generation job onto
-            # the queue between the bump and this clear and have it wiped
-            # (that would leak its _inflight entry). The generation bump
-            # already makes queued jobs no-ops; this just saves the
-            # workers pulling each stale closure off the queue first.
+            # Drop jobs still sitting in the pool queue -- thumbnail AND
+            # clip jobs alike, since both share this one pool. Inside the
+            # lock so no request_thumbnail / request_clip_frames can slip
+            # a current-generation job onto the queue between the bump and
+            # this clear and have it wiped (that would leak its inflight
+            # entry). The generation bump already makes a queued thumbnail
+            # job a no-op and clearing _clip_active_job already makes a
+            # queued clip job a no-op; this just saves the workers pulling
+            # each stale closure off the queue first.
             self._pool.clear_pending()
         self._cache.clear()
         self._cache_bytes = 0
+
+    # ------------------------------------------------------------------
+    # Frame-by-frame clip cache (P1.4b part 1)
+    # ------------------------------------------------------------------
+    #
+    # In-memory only: nothing here touches ArtifactCodec, _index,
+    # save_index/load_index or reconcile_and_evict. A clip is a #t= range
+    # address or a bare video path; every frame is decoded through
+    # MediaResolver.decode_video_span(address, "display",
+    # with_ordinals=True), so a cached frame's frame_ordinal equals the
+    # frame_index operators/frame_operator.py's "Split into frames" would
+    # produce for the same frame. The cache holds at most _MAX_CACHED_CLIPS
+    # clips; see the LRU fields' comments in __init__.
+
+    def clip_fits_frame_cache(self, length_us: int) -> bool:
+        """True if a clip `length_us` microseconds long is short enough to
+        decode whole into the in-memory frame cache.
+
+        The ONE place this comparison lives -- request_clip_frames()'s
+        refusal calls this rather than re-deriving the comparison, so a
+        future caller that wants to know eligibility before even asking
+        (to grey out a stepper control, say) agrees with the refusal by
+        construction.
+        """
+        return length_us <= self._frame_stepper_max_seconds * 1_000_000
+
+    def request_clip_frames(self, canonical_address: str) -> None:
+        """Queue the decode of every frame of a clip onto the bounded
+        worker pool. Returns immediately.
+
+        No-op if the clip is already cached or already queued/running --
+        either way, this call still marks it the most recently requested
+        for the two-clip LRU below.
+
+        Raises ValueError if the clip's length exceeds the
+        frame_stepper_max_seconds setting (see clip_fits_frame_cache()).
+        The length is the address's own #t= range (end - start) if it has
+        one, otherwise the whole file's duration from
+        MediaResolver.get_duration_us -- container metadata only, no
+        decode.
+
+        The cache holds at most two clips. Requesting a third evicts the
+        least recently requested: if it had already finished decoding,
+        its frames are dropped from the cache; if it was still queued or
+        decoding, its slot is simply removed from _clip_active_job, which
+        is what _run_clip_job checks before doing any further work -- so
+        that job stores nothing and notifies nobody, whether it was
+        mid-decode or had not started yet.
+        """
+        address = str(canonical_address)
+
+        length_us = self._clip_length_us(address)
+        if not self.clip_fits_frame_cache(length_us):
+            raise ValueError(
+                f"clip {address!r} is {length_us} microseconds long, over "
+                f"the frame_stepper_max_seconds limit of "
+                f"{self._frame_stepper_max_seconds} seconds"
+            )
+
+        with self._lock:
+            generation = self._generation
+            if address in self._clip_slots:
+                # Already cached, or already queued/running under an
+                # earlier counter value for this same address -- just
+                # refresh its recency and start no second decode.
+                self._clip_slots.move_to_end(address)
+                return
+
+            # A new slot is needed. Evict the least-recently-requested
+            # slot(s) first, so there is room for exactly one more.
+            while len(self._clip_slots) >= _MAX_CACHED_CLIPS:
+                evicted_address, _ = self._clip_slots.popitem(last=False)
+                self._clip_cache.pop(evicted_address, None)
+                # Removing this is what tells a still-running or still-
+                # queued job for evicted_address that it has been
+                # superseded -- see _clip_job_current_locked.
+                self._clip_active_job.pop(evicted_address, None)
+
+            self._clip_job_counter += 1
+            job_key = (generation, address, self._clip_job_counter)
+            self._clip_slots[address] = None
+            self._clip_active_job[address] = job_key
+
+        self._pool.submit(lambda: self._run_clip_job(job_key), key=job_key)
+
+    def clip_frames(self, canonical_address: str):
+        """The cached frames for `canonical_address` as a tuple of
+        ClipFrame, or None if not (yet) cached.
+
+        Main-thread read, but still taken under _lock: unlike the
+        thumbnail image _cache (populated only by get_pixmap() on the
+        main thread), _clip_cache is written by a worker thread's commit
+        in _run_clip_job. Marks the clip most recently used for the
+        two-clip LRU.
+        """
+        address = str(canonical_address)
+        with self._lock:
+            frames = self._clip_cache.get(address)
+            if frames is None:
+                return None
+            self._clip_cache.move_to_end(address)
+            self._clip_slots.move_to_end(address)
+            return frames
+
+    def _clip_length_us(self, address: str) -> int:
+        """The length, in microseconds, of the clip `address` names: a
+        #t= range's own (end - start), or a bare video path's whole-
+        stream duration from MediaResolver.get_duration_us (container
+        metadata only -- no decode, no frame-time index).
+
+        Raises MediaResolverError if a bare path's container reports no
+        duration at all: there is then no length to compare against the
+        setting, and refusing beats caching a clip whose eligibility was
+        never actually checked.
+        """
+        addr = parse_media_address(address)
+        if addr.time_range_us is not None:
+            start_us, end_us = addr.time_range_us
+            return end_us - start_us
+
+        duration_us = self._resolver.get_duration_us(addr)
+        if duration_us is None:
+            raise MediaResolverError(
+                f"{address!r}: the container reports no duration, so its "
+                f"length cannot be checked against the frame stepper limit"
+            )
+        return duration_us
+
+    def _decode_clip_span(self, address: str):
+        """The clip decode's only entry into the resolver: every frame of
+        `address`, in presentation order, with real frame ordinals.
+
+        Split out as its own method (mirroring _decode_source above) so a
+        test can subclass ArtifactStore and gate this one call, exactly
+        as tests/test_request_queue.py already gates _decode_source, to
+        exercise cancellation timing without needing a slow real file.
+        """
+        return self._resolver.decode_video_span(
+            address, "display", with_ordinals=True
+        )
+
+    def _clip_job_current(self, address: str, job_key: tuple[int, str, int]) -> bool:
+        """True if `job_key` is still the active decode for `address` --
+        acquires _lock itself, for the per-frame check inside the decode
+        loop, which must not hold the lock across a resolver call."""
+        with self._lock:
+            return self._clip_job_current_locked(address, job_key)
+
+    def _clip_job_current_locked(
+        self, address: str, job_key: tuple[int, str, int]
+    ) -> bool:
+        """CALLER MUST HOLD _lock. See _clip_job_current."""
+        return self._clip_active_job.get(address) == job_key
+
+    def _run_clip_job(self, job_key: tuple[int, str, int]) -> None:
+        """
+        Runs on a worker thread. Decodes every frame of one clip through
+        _decode_clip_span, resizing each frame on this worker (PIL,
+        LANCZOS, aspect kept) to at most this store's preview resolution,
+        and commits the result to the in-memory clip cache. Nothing here
+        touches disk.
+
+        job_key is (generation, address, a monotonic per-request
+        counter). The counter, not just (generation, address), identifies
+        THIS request: a clip evicted and immediately re-requested gets a
+        fresh job_key for the same address (see request_clip_frames), so
+        the stale job's checks below correctly see itself superseded
+        rather than matching the new job by coincidence.
+
+        Checked before decoding a single frame, and again between every
+        yielded frame: if _clip_active_job[address] no longer equals this
+        job_key -- because reset() cleared the whole map, or an LRU
+        eviction removed just this address's entry -- the job is
+        cancelled. It stores nothing and notifies nobody, whichever point
+        it was cancelled at.
+
+        The decode_video_span iterator is closed explicitly (try/finally)
+        on every exit -- early cancellation, a caught decode error, or
+        reaching the end normally -- so the resolver's pool handle is
+        released at once rather than waiting for the abandoned generator
+        to be garbage collected.
+
+        Ending without a commit, for ANY reason -- a caught decode error,
+        an exception outside that tuple, or supersession -- runs the
+        outer finally below, which frees both _clip_active_job[address]
+        and _clip_slots[address] (under _lock) PROVIDED this job is still
+        the one on record for address. That proviso is what tells
+        "supersession" apart from "still current but failed" without a
+        separate flag: a superseded job's own job_key is no longer the
+        one request_clip_frames (eviction) or reset() left there, so the
+        check is false and this job leaves that already-updated state
+        alone; a job that is still current but ends without committing
+        frees its own slot so a later request_clip_frames() for the same
+        address retries instead of finding it permanently "already
+        there". An exception not in the except tuple below still
+        propagates after this cleanup runs -- it is not swallowed here,
+        only cleaned up after; WorkerPool._worker_loop's own except
+        Exception is the backstop that keeps it from taking the worker
+        thread down.
+        """
+        _generation, address, _counter = job_key
+        if not self._clip_job_current(address, job_key):
+            return
+
+        committed = False
+        try:
+            frames: list[ClipFrame] = []
+            iterator = self._decode_clip_span(address)
+            try:
+                for payload in iterator:
+                    if not self._clip_job_current(address, job_key):
+                        return
+                    image = Image.fromarray(payload.pixels)
+                    side = self.resolution_for("preview")
+                    image.thumbnail((side, side), Image.LANCZOS)
+                    frames.append(ClipFrame(
+                        pixels=np.array(image, dtype=np.uint8),
+                        frame_ordinal=payload.frame_ordinal,
+                        presentation_time_us=payload.presentation_time_us,
+                    ))
+            finally:
+                iterator.close()
+
+            with self._lock:
+                if not self._clip_job_current_locked(address, job_key):
+                    return
+                self._clip_cache[address] = tuple(frames)
+                self._clip_cache.move_to_end(address)
+                self._clip_active_job.pop(address, None)
+                committed = True
+        except (MediaResolverError, MediaAddressError, ValueError) as error:
+            print(f"[ArtifactStore] Failed to decode clip frames "
+                  f"for {address}: {error}")
+        finally:
+            if not committed:
+                with self._lock:
+                    if self._clip_job_current_locked(address, job_key):
+                        self._clip_active_job.pop(address, None)
+                        self._clip_slots.pop(address, None)
+
+        if committed:
+            self._notify_clip_ready(address)
+
+    def _notify_clip_ready(self, canonical_address: str) -> None:
+        if self.on_clip_frames_ready is not None:
+            self.on_clip_frames_ready(canonical_address)
 
     # ------------------------------------------------------------------
     # Internal helpers

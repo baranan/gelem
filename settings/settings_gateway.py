@@ -35,6 +35,7 @@ from settings.settings import (
     PREVIEW_MAX_SIDE_RANGE,
     OUTPUT_COPY_WARNING_THRESHOLD_BYTES_RANGE,
     MAX_OPEN_DECODERS_RANGE,
+    FRAME_STEPPER_MAX_SECONDS_RANGE,
 )
 from settings.settings_store import SettingsStore
 
@@ -43,9 +44,10 @@ from settings.settings_store import SettingsStore
 class SettingField:
     """One editable setting, described as plain data for a UI to render.
 
-    `unit` is one of the plain strings "bytes", "count", "pixels". It
-    says what the number IS, not how to display it: choosing to show a
-    byte value in MiB is the dialog's job, not this file's.
+    `unit` is one of the plain strings "bytes", "count", "pixels",
+    "seconds". It says what the number IS, not how to display it:
+    choosing to show a byte value in MiB is the dialog's job, not this
+    file's.
     """
 
     name: str
@@ -60,8 +62,9 @@ class SettingField:
 
 # The six ArtifactStore/MediaResolver values docs/architecture.md section 9's
 # table lists, in that order, plus output_copy_warning_threshold_bytes
-# (P1.9b-2) after them -- it is not one of "the six values" section 9
-# documents, but it is edited the same way. minimum and maximum are ALWAYS
+# (P1.9b-2) and frame_stepper_max_seconds (P1.4b part 1) after them -- neither
+# is one of "the six values" section 9 documents, but both are edited the
+# same way. minimum and maximum are ALWAYS
 # read from the *_RANGE tuples in settings/settings.py -- never retyped as
 # literals here -- so a bound change in one place cannot silently disagree
 # with another.
@@ -139,6 +142,17 @@ _FIELD_SPECS = (
         OUTPUT_COPY_WARNING_THRESHOLD_BYTES_RANGE,
         "bytes",
         False,
+    ),
+    (
+        "frame_stepper_max_seconds",
+        "Frame stepper clip length limit",
+        "Longest clip, in seconds, that the frame-by-frame stepper will "
+        "decode whole and hold in memory for scrubbing frame by frame. A "
+        "longer clip is refused rather than cached. Takes effect on "
+        "restart.",
+        FRAME_STEPPER_MAX_SECONDS_RANGE,
+        "seconds",
+        True,
     ),
 )
 
