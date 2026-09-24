@@ -43,6 +43,11 @@ class PlaybackAdapter(QWidget):
     from media/playback.py, never computed here.
     """
 
+    # Session-lifetime, not per-instance: a mute choice made on one row's
+    # player carries over to the next player opened, on any row, until the
+    # app closes. Not persisted to Settings.
+    _muted = False
+
     def __init__(self, span: PlaybackSpan, parent=None):
         super().__init__(parent)
         self._span = span
@@ -75,16 +80,22 @@ class PlaybackAdapter(QWidget):
         controls = QHBoxLayout()
         play_btn = QPushButton("▶ Play")
         pause_btn = QPushButton("⏸ Pause")
+        mute_btn = QPushButton()
         controls.addWidget(play_btn)
         controls.addWidget(pause_btn)
+        controls.addWidget(mute_btn)
         controls.addStretch()
         layout.addLayout(controls)
+        self._mute_btn = mute_btn
 
         # QAudioOutput is required in Qt6 to route audio.
         self._player = QMediaPlayer(self)
-        audio = QAudioOutput(self)
-        self._player.setAudioOutput(audio)
+        self._audio = QAudioOutput(self)
+        self._audio.setMuted(PlaybackAdapter._muted)
+        self._player.setAudioOutput(self._audio)
         self._player.setVideoOutput(self._video_widget)
+        self._update_mute_button()
+        mute_btn.clicked.connect(self._on_mute_clicked)
 
         # setPosition() before the media has finished loading is a no-op,
         # so the initial seek to the span's start waits for this signal.
@@ -203,6 +214,20 @@ class PlaybackAdapter(QWidget):
         if restart_ms is not None:
             self._player.setPosition(restart_ms)
         self._player.play()
+
+    def _on_mute_clicked(self) -> None:
+        new_state = not self._audio.isMuted()
+        self._audio.setMuted(new_state)
+        PlaybackAdapter._muted = new_state
+        self._update_mute_button()
+
+    def _update_mute_button(self) -> None:
+        if self._audio.isMuted():
+            self._mute_btn.setText("🔇 Muted")
+            self._mute_btn.setToolTip("Sound is muted. Click to unmute.")
+        else:
+            self._mute_btn.setText("🔊 Sound on")
+            self._mute_btn.setToolTip("Sound is on. Click to mute.")
 
     def pause(self) -> None:
         """Pauses playback. Used by the frame stepper (P1.4b part 2) to
