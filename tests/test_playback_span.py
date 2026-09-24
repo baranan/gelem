@@ -38,7 +38,12 @@ from media.playback import (
     initial_position_ms,
     play_from_ms,
     playback_span,
+    position_for_slider_value,
     should_pause,
+    slider_page_step_ms,
+    slider_single_step_ms,
+    slider_value_for_position,
+    span_length_ms,
 )
 
 
@@ -176,6 +181,140 @@ def test_at_end_of_media_false_keeps_todays_results():
 
     bare_span = PlaybackSpan(source_path="x.mp4", start_ms=0, end_ms=None)
     assert play_from_ms(10**9, bare_span, at_end_of_media=False) is None
+
+
+# ---------------------------------------------------------------------------
+# span_length_ms() -- the slider's track length, in milliseconds.
+# ---------------------------------------------------------------------------
+
+def test_range_length_is_end_minus_start():
+    span = PlaybackSpan(source_path="x.mp4", start_ms=1000, end_ms=2500)
+    assert span_length_ms(span, media_duration_ms=None) == 1500
+    assert span_length_ms(span, media_duration_ms=10_000) == 1500
+
+
+def test_bare_path_length_is_duration_minus_start_when_duration_known():
+    span = PlaybackSpan(source_path="x.mp4", start_ms=0, end_ms=None)
+    assert span_length_ms(span, media_duration_ms=5000) == 5000
+
+    started_late = PlaybackSpan(source_path="x.mp4", start_ms=1000, end_ms=None)
+    assert span_length_ms(started_late, media_duration_ms=5000) == 4000
+
+
+def test_bare_path_length_is_none_when_duration_unknown():
+    span = PlaybackSpan(source_path="x.mp4", start_ms=0, end_ms=None)
+    assert span_length_ms(span, media_duration_ms=None) is None
+
+
+def test_range_overrunning_the_file_is_clamped_to_the_real_duration():
+    # The address names a range past the end of the file (media/playback.py
+    # never checks this itself -- see the module docstring); once the
+    # player reports the file's real duration, the slider's track must not
+    # extend past it.
+    span = PlaybackSpan(source_path="x.mp4", start_ms=1000, end_ms=99_999_000)
+    assert span_length_ms(span, media_duration_ms=5000) == 4000
+
+
+def test_range_not_yet_known_to_overrun_uses_its_nominal_length():
+    span = PlaybackSpan(source_path="x.mp4", start_ms=1000, end_ms=99_999_000)
+    assert span_length_ms(span, media_duration_ms=None) == 99_998_000
+
+
+def test_span_length_is_never_negative():
+    span = PlaybackSpan(source_path="x.mp4", start_ms=1000, end_ms=2500)
+    assert span_length_ms(span, media_duration_ms=500) == 0
+
+
+# ---------------------------------------------------------------------------
+# slider_value_for_position() -- player position -> slider value, relative
+# to the span's start and clamped to [0, length].
+# ---------------------------------------------------------------------------
+
+def test_slider_value_is_position_relative_to_span_start():
+    span = PlaybackSpan(source_path="x.mp4", start_ms=1000, end_ms=2500)
+    assert slider_value_for_position(1000, span, media_duration_ms=None) == 0
+    assert slider_value_for_position(1600, span, media_duration_ms=None) == 600
+    assert slider_value_for_position(2500, span, media_duration_ms=None) == 1500
+
+
+def test_slider_value_is_zero_when_length_is_unknown():
+    span = PlaybackSpan(source_path="x.mp4", start_ms=0, end_ms=None)
+    assert slider_value_for_position(5000, span, media_duration_ms=None) == 0
+
+
+def test_slider_value_clamps_below_zero():
+    span = PlaybackSpan(source_path="x.mp4", start_ms=1000, end_ms=2500)
+    assert slider_value_for_position(0, span, media_duration_ms=None) == 0
+
+
+def test_slider_value_clamps_above_the_length():
+    span = PlaybackSpan(source_path="x.mp4", start_ms=1000, end_ms=2500)
+    assert slider_value_for_position(999_999, span, media_duration_ms=None) == 1500
+
+
+# ---------------------------------------------------------------------------
+# position_for_slider_value() -- slider value -> player position, clamped
+# to [span.start_ms, span.start_ms + length].
+# ---------------------------------------------------------------------------
+
+def test_position_for_slider_value_offsets_from_span_start():
+    span = PlaybackSpan(source_path="x.mp4", start_ms=1000, end_ms=2500)
+    assert position_for_slider_value(0, span, media_duration_ms=None) == 1000
+    assert position_for_slider_value(600, span, media_duration_ms=None) == 1600
+    assert position_for_slider_value(1500, span, media_duration_ms=None) == 2500
+
+
+def test_position_for_slider_value_clamps_below_zero():
+    span = PlaybackSpan(source_path="x.mp4", start_ms=1000, end_ms=2500)
+    assert position_for_slider_value(-100, span, media_duration_ms=None) == 1000
+
+
+def test_position_for_slider_value_clamps_above_the_length():
+    span = PlaybackSpan(source_path="x.mp4", start_ms=1000, end_ms=2500)
+    assert position_for_slider_value(999_999, span, media_duration_ms=None) == 2500
+
+
+def test_position_for_slider_value_with_unknown_length_clamps_to_span_start():
+    span = PlaybackSpan(source_path="x.mp4", start_ms=1000, end_ms=None)
+    assert position_for_slider_value(500, span, media_duration_ms=None) == 1000
+
+
+def test_slider_value_and_position_round_trip():
+    span = PlaybackSpan(source_path="x.mp4", start_ms=1000, end_ms=2500)
+    for value in (0, 750, 1500):
+        position_ms = position_for_slider_value(value, span, media_duration_ms=None)
+        assert slider_value_for_position(position_ms, span, media_duration_ms=None) == value
+
+
+# ---------------------------------------------------------------------------
+# slider_page_step_ms() / slider_single_step_ms() -- how far a page step
+# (a click on the bar, Page Up/Down) or a single step (an arrow key) moves
+# the slider, as a fraction of the track's length, never zero.
+# ---------------------------------------------------------------------------
+
+def test_page_step_is_a_tenth_of_the_length():
+    assert slider_page_step_ms(1000) == 100
+    assert slider_page_step_ms(250) == 25
+
+
+def test_page_step_is_never_zero_for_a_short_track():
+    assert slider_page_step_ms(5) == 1
+    assert slider_page_step_ms(1) == 1
+
+
+def test_single_step_is_a_hundredth_of_the_length():
+    assert slider_single_step_ms(1000) == 10
+    assert slider_single_step_ms(2500) == 25
+
+
+def test_single_step_is_never_zero_for_a_short_track():
+    assert slider_single_step_ms(50) == 1
+    assert slider_single_step_ms(1) == 1
+
+
+def test_single_step_is_never_larger_than_the_page_step():
+    for length_ms in (1, 5, 50, 100, 1000, 99_999):
+        assert slider_single_step_ms(length_ms) <= slider_page_step_ms(length_ms)
 
 
 # ---------------------------------------------------------------------------

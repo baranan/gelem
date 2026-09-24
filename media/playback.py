@@ -119,3 +119,81 @@ def play_from_ms(
     if span.end_ms is not None and position_ms >= span.end_ms:
         return span.start_ms
     return None
+
+
+def span_length_ms(span: PlaybackSpan, media_duration_ms: int | None) -> int | None:
+    """How long the slider's track is, in milliseconds.
+
+    A range's nominal length is end_ms - start_ms, but a range can overrun
+    the file (docs/media_architecture.md section 3.6, decision 11 -- the
+    resolver never shortens one), so once the file's real duration is
+    known and is shorter than the nominal end, the length is clamped to
+    what the file actually has: media_duration_ms - start_ms.
+
+    A bare path (end_ms is None) plays to the end of the file, so its
+    length IS media_duration_ms - start_ms -- None until the duration is
+    known, because there is nothing else to measure it against.
+
+    Never negative: a span's start_ms is never past a known duration
+    because initial_position_ms() seeks to start_ms before there is
+    anything to overrun.
+    """
+    if span.end_ms is not None:
+        end_ms = span.end_ms
+        if media_duration_ms is not None and media_duration_ms < end_ms:
+            end_ms = media_duration_ms
+        return max(0, end_ms - span.start_ms)
+
+    if media_duration_ms is None:
+        return None
+    return max(0, media_duration_ms - span.start_ms)
+
+
+def slider_value_for_position(
+    position_ms: int, span: PlaybackSpan, media_duration_ms: int | None
+) -> int:
+    """The slider value for a player position, relative to the span's
+    start and clamped to [0, span length].
+
+    0 whenever the length itself is unknown -- the slider stays disabled
+    in that state (column_types/playback_adapter.py), so its value does
+    not matter, but it must still be a valid in-range int.
+    """
+    length_ms = span_length_ms(span, media_duration_ms)
+    if length_ms is None:
+        return 0
+    value = position_ms - span.start_ms
+    return max(0, min(value, length_ms))
+
+
+def position_for_slider_value(
+    value: int, span: PlaybackSpan, media_duration_ms: int | None
+) -> int:
+    """The player position a slider value names, clamped to the span
+    itself -- [span.start_ms, span.start_ms + span length].
+
+    A length of None (not yet known) clamps the position to span.start_ms:
+    with no track length, no drag is possible; this is the position the
+    player already sits at right after the initial seek.
+    """
+    length_ms = span_length_ms(span, media_duration_ms)
+    if length_ms is None:
+        return span.start_ms
+    clamped_value = max(0, min(value, length_ms))
+    return span.start_ms + clamped_value
+
+
+def slider_page_step_ms(length_ms: int) -> int:
+    """How far a page step (a click on the slider's bar, or Page Up/Down)
+    should move the slider: a tenth of the track's length, never zero --
+    a zero step would leave a click on the bar with no effect at all.
+    """
+    return max(1, length_ms // 10)
+
+
+def slider_single_step_ms(length_ms: int) -> int:
+    """How far a single step (an arrow key) should move the slider: a
+    hundredth of the track's length, never zero, for the same reason
+    slider_page_step_ms() is never zero.
+    """
+    return max(1, length_ms // 100)

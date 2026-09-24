@@ -414,7 +414,9 @@ state. This rule carries no violation list of its own -- it points at the three
   with the resolver but not the decoding path. The range-to-player conversion
   lives only in `media/playback.py`; `QMediaPlayer` is built only in
   `column_types/playback_adapter.py`. Made true by P1.10. Tests:
-  `tests/test_playback_span.py`.
+  `tests/test_playback_span.py`. The detail-view player's position slider
+  (P1.4a) computes its range, value and seek target the same way --
+  `span_length_ms`, `slider_value_for_position`, `position_for_slider_value`.
 - **`[NOW]`** No media is opened or decoded during a paint. In thumbnail mode
   `make_media_path_renderer`'s `render()` is cache-or-placeholder for **both**
   image and video tiles: a hit returns the cached picture touching no

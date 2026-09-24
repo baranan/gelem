@@ -152,7 +152,6 @@ to P1.8d, and the two OS-native / non-parsing media-cell entries to P1.8e.
   `addr.stream` are silently dropped, so a #r=... crop or a #v=/#a=
   stream selector on a playable address has no effect on what
   `PlaybackAdapter` shows or plays. Added P1.10; no item assigned.
-
 - **Double-clicking a tile opens the detail view on the wrong column.** After
   an operator adds a media column (for example the per-row plot images), the
   gallery can show that column in its tiles, but double-clicking a tile opens
@@ -664,3 +663,31 @@ to P1.8d, and the two OS-native / non-parsing media-cell entries to P1.8e.
   resizes to its widest current entry on every repopulation, capped at
   `setMaximumWidth(260)` so one very long name cannot crowd out the rest of
   the toolbar row.)*
+- **The detail player's slider did not change the picture before Play had
+  been pressed once, and, once the player was made to open already
+  playing, dragging the slider instead visibly restarted the video from
+  the beginning.** Found by eye by Y B, Sep 2026, across several rounds of
+  the P1.4a work item; several fixes were tried and reverted before the
+  cause was found (`pause()` alone at `LoadedMedia`; `play()` immediately
+  followed by `pause()`; a priming sequence playing muted until
+  `MediaStatus.BufferedMedia`, which broke the Play button and was
+  reverted). *(P1.4a: a scratchpad probe against a real file
+  (`vids/vid11.mp4`), logging every `mediaStatusChanged` with a timestamp,
+  found the actual cause -- this machine's ffmpeg Qt Multimedia backend
+  (PySide6 6.11, Windows) re-emits `MediaStatus.LoadedMedia` after every
+  `QMediaPlayer.setPosition()` call, regardless of play or pause state.
+  `_on_media_status_changed`'s "seek to the span's start" block used to
+  re-run on every such re-emission, so every seek -- a drag, a click, Play
+  -- was silently undone by a reseek back to the span's start moments
+  later. This explains both symptoms consistently: before autoplay, a
+  paused drag's final player position (and so its picture) reverted to
+  the start frame while the slider's own displayed value stayed wherever
+  the user had dragged it, because `isSliderDown()` suppresses the
+  correcting update to the slider during an active drag; once the player
+  opened autoplaying, the same reset was visible as the video restarting.
+  Fixed by running the initial seek-and-play exactly once per widget
+  (`self._initial_play_started` in `column_types/playback_adapter.py`),
+  guarding it so a later `LoadedMedia` only refreshes the duration and
+  slider range. `media/playback.py` was never implicated. No dedicated
+  regression test -- the fix is exercised by eye, the same way the defect
+  was found.)*
