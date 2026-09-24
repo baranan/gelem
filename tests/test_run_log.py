@@ -132,7 +132,7 @@ def test_log_forwards_every_call_not_just_the_last():
 
 def test_log_is_available_on_a_table_mode_run():
     # Unlike emit() (COLUMNS-only), log() is wired for every mode -- a
-    # TABLE operator such as video_frames reports per-clip progress the
+    # TABLE operator such as segment reports per-clip progress the
     # same way a COLUMNS operator would.
     table_mode = ModeDescriptor(
         mode=ExecutionMode.TABLE,

@@ -301,18 +301,17 @@ state. This rule carries no violation list of its own -- it points at the three
 ### UI
 
 - **`[NOW]`** UI files never import pandas, PIL, numpy, mediapipe, or cv2.
-- **`[MIGRATING]`** UI never reads a DataFrame. Known violation, one site:
-  `ui/main_window.py:415` (`columns=list(df.columns)`), which belongs to P1.13.
-  It is the only `.columns`/`.iloc`/`.loc`/`DataFrame` site under `ui/`.
-  *(Re-verified 27 Aug 2026, P0.4.)*
-- **`[MIGRATING]`** UI never touches private controller attributes. Known
-  violations, one occurrence each: `ui/main_window.py:290-292` (`_op_registry`)
-  and `ui/main_window.py:410-411` (`_dataset`, `_active_table`). Public
-  equivalents already exist -- `get_all_row_ids()`, `get_column_type()`,
-  `get_operator()` -- so these are unfinished migrations, not missing API. Both
-  sites are on the closed allowlist in `tests/test_ui_private_access.py`, which
-  fails on any other foreign private read under `ui/`.
-  *(Re-verified 27 Aug 2026, P0.4.)*
+- **`[MIGRATING]`** UI never reads a DataFrame. No known violation site --
+  no `.columns`/`.iloc`/`.loc`/`DataFrame` usage under `ui/` -- but no test
+  guards this specifically, so it stays `[MIGRATING]` rather than `[NOW]`
+  until one does. *(Re-verified 24 Sep 2026, P1.13.)*
+- **`[NOW]`** UI never touches private controller attributes: no file under
+  `ui/` reads a private attribute of another object. P1.13 migrated the last
+  sites (`ui/main_window.py`'s Operators-menu builder reaching into
+  `_op_registry`) onto `AppController.list_operators_for_mode()`. Guarded by
+  `tests/test_ui_private_access.py`, whose allowlist is empty and closed --
+  it fails on any foreign private read under `ui/`.
+  *(Re-verified 24 Sep 2026, P1.13.)*
 - **`[MIGRATING]`** No widget reads another component's private state. The
   last listed site -- `ui/main_window.py` reading `operator._group_by` back
   off the operator instance -- was removed by P1.12d-2a: every per-run value
@@ -364,9 +363,11 @@ state. This rule carries no violation list of its own -- it points at the three
 - **`[NOW]`** **Only the media resolver decodes *source* media.** No
   `cv2.VideoCapture`, `av.open`, or `Image.open` **of a user's media file**
   anywhere else. Made true by P1.2c-1 and P1.2c-2: `BaseOperator.load_image`
-  is deleted, `ArtifactStore._decode_source` and `operators/video_frames.py`
-  (the last operator that opened a video file itself) both decode through
-  `run.resolver` / the shared `MediaResolver`. (`column_types/renderers.py`
+  is deleted, and `ArtifactStore._decode_source` decodes through
+  `run.resolver` / the shared `MediaResolver` instead of opening a file
+  itself -- the same routing P1.2c-2 gave the era's frame-extraction
+  operator, which P1.14 later deleted outright rather than keep as a
+  routed example. (`column_types/renderers.py`
   came off this list in P0.5b-3i: thumbnail mode is cache-or-placeholder and
   decodes nothing, and detail mode loads through Qt's `QImageReader(path)`,
   not PIL or cv2.) Guarded by an AST walk over every non-test module in the
@@ -392,9 +393,8 @@ state. This rule carries no violation list of its own -- it points at the three
   P1.2c-2. `column_types/renderers.py` stopped decoding source media in
   P0.5b-3i (its `_render_image` `Image.open` fallback and
   `_video_first_frame_pixmap` `cv2` path are gone). `ArtifactStore._decode_source`
-  decodes through `MediaResolver`, and `operators/video_frames.py` decodes
-  through `run.resolver` rather than opening a video file itself. Guarded by
-  `tests/test_source_decode_guard.py`.
+  decodes through `MediaResolver` rather than opening a video file itself.
+  Guarded by `tests/test_source_decode_guard.py`.
 - **`[NOW]`** The artifact cache directory is bound to the project folder on save
   and load, and swept to stay in bounds. `docs/media_architecture.md` §4.7 is the
   authority for where derived JPEGs live, why their one-way filenames force

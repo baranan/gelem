@@ -571,7 +571,7 @@ def test_load_project_moves_off_a_table_name_the_new_project_does_not_have(
     controller, dataset, _ = make_controller(tmp_path)
 
     # Simulates an operator-created table becoming the active one, exactly
-    # as running video_frames/frame would leave "frame_rows" or similar
+    # as running the frame operator would leave "frame_rows" or similar
     # active -- make_controller's own load_folder() table is "frames".
     dataset.create_table_from_df(
         "frame_rows", pd.DataFrame({"clip": ["media/a.mp4", "media/b.mp4"]})

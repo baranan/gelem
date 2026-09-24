@@ -579,12 +579,12 @@ class AppController(QObject):
         # It is handed to every OperatorRun as run.paths, and replaced
         # wholesale -- never mutated -- by save_project() and
         # load_project(), at the same point each already re-roots
-        # ArtifactStore. Left None, a run still starts, but any of the five
-        # operators that write files (video_frames, plot_advanced, plot,
-        # mean_face, blendshape_avatar) fails loudly reading run.paths.
-        # outputs_dir off None rather than silently writing somewhere
-        # unexpected -- main.py always passes a real one, so production is
-        # never in that state.
+        # ArtifactStore. Left None, a run still starts, but any of the four
+        # operators that write files (plot_advanced, plot, mean_face,
+        # blendshape_avatar) fails loudly reading run.paths.outputs_dir
+        # off None rather than silently writing somewhere unexpected --
+        # main.py always passes a real one, so production is never in
+        # that state.
         self._project_paths    = project_paths
 
         # The plain-data editing face of the machine-tunable settings
@@ -4067,6 +4067,23 @@ class AppController(QObject):
         if resolved is operator.descriptor:
             return operator
         return _ResolvedTableNameOperatorView(operator, resolved)
+
+    def list_operators_for_mode(self, mode: ExecutionMode) -> list[tuple[str, str]]:
+        """
+        Returns the operators whose descriptor declares *mode*, in
+        registration order.
+
+        Gives the UI access to the operator listing without reaching into
+        _op_registry directly. A thin pass-through onto
+        OperatorRegistry.list_operators_for_mode() -- no logic of its own.
+
+        Args:
+            mode: The ExecutionMode to list -- COLUMNS, TABLE or DISPLAY.
+
+        Returns:
+            List of (operator_name, label) tuples.
+        """
+        return self._op_registry.list_operators_for_mode(mode)
 
     def _resolve_new_table_name_defaults(self, operator_name, descriptor):
         """Returns `descriptor` unchanged if none of its modes declare a

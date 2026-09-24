@@ -537,7 +537,7 @@ class MainWindow(QMainWindow):
         """
         Rebuilds the Operators menu just before it is shown.
         Builds three sections from the operators' descriptors, via
-        OperatorRegistry.list_operators_for_mode() — no hardcoded
+        AppController.list_operators_for_mode() — no hardcoded
         operator names here. Each list is in registration order, which
         is operators_config.yaml's order.
 
@@ -547,13 +547,13 @@ class MainWindow(QMainWindow):
         """
         self._operators_menu.clear()
 
-        columns_ops = self._controller._op_registry.list_operators_for_mode(
+        columns_ops = self._controller.list_operators_for_mode(
             ExecutionMode.COLUMNS
         )
-        table_ops = self._controller._op_registry.list_operators_for_mode(
+        table_ops = self._controller.list_operators_for_mode(
             ExecutionMode.TABLE
         )
-        display_ops = self._controller._op_registry.list_operators_for_mode(
+        display_ops = self._controller.list_operators_for_mode(
             ExecutionMode.DISPLAY
         )
 

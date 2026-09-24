@@ -5,7 +5,7 @@ Guardrail behind P1.9a: an operator writes files only under
 run.paths.outputs_dir (operators/CLAUDE.md, "Write only to run.paths"),
 never into a directory it chose itself.
 
-Before this item, five operators (video_frames, plot_advanced, plot,
+Before this item, four operators (plot_advanced, plot,
 mean_face, blendshape_avatar) each captured a construction-time
 self._output_dir -- a repo-relative gelem_project/ folder, or a system
 Temp folder built from tempfile.gettempdir() -- and wrote there regardless

@@ -55,7 +55,6 @@ from operators.plot_advanced import PlotAdvancedOperator
 from operators.segment import SegmentOperator
 from operators.stats_operator import StatsOperator
 from operators.summary_stats import SummaryStatsOperator
-from operators.video_frames import VideoFramesOperator
 
 
 # The operators this module pins, keyed by their `name` attribute. Each
@@ -73,7 +72,6 @@ OPERATORS_UNDER_TEST = {
     "segment": SegmentOperator,
     "stats": StatsOperator,
     "summary_stats": SummaryStatsOperator,
-    "video_frames": VideoFramesOperator,
 }
 
 
@@ -117,10 +115,6 @@ EXPECTED = {
     },
     "summary_stats": {
         "modes": {ExecutionMode.DISPLAY},
-        "columns": None,
-    },
-    "video_frames": {
-        "modes": {ExecutionMode.TABLE},
         "columns": None,
     },
 }
@@ -209,10 +203,6 @@ def test_stats_descriptor_matches_expected():
 
 def test_summary_stats_descriptor_matches_expected():
     _assert_descriptor_matches_expected("summary_stats")
-
-
-def test_video_frames_descriptor_matches_expected():
-    _assert_descriptor_matches_expected("video_frames")
 
 
 # ---------------------------------------------------------------------------

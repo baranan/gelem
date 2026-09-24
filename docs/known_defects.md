@@ -414,8 +414,8 @@ to P1.8d, and the two OS-native / non-parsing media-cell entries to P1.8e.
   under another column name gets no decoded frame at all, silently, however
   the pre-resolution step improves. Which column a FRAME operator reads is a
   contract question -- letting an operator or its descriptor name the column,
-  the same way `video_frames.py`'s `video_column` parameter does for a TABLE
-  operator -- not a patch to this file. No item assigned.
+  the same way `frame_operator.py`'s `media_column` parameter does for a
+  TABLE operator -- not a patch to this file. No item assigned.
 - **The per-file frame-time index (`media/resolver.py`'s `_build_frame_index`)
   identifies a frame by its presentation time rounded to the nearest
   microsecond, not by its exact timestamp.** It refuses two presented frames

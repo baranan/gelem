@@ -85,9 +85,9 @@ def looks_like_video_extension(cell: str) -> str | None:
     VIDEO_EXTENSIONS only, not the full MEDIA_EXTENSIONS set.
 
     For a caller that must reject a still-image cell as "not a video" at
-    this same cheap, pre-parse gate -- operators/video_frames.py's own
-    cell-level gate, specifically -- rather than accepting it as media in
-    general and discovering only much later, deep inside the resolver
+    this same cheap, pre-parse gate, specifically, rather than accepting
+    it as media in general and discovering only much later, deep inside
+    the resolver
     (which refuses to decode_video_span() an image path), that it was
     never a video. Using looks_like_media_extension there would let an
     image cell through the gate and have it counted among the resolver's

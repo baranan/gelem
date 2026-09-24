@@ -4,9 +4,9 @@ tests/test_operators_are_qt_free.py
 The guardrail behind P1.12e-2's whole point: no operator module contains
 Qt.
 
-Before this item, ``operators/plot_advanced.py`` and
-``operators/video_frames.py`` each built a ``QDialog`` by hand in
-``get_parameters_dialog()``, and ``operators/base.py`` carried a
+Before this item, ``operators/plot_advanced.py`` built a
+``QDialog`` by hand in ``get_parameters_dialog()``, and
+``operators/base.py`` carried a
 ``QDialog`` example in a docstring. That put UI code in the analysis layer
 and made those operators impossible to run from a plain script, a test, or
 a future headless terminal. P1.12e-2 deleted ``get_parameters_dialog``

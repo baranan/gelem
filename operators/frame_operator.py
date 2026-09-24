@@ -135,8 +135,7 @@ class FrameOperator(BaseOperator):
                 ),
                 # The operator resolves each row's address itself, through
                 # run.resolver -- this is the ADDRESS case
-                # operators/descriptor.py's own docstring names
-                # operators/video_frames.py as the example of.
+                # operators/descriptor.py's own docstring describes.
                 media_requirement=MediaRequirement.ADDRESS,
                 parameters=(
                     ColumnParameter(
@@ -336,9 +335,8 @@ class FrameOperator(BaseOperator):
                 # a missing, permission-denied or otherwise unreadable
                 # file can reach av.open() inside the resolver's decoder
                 # pool and raise a raw OSError-family exception instead of
-                # a MediaResolverError -- operators/video_frames.py
-                # already catches OSError for this exact call, for this
-                # exact reason. Reported under the same "UnreadableMedia"
+                # a MediaResolverError -- this call is guarded against
+                # exactly that. Reported under the same "UnreadableMedia"
                 # kind as a MediaResolverError, not a separate one: from
                 # the researcher's side both mean the same thing -- this
                 # row's media could not be read -- and CLAUDE.md's media

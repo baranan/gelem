@@ -5,9 +5,10 @@ P1.2c-2's guardrail for CLAUDE.md's Media rule: "Only the media resolver
 decodes *source* media." Before this item, three places decoded a
 user's media file directly -- BaseOperator.load_image (deleted, P1.2c-1),
 ArtifactStore._decode_source (routed through MediaResolver, P1.2c-1), and
-operators/video_frames.py's cv2.VideoCapture loop (routed through
-MediaResolver, P1.2c-2). This test makes the rule enforceable instead of
-a hand-maintained list that goes stale silently.
+the frame-extraction operator's cv2.VideoCapture loop (routed through
+MediaResolver, P1.2c-2, then deleted outright, P1.14). This test makes
+the rule enforceable instead of a hand-maintained list that goes stale
+silently.
 
 Walks every non-test .py file in the repository with ``ast`` -- not a
 text search, which a comment or docstring naming cv2 or PIL would trip --

@@ -386,7 +386,7 @@ def test_decision8_select_frame_never_recomputes_a_frame_ordinal_from_timing():
 # a bare path is the range covering the whole file; decision 8: a frame
 # ordinal and a time point are both single-frame selections, a time
 # range is not). Written so a caller (controller.py's detail-mode still
-# vs. player branch, operators/video_frames.py's point-vs-span split)
+# vs. player branch, operators/frame_operator.py's point-vs-span split)
 # never re-derives this boolean itself.
 # ---------------------------------------------------------------------------
 

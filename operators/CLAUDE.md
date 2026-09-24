@@ -347,9 +347,9 @@ The message is shown to the researcher exactly as written, with only the
 status bar's one-line display truncated (`controller.py`'s
 `_truncated_message`, 100 characters) -- never the stored text.
 
-`operators/video_frames.py` and `operators/blendshapes.py` are the worked
-examples: one call per video naming its position ("video 3 of 40: ...") and
-one call per row with no detected face, respectively.
+`operators/segment.py` and `operators/blendshapes.py` are the worked
+examples: one call summarising how many rows were dropped, and one call per
+row with no detected face, respectively.
 
 ### `create_columns(row_id, media, metadata, run) -> dict`
 
@@ -428,10 +428,9 @@ the old `plot_html` fallback).
   folder and never to a path you chose yourself, and never to a path cached on
   `self`. Made true by P1.9a, which removed the `output_dir` constructor
   argument (and the `self._output_dir` it fed) from every operator that had
-  one -- `video_frames`, `plot_advanced`, `plot`, `mean_face`,
-  `blendshape_avatar`. Each names its own subfolder under `outputs_dir` (e.g.
-  `"frames"`, `"plots"`) -- there is no operator-specific field on
-  `ProjectPaths` itself. Guarded by an AST walk over every module under
+  one -- `plot_advanced`, `plot`, `mean_face`, `blendshape_avatar`. Each
+  names its own subfolder under `outputs_dir` (e.g. `"plots"`) -- there is
+  no operator-specific field on `ProjectPaths` itself. Guarded by an AST walk over every module under
   `operators/`: `tests/test_operator_output_paths.py::test_no_operator_module_references_a_scratch_directory`.
 - **`[NOW]` An operator that detects boundaries in media itself writes the
   finished media address, not bare start/end numbers.** Build it through

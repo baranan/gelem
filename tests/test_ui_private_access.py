@@ -10,15 +10,12 @@ This is the test that fails if the row order -- or any other component's
 private state -- ever goes back into a widget. It is why TileWidget got a
 public get_row_ids(): GalleryWidget used to read TileWidget._tile.
 
-A closed allowlist names the sites P1.13 still owns and has not yet
-migrated. Everything else is a failure. Extend the allowlist only when a
-rule elsewhere says a site is deliberately deferred; never to silence a
-new violation.
+P1.13 closed the last remaining sites (`ui/main_window.py` reading
+`_op_registry` off the controller, via `AppController.list_operators_for_mode()`
+now instead). The allowlist below is empty and stays that way -- every
+foreign private read under `ui/` is a failure.
 
-Two looseness notes, recorded rather than fixed:
-  * the allowlist is keyed by attribute *name*, not by file and line, so
-    a new `foo._dataset` anywhere under `ui/` would pass. `CLAUDE.md`'s
-    closed-list discipline is file-and-line; this test is looser.
+One looseness note, recorded rather than fixed:
   * `shared_widgets/` is not scanned -- only `ui/`.
 
 The second test here (no widget re-introduces `_row_ids` state) guards
@@ -41,13 +38,12 @@ import pathlib
 ROOT = pathlib.Path(__file__).parent.parent
 UI_DIR = ROOT / "ui"
 
-# Private attribute names that a UI file is still allowed to read off
-# another object, because migrating them is explicitly someone else's
-# work item (P1.13). This list is closed.
-#   _op_registry, _dataset, _active_table -- ui/main_window.py reaching
-#       into AppController, tracked under CLAUDE.md's "UI never touches
-#       private controller attributes" rule.
-ALLOWLIST = {"_op_registry", "_dataset", "_active_table"}
+# Private attribute names a UI file is allowed to read off another
+# object. Closed and empty -- P1.13 migrated the last sites
+# (_op_registry, _dataset, _active_table) to public AppController
+# methods. Extend only when a rule elsewhere says a new site is
+# deliberately deferred; never to silence a new violation.
+ALLOWLIST: set[str] = set()
 
 _GETATTR_BUILTINS = {"getattr", "setattr", "hasattr"}
 

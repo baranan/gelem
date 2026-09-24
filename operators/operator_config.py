@@ -118,13 +118,6 @@ def _build_stats():
     return StatsOperator()
 
 
-def _build_video_frames():
-    # VideoFramesOperator writes under run.paths.outputs_dir, supplied
-    # fresh on every run -- no constructor argument needed.
-    from operators.video_frames import VideoFramesOperator
-    return VideoFramesOperator()
-
-
 def _build_segment():
     # SegmentOperator takes no constructor arguments -- it writes no files.
     from operators.segment import SegmentOperator
@@ -149,7 +142,6 @@ OPERATOR_FACTORIES: dict[str, Callable[[], object]] = {
     "summary_stats": _build_summary_stats,
     "plot_advanced": _build_plot_advanced,
     "stats": _build_stats,
-    "video_frames": _build_video_frames,
     "segment": _build_segment,
     "frame": _build_frame,
 }

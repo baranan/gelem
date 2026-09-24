@@ -64,8 +64,8 @@ This is the authoritative reference for **media handling** and supersedes any
 contrary assumption in the original design doc or in the student-era code.
 
 Read this before proposing changes to: `column_types/renderers.py`,
-`artifacts/artifact_store.py`, `media/resolver.py`,
-`operators/video_frames.py`, or anything that opens a media file.
+`artifacts/artifact_store.py`, `media/resolver.py`, or anything that
+opens a media file.
 
 Sections 1-5 are decisions with their reasoning. Section 6 is the work. Section 9
 is how to behave in these sessions.
@@ -201,11 +201,12 @@ started reading `media_requirement` off the descriptor.
 **Nothing else in Gelem decodes media.** Made true by P1.2c-1 and P1.2c-2:
 `BaseOperator.load_image` (the analysis path) is deleted -- an operator that
 needs a decoded frame reads `run.resolver` instead, or (for `ADDRESS` mode)
-calls it directly; `ArtifactStore._decode_source` (the thumbnail path) and
-`operators/video_frames.py`'s frame-extraction loop (the last operator that
-opened a video file itself, via `cv2.VideoCapture`) both now decode through
-the one shared `MediaResolver` instance, injected by `main.py` into both
-`ArtifactStore` and `AppController`. `column_types/renderers.py` decodes no
+calls it directly; `ArtifactStore._decode_source` (the thumbnail path) now
+decodes through the one shared `MediaResolver` instance, injected by
+`main.py` into both `ArtifactStore` and `AppController`. (The only operator
+that ever opened a video file itself, via `cv2.VideoCapture`, was routed
+through the same resolver by this item and later deleted outright by
+P1.14 -- see §3.5.) `column_types/renderers.py` decodes no
 source media at all: thumbnail mode is cache-or-placeholder (P0.5b-3i) and
 never opens a file, and detail mode is the one Qt exception below.
 `artifacts/artifact_codec.py`'s `ArtifactCodec` reads back JPEGs
@@ -239,8 +240,8 @@ home instead of being scattered.
 
 - Splits are **not files**. Exporting split files is an explicit user action
   ("Export frames as files", "Export clips"), never a side effect of analysis.
-- `VideoFramesOperator` is demoted to that export action. It is no longer how
-  frame tables are made.
+- The old frame extractor was deleted (P1.14); exporting media as files is a
+  future explicit action, not part of the plan.
 - Addresses survive project save/load. `models/dataset.py`'s `_rewrite_media_cell`
   parses each media cell as an address, moves only the path portion
   (relative-if-inside on save, absolute on load), and re-formats, so an address
@@ -1361,7 +1362,9 @@ and the segment index. Writes zero files.
 **P1.10 Playback adapter.** `QMediaPlayer` from an address, honouring time ranges,
 sharing the parser and not the decoder.
 
-**P1.14 Demote `VideoFramesOperator`** to "Export frames as files".
+**P1.14 Delete the old frame extractor -- done.** `VideoFramesOperator` was
+deleted rather than demoted; exporting media as files returns later as a
+separate, explicit feature.
 
 **P1.11 Operator registration and output contract.** Three sub-tasks:
 
