@@ -207,13 +207,16 @@ class FrameStepperWidget(QWidget):
             index = nearest_frame_index(frame_times_us, position_ms)
             self._show_frame(index)
             self._stack.setCurrentWidget(self._stepper_page)
-            # Deferred so the fit runs once the stepper page is actually
+            # Deferred so the fit (and the table's remembered zoom
+            # factor, if any) runs once the stepper page is actually
             # current and laid out, rather than against whatever size it
             # had before becoming visible. Fires once, on this entry into
             # frame view only -- stepping afterwards
             # (_on_slider_value_changed) keeps whatever zoom the
-            # researcher chooses.
-            QTimer.singleShot(0, self._image_view.fit_to_view)
+            # researcher chooses. The image view is passed as context so
+            # Qt drops the call instead of firing it against a deleted
+            # view, if this whole widget is torn down first.
+            QTimer.singleShot(0, self._image_view, self._image_view.reset_view)
             self._slider.setFocus()
         else:
             frame = self._frames[self._slider.value()]

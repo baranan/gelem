@@ -64,6 +64,13 @@ class DetailWidget(QWidget):
         # the order they appear left-to-right. Drives the per-panel
         # close buttons — when one is removed we re-render from this list.
         self._current_row_ids: list[str] = []
+        # Zoom is view state, remembered per table for this session only
+        # (not saved with the project). Maps table name to a zoom factor
+        # relative to fit; a table with no entry opens at plain fit.
+        self._table_zoom_factors: dict[str, float] = {}
+        # Every ZoomableImageView inside the widget currently on screen —
+        # what the Fit button acts on, and what decides its enabled state.
+        self._current_zoom_views: list[ZoomableImageView] = []
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -80,6 +87,13 @@ class DetailWidget(QWidget):
         self._save_btn.setEnabled(False)
         self._save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         toolbar.addWidget(self._save_btn)
+
+        self._fit_btn = QPushButton("Fit")
+        self._fit_btn.setToolTip("Reset zoom to fit and forget this table's remembered zoom")
+        self._fit_btn.clicked.connect(self._on_fit_clicked)
+        self._fit_btn.setEnabled(False)
+        self._fit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        toolbar.addWidget(self._fit_btn)
 
         self._close_btn = QPushButton("\u2715")  # multiplication-x glyph
         self._close_btn.setToolTip("Close")
@@ -211,6 +225,7 @@ class DetailWidget(QWidget):
             widget = None
 
         self._swap_media_widget(widget)
+        self._wire_zoom_memory(widget)
 
         # Restore the metadata-table page in case we just came back from
         # a multi-item view that hid the bottom stack or a group-result
@@ -262,6 +277,7 @@ class DetailWidget(QWidget):
         splitter.setSizes([1] * len(row_ids))
 
         self._swap_media_widget(splitter)
+        self._wire_zoom_memory(splitter)
 
         # Hide the bottom stack — each panel has its own metadata text.
         self._bottom_stack.setVisible(False)
@@ -304,8 +320,10 @@ class DetailWidget(QWidget):
         self._label.setText("No item selected")
         self._current_pixmap = None
         self._current_row_ids = []
+        self._current_zoom_views = []
         self._save_btn.setEnabled(False)
         self._close_btn.setEnabled(False)
+        self._fit_btn.setEnabled(False)
 
     def _build_item_panel(
         self, row_id: str, media_column: str | None
@@ -420,6 +438,11 @@ class DetailWidget(QWidget):
                 artifact_path, size=600, mode="detail"
             )
             self._swap_media_widget(widget)
+            # A result image is not a cell in any table, so it opens at
+            # plain fit and never reads or writes a table's remembered
+            # zoom -- only the Fit button's enabled state is tracked.
+            self._current_zoom_views = self._find_zoom_views(widget)
+            self._fit_btn.setEnabled(bool(self._current_zoom_views))
 
             if isinstance(widget, ZoomableImageView):
                 self._current_pixmap = widget.current_pixmap()
@@ -430,6 +453,8 @@ class DetailWidget(QWidget):
             # has room to breathe.
             self._swap_media_widget(None)
             self._current_pixmap = None
+            self._current_zoom_views = []
+            self._fit_btn.setEnabled(False)
 
         # ── Stats area ────────────────────────────────────────────────
         # If the operator returned any tabular/stats payload, populate the
@@ -565,6 +590,56 @@ class DetailWidget(QWidget):
 
     # ── Internal helpers ──────────────────────────────────────────────
 
+    def _find_zoom_views(self, widget: QWidget | None) -> list[ZoomableImageView]:
+        """
+        Returns every ZoomableImageView inside widget, including widget
+        itself if it is one. Reaches the frame stepper's inner view (a
+        child of the widget the renderer returns for a steppable clip)
+        as well as a bare image view returned directly.
+        """
+        if widget is None:
+            return []
+        views: list[ZoomableImageView] = []
+        if isinstance(widget, ZoomableImageView):
+            views.append(widget)
+        views.extend(widget.findChildren(ZoomableImageView))
+        return views
+
+    def _wire_zoom_memory(self, widget: QWidget | None) -> None:
+        """
+        Applies the active table's remembered zoom factor to every
+        ZoomableImageView inside widget, and connects each view's
+        zoom_factor_changed signal so a further zoom updates that
+        table's remembered factor. Used for a row's own media
+        (_show_single, _show_multi) -- not for show_result, whose image
+        belongs to no table.
+        """
+        self._current_zoom_views = self._find_zoom_views(widget)
+        table = self._controller.get_active_table()
+        factor = self._table_zoom_factors.get(table)
+        for view in self._current_zoom_views:
+            view.set_preferred_factor(factor)
+            view.zoom_factor_changed.connect(
+                lambda new_factor, t=table: self._on_zoom_factor_changed(t, new_factor)
+            )
+        self._fit_btn.setEnabled(bool(self._current_zoom_views))
+
+    def _on_zoom_factor_changed(self, table: str, factor: float) -> None:
+        self._table_zoom_factors[table] = factor
+
+    def _on_fit_clicked(self) -> None:
+        """
+        Resets every image view currently shown to plain fit and forgets
+        the active table's remembered zoom factor, so the next picture
+        from this table also opens at plain fit until the researcher
+        zooms again.
+        """
+        table = self._controller.get_active_table()
+        self._table_zoom_factors.pop(table, None)
+        for view in self._current_zoom_views:
+            view.set_preferred_factor(None)
+            view.reset_view()
+
     def _clear(self) -> None:
         """
         Resets the detail view to its empty state — hides any media
@@ -577,8 +652,10 @@ class DetailWidget(QWidget):
         self._bottom_stack.setVisible(True)
         self._label.setText("No item selected")
         self._current_pixmap = None
+        self._current_zoom_views = []
         self._save_btn.setEnabled(False)
         self._close_btn.setEnabled(False)
+        self._fit_btn.setEnabled(False)
         # Reset the first-populate flag so the splitter auto-fits the
         # metadata table again the next time a row is shown.
         self._meta_table_sized = False
