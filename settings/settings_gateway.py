@@ -36,6 +36,7 @@ from settings.settings import (
     OUTPUT_COPY_WARNING_THRESHOLD_BYTES_RANGE,
     MAX_OPEN_DECODERS_RANGE,
     FRAME_STEPPER_MAX_SECONDS_RANGE,
+    OPERATOR_WORKER_COUNT_RANGE,
 )
 from settings.settings_store import SettingsStore
 
@@ -62,9 +63,13 @@ class SettingField:
 
 # The six ArtifactStore/MediaResolver values docs/architecture.md section 9's
 # table lists, in that order, plus output_copy_warning_threshold_bytes
-# (P1.9b-2) and frame_stepper_max_seconds (P1.4b part 1) after them -- neither
-# is one of "the six values" section 9 documents, but both are edited the
-# same way. minimum and maximum are ALWAYS
+# (P1.9b-2), frame_stepper_max_seconds (P1.4b part 1) and
+# operator_worker_count after them -- none of the three is one of
+# "the six values" section 9 documents, but all are edited the same way.
+# operator_worker_count is not an ArtifactStore/MediaResolver value at
+# all -- it is OperatorRegistry's, read fresh by AppController at the
+# start of every COLUMNS run rather than once at app startup, which is
+# why it alone is NOT restart_required below. minimum and maximum are ALWAYS
 # read from the *_RANGE tuples in settings/settings.py -- never retyped as
 # literals here -- so a bound change in one place cannot silently disagree
 # with another.
@@ -154,6 +159,18 @@ _FIELD_SPECS = (
         "seconds",
         True,
     ),
+    (
+        "operator_worker_count",
+        "Operator worker threads",
+        "How many threads run a per-image analysis operator's rows in "
+        "parallel (only operators whose model can be built once per "
+        "thread support this; others always run on one thread regardless "
+        "of this number). Higher uses more CPU and RAM for faster runs. "
+        "Takes effect on the next run -- no restart needed.",
+        OPERATOR_WORKER_COUNT_RANGE,
+        "count",
+        False,
+    ),
 )
 
 
@@ -240,3 +257,15 @@ class SettingsGateway:
         """
         current_settings, _problems = self._store.load()
         return current_settings.output_copy_warning_threshold_bytes
+
+    def get_operator_worker_count(self) -> int:
+        """The current operator_worker_count value.
+
+        Also one of the fields describe_fields() lists, so the settings
+        dialog can edit it. This direct getter stays because
+        AppController.run_create_columns reads this one number fresh at
+        the start of every COLUMNS run and should not build the whole
+        SettingField list just to get it.
+        """
+        current_settings, _problems = self._store.load()
+        return current_settings.operator_worker_count

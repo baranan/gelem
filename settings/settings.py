@@ -18,6 +18,7 @@ validation.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Mapping
 
@@ -82,6 +83,18 @@ OUTPUT_COPY_WARNING_THRESHOLD_BYTES_RANGE = (0, 1024 * 1024 * 1024 * 1024)
 # constant, per CLAUDE.md's generality rule.
 DEFAULT_FRAME_STEPPER_MAX_SECONDS = 10
 FRAME_STEPPER_MAX_SECONDS_RANGE = (1, 120)
+
+# How many consumer threads a COLUMNS run splits its rows across when the
+# operator is eligible for the parallel path (operators/operator_registry.py:
+# model_lifecycle PER_WORKER, no override of iter_column_updates,
+# worker_count >= 2 -- 1 always takes the serial path). 2 default; 1 to
+# the machine's own core count (or 8 if os.cpu_count() cannot tell) --
+# machine-dependent, per CLAUDE.md's generality rule, same reasoning as
+# worker_count above, but this ceiling is a live measurement of THIS
+# machine rather than a fixed constant, since a thread count that makes
+# sense on a 24-core workstation would oversubscribe a 4-core laptop.
+DEFAULT_OPERATOR_WORKER_COUNT = 2
+OPERATOR_WORKER_COUNT_RANGE = (1, os.cpu_count() or 8)
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +167,7 @@ class GelemSettings:
     )
     max_open_decoders: int = DEFAULT_MAX_OPEN_DECODERS
     frame_stepper_max_seconds: int = DEFAULT_FRAME_STEPPER_MAX_SECONDS
+    operator_worker_count: int = DEFAULT_OPERATOR_WORKER_COUNT
 
     @classmethod
     def from_values(
@@ -229,6 +243,13 @@ class GelemSettings:
             "frame stepper clip length limit",
             problems,
         )
+        operator_worker_count = _parse_int_field(
+            mapping.get("operator_worker_count"),
+            DEFAULT_OPERATOR_WORKER_COUNT,
+            OPERATOR_WORKER_COUNT_RANGE,
+            "operator worker count",
+            problems,
+        )
 
         # Cross-field rule: a preview must not be smaller than a thumbnail.
         # Both are now the largest side directly, so this is a plain compare.
@@ -252,6 +273,7 @@ class GelemSettings:
                 ),
                 max_open_decoders=max_open_decoders,
                 frame_stepper_max_seconds=frame_stepper_max_seconds,
+                operator_worker_count=operator_worker_count,
             ),
             problems,
         )

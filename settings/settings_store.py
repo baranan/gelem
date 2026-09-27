@@ -58,6 +58,9 @@ class SettingsStore:
     # frame cache -- same "artifacts/" namespace as the other ArtifactStore-
     # bound numbers above.
     _KEY_FRAME_STEPPER_MAX_SECONDS = "artifacts/frame_stepper_max_seconds"
+    # operator_worker_count is an OperatorRegistry value, not an
+    # ArtifactStore/MediaResolver one -- its own "operators/" namespace.
+    _KEY_OPERATOR_WORKER_COUNT = "operators/operator_worker_count"
 
     def __init__(self, backend: SettingsBackend):
         self._backend = backend
@@ -90,6 +93,9 @@ class SettingsStore:
             "frame_stepper_max_seconds": self._backend.get(
                 self._KEY_FRAME_STEPPER_MAX_SECONDS
             ),
+            "operator_worker_count": self._backend.get(
+                self._KEY_OPERATOR_WORKER_COUNT
+            ),
         }
         return GelemSettings.from_values(raw)
 
@@ -120,4 +126,8 @@ class SettingsStore:
         self._backend.set(
             self._KEY_FRAME_STEPPER_MAX_SECONDS,
             str(settings.frame_stepper_max_seconds),
+        )
+        self._backend.set(
+            self._KEY_OPERATOR_WORKER_COUNT,
+            str(settings.operator_worker_count),
         )

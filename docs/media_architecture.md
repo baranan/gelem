@@ -119,6 +119,14 @@ Worst common case is therefore about **240 hours of footage**.
 **"Handle" does not mean:** dense frame-by-frame analysis of the entire corpus.
 That is compute-bound, not architecture-bound (see §5.3).
 
+**Total video per dataset** (as opposed to per-video length above): 100 minutes to
+2000 hours (rare), median 50 hours. Reviewed with Y B 27 Sep 2026. This is a wider
+scale than the per-video "common case" table above states, but it changes nothing
+about §5's storage decision: §5 is about the in-memory metadata table's row count,
+which stays bounded by the number of frames actually analysed (§5.3's "compute-bound,
+not memory-bound" argument), not by how many hours of source video sit on disk. The
+in-memory storage decision stands.
+
 ---
 
 ## 3. The central decision: media values are addresses
@@ -1115,7 +1123,19 @@ easy to mistake for current ones.
 
 - does inference parallelise across threads? Time 200 frames on 1 thread, then 4.
   This is a property of whether the library releases the GIL, so it generalises.
-  **Still gates Phase 2** -- decides threads versus processes (P2.3).
+  **Done, 27 Sep 2026** (measured on this machine: 24 physical / 32 logical
+  cores, mediapipe 0.10.35). 400 frames of a real recording, `FaceLandmarker.
+  detect()` only, threads versus processes, 3 repeats each, median reported.
+  Threads speedup at N=4: 3.25x; processes speedup at N=4 (inference only,
+  excluding process startup/model-load): 3.26x -- threads reach 99.9% of the
+  process speedup, comfortably clear of the "80% of process speedup" decision
+  line agreed before measuring. Correctness: bit-identical blendshape scores
+  between an N=1 and an N=4 threaded run on 20 sampled frames (max abs
+  difference 0.0). MediaPipe's own internal CPU usage during a single-thread
+  run sampled at ~100% of one core (mean), briefly up to 155% -- it does not
+  already spread itself across several cores on its own, which is consistent
+  with threads scaling as well as processes do here. **Decided: threads, not
+  processes (P2.3).**
 - tracking mode versus per-image: how much faster, and **how far do the numbers
   diverge**. The second half is a reproducibility question, not a speed one.
   **Still gates Phase 2** -- decides whether tracking is safe to default to
@@ -1406,7 +1426,8 @@ Design settled; three parameters decided **by measurement**, not by argument.
 - **Cancellable**, with partial results retained. **Resumability is narrower and
   differs by mode** -- see P2.2. The two were previously stated as one property,
   which was too broad.
-- The parallel unit is the **clip**, processed sequentially inside.
+- For per-image operators the parallel unit is the **row**, fed by one ordered
+  producer; for tracking (P2.4) the unit will be the **sequence**.
 - Parallelism is a strategy behind one interface, with the serial path always
   present and always correct, and automatic fallback to serial if a worker fails.
   A user with an unusual machine gets slow but correct results, never a broken
@@ -1461,17 +1482,26 @@ documents implied it did.
 boundaries, which is a further reason segments are a first-class row type rather
 than a display convenience.
 
-**P2.3 Threads versus processes**, decided by §6.0. If wall clock drops across
-threads, use threads -- same process, no serialisation, normal debugging, no
-Windows spawn issues, no per-worker model copies. Only pay for multiprocessing if
-threads do not deliver.
+**P2.3 Threads versus processes -- done.** Decided by §6.0's measurement: threads,
+not processes -- same process, no serialisation, normal debugging, no Windows spawn
+issues. One producer thread reproduces today's decode/classification exactly and
+feeds a bounded queue; N consumer threads each build their own PER_WORKER model and
+call `create_columns()`; the run's coordinator thread is the only one that records
+results, row errors or progress. Parallel only when the operator's model_lifecycle
+is PER_WORKER, it does not override `iter_column_updates`, and the worker count
+setting is 2 or more -- everything else keeps the serial path, which stays the
+reference implementation and the automatic fallback if a consumer thread dies.
+
+**P2.5 folded into P2.3.** Worker count is the `operator_worker_count` setting,
+default 2, read fresh at the start of every run rather than fixed at app startup.
+Each consumer thread loads its own model, measured at **~26 MB per landmarker**
+(not the "hundreds of MB" this section previously assumed) -- eight workers on a
+student's 8 GB laptop costs roughly 200 MB for models, not a device-defining
+number, though CPU contention (not memory) is still the reason the default stays
+low rather than defaulting to the machine's full core count.
 
 **P2.4 Tracking mode as a flag**, defaulting to per-image, with a test of how far
 the two diverge on real data.
-
-**P2.5 Worker count** defaults low and is a setting. Each process loads its own
-model (hundreds of MB). Six workers is fine on a development machine and not fine
-on a student's 8 GB laptop.
 
 ---
 
@@ -1613,8 +1643,6 @@ not volunteer it.
   an architecture problem.
 - GPU inference. Undermines "installs easily for undergraduates".
 - Distributed or cluster execution.
-- Crash recovery of in-flight operator results. Cancellation is supported;
-  surviving a process crash would need checkpointing and is not planned.
 - OCR / ROI trial-number detection. **Deliberately postponed by Y B**; short clips
   will be produced externally for now. When it returns, it is "let the user mark a
   region on a sample frame, then read from that region on every frame" -- and the
@@ -1809,7 +1837,7 @@ causes were checked, per the method rules, before accepting this:
 | Seek fixed cost F0 (as a share of total scattered-seek time) | h264: F0 = 23.4 ms = **64%** of seek time on the dense (1 s-GOP) file, **15%** on the sparse (10 s-GOP) file. hevc: F0 = 14.5 ms, same 64%/15% split. | F0 is index lookup + decoder flush/reinit, a structural cost of any seek in any container/decoder. That it dominates for dense-keyframe files and shrinks proportionally for sparse ones is a property of the mechanism. The absolute F0 value (14-23 ms) is machine- and library-specific and will not generalise numerically. |
 | Does PyAV release the GIL during decode? | **Yes, confirmed.** W > 1 at every worker count tested (never ≈1.0, which would mean no parallelism). Sub-linear: same-file W = 1.60 (2 workers) / 2.06 (4 workers, of ideal 4.0); different-files W = 1.36 / 1.72 (5-repeat median, tight range -- see `RUNLOG.md`). | Whether the C library releases the GIL during its C-level decode call is a fact about the binding, true on any machine. That scaling is sub-linear, and further reduced when threads decode different files/codecs simultaneously rather than one shared file, is a real, reproduced effect -- but the exact multipliers are this CPU's core count and scheduler, and will not generalise numerically. |
 | Sorted vs scattered batching benefit | **0.5-2.9% faster sorted**, one file (h265 1 s-GOP) measured 7.4% *slower* sorted -- within noise. No meaningful benefit observed. | **Does not generalise, and cannot be read as "batching doesn't help."** The method's mandatory warm-cache protocol (discard first pass, report second) removes exactly the disk-I/O locality effect that sequential access is supposed to exploit. This result says the batching benefit is not visible *once the OS page cache is already warm* -- it is silent on the cold-cache / Google-Drive-Streaming case §4.3 is actually written for. A cold-cache variant would be needed to test the claim as stated. |
-| MediaPipe parallelises across threads? | unknown -- not yet measured | Depends on whether the library releases the GIL; still gates Phase 2 (§6.0) |
+| MediaPipe parallelises across threads? | **Yes, confirmed, measured 27 Sep 2026.** Thread speedup at N=4 = 3.25x, process speedup at N=4 (inference only) = 3.26x -- threads reach 99.9% of the process speedup. Bit-identical output between N=1 and N=4 threads on 20 sampled frames (max abs diff 0.0). MediaPipe's own internal CPU usage at N=1 sampled ~100% of one core (mean), 155% max. | Whether the library releases the GIL during inference is a fact about the binding, true on any machine, and decides threads over processes independent of core count. The specific speedup multipliers (3.25x / 3.26x at N=4) are this CPU's core count and scheduler, and will not generalise numerically -- see the process-startup-cost row below for the machine-specific numbers this measurement also produced. |
 | Tracking vs per-image output divergence | unknown -- not yet measured | A property of the model; still gates Phase 2 (§6.0) |
 
 ### Machine and file specific, must not become a constant
@@ -1831,6 +1859,28 @@ note below), and this machine's single-thread decode speed and disk cache
 state (all of it). None of it should become a setting default or a hardcoded
 threshold without re-measuring on the machine and files it will actually run
 against.
+
+**MediaPipe threads-versus-processes numbers, this machine only (measured
+27 Sep 2026, mediapipe 0.10.35, 24 physical / 32 logical cores, 128 GB RAM).**
+None of these should become a constant:
+
+- One `FaceLandmarker` instance: **~26 MB** resident memory.
+- One `detect()` call, warm (N=1 thread): mean 6.5 ms, stdev 0.66 ms.
+- Process startup (spawn + import + `build_model()`, includes shipping each
+  worker's frame data across the process boundary): 2.1 s at N=1, rising to
+  8.2 s at N=8 -- versus threads, where each consumer's own model build costs
+  a small fraction of a second and no data crosses a process boundary at all.
+- Decoding and inference overlapped on one long video (one decode thread
+  feeding N inference threads) beat the fully serial (decode-then-detect,
+  no overlap) baseline by **2.16x even at N=1** inference thread -- most of
+  that win is from overlap alone, not from adding more inference threads
+  (N=2 reached 3.42x; N=4 gained nothing further over N=2).
+- Processes got *slower* going from N=4 to N=8 (inference speedup 3.26x ->
+  3.22x); the same pattern, smaller, shows in threads (N=8's speedup, 3.99x,
+  is well short of a naive 8x). MediaPipe's own internal CPU usage already
+  sitting near or above one full core (row above) most likely means N
+  workers, each carrying that internal cost, oversubscribe the core count
+  before N reaches the core count itself.
 
 **Unexpected: the phone file, not the legacy file, is the outlier.** The
 prediction was that the legacy 3200x1200 recording would differ sharply from

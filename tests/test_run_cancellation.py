@@ -174,7 +174,7 @@ def _run_and_join(op_registry, operator, row_ids, run, monkeypatch):
             operator.name, snapshot, row_ids, "frames", run,
             operation_id="op-1",
             on_item_complete=lambda *a: item_results.append(a),
-            on_complete=lambda *a: completions.append(a),
+            on_complete=lambda *a, **kw: completions.append(a),
         )
     finally:
         monkeypatch.setattr(threading, "Thread", real_thread)

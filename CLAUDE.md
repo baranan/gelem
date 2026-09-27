@@ -264,6 +264,19 @@ state. This rule carries no violation list of its own -- it points at the three
   `tests/test_operator_registry_boundaries.py`).
 - **`[NOW]`** Worker callbacks **are** bound controller methods. This is correct
   and deliberate.
+- **`[NOW]`** In a COLUMNS run, only the coordinator thread records results,
+  row errors and progress; consumer threads only compute. Made true by the
+  parallel per-row runner (`operators/operator_registry.py`,
+  `_run_create_columns_parallel`): one producer thread reproduces today's
+  decode/classification and feeds a bounded queue; N consumer threads each
+  build their own `PER_WORKER` model and classify one row's outcome through
+  the same pure mapping the serial path's `_deliver` uses
+  (`_classify_row_result`); the thread that started the run -- the same one
+  the serial path already ran everything on -- is the only thread that ever
+  appends to `row_errors`, calls `on_item_complete` / `on_setup_error` /
+  `on_row_errors`, or reports progress. A consumer only computes and hands
+  its outcome back through a results queue. Guarded by
+  `tests/test_parallel_columns_runner.py::test_recording_happens_only_on_the_coordinator_thread`.
 - **`[NOW]`** Draining the result queues is bounded -- at most
   `AppController._drain_budget` items are taken from each queue per timer tick,
   and whatever is left is picked up on the next tick. Made true by P0.2b: the

@@ -652,7 +652,7 @@ def test_columns_path_row_errors_still_arrive_the_same_way(monkeypatch):
             operator.name, snapshot, row_ids, "frames", run,
             operation_id="op-1",
             on_item_complete=lambda *a: None,
-            on_complete=lambda *a: (
+            on_complete=lambda *a, **kw: (
                 call_order.append("complete"), completions.append(a)
             ),
             on_row_errors=lambda *a: (
@@ -721,7 +721,7 @@ def test_columns_operator_raising_and_reporting_both_reach_on_row_errors(
             operator.name, snapshot, row_ids, "frames", run,
             operation_id="op-1",
             on_item_complete=lambda *a: None,
-            on_complete=lambda *a: completions.append(a),
+            on_complete=lambda *a, **kw: completions.append(a),
             on_row_errors=lambda *a: row_error_calls.append(a),
         )
     finally:

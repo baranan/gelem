@@ -847,6 +847,13 @@ class AppController(QObject):
             "had_setup_error":    False,
             "had_row_errors":     False,
             "pending_row_errors": None,
+            # The registry's per-run cost figures, overwritten by
+            # _on_operator_complete's "create_columns" branch once this
+            # run's completion arrives. 1 worker until proven otherwise --
+            # matches the serial path, which every run starts on.
+            "rows_processed":    0,
+            "elapsed_seconds":   0.0,
+            "worker_count":      1,
         }
         # A new operation_id is always a new entry (uuid-generated per
         # run), so this always changes the set -- see live_runs_changed.
@@ -1681,7 +1688,7 @@ class AppController(QObject):
             except queue.Empty:
                 break
             if mode == "create_columns":
-                operation_id, _operator_name, emitted = payload
+                operation_id, _operator_name, emitted, _es, _wc = payload
                 run = self._live_runs.get(operation_id)
                 if run is not None and run["applied"] < emitted:
                     deferred.append((mode, payload))
@@ -1732,13 +1739,23 @@ class AppController(QObject):
         operation_id: str,
         operator_name: str,
         emitted: int,
+        elapsed_seconds: float = 0.0,
+        worker_count: int = 1,
     ) -> None:
         # `emitted` is how many per-row results the worker handed to
         # on_item_complete. The drain holds this completion back until it
         # has applied that many for this run.
-        self._complete_queue.put(
-            ("create_columns", (operation_id, operator_name, emitted))
-        )
+        #
+        # elapsed_seconds / worker_count: the registry's own
+        # per-run cost figures -- wall clock for the whole run and how
+        # many worker threads actually processed rows (1 for the serial
+        # path, however it was reached; the configured count for the
+        # parallel path). Defaulted so a caller that predates this change
+        # (a fake registry in an older test) still works.
+        self._complete_queue.put((
+            "create_columns",
+            (operation_id, operator_name, emitted, elapsed_seconds, worker_count),
+        ))
 
     def _on_operator_setup_error(
         self,
@@ -1804,7 +1821,10 @@ class AppController(QObject):
         modes that own a live run, deregisters it.
         """
         if mode == "create_columns":
-            operation_id, operator_name, _emitted = payload
+            (
+                operation_id, operator_name, _emitted,
+                _elapsed_seconds, _worker_count,
+            ) = payload
             run = self._live_runs.get(operation_id)
             if run is None:
                 # The project was replaced while this run was in flight.
@@ -1816,6 +1836,15 @@ class AppController(QObject):
                 # which would be work for a run that changed nothing.
                 self.operator_complete.emit(operator_name)
                 return
+            # The registry's own per-run cost figures, recorded on
+            # this run's own tracking dict -- the object _run_outcome()
+            # already reads to decide "complete" / "partial" / "failed".
+            # Diagnostic only today (not yet surfaced in the UI or in
+            # provenance); rows_processed mirrors _emitted under its own
+            # name for symmetry with rows_requested already on this dict.
+            run["rows_processed"] = _emitted
+            run["elapsed_seconds"] = _elapsed_seconds
+            run["worker_count"] = _worker_count
             if run["unplaceable"]:
                 n = len(run["unplaceable"])
                 self.error_occurred.emit(
@@ -2910,6 +2939,17 @@ class AppController(QObject):
                 rows_requested=len(row_ids),
                 inputs=self._run_inputs_snapshot(run),
             )
+            # How many threads may split this run's rows in
+            # parallel -- read here, once, at run start, and passed in as
+            # a plain argument; the registry never reads settings itself.
+            # No settings gateway wired (most tests construct a bare
+            # AppController this way) means worker_count stays 1, the
+            # same serial path every run took before this setting
+            # existed -- not the gateway's own default of 2, which only
+            # applies once settings are actually being read for real.
+            worker_count = 1
+            if self._settings_gateway is not None:
+                worker_count = self._settings_gateway.get_operator_worker_count()
             try:
                 started = self._op_registry.run_create_columns(
                     operator_name,
@@ -2924,6 +2964,7 @@ class AppController(QObject):
                     on_setup_error=self._on_operator_setup_error,
                     on_row_errors=self._on_operator_row_errors,
                     media_column=media_column,
+                    worker_count=worker_count,
                 )
             except Exception:
                 # The run never started, so no callback will ever

@@ -41,7 +41,9 @@ This file is written centrally (not by a student).
 from __future__ import annotations
 from pathlib import Path
 import dataclasses
+import queue
 import threading
+import time
 import pandas as pd
 
 from operators.base import BaseOperator, OperatorSetupError
@@ -77,6 +79,22 @@ def _is_bare_video_address(addr) -> bool:
     return Path(addr.path).suffix.lower() not in IMAGE_EXTENSIONS
 
 
+def _unreadable_media_row_error(row_id: str, full_path, exc: Exception) -> tuple:
+    """The row_errors tuple for a still-image or #t= row whose
+    resolve_frame() call raised. Shared by the serial per-row loop and
+    the parallel path's producer -- one place decides what this failure
+    is called and how its message reads, so it cannot silently drop the
+    row in one path while reporting it in the other. Previously this row
+    was printed and skipped with no row error at all, in both paths: the
+    row simply had no result and nothing told the researcher why.
+    """
+    return (
+        row_id, "UnreadableMedia",
+        f"could not read the media at {full_path!r}: "
+        f"{type(exc).__name__}: {exc}",
+    )
+
+
 def _iter_group_rows(run, addresses, media_by_address_id):
     """(row_id, media, metadata) for one per-source group, in ASCENDING
     ORDINAL order -- the `rows` iterable operators.base.BaseOperator.
@@ -95,6 +113,60 @@ def _iter_group_rows(run, addresses, media_by_address_id):
     ):
         row_id, metadata = media_by_address_id[id(addr)]
         yield row_id, payload.pixels, metadata
+
+
+def _classify_row_result(operator, row_id: str, media, metadata: dict, run):
+    """Call operator.create_columns() for one row and classify what
+    happened -- the exception mapping the serial `_deliver` closure and
+    the parallel runner's consumer threads both need, factored out so
+    there is exactly ONE place that decides what each exception means.
+    Pure: no side effect on any shared state, so it is safe to
+    call from any thread. Returns one of:
+
+        ("ok", result_dict)
+        ("row_error", exc_type_name, message, all_none_dict)
+        ("abort_silent", message)        -- NotImplementedError
+        ("abort_setup_error", message)   -- OperatorSetupError
+
+    RECORDING what a tag means (appending to row_errors, calling
+    on_item_complete, incrementing emitted, reporting progress) is a
+    separate concern and must happen only on the run's coordinator
+    thread -- see _run_create_columns_worker's `_deliver` and
+    `_run_create_columns_parallel`'s `_record`, the two callers of this
+    function.
+    """
+    try:
+        result = operator.create_columns(row_id, media, metadata, run)
+    except NotImplementedError:
+        return (
+            "abort_silent",
+            f"Operator '{operator.name}' does not implement "
+            f"create_columns().",
+        )
+    except OperatorSetupError as e:
+        return ("abort_setup_error", str(e))
+    except Exception as e:
+        all_none = {
+            column.name: None
+            for column in run.spec.mode_descriptor.output.columns
+        }
+        return ("row_error", type(e).__name__, str(e), all_none)
+    return ("ok", result)
+
+
+def _log_run_cost(
+    operator_name: str, rows: int, elapsed_seconds: float, worker_count: int
+) -> None:
+    """The one-line per-run cost summary CLAUDE.md's threading rule
+    requires: how many rows, how long, the per-row wall cost, and
+    how many worker threads actually did the work (1 for the serial
+    path, however it was reached)."""
+    ms_per_row = (elapsed_seconds / rows * 1000) if rows else 0.0
+    print(
+        f"[OperatorRegistry] '{operator_name}': {rows} rows in "
+        f"{elapsed_seconds:.3f} s, {ms_per_row:.2f} ms/row wall, "
+        f"{worker_count} workers"
+    )
 
 
 class OperatorRegistry:
@@ -333,6 +405,7 @@ class OperatorRegistry:
         on_setup_error=None,
         on_row_errors=None,
         media_column: str | None = None,
+        worker_count: int = 1,
     ) -> bool:
         """
         Runs create_columns() over an ordered group of rows in a
@@ -340,6 +413,15 @@ class OperatorRegistry:
         selected rows (Dataset.snapshot_rows) on the main thread before
         calling this method, so the worker never reads from Dataset
         directly and never receives one dict per row built in advance.
+
+        worker_count: defaults to 1, which always takes today's
+        serial path unchanged -- every existing caller that does not pass
+        this stays exactly as it was. A value of 2 or more is honoured
+        ONLY when the run is also mode COLUMNS (this method's only mode),
+        model_lifecycle PER_WORKER, and the operator does not override
+        iter_column_updates; every other combination still runs serial.
+        AppController reads the operator_worker_count setting and passes
+        it in -- this registry never reads settings itself.
 
         snapshot holds exactly the rows named by row_ids, in the same
         order, as a single DataFrame. The worker builds each row's
@@ -472,7 +554,7 @@ class OperatorRegistry:
             args=(
                 operator, snapshot, row_ids, table_name, run, operation_id,
                 on_item_complete, on_progress, on_complete,
-                on_setup_error, on_row_errors, media_column,
+                on_setup_error, on_row_errors, media_column, worker_count,
             ),
             daemon=True,
         )
@@ -493,10 +575,15 @@ class OperatorRegistry:
         on_setup_error,
         on_row_errors,
         media_column: str | None = None,
+        worker_count: int = 1,
     ) -> None:
         """
-        Worker that runs create_columns() in the background thread.
-        Builds each row's metadata dict from the pre-snapshotted
+        Worker that runs create_columns() in the background thread. This
+        thread is the run's COORDINATOR: whether it takes the serial path
+        below or delegates to _run_create_columns_parallel, it is
+        the only thread that ever touches row_errors, calls
+        on_item_complete / on_setup_error / on_row_errors, or reports
+        progress. Builds each row's metadata dict from the pre-snapshotted
         DataFrame as it reaches that row — never reads Dataset, and
         never receives 530,000 dicts built in advance.
 
@@ -510,6 +597,7 @@ class OperatorRegistry:
         or a #t= time point -- keeps the ORIGINAL per-row resolve_frame()
         path immediately below, unchanged.
         """
+        start_time = time.perf_counter()
         total = len(row_ids)
         row_errors: list[tuple[str, str, str]] = []
         # The user-facing label for this run's error callbacks. It is the
@@ -554,53 +642,58 @@ class OperatorRegistry:
                 on_progress(int(progress_count / total * 100))
 
         def _deliver(row_id: str, media, metadata: dict) -> bool:
-            """Calls operator.create_columns() for one row and delivers
-            the result through on_item_complete -- the exact exception
-            handling the per-row loop below had inline before P2.1,
-            factored out so the grouped (ordered) path can share it.
-            Returns False to ABORT THE ENTIRE RUN (NotImplementedError,
-            OperatorSetupError), True otherwise -- whether the row
-            succeeded or the operator raised an unexpected exception
-            (reported as a row error, not an abort)."""
+            """Calls operator.create_columns() for one row (through the
+            shared _classify_row_result mapping) and RECORDS the
+            outcome -- the exact exception handling the per-row loop below
+            had inline before P2.1, factored out so the grouped (ordered)
+            path can share it. This serial worker thread is its own
+            coordinator, so recording happens right here, inline; the
+            parallel runner's own _record (below) is the same recording
+            logic, on ITS coordinator thread, for an outcome a consumer
+            thread computed. Returns False to ABORT THE ENTIRE RUN
+            (NotImplementedError, OperatorSetupError), True otherwise --
+            whether the row succeeded or the operator raised an
+            unexpected exception (reported as a row error, not an
+            abort)."""
             nonlocal emitted
-            try:
-                result = operator.create_columns(row_id, media, metadata, run)
-            except NotImplementedError:
+            outcome = _classify_row_result(operator, row_id, media, metadata, run)
+            kind = outcome[0]
+            if kind == "abort_silent":
                 print(
                     f"[OperatorRegistry] Operator '{operator.name}' "
                     f"does not implement create_columns()."
                 )
                 return False
-            except OperatorSetupError as e:
+            if kind == "abort_setup_error":
+                message = outcome[1]
                 # Setup-level failure (e.g. required model file missing).
                 # Abort the run rather than spamming the same error per row.
                 print(
-                    f"[OperatorRegistry] Setup error in '{operator.name}': {e}"
+                    f"[OperatorRegistry] Setup error in '{operator.name}': "
+                    f"{message}"
                 )
                 if on_setup_error is not None:
                     # Pass the operator's own display label so the
                     # controller never rebuilds it from a worker thread.
-                    on_setup_error(operation_id, label, str(e))
+                    on_setup_error(operation_id, label, message)
                 return False
-            except Exception as e:
+            if kind == "row_error":
                 # Unexpected per-row failure (mediapipe crash, bug, malformed
                 # image, etc.). Mark the row as missing for consistency with
                 # the operator's no-face path, and remember it so we can
                 # surface a single summary at the end of the run.
+                _, exc_kind, message, all_none = outcome
                 print(
                     f"[OperatorRegistry] Unexpected error in '{operator.name}' "
-                    f"on {row_id}: {type(e).__name__}: {e}"
+                    f"on {row_id}: {exc_kind}: {message}"
                 )
-                row_errors.append((row_id, type(e).__name__, str(e)))
+                row_errors.append((row_id, exc_kind, message))
                 if on_item_complete is not None:
-                    all_none = {
-                        column.name: None
-                        for column
-                        in run.spec.mode_descriptor.output.columns
-                    }
                     on_item_complete(operation_id, table_name, row_id, all_none)
                     emitted += 1
                 return True
+            # "ok"
+            _, result = outcome
             if on_item_complete is not None:
                 on_item_complete(operation_id, table_name, row_id, result)
                 emitted += 1
@@ -649,11 +742,43 @@ class OperatorRegistry:
                     f"have refused this run before it started.",
                 )
             if on_complete is not None:
-                on_complete(operation_id, operator.name, emitted)
+                elapsed_seconds = time.perf_counter() - start_time
+                _log_run_cost(operator.name, emitted, elapsed_seconds, 1)
+                on_complete(
+                    operation_id, operator.name, emitted,
+                    elapsed_seconds=elapsed_seconds, worker_count=1,
+                )
             return
 
         # FRAME is the only requirement that makes the runner decode.
         needs_frame = media_requirement is MediaRequirement.FRAME
+
+        # Whether this run is eligible for the parallel path,
+        # decided BEFORE any model is built -- model_lifecycle PER_WORKER,
+        # the operator does not override iter_column_updates() (an
+        # overriding operator may carry cross-frame state, which the
+        # parallel consumers' independent per-row calls cannot honour),
+        # and worker_count >= 2. worker_count == 1 always takes the
+        # serial path below, unchanged -- see run_create_columns's
+        # docstring. CLAUDE.md's threading rule: only the coordinator
+        # thread (this one) ever touches row_errors / on_item_complete /
+        # on_setup_error / progress, whichever path is taken.
+        model_lifecycle = run.spec.mode_descriptor.model_lifecycle
+        uses_default_iter_column_updates = (
+            type(operator).iter_column_updates is BaseOperator.iter_column_updates
+        )
+        if (
+            model_lifecycle is ModelLifecycle.PER_WORKER
+            and uses_default_iter_column_updates
+            and worker_count >= 2
+        ):
+            self._run_create_columns_parallel(
+                operator, snapshot, row_ids, table_name, run, operation_id,
+                on_item_complete, on_progress, on_complete, on_setup_error,
+                on_row_errors, media_column, needs_frame, label,
+                worker_count, start_time,
+            )
+            return
 
         # Build this run's model BEFORE the row loop, honouring the mode's
         # declared model_lifecycle (operators/descriptor.py ->
@@ -685,7 +810,6 @@ class OperatorRegistry:
         # whose media happened to decode: a run where every row failed to
         # decode used to report success having processed zero rows and
         # never mention the missing model.
-        model_lifecycle = run.spec.mode_descriptor.model_lifecycle
         if model_lifecycle is ModelLifecycle.PER_SEQUENCE:
             if on_setup_error is not None:
                 on_setup_error(
@@ -697,7 +821,12 @@ class OperatorRegistry:
                     f"this run before it started.",
                 )
             if on_complete is not None:
-                on_complete(operation_id, operator.name, emitted)
+                elapsed_seconds = time.perf_counter() - start_time
+                _log_run_cost(operator.name, emitted, elapsed_seconds, 1)
+                on_complete(
+                    operation_id, operator.name, emitted,
+                    elapsed_seconds=elapsed_seconds, worker_count=1,
+                )
             return
 
         try:
@@ -734,7 +863,12 @@ class OperatorRegistry:
             if on_setup_error is not None:
                 on_setup_error(operation_id, label, message)
             if on_complete is not None:
-                on_complete(operation_id, operator.name, emitted)
+                elapsed_seconds = time.perf_counter() - start_time
+                _log_run_cost(operator.name, emitted, elapsed_seconds, 1)
+                on_complete(
+                    operation_id, operator.name, emitted,
+                    elapsed_seconds=elapsed_seconds, worker_count=1,
+                )
             return
 
         for i, row_id in enumerate(row_ids):
@@ -843,6 +977,9 @@ class OperatorRegistry:
                         f"[OperatorRegistry] Could not load image "
                         f"for {row_id}: {full_path} ({e})"
                     )
+                    row_errors.append(
+                        _unreadable_media_row_error(row_id, full_path, e)
+                    )
                     continue
             else:
                 media = None
@@ -874,10 +1011,9 @@ class OperatorRegistry:
         #   frames (P2.4) may have left that state unreliable after a
         #   failure partway through its own generator, so the whole
         #   group still ends on any exception, the pre-this-fix
-        #   behaviour, kept only for this case.
-        uses_default_iter_column_updates = (
-            type(operator).iter_column_updates is BaseOperator.iter_column_updates
-        )
+        #   behaviour, kept only for this case. (uses_default_iter_column_
+        #   updates was already computed above, before the
+        #   parallel-eligibility check, which needs the same value.)
 
         # The ordered path (P2.1): every #f= row on a video, grouped by
         # source above, decoded here in ONE sequential pass per source
@@ -1001,7 +1137,454 @@ class OperatorRegistry:
             on_row_errors(operation_id, label, row_errors)
 
         if on_complete is not None:
-            on_complete(operation_id, operator.name, emitted)
+            elapsed_seconds = time.perf_counter() - start_time
+            _log_run_cost(operator.name, emitted, elapsed_seconds, 1)
+            on_complete(
+                operation_id, operator.name, emitted,
+                elapsed_seconds=elapsed_seconds, worker_count=1,
+            )
+
+    # ── _run_create_columns_parallel ─────────────────────────────────────
+
+    def _run_create_columns_parallel(
+        self,
+        operator: BaseOperator,
+        snapshot: pd.DataFrame,
+        row_ids: list[str],
+        table_name: str,
+        run,
+        operation_id: str,
+        on_item_complete,
+        on_progress,
+        on_complete,
+        on_setup_error,
+        on_row_errors,
+        media_column: str | None,
+        needs_frame: bool,
+        label: str,
+        worker_count: int,
+        start_time: float,
+    ) -> None:
+        """
+        The parallel COLUMNS path. Reached only from
+        _run_create_columns_worker's eligibility check (model_lifecycle
+        PER_WORKER, the operator does not override iter_column_updates,
+        worker_count >= 2) -- every other run takes the serial path
+        above, unchanged.
+
+        Shape: ONE producer thread reproduces today's serial per-row
+        decode/classification exactly (grouping and ordered decode for a
+        #f= row on a video; per-row resolve_frame for a still image or a
+        #t= point; media=None for METADATA/ADDRESS), and feeds
+        (row_id, media, metadata) into a bounded work queue instead of
+        calling _deliver itself. N CONSUMER threads each get their OWN
+        PER_WORKER model (built once, before any thread starts) and call
+        operator.create_columns() through the same _classify_row_result
+        mapping _deliver uses, handing the classified outcome back
+        through a results queue. THIS thread -- the coordinator, the
+        same thread _run_create_columns_worker is already running on --
+        is the only thread that ever appends to row_errors, calls
+        on_item_complete / on_setup_error, or reports progress
+        (CLAUDE.md's threading rule). Consumers only compute.
+
+        Fallback: if a consumer thread dies from something other than a
+        per-row exception (_classify_row_result already turns every
+        ordinary create_columns() failure into a row_error or an abort
+        outcome, so this is BaseException escaping that mapping, or a bug
+        in the consumer loop itself), the coordinator reprocesses that
+        row immediately, with its own separately built model, and logs
+        one line saying so. If EVERY consumer dies this way (and nothing
+        else independently aborted the run), the coordinator takes over
+        as the sole remaining consumer until the producer itself stops --
+        so every row still gets done, including ones the producer had
+        not queued yet at the moment of the last death.
+
+        The run never hangs. Every work_queue.put() the producer makes
+        goes through _try_enqueue, which retries on a bounded timeout and
+        gives up (stopping the producer entirely) once run.cancelled() or
+        abort_event is set -- a plain blocking put() here could wait
+        forever on a queue nobody is left to drain, which would in turn
+        hang this method's own producer_thread.join() below, so
+        on_complete would never fire and the run would stay "live"
+        forever. That join is itself bounded as a second line of defence.
+        Every consumer polls the same two flags on its own timeout rather
+        than blocking on the queue forever either, so nothing here can
+        wait on a peer that is never coming back.
+        """
+        total = len(row_ids)
+        row_errors: list[tuple[str, str, str]] = []
+        emitted = 0
+        progress_count = 0
+        aborted = False
+        fallback_run_holder: list = []  # 0 or 1 OperatorRun, built lazily
+
+        def _report_progress() -> None:
+            nonlocal progress_count
+            progress_count += 1
+            if on_progress is not None:
+                on_progress(int(progress_count / total * 100))
+
+        def _record(row_id: str, outcome: tuple) -> bool:
+            """Coordinator-only recording -- see _deliver's docstring
+            above for why this is the same logic, just reached from a
+            queued outcome instead of a direct call. Returns False to
+            abort the run."""
+            nonlocal emitted
+            kind = outcome[0]
+            if kind == "abort_silent":
+                print(
+                    f"[OperatorRegistry] Operator '{operator.name}' "
+                    f"does not implement create_columns()."
+                )
+                return False
+            if kind == "abort_setup_error":
+                message = outcome[1]
+                print(
+                    f"[OperatorRegistry] Setup error in '{operator.name}': "
+                    f"{message}"
+                )
+                if on_setup_error is not None:
+                    on_setup_error(operation_id, label, message)
+                return False
+            if kind == "row_error":
+                _, exc_kind, message, all_none = outcome
+                print(
+                    f"[OperatorRegistry] Unexpected error in '{operator.name}' "
+                    f"on {row_id}: {exc_kind}: {message}"
+                )
+                row_errors.append((row_id, exc_kind, message))
+                if on_item_complete is not None:
+                    on_item_complete(operation_id, table_name, row_id, all_none)
+                    emitted += 1
+                _report_progress()
+                return True
+            # "ok"
+            _, result = outcome
+            if on_item_complete is not None:
+                on_item_complete(operation_id, table_name, row_id, result)
+                emitted += 1
+            _report_progress()
+            return True
+
+        def _get_fallback_run():
+            # Built lazily -- only paid for if a consumer actually dies --
+            # and only once, reused for every row the fallback processes.
+            if not fallback_run_holder:
+                fallback_run_holder.append(
+                    dataclasses.replace(run, model=operator.build_model())
+                )
+            return fallback_run_holder[0]
+
+        # Build every consumer's own model BEFORE any thread starts -- the
+        # same "abort before any row is processed" guarantee the serial
+        # path gives (see its own model-build comment above). Building
+        # sequentially, here, on the coordinator, means a build failure
+        # needs no thread teardown: nothing else is running yet.
+        models = []
+        for _ in range(worker_count):
+            try:
+                models.append(operator.build_model())
+            except Exception as e:
+                if isinstance(e, OperatorSetupError):
+                    message = str(e)
+                else:
+                    message = f"could not build its model: {type(e).__name__}: {e}"
+                print(
+                    f"[OperatorRegistry] Model build failed for "
+                    f"'{operator.name}': {type(e).__name__}: {e}"
+                )
+                if on_setup_error is not None:
+                    on_setup_error(operation_id, label, message)
+                if on_complete is not None:
+                    elapsed_seconds = time.perf_counter() - start_time
+                    _log_run_cost(operator.name, emitted, elapsed_seconds, worker_count)
+                    on_complete(
+                        operation_id, operator.name, emitted,
+                        elapsed_seconds=elapsed_seconds, worker_count=worker_count,
+                    )
+                return
+
+        _SENTINEL = object()
+        _ENQUEUE_POLL_SECONDS = 0.5
+        _JOIN_TIMEOUT_SECONDS = 5.0
+        work_queue: "queue.Queue" = queue.Queue(maxsize=2 * worker_count)
+        results_queue: "queue.Queue" = queue.Queue()
+        abort_event = threading.Event()
+
+        def _try_enqueue(item) -> bool:
+            """Put item onto work_queue, retrying on a bounded timeout
+            instead of blocking forever. A plain blocking put() here
+            could wait on a queue nobody will ever drain again (every
+            consumer already stopped for cancellation, an aborting
+            outcome, or having died) -- which would leave this producer
+            thread stuck forever, which would in turn hang the
+            coordinator's own producer_thread.join() below, so
+            on_complete would never fire and the run would stay "live"
+            forever. Returns False if it gave up without
+            enqueueing, in which case the caller stops producing
+            entirely -- there is no point trying the next item either.
+            """
+            while True:
+                if run.cancelled() or abort_event.is_set():
+                    return False
+                try:
+                    work_queue.put(item, timeout=_ENQUEUE_POLL_SECONDS)
+                    return True
+                except queue.Full:
+                    continue
+
+        def _producer() -> None:
+            frame_groups: "dict[tuple, list[tuple[str, object, dict]]]" = {}
+            for i, row_id in enumerate(row_ids):
+                if run.cancelled() or abort_event.is_set():
+                    return
+                metadata = snapshot.iloc[i].to_dict()
+                if needs_frame:
+                    full_path = metadata.get(media_column, "")
+                    if not full_path or pd.isna(full_path):
+                        results_queue.put((
+                            "producer_row_error", row_id, "MissingMedia",
+                            "this row has no media value to read",
+                        ))
+                        continue
+                    try:
+                        addr = parse_address(full_path)
+                    except MediaAddressError as e:
+                        results_queue.put((
+                            "producer_row_error", row_id, "UnparseableMedia",
+                            f"could not parse the media value {full_path!r}: {e}",
+                        ))
+                        continue
+                    if _is_bare_video_address(addr):
+                        results_queue.put((
+                            "producer_row_error", row_id, "WholeVideoRow",
+                            "this operator reads single frames; this row "
+                            "is a whole video",
+                        ))
+                        continue
+                    if addr.frame is not None and not is_image_path(addr.path):
+                        group_key = (addr.path, addr.stream)
+                        frame_groups.setdefault(group_key, []).append(
+                            (row_id, addr, metadata)
+                        )
+                        continue
+                    try:
+                        media = run.resolver.resolve_frame(addr, "analysis").pixels
+                    except (MediaResolverError, MediaAddressError, OSError) as e:
+                        print(
+                            f"[OperatorRegistry] Could not load image "
+                            f"for {row_id}: {full_path} ({e})"
+                        )
+                        results_queue.put((
+                            "producer_row_error",
+                            *_unreadable_media_row_error(row_id, full_path, e),
+                        ))
+                        continue
+                else:
+                    media = None
+                if not _try_enqueue((row_id, media, metadata)):
+                    return
+
+            for (_source_path, _stream), entries in frame_groups.items():
+                if run.cancelled() or abort_event.is_set():
+                    return
+                addresses = [addr for (_rid, addr, _md) in entries]
+                media_by_address_id = {
+                    id(addr): (row_id, metadata)
+                    for (row_id, addr, metadata) in entries
+                }
+                pending_row_ids = {row_id for (row_id, _a, _m) in entries}
+                try:
+                    for row_id, media, metadata in _iter_group_rows(
+                        run, addresses, media_by_address_id
+                    ):
+                        if run.cancelled() or abort_event.is_set():
+                            return
+                        pending_row_ids.discard(row_id)
+                        if not _try_enqueue((row_id, media, metadata)):
+                            return
+                except Exception as e:
+                    print(
+                        f"[OperatorRegistry] Ordered decode failed for "
+                        f"'{operator.name}' on {_source_path!r}: "
+                        f"{type(e).__name__}: {e}"
+                    )
+                    for row_id in pending_row_ids:
+                        results_queue.put((
+                            "producer_row_error", row_id,
+                            type(e).__name__, str(e),
+                        ))
+                    continue
+
+            if not (run.cancelled() or abort_event.is_set()):
+                # Normal completion only: every consumer is still alive
+                # and still draining, so this cannot block forever even
+                # with the plain, bounded _try_enqueue below giving up
+                # early -- there is nothing to give up FROM here, since
+                # every real item was already enqueued above. A
+                # cancelled/aborted run skips this entirely: consumers
+                # notice run.cancelled() / abort_event on their own poll
+                # and stop without needing a sentinel.
+                for _ in range(worker_count):
+                    if not _try_enqueue(_SENTINEL):
+                        break
+
+        def _consumer(consumer_run) -> None:
+            while True:
+                try:
+                    item = work_queue.get(timeout=0.5)
+                except queue.Empty:
+                    if run.cancelled() or abort_event.is_set():
+                        results_queue.put(("consumer_finished",))
+                        return
+                    continue
+                if item is _SENTINEL:
+                    results_queue.put(("consumer_finished",))
+                    return
+                if run.cancelled() or abort_event.is_set():
+                    results_queue.put(("consumer_finished",))
+                    return
+                row_id, media, metadata = item
+                try:
+                    outcome = _classify_row_result(
+                        operator, row_id, media, metadata, consumer_run
+                    )
+                except BaseException as e:
+                    results_queue.put(
+                        ("consumer_died", row_id, media, metadata, e)
+                    )
+                    return
+                results_queue.put(("row_outcome", row_id, outcome))
+
+        producer_thread = threading.Thread(target=_producer, daemon=True)
+        consumer_threads = [
+            threading.Thread(
+                target=_consumer,
+                args=(dataclasses.replace(run, model=models[i]),),
+                daemon=True,
+            )
+            for i in range(worker_count)
+        ]
+        producer_thread.start()
+        for t in consumer_threads:
+            t.start()
+
+        live_consumers = worker_count
+        died_count = 0
+        while live_consumers > 0:
+            item = results_queue.get()
+            tag = item[0]
+            if tag == "consumer_finished":
+                live_consumers -= 1
+            elif tag == "consumer_died":
+                _, row_id, media, metadata, exc = item
+                live_consumers -= 1
+                died_count += 1
+                print(
+                    f"[OperatorRegistry] A consumer thread for "
+                    f"'{operator.name}' died on row {row_id!r}: "
+                    f"{type(exc).__name__}: {exc}; falling back to serial "
+                    f"processing on the coordinator for this row and any "
+                    f"rows still queued."
+                )
+                outcome = _classify_row_result(
+                    operator, row_id, media, metadata, _get_fallback_run()
+                )
+                if not _record(row_id, outcome):
+                    aborted = True
+                    abort_event.set()
+            elif tag == "producer_row_error":
+                _, row_id, kind, message = item
+                row_errors.append((row_id, kind, message))
+            else:  # "row_outcome"
+                _, row_id, outcome = item
+                if not _record(row_id, outcome):
+                    aborted = True
+                    abort_event.set()
+
+        # Every consumer is now accounted for (finished normally, or
+        # died). If NONE survived and nothing else already aborted the
+        # run, the producer may still be decoding/classifying rows that
+        # nobody is left to consume -- take over as the sole remaining
+        # consumer, ourselves, until the producer itself stops:
+        # "every consumer dies" must still finish every row, including
+        # ones the producer had not queued yet at the moment of death.
+        # abort_event is deliberately NOT set before this loop -- setting
+        # it would tell the still-running producer to give up early,
+        # which is exactly what this branch exists to avoid.
+        if died_count == worker_count and worker_count > 0 and not aborted:
+            while producer_thread.is_alive() or not work_queue.empty():
+                if run.cancelled():
+                    break
+                try:
+                    item = work_queue.get(timeout=_ENQUEUE_POLL_SECONDS)
+                except queue.Empty:
+                    continue
+                if item is _SENTINEL:
+                    continue
+                row_id, media, metadata = item
+                outcome = _classify_row_result(
+                    operator, row_id, media, metadata, _get_fallback_run()
+                )
+                if not _record(row_id, outcome):
+                    aborted = True
+                    break
+
+        # Whatever the outcome above, the producer must stop now -- a
+        # cancelled/aborted run should not keep decoding, and a normally
+        # finished or now-fully-drained run has nothing left for it to
+        # do. Setting this unconditionally is harmless when the producer
+        # has already returned. The join is bounded: a producer that is
+        # not a daemon thread's own doom, so a bound here means
+        # on_complete still fires (and the run still ends) even in an
+        # unanticipated case where the producer does not stop promptly,
+        # rather than the coordinator hanging right back where an
+        # unbounded join used to.
+        abort_event.set()
+        producer_thread.join(timeout=_JOIN_TIMEOUT_SECONDS)
+        if producer_thread.is_alive():
+            print(
+                f"[OperatorRegistry] Producer thread for '{operator.name}' "
+                f"did not stop within {_JOIN_TIMEOUT_SECONDS}s of being "
+                f"told to; continuing without it (it is a daemon thread "
+                f"and will not block process exit)."
+            )
+
+        # A no-op in the ordinary case: FIFO guarantees no sentinel is
+        # ever reached before every real item ahead of it in the queue
+        # has been dequeued by some still-living consumer, so once every
+        # consumer has reported in without any dying, the queue holds
+        # nothing but orphaned extra sentinels, if any. The all-died
+        # fallback above already drained everything else. Skipped
+        # entirely once cancelled or aborted: a cancelled run must not
+        # process more rows, including ones already sitting in the
+        # queue.
+        if not (run.cancelled() or aborted):
+            while True:
+                try:
+                    item = work_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if item is _SENTINEL:
+                    continue
+                row_id, media, metadata = item
+                outcome = _classify_row_result(
+                    operator, row_id, media, metadata, _get_fallback_run()
+                )
+                if not _record(row_id, outcome):
+                    aborted = True
+
+        row_errors = row_errors + run.collected_row_errors()
+        if row_errors and on_row_errors is not None:
+            on_row_errors(operation_id, label, row_errors)
+
+        if on_complete is not None:
+            elapsed_seconds = time.perf_counter() - start_time
+            _log_run_cost(operator.name, emitted, elapsed_seconds, worker_count)
+            on_complete(
+                operation_id, operator.name, emitted,
+                elapsed_seconds=elapsed_seconds, worker_count=worker_count,
+            )
 
     # ── run_create_table ──────────────────────────────────────────────
 

@@ -653,6 +653,18 @@ ever entered the artifact key, so a pair such as `700x100` could pass validation
 while describing a picture whose real short side was nowhere near the resolution
 the key claimed.
 
+### Also settings-editable, not one of the six ArtifactStore/MediaResolver values
+
+| Value | Default | Meaning | Takes effect |
+|---|---|---|---|
+| `operator_worker_count` | 2 | How many consumer threads a COLUMNS run splits its rows across, for an operator eligible for the parallel path (`operators/operator_registry.py`: `model_lifecycle` `PER_WORKER`, no override of `iter_column_updates`, this value 2 or more -- 1 always takes the serial path). | **On the next run** |
+
+`operator_worker_count` is `OperatorRegistry`'s own value, not `ArtifactStore`'s or
+`MediaResolver`'s -- `AppController.run_create_columns` reads it fresh, through
+`SettingsGateway`, at the start of every COLUMNS run, rather than once at app
+startup. Changing it therefore needs no restart: the very next run picks up the
+new value.
+
 Bounds and the exact defaults live in `settings/settings.py` as module-level
 constants; a saved value outside its bounds is clamped, an unparseable one falls
 back to the default, and either way the app still starts. One cross-field rule:

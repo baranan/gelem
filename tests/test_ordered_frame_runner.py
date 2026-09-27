@@ -245,7 +245,7 @@ def _run_columns_and_collect(
     def _on_row_errors(operation_id, label, errors):
         row_errors.extend(errors)
 
-    def _on_complete(operation_id, operator_name, emitted):
+    def _on_complete(operation_id, operator_name, emitted, *_extra, **_kw):
         completions.append((operation_id, operator_name, emitted))
 
     monkeypatch.setattr(threading, "Thread", _Tracked)

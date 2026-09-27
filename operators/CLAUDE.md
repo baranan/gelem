@@ -291,6 +291,28 @@ loading one on `self`.
 `PER_WORKER`; if the model tracks across frames, `PER_SEQUENCE` is the only correct
 answer and P2.2's per-clip-run cache identity depends on it.
 
+**A `PER_WORKER` operator's `create_columns` may run on several threads at
+once, each with its own model instance.** The per-row COLUMNS runner
+parallelises across worker threads when the mode declares `PER_WORKER`, does
+not override `iter_column_updates`, and the configured worker count is 2 or
+more (`operators/operator_registry.py`, `_run_create_columns_parallel`); the
+serial, one-thread-at-a-time path stays the reference implementation and
+runs whenever any of those conditions does not hold. `create_columns` must
+therefore not keep state between rows anywhere except in `run.model` --
+exactly the same rule "never build or cache a model on `self`" already
+enforces, extended to any other per-row bookkeeping. A row's own arguments
+(`row_id`, `media`, `metadata`, `run`) are the only per-row state a call may
+read or write; a counter, a running average, or anything else on `self` is
+shared by every thread the operator's own instance is called from, whether
+or not those threads belong to the same run.
+
+**`iter_column_updates` (P2.1's serial reference, and P2.4's future tracking
+path) is exactly the exception this rule protects against**: an operator
+declaring it carries state across the rows it yields, which is why the
+runner's eligibility check refuses to parallelise ANY operator that
+overrides it -- the independent, any-order calls a parallel run's consumer
+threads make are incompatible with carrying state forward at all.
+
 ```python
 # The runner calls this as often as the declared lifecycle requires:
 # once per worker for PER_WORKER, once per application for SHARED, never
@@ -319,7 +341,9 @@ raised on the first row whose media happened to decode; a run where every row
 failed to decode reported success having processed zero rows and never mentioned
 the missing model.
 
-Guarded by `tests/test_model_lifecycle.py`.
+Guarded by `tests/test_model_lifecycle.py`. The parallel `PER_WORKER` path and
+its "consumers only compute, the coordinator alone records" rule are guarded
+by `tests/test_parallel_columns_runner.py`.
 
 ### Progress messages -- `run.log`
 

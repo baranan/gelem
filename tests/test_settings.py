@@ -31,6 +31,7 @@ from settings.settings import (
     DEFAULT_OUTPUT_COPY_WARNING_THRESHOLD_BYTES,
     DEFAULT_MAX_OPEN_DECODERS,
     DEFAULT_FRAME_STEPPER_MAX_SECONDS,
+    DEFAULT_OPERATOR_WORKER_COUNT,
     PICTURE_MEMORY_MAX_BYTES_RANGE,
     WORKER_COUNT_RANGE,
     THUMBNAIL_MAX_SIDE_RANGE,
@@ -327,6 +328,7 @@ def test_settings_store_round_trip_through_dict_backend():
         "artifacts/frame_stepper_max_seconds": str(
             DEFAULT_FRAME_STEPPER_MAX_SECONDS
         ),
+        "operators/operator_worker_count": str(DEFAULT_OPERATOR_WORKER_COUNT),
     }
     assert backend.data == expected_persisted
 
