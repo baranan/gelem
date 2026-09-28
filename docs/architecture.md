@@ -658,12 +658,15 @@ the key claimed.
 | Value | Default | Meaning | Takes effect |
 |---|---|---|---|
 | `operator_worker_count` | 2 | How many consumer threads a COLUMNS run splits its rows across, for an operator eligible for the parallel path (`operators/operator_registry.py`: `model_lifecycle` `PER_WORKER`, no override of `iter_column_updates`, this value 2 or more -- 1 always takes the serial path). | **On the next run** |
+| `long_run_warning_minutes` | 30 | Above this many minutes, a COLUMNS run's first run-time estimate shows a one-time warning dialog naming ways to shorten the run, instead of running silently. | **On the next run** |
 
 `operator_worker_count` is `OperatorRegistry`'s own value, not `ArtifactStore`'s or
 `MediaResolver`'s -- `AppController.run_create_columns` reads it fresh, through
 `SettingsGateway`, at the start of every COLUMNS run, rather than once at app
 startup. Changing it therefore needs no restart: the very next run picks up the
-new value.
+new value. `long_run_warning_minutes` is `AppController`'s own the same way --
+read fresh each time a run's first estimate is checked
+(`AppController._maybe_warn_long_run`), so it too needs no restart.
 
 Bounds and the exact defaults live in `settings/settings.py` as module-level
 constants; a saved value outside its bounds is clamped, an unparseable one falls

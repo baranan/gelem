@@ -406,6 +406,7 @@ class OperatorRegistry:
         on_row_errors=None,
         media_column: str | None = None,
         worker_count: int = 1,
+        on_row_finished=None,
     ) -> bool:
         """
         Runs create_columns() over an ordered group of rows in a
@@ -507,6 +508,25 @@ class OperatorRegistry:
                               caught exception, or whatever string the
                               operator itself passed to
                               report_row_error().
+            on_row_finished:  Called once, on the run's own
+                              coordinator thread, for EVERY row that
+                              reaches a terminal outcome -- success, an
+                              unexpected create_columns() exception, or a
+                              refusal before create_columns() was ever
+                              called (MissingMedia, UnparseableMedia,
+                              WholeVideoRow, an unreadable image, or a
+                              whole source-group failure during the
+                              ordered frame decode). A row a cancelled run
+                              never reaches, and a row skipped because the
+                              run aborted on a setup error, is never
+                              "finished" and this is not called for it.
+                              Signature: (operation_id: str). Used by
+                              AppController to time the run-time estimate
+                              from an exact per-run count of finished
+                              rows -- on_progress's percentage is coalesced
+                              across the whole application and cannot
+                              serve that purpose (CLAUDE.md's threading
+                              rule: only the coordinator thread records).
 
         Raises:
             ValueError: If snapshot does not have exactly one row per
@@ -555,6 +575,7 @@ class OperatorRegistry:
                 operator, snapshot, row_ids, table_name, run, operation_id,
                 on_item_complete, on_progress, on_complete,
                 on_setup_error, on_row_errors, media_column, worker_count,
+                on_row_finished,
             ),
             daemon=True,
         )
@@ -576,6 +597,7 @@ class OperatorRegistry:
         on_row_errors,
         media_column: str | None = None,
         worker_count: int = 1,
+        on_row_finished=None,
     ) -> None:
         """
         Worker that runs create_columns() in the background thread. This
@@ -691,13 +713,27 @@ class OperatorRegistry:
                 if on_item_complete is not None:
                     on_item_complete(operation_id, table_name, row_id, all_none)
                     emitted += 1
+                if on_row_finished is not None:
+                    on_row_finished(operation_id)
                 return True
             # "ok"
             _, result = outcome
             if on_item_complete is not None:
                 on_item_complete(operation_id, table_name, row_id, result)
                 emitted += 1
+            if on_row_finished is not None:
+                on_row_finished(operation_id)
             return True
+
+        def _record_row_error(row_id: str, kind: str, message: str) -> None:
+            """A row refused before create_columns() was ever called
+            (missing/unparseable media, a whole video where a frame was
+            expected, an unreadable image) -- this row has still
+            reached a terminal outcome, so on_row_finished must see it
+            even though on_item_complete never will."""
+            row_errors.append((row_id, kind, message))
+            if on_row_finished is not None:
+                on_row_finished(operation_id)
 
         # What the runner decodes for each row is decided by this run's
         # declared media_requirement (operators/descriptor.py ->
@@ -776,7 +812,7 @@ class OperatorRegistry:
                 operator, snapshot, row_ids, table_name, run, operation_id,
                 on_item_complete, on_progress, on_complete, on_setup_error,
                 on_row_errors, media_column, needs_frame, label,
-                worker_count, start_time,
+                worker_count, start_time, on_row_finished,
             )
             return
 
@@ -922,18 +958,18 @@ class OperatorRegistry:
                 # media is a different, more accurate answer than
                 # telling them it names a whole video).
                 if not full_path or pd.isna(full_path):
-                    row_errors.append((
+                    _record_row_error(
                         row_id, "MissingMedia",
                         "this row has no media value to read",
-                    ))
+                    )
                     continue
                 try:
                     addr = parse_address(full_path)
                 except MediaAddressError as e:
-                    row_errors.append((
+                    _record_row_error(
                         row_id, "UnparseableMedia",
                         f"could not parse the media value {full_path!r}: {e}",
-                    ))
+                    )
                     continue
                 if _is_bare_video_address(addr):
                     # Not a decode failure -- a deliberate refusal, but
@@ -950,7 +986,7 @@ class OperatorRegistry:
                         "this operator reads single frames; this row "
                         "is a whole video"
                     )
-                    row_errors.append((row_id, "WholeVideoRow", message))
+                    _record_row_error(row_id, "WholeVideoRow", message)
                     continue
 
                 # A #f=<n> address on a VIDEO is the ordered path's case
@@ -977,8 +1013,8 @@ class OperatorRegistry:
                         f"[OperatorRegistry] Could not load image "
                         f"for {row_id}: {full_path} ({e})"
                     )
-                    row_errors.append(
-                        _unreadable_media_row_error(row_id, full_path, e)
+                    _record_row_error(
+                        *_unreadable_media_row_error(row_id, full_path, e)
                     )
                     continue
             else:
@@ -1060,7 +1096,7 @@ class OperatorRegistry:
                             f"{type(e).__name__}: {e}"
                         )
                         for row_id in pending_row_ids:
-                            row_errors.append((row_id, type(e).__name__, str(e)))
+                            _record_row_error(row_id, type(e).__name__, str(e))
                         continue
                     if aborted:
                         break
@@ -1082,6 +1118,8 @@ class OperatorRegistry:
                                     operation_id, table_name, row_id, result
                                 )
                                 emitted += 1
+                            if on_row_finished is not None:
+                                on_row_finished(operation_id)
                             _report_progress()
                     except NotImplementedError:
                         print(
@@ -1121,7 +1159,7 @@ class OperatorRegistry:
                             f"{type(e).__name__}: {e}"
                         )
                         for row_id in pending_row_ids:
-                            row_errors.append((row_id, type(e).__name__, str(e)))
+                            _record_row_error(row_id, type(e).__name__, str(e))
                         continue
 
         # P1.7-1 fix round: run.report_row_error() is available on every
@@ -1164,6 +1202,7 @@ class OperatorRegistry:
         label: str,
         worker_count: int,
         start_time: float,
+        on_row_finished=None,
     ) -> None:
         """
         The parallel COLUMNS path. Reached only from
@@ -1256,6 +1295,8 @@ class OperatorRegistry:
                 if on_item_complete is not None:
                     on_item_complete(operation_id, table_name, row_id, all_none)
                     emitted += 1
+                if on_row_finished is not None:
+                    on_row_finished(operation_id)
                 _report_progress()
                 return True
             # "ok"
@@ -1263,6 +1304,8 @@ class OperatorRegistry:
             if on_item_complete is not None:
                 on_item_complete(operation_id, table_name, row_id, result)
                 emitted += 1
+            if on_row_finished is not None:
+                on_row_finished(operation_id)
             _report_progress()
             return True
 
@@ -1494,8 +1537,19 @@ class OperatorRegistry:
                     aborted = True
                     abort_event.set()
             elif tag == "producer_row_error":
+                # This message is how a row refused before ever
+                # reaching a consumer (MissingMedia, UnparseableMedia,
+                # WholeVideoRow, an unreadable image, or a whole
+                # source-group decode failure) reaches the coordinator --
+                # see _producer()'s own comments. It is a terminal outcome
+                # for that row exactly as a "row_outcome" message is, so
+                # on_row_finished must count it here, on the coordinator
+                # thread, the same place _record() counts every other
+                # terminal outcome.
                 _, row_id, kind, message = item
                 row_errors.append((row_id, kind, message))
+                if on_row_finished is not None:
+                    on_row_finished(operation_id)
             else:  # "row_outcome"
                 _, row_id, outcome = item
                 if not _record(row_id, outcome):

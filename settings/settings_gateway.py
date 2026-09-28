@@ -37,6 +37,7 @@ from settings.settings import (
     MAX_OPEN_DECODERS_RANGE,
     FRAME_STEPPER_MAX_SECONDS_RANGE,
     OPERATOR_WORKER_COUNT_RANGE,
+    LONG_RUN_WARNING_MINUTES_RANGE,
 )
 from settings.settings_store import SettingsStore
 
@@ -63,13 +64,16 @@ class SettingField:
 
 # The six ArtifactStore/MediaResolver values docs/architecture.md section 9's
 # table lists, in that order, plus output_copy_warning_threshold_bytes
-# (P1.9b-2), frame_stepper_max_seconds (P1.4b part 1) and
-# operator_worker_count after them -- none of the three is one of
-# "the six values" section 9 documents, but all are edited the same way.
-# operator_worker_count is not an ArtifactStore/MediaResolver value at
-# all -- it is OperatorRegistry's, read fresh by AppController at the
-# start of every COLUMNS run rather than once at app startup, which is
-# why it alone is NOT restart_required below. minimum and maximum are ALWAYS
+# (P1.9b-2), frame_stepper_max_seconds (P1.4b part 1),
+# operator_worker_count and long_run_warning_minutes after them --
+# none of the four is one of "the six values" section 9 documents, but all
+# are edited the same way. operator_worker_count is not an
+# ArtifactStore/MediaResolver value at all -- it is OperatorRegistry's, read
+# fresh by AppController at the start of every COLUMNS run rather than once
+# at app startup, which is why it alone is NOT restart_required below.
+# long_run_warning_minutes is AppController's own -- read fresh every time a
+# COLUMNS run's first estimate is checked, so it too is NOT restart_required.
+# minimum and maximum are ALWAYS
 # read from the *_RANGE tuples in settings/settings.py -- never retyped as
 # literals here -- so a bound change in one place cannot silently disagree
 # with another.
@@ -171,6 +175,17 @@ _FIELD_SPECS = (
         "count",
         False,
     ),
+    (
+        "long_run_warning_minutes",
+        "Warn when a run will take longer than (minutes)",
+        "Above this many minutes, a per-image analysis run's first "
+        "time estimate shows a one-time warning with ways to shorten it, "
+        "instead of running silently for however long it takes. Takes "
+        "effect on the next run -- no restart needed.",
+        LONG_RUN_WARNING_MINUTES_RANGE,
+        "minutes",
+        False,
+    ),
 )
 
 
@@ -269,3 +284,15 @@ class SettingsGateway:
         """
         current_settings, _problems = self._store.load()
         return current_settings.operator_worker_count
+
+    def get_long_run_warning_minutes(self) -> int:
+        """The current long_run_warning_minutes value.
+
+        Also one of the fields describe_fields() lists, so the settings
+        dialog can edit it. This direct getter stays because
+        AppController._maybe_warn_long_run reads this one number fresh
+        each time it checks a run's first estimate and should not build
+        the whole SettingField list just to get it.
+        """
+        current_settings, _problems = self._store.load()
+        return current_settings.long_run_warning_minutes

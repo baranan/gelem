@@ -587,6 +587,13 @@ state. This rule carries no violation list of its own -- it points at the three
   method's contract). A still image row or a `#t=` time-point row is unaffected --
   it keeps the original per-row `resolve_frame()` path. Tests:
   `tests/test_ordered_frame_runner.py`.
+- **`[NOW]`** A COLUMNS run's run-time estimate is measured on the run itself
+  (no separate pilot) from an exact per-run count of finished rows, successes
+  and row errors alike, delivered by `OperatorRegistry`'s `on_row_finished`
+  callback from each run's coordinator thread in both the serial and parallel
+  paths. No estimate until `run_timing.ESTIMATE_MIN_ROWS` rows have finished
+  after the anchor. TABLE and DISPLAY runs show elapsed time only. Tests:
+  `tests/test_run_timing.py`, `tests/test_row_finished_counting.py`.
 
 ---
 

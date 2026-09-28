@@ -26,10 +26,13 @@ from dataclasses import replace as _dataclasses_replace
 from pathlib import Path
 import queue
 import threading
+import time
 import uuid
 import pandas as pd
 
 from PySide6.QtCore import QObject, Signal, QTimer
+
+import run_timing
 
 from models.query_result import QueryResult, ResultLayout, GroupSection
 from models.notifications import RowsUpdated, ThumbnailsReady
@@ -192,9 +195,37 @@ def _truncated_message(message: str | None) -> str | None:
     return message[: _MAX_INDICATOR_MESSAGE_CHARS - 3] + "..."
 
 
+def _run_duration_clause(run: dict, now: float) -> str:
+    """The elapsed-time clause for one live run: the elapsed time alone,
+    or "elapsed; about REMAINING left" once a COLUMNS run has measured
+    enough rows to trust a rate (run_timing.estimate_remaining_seconds).
+    TABLE and DISPLAY runs -- and a COLUMNS run before it has enough data
+    -- get elapsed time only, never a fabricated estimate.
+
+    Every key this reads defaults to something harmless when absent, so a
+    caller's plain dict missing "start_monotonic" and the rest still
+    renders rather than raising -- it just shows no elapsed time and no
+    estimate.
+    """
+    elapsed = now - run.get("start_monotonic", now)
+    text = run_timing.format_duration(elapsed)
+    if run.get("mode_name") == "COLUMNS":
+        remaining = run_timing.estimate_remaining_seconds(
+            finished_row_count=run.get("finished_row_count", 0),
+            rows_requested=run.get("rows_requested", 0),
+            first_finished_monotonic=run.get("finished_first_time"),
+            finished_count_at_first=run.get("finished_count_at_first"),
+            now=now,
+        )
+        if remaining is not None:
+            text += f"; about {run_timing.format_duration(remaining)} left"
+    return text
+
+
 def format_run_indicator_text(
     live_runs: list[dict],
     percent: int | None,
+    now: float,
 ) -> str:
     """The sentence the run-indicator status-bar widget should show, or
     "" when nothing is running -- the empty string is what tells
@@ -208,22 +239,35 @@ def format_run_indicator_text(
     "message" (run-indicator-2) is the run's latest run.log() text, or
     None/absent if the operator has not called it yet -- a caller such as
     tests/test_result_delivery.py's older cases may omit the key entirely,
-    which reads the same as None.
+    which reads the same as None. Also read from "start_monotonic",
+    "mode_name", "finished_row_count", "rows_requested" and
+    "finished_first_time", by _run_duration_clause() above -- see its own
+    docstring for what each defaults to when absent.
 
     percent is the latest value reported by AppController's
     operator_progress signal (0-100), or None if no progress tick has
     arrived since the live-run set last changed.
+
+    now is a time.monotonic() reading, supplied by the caller -- this
+    function never reads the clock itself, so it stays plain-data-in,
+    plain-data-out and testable with a fabricated value. MainWindow's 1s
+    QTimer passes a fresh reading on every tick so the elapsed time in the
+    sentence keeps ticking even while nothing else about the run changes.
 
     AppController coalesces progress into ONE latest value for the WHOLE
     APPLICATION, not one per run (see operator_progress on AppController).
     So a percentage can only be shown honestly when there is exactly one
     live run -- with two or more, the shared number cannot be attributed
     to either one, so no percentage is shown at all, only how many
-    operators are running and their labels.
+    operators are running and their labels (each with its own elapsed
+    time, which carries no such ambiguity -- see _run_duration_clause).
 
-    A run.log() message has no such ambiguity: it is stored per
+    A run.log() message has no such ambiguity either: it is stored per
     operation_id (see AppController._latest_logs), so it is shown next to
     every run it belongs to, whether there is one live run or several.
+
+    Every " -- " separator earlier versions of this sentence used is now
+    ";".
     """
     if not live_runs:
         return ""
@@ -231,21 +275,25 @@ def format_run_indicator_text(
     if len(live_runs) == 1:
         run = live_runs[0]
         text = f'Running "{run["label"]}" on "{run["table_name"]}"'
+        duration_clause = _run_duration_clause(run, now)
         if percent is not None:
-            text += f" -- {percent}%"
+            text += f"; {percent}% ({duration_clause})"
+        else:
+            text += f"; {duration_clause}"
         message = _truncated_message(run.get("message"))
         if message:
-            text += f" -- {message}"
+            text += f"; {message}"
         return text
 
     parts = []
     for run in live_runs:
-        part = f'"{run["label"]}"'
+        part = f'"{run["label"]}" ({_run_duration_clause(run, now)}'
         message = _truncated_message(run.get("message"))
         if message:
-            part += f" ({message})"
+            part += f"; {message}"
+        part += ")"
         parts.append(part)
-    return f"{len(live_runs)} operators running: {', '.join(parts)}"
+    return f"{len(live_runs)} operators running: {'; '.join(parts)}"
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +347,41 @@ def format_cancel_message(label: str) -> str:
         f'Cancelling "{label}". Nothing already written to the table is '
         f"undone. Any work still in progress when it stops will not be "
         f"saved."
+    )
+
+
+# ---------------------------------------------------------------------------
+# The one-time long-run warning. AppController._maybe_warn_long_run
+# emits long_run_estimated the first time a COLUMNS run's estimate exceeds
+# the researcher's long_run_warning_minutes setting; MainWindow shows this
+# text with a Keep running / Cancel run choice. Plain wording, no Qt --
+# the same two-layer pattern as format_cancel_message above.
+# ---------------------------------------------------------------------------
+
+def format_long_run_warning_message(label: str, estimated_total_seconds: float) -> str:
+    """The plain-English body of the long-run warning dialog.
+
+    Names the two concrete ways to shorten a run, by the exact control and
+    menu wording the researcher will actually see, rather than a generic
+    "try a smaller sample": the filter panel's "Randomise order" button
+    followed by the "Save filtered set as new table..." menu item build a
+    small random table to test on first; "Split into frames"'s own "Frame
+    step (keep every Nth)" parameter is the video-specific option.
+    """
+    approx = run_timing.format_approximate_duration(estimated_total_seconds)
+    return (
+        f'"{label}" is estimated to take {approx} in total, based on its '
+        f"speed so far on this computer -- this is approximate, not "
+        f"exact.\n\n"
+        f"You can keep it running, or cancel it now: cancelling keeps "
+        f"every column already filled in by rows finished so far.\n\n"
+        f"Two ways to make a run like this shorter next time:\n"
+        f'  - Try it first on a random sample of rows: click "Randomise '
+        f'order", then use "Save filtered set as new table..." to save a '
+        f"small random 1-2% of the rows as a new table to test on before "
+        f"running on everything.\n"
+        f'  - For video, "Split into frames" has a "Frame step (keep '
+        f'every Nth)" parameter -- a larger step analyses fewer frames.'
     )
 
 
@@ -523,6 +606,13 @@ class AppController(QObject):
         display_result_ready:    Result dict from a create_display
                                  operator, for ResultsPanel.
         table_created:           Name of a newly created table.
+        long_run_estimated:      (operation_id, estimated_total_
+                                 seconds) -- emitted at most once per run,
+                                 the first time a COLUMNS run's estimated
+                                 total time exceeds the researcher's
+                                 long_run_warning_minutes setting.
+                                 MainWindow shows the warning dialog; the
+                                 run itself keeps going regardless.
     """
 
     result_changed           = Signal(object)
@@ -541,6 +631,7 @@ class AppController(QObject):
     error_occurred           = Signal(str)
     display_result_ready     = Signal(dict)
     table_created            = Signal(str)
+    long_run_estimated       = Signal(str, float)
 
     def __init__(
         self,
@@ -637,6 +728,18 @@ class AppController(QObject):
         # 50,000 rows costs the same as one that logs twice.
         self._log_lock = threading.Lock()
         self._latest_logs: dict[str, str] = {}
+
+        # The exact per-run finished-row count (successes AND row
+        # errors -- every row a COLUMNS run's coordinator thread reports
+        # through on_row_finished, operators/operator_registry.py). NOT
+        # coalesced the way progress and run.log() are -- a running total
+        # is written back under the lock (get-then-increment), so the
+        # drain always reads the true cumulative count, never a value
+        # reset out from under it between ticks. Cleared per run on
+        # deregistration (_deregister_run) so this dict does not grow
+        # across a long session.
+        self._finished_rows_lock = threading.Lock()
+        self._latest_finished_counts: dict[str, int] = {}
 
         # How many items to take from each queue per tick. The same
         # budget is applied to each queue independently. A constructor
@@ -827,6 +930,49 @@ class AppController(QObject):
         "message" (run-indicator-2) starts None and is overwritten by
         _apply_run_logs with this run's newest run.log() text, moved off
         self._latest_logs during the drain -- see get_live_runs().
+
+        "start_monotonic" is a time.monotonic() reading taken HERE, at
+        registration -- the anchor the status-bar indicator's elapsed
+        time is measured from (now - start_monotonic).
+
+        "finished_row_count" starts 0 and is overwritten by
+        _apply_finished_row_counts with the exact count of rows this run
+        has finished -- successes AND row errors alike, counted by
+        operators/operator_registry.py's on_row_finished callback on the
+        run's own coordinator thread. Unlike "applied" above, which only
+        counts a row after Dataset.apply_row_updates() has placed it, this
+        counts a row the moment it reaches ANY terminal outcome,
+        including ones "applied" never sees (a row refused before
+        create_columns() was ever called) -- see run_create_columns's own
+        on_row_finished docstring.
+
+        "finished_first_time" starts None and is set once, at the first
+        DRAIN TICK finished_row_count is observed to be nonzero -- the
+        anchor run_timing.estimate_remaining_seconds measures its rate
+        from. TABLE and DISPLAY runs never advance finished_row_count, so
+        this never leaves None for them and they never get an estimate --
+        by design, not by omission (CLAUDE.md's "Long-running work": a
+        TABLE/DISPLAY run's runner cannot report progress mid-computation
+        the way the per-row COLUMNS runner can).
+
+        "finished_count_at_first" starts None and is set in the SAME tick
+        as "finished_first_time", to whatever finished_row_count already
+        was at that tick -- never assumed to be 1. A drain runs only
+        periodically (every 50ms), so several rows may already have
+        finished by the first tick that notices any did, especially on
+        the parallel path where more than one consumer thread finishes
+        rows concurrently between two ticks. Without this, the rate would
+        wrongly count those already-finished rows as if they finished
+        after the anchor, overstating it and understating time left --
+        worst for the very first estimate, the one the long-run warning
+        acts on. See run_timing.estimate_remaining_seconds's docstring.
+
+        "long_run_checked" starts False and is set True the first
+        time this run's estimate becomes available -- whether or not that
+        first estimate actually exceeded long_run_warning_minutes -- so
+        the warning is judged against the FIRST estimate only, and
+        long_run_estimated fires at most once per run. See
+        _maybe_warn_long_run.
         """
         self._live_runs[operation_id] = {
             "label":              label,
@@ -854,6 +1000,13 @@ class AppController(QObject):
             "rows_processed":    0,
             "elapsed_seconds":   0.0,
             "worker_count":      1,
+            # The run-time estimate's own bookkeeping. See this
+            # method's docstring above for what each means.
+            "start_monotonic":         time.monotonic(),
+            "finished_row_count":      0,
+            "finished_first_time":     None,
+            "finished_count_at_first": None,
+            "long_run_checked":        False,
         }
         # A new operation_id is always a new entry (uuid-generated per
         # run), so this always changes the set -- see live_runs_changed.
@@ -865,8 +1018,14 @@ class AppController(QObject):
         Only emits live_runs_changed when a run was actually removed --
         a no-op pop (already-idempotent caller, or a run the failed-start
         cleanup already dropped) is not a change to the set.
+
+        Also drops this run's entry from _latest_finished_counts, if it
+        has one -- harmless if it never got one (a TABLE/DISPLAY run
+        never does), and stops that dict growing across a long session.
         """
         if self._live_runs.pop(operation_id, None) is not None:
+            with self._finished_rows_lock:
+                self._latest_finished_counts.pop(operation_id, None)
             self.live_runs_changed.emit()
 
     def get_live_runs(self) -> list[dict]:
@@ -876,8 +1035,19 @@ class AppController(QObject):
 
         Returns one
         {"operation_id": str, "label": str, "table_name": str,
-         "message": str | None}
-        dict per live run, IN THE ORDER THOSE RUNS STARTED.
+         "message": str | None, "mode_name": str, "start_monotonic": float,
+         "finished_row_count": int, "rows_requested": int,
+         "finished_first_time": float | None,
+         "finished_count_at_first": int | None}
+        dict per live run, IN THE ORDER THOSE RUNS STARTED. Widened from
+        four fields to ten: format_run_indicator_text() (via
+        controller._run_duration_clause()) reads the six new ones to
+        show elapsed time and, for a COLUMNS run with enough data, a
+        run-time estimate. "mode_name" is one of "COLUMNS", "TABLE" or
+        "DISPLAY" -- only a COLUMNS run ever gets a non-None
+        "finished_first_time", so only a COLUMNS run ever gets an
+        estimate; TABLE and DISPLAY show elapsed time alone. Still never
+        "token", "column_tags" or the rest of the internal bookkeeping.
 
         That order is a real guarantee, not an accident of dict iteration:
         _live_runs is only ever appended to by _register_run (a fresh
@@ -907,10 +1077,16 @@ class AppController(QObject):
         """
         return [
             {
-                "operation_id": operation_id,
-                "label":        run["label"],
-                "table_name":   run["table_name"],
-                "message":      run["message"],
+                "operation_id":         operation_id,
+                "label":                run["label"],
+                "table_name":           run["table_name"],
+                "message":              run["message"],
+                "mode_name":            run["mode_name"],
+                "start_monotonic":      run["start_monotonic"],
+                "finished_row_count":   run["finished_row_count"],
+                "rows_requested":       run["rows_requested"],
+                "finished_first_time":  run["finished_first_time"],
+                "finished_count_at_first": run["finished_count_at_first"],
             }
             for operation_id, run in self._live_runs.items()
         ]
@@ -1487,6 +1663,7 @@ class AppController(QObject):
         self._drain_item_results()
         self._emit_progress_if_changed()
         self._apply_run_logs()
+        self._apply_finished_row_counts()
         self._drain_completions()
 
     def _drain_thumbnails(self) -> None:
@@ -1669,6 +1846,79 @@ class AppController(QObject):
         if changed:
             self.operator_log_changed.emit()
 
+    def _apply_finished_row_counts(self) -> None:
+        """
+        Copies the worker-maintained finished-row counts onto each
+        still-live run's "finished_row_count", and, the first tick a
+        run's count is observed to be nonzero, records that moment as
+        "finished_first_time" AND the count already reached by then as
+        "finished_count_at_first" (the anchor run_timing.estimate_
+        remaining_seconds measures its rate from -- see its own
+        docstring for why the count matters as much as the timestamp).
+        Then checks whether that is enough for a first run-time estimate
+        (see _maybe_warn_long_run).
+
+        Unlike _apply_run_logs, the source dict is NOT cleared here -- it
+        is a running total a worker thread increments with get-then-set
+        under the same lock (see _on_row_finished), so clearing it would
+        make the next increment start over from zero and undercount every
+        run whose drain has ever run. A snapshot (plain dict copy) is
+        enough: reading it does not disturb the running total.
+
+        A count for a run no longer in self._live_runs is silently
+        ignored here -- the same "drop silently" treatment every other
+        drain in this class gives a dead run's leftover data.
+        """
+        with self._finished_rows_lock:
+            counts = dict(self._latest_finished_counts)
+        now = time.monotonic()
+        for operation_id, count in counts.items():
+            run = self._live_runs.get(operation_id)
+            if run is None:
+                continue
+            run["finished_row_count"] = count
+            if run["finished_first_time"] is None and count > 0:
+                run["finished_first_time"] = now
+                run["finished_count_at_first"] = count
+            self._maybe_warn_long_run(operation_id, run, now)
+
+    def _maybe_warn_long_run(self, operation_id: str, run: dict, now: float) -> None:
+        """
+        Emits long_run_estimated(operation_id, estimated_total_seconds)
+        the first time this run's estimate becomes available, if that
+        FIRST estimate exceeds the researcher's long_run_warning_minutes
+        setting -- never re-checked after that, whichever way it went, so
+        the warning is judged against the first estimate only and can
+        fire at most once per run.
+
+        A no-op for a TABLE/DISPLAY run (mode_name is never "COLUMNS" for
+        one) and for a run with no settings gateway wired (most tests
+        construct a bare AppController this way -- there is no configured
+        threshold to check against, so this simply never fires, the same
+        "no gateway -> the setting-backed behaviour is skipped" choice
+        run_create_columns already makes for operator_worker_count).
+        """
+        if run["long_run_checked"] or run["mode_name"] != "COLUMNS":
+            return
+        if self._settings_gateway is None:
+            return
+        remaining = run_timing.estimate_remaining_seconds(
+            finished_row_count=run["finished_row_count"],
+            rows_requested=run["rows_requested"],
+            first_finished_monotonic=run["finished_first_time"],
+            finished_count_at_first=run["finished_count_at_first"],
+            now=now,
+        )
+        if remaining is None:
+            return
+        run["long_run_checked"] = True
+        estimated_total_seconds = (now - run["start_monotonic"]) + remaining
+        threshold_minutes = self._settings_gateway.get_long_run_warning_minutes()
+        if run_timing.exceeds_long_run_threshold(
+            estimated_total_seconds, threshold_minutes
+        ):
+            self.long_run_estimated.emit(operation_id, estimated_total_seconds)
+
     def _drain_completions(self) -> None:
         """
         Processes up to _drain_budget completion-queue items.
@@ -1733,6 +1983,20 @@ class AppController(QObject):
         """
         with self._log_lock:
             self._latest_logs[operation_id] = text
+
+    def _on_row_finished(self, operation_id: str) -> None:
+        """Called on the run's own coordinator thread once for
+        every row that reaches a terminal outcome (success or a row
+        error) -- see run_create_columns's on_row_finished docstring for
+        the exact set. Does nothing but bump this run's running total
+        under the lock; _apply_finished_row_counts reads it back on the
+        main thread next tick. Never raises, whether or not operation_id
+        still names a live run -- the same discipline _on_run_log and
+        _on_progress already follow."""
+        with self._finished_rows_lock:
+            self._latest_finished_counts[operation_id] = (
+                self._latest_finished_counts.get(operation_id, 0) + 1
+            )
 
     def _on_create_columns_complete(
         self,
@@ -2965,6 +3229,7 @@ class AppController(QObject):
                     on_row_errors=self._on_operator_row_errors,
                     media_column=media_column,
                     worker_count=worker_count,
+                    on_row_finished=self._on_row_finished,
                 )
             except Exception:
                 # The run never started, so no callback will ever

@@ -1106,6 +1106,7 @@ def test_accepting_a_conflict_starts_the_run(qapp, monkeypatch):
 # ===========================================================================
 
 from PySide6.QtWidgets import QLabel, QPushButton
+from PySide6.QtCore import QTimer
 
 
 class _LiveRunsController:
@@ -1127,13 +1128,15 @@ class _LiveRunsController:
 def _indicator_window(controller):
     """A MainWindow with no __init__ run, carrying just the run-indicator
     state _build_status_bar() would have created -- the label
-    (run-indicator-1/2) and, since run-indicator-3, the Cancel button
-    beside it."""
+    (run-indicator-1/2), the Cancel button beside it (run-indicator-3),
+    and the 1s elapsed-time timer (run-time-estimate item) _on_live_runs_
+    changed starts and stops."""
     window = MainWindow.__new__(MainWindow)
     window._controller = controller
     window._run_indicator_label = QLabel()
     window._cancel_run_button = QPushButton()
     window._latest_run_percent = None
+    window._run_elapsed_timer = QTimer()
     return window
 
 
@@ -1246,8 +1249,12 @@ def test_indicator_label_shows_no_message_text_before_one_arrives(qapp):
     # Would still pass if violated? No. A version that rendered "None"
     # into the sentence for an unset message would fail this.
     assert "None" not in window._run_indicator_label.text()
+    # The run-time-estimate item appends an elapsed-time clause after the
+    # table name -- 0d:0h:00m:00s here, since this live-run dict carries
+    # no "start_monotonic" and _run_duration_clause defaults elapsed to
+    # zero in that case (controller.py's own docstring).
     assert window._run_indicator_label.text() == (
-        'Running "Extract frames" on "videos"'
+        'Running "Extract frames" on "videos"; 0d:0h:00m:00s'
     )
 
 

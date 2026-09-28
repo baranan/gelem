@@ -61,6 +61,10 @@ class SettingsStore:
     # operator_worker_count is an OperatorRegistry value, not an
     # ArtifactStore/MediaResolver one -- its own "operators/" namespace.
     _KEY_OPERATOR_WORKER_COUNT = "operators/operator_worker_count"
+    # long_run_warning_minutes is AppController's own -- its own
+    # "operators/" namespace, alongside operator_worker_count, since both
+    # bound a COLUMNS run rather than ArtifactStore/MediaResolver decoding.
+    _KEY_LONG_RUN_WARNING_MINUTES = "operators/long_run_warning_minutes"
 
     def __init__(self, backend: SettingsBackend):
         self._backend = backend
@@ -96,6 +100,9 @@ class SettingsStore:
             "operator_worker_count": self._backend.get(
                 self._KEY_OPERATOR_WORKER_COUNT
             ),
+            "long_run_warning_minutes": self._backend.get(
+                self._KEY_LONG_RUN_WARNING_MINUTES
+            ),
         }
         return GelemSettings.from_values(raw)
 
@@ -130,4 +137,8 @@ class SettingsStore:
         self._backend.set(
             self._KEY_OPERATOR_WORKER_COUNT,
             str(settings.operator_worker_count),
+        )
+        self._backend.set(
+            self._KEY_LONG_RUN_WARNING_MINUTES,
+            str(settings.long_run_warning_minutes),
         )

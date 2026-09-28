@@ -29,6 +29,7 @@ from settings.settings import (
     MAX_OPEN_DECODERS_RANGE,
     FRAME_STEPPER_MAX_SECONDS_RANGE,
     OPERATOR_WORKER_COUNT_RANGE,
+    LONG_RUN_WARNING_MINUTES_RANGE,
 )
 from settings.settings_store import SettingsStore
 from settings.settings_gateway import SettingsGateway, SettingField
@@ -223,10 +224,10 @@ def test_apply_settings_pushes_the_corrected_value_not_the_raw_one():
 
 # ===========================================================================
 # CHECK 4 -- the persisted layout, pinned. This is the first code in the app
-# that ever writes these eight keys, so the layout is pinned on purpose.
+# that ever writes these ten keys, so the layout is pinned on purpose.
 # ===========================================================================
 
-def test_save_values_writes_exactly_the_nine_settings_keys():
+def test_save_values_writes_exactly_the_ten_settings_keys():
     backend = DictBackend()
     gateway = SettingsGateway(SettingsStore(backend))
 
@@ -240,6 +241,7 @@ def test_save_values_writes_exactly_the_nine_settings_keys():
         "output_copy_warning_threshold_bytes": 2147483648,
         "frame_stepper_max_seconds": 15,
         "operator_worker_count": 3,
+        "long_run_warning_minutes": 45,
     })
 
     assert problems == []
@@ -253,6 +255,7 @@ def test_save_values_writes_exactly_the_nine_settings_keys():
         "save/output_copy_warning_threshold_bytes": "2147483648",
         "artifacts/frame_stepper_max_seconds": "15",
         "operators/operator_worker_count": "3",
+        "operators/long_run_warning_minutes": "45",
     }
 
 
@@ -276,6 +279,7 @@ def test_describe_fields_metadata_comes_from_the_range_constants():
         "output_copy_warning_threshold_bytes",
         "frame_stepper_max_seconds",
         "operator_worker_count",
+        "long_run_warning_minutes",
     ]
 
     expected_bounds = [
@@ -288,18 +292,19 @@ def test_describe_fields_metadata_comes_from_the_range_constants():
         OUTPUT_COPY_WARNING_THRESHOLD_BYTES_RANGE,
         FRAME_STEPPER_MAX_SECONDS_RANGE,
         OPERATOR_WORKER_COUNT_RANGE,
+        LONG_RUN_WARNING_MINUTES_RANGE,
     ]
     for field, (low, high) in zip(fields, expected_bounds):
         assert field.minimum == low
         assert field.maximum == high
 
     assert [f.restart_required for f in fields] == [
-        False, False, True, True, True, True, False, True, False,
+        False, False, True, True, True, True, False, True, False, False,
     ]
 
     assert [f.unit for f in fields] == [
         "bytes", "bytes", "count", "count", "pixels", "pixels", "bytes",
-        "seconds", "count",
+        "seconds", "count", "minutes",
     ]
 
 
@@ -336,9 +341,9 @@ def test_cross_field_correction_is_applied_before_the_value_is_written():
 # and are NOT reset to defaults.
 # ===========================================================================
 
-# Eight NON-default in-range values, so a reset-to-defaults is visibly
+# Nine NON-default in-range values, so a reset-to-defaults is visibly
 # different from a correct overlay. (Defaults are 500 MiB / 1 GiB / 2 / 6 /
-# 150 / 600 / 1 GiB / 10 s / 2.)
+# 150 / 600 / 1 GiB / 10 s / 2 / 30 min.)
 _SEED_PERSISTED = {
     "artifacts/picture_memory_max_bytes": "268435456",   # 256 MiB
     "artifacts/picture_disk_max_bytes": "536870912",      # 512 MiB
@@ -349,6 +354,7 @@ _SEED_PERSISTED = {
     "save/output_copy_warning_threshold_bytes": "3221225472",   # 3 GiB
     "artifacts/frame_stepper_max_seconds": "3",
     "operators/operator_worker_count": "4",
+    "operators/long_run_warning_minutes": "45",
 }
 
 
@@ -360,7 +366,7 @@ def test_save_values_overlays_a_partial_mapping_and_keeps_the_rest():
     problems = gateway.save_values({"worker_count": 8})
     assert problems == []
 
-    # The named field changed; the other eight are exactly as seeded.
+    # The named field changed; the other nine are exactly as seeded.
     assert backend.data == {
         "artifacts/picture_memory_max_bytes": "268435456",
         "artifacts/picture_disk_max_bytes": "536870912",
@@ -371,6 +377,7 @@ def test_save_values_overlays_a_partial_mapping_and_keeps_the_rest():
         "save/output_copy_warning_threshold_bytes": "3221225472",
         "artifacts/frame_stepper_max_seconds": "3",
         "operators/operator_worker_count": "4",
+        "operators/long_run_warning_minutes": "45",
     }
 
 

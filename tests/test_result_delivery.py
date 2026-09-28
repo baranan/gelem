@@ -22,6 +22,7 @@ from __future__ import annotations
 import ast
 import sys
 import threading
+import time
 from pathlib import Path
 
 project_root = Path(__file__).parent.parent
@@ -1104,26 +1105,36 @@ def test_indicator_text_is_empty_with_no_live_runs():
     # Would still pass if violated? No. A version that always produced
     # some text (even a generic "idle" message) would fail this, and the
     # empty string is exactly what tells the widget to hide itself.
-    assert format_run_indicator_text([], None) == ""
-    assert format_run_indicator_text([], 50) == ""
+    assert format_run_indicator_text([], None, 1000.0) == ""
+    assert format_run_indicator_text([], 50, 1000.0) == ""
 
 
 def test_indicator_text_one_run_no_progress_yet():
-    live_runs = [{"label": "Extract blendshapes", "table_name": "frames"}]
-    text = format_run_indicator_text(live_runs, None)
+    live_runs = [{
+        "label": "Extract blendshapes", "table_name": "frames",
+        "start_monotonic": 1000.0, "mode_name": "TABLE",
+    }]
+    text = format_run_indicator_text(live_runs, None, 1000.0)
     assert "Extract blendshapes" in text
     assert "frames" in text
     # No progress tick has arrived -- no percentage should appear.
     assert "%" not in text
+    # Elapsed time shows regardless of percent (zero here: now == start).
+    assert "0d:0h:00m:00s" in text
 
 
 def test_indicator_text_one_run_with_progress():
-    live_runs = [{"label": "Extract blendshapes", "table_name": "frames"}]
-    text = format_run_indicator_text(live_runs, 42)
+    live_runs = [{
+        "label": "Extract blendshapes", "table_name": "frames",
+        "start_monotonic": 1000.0, "mode_name": "COLUMNS",
+    }]
+    text = format_run_indicator_text(live_runs, 42, 1065.0)
     assert "Extract blendshapes" in text
     assert "frames" in text
     assert "42" in text
     assert "%" in text
+    # 65 seconds elapsed, shown alongside the percent.
+    assert "0d:0h:01m:05s" in text
 
 
 def test_indicator_text_two_runs_has_no_percentage():
@@ -1132,15 +1143,94 @@ def test_indicator_text_two_runs_has_no_percentage():
     # next to either run's label would misattribute it. Even when a
     # percent is supplied, two live runs must suppress it entirely.
     live_runs = [
-        {"label": "Extract blendshapes", "table_name": "frames"},
-        {"label": "Summary statistics", "table_name": "frames"},
+        {"label": "Extract blendshapes", "table_name": "frames",
+         "start_monotonic": 1000.0, "mode_name": "COLUMNS"},
+        {"label": "Summary statistics", "table_name": "frames",
+         "start_monotonic": 1000.0, "mode_name": "TABLE"},
     ]
-    text = format_run_indicator_text(live_runs, 77)
+    text = format_run_indicator_text(live_runs, 77, 1000.0)
     assert "%" not in text
     assert "77" not in text
     assert "Extract blendshapes" in text
     assert "Summary statistics" in text
     assert "2" in text
+
+
+# ---------------------------------------------------------------------------
+# 12c. format_run_indicator_text(): the elapsed-time clause and the
+# run-time estimate (run-time-estimate item). Every " -- " separator
+# earlier sections pinned is now ";".
+# ---------------------------------------------------------------------------
+
+def test_indicator_uses_semicolons_not_double_dashes():
+    live_runs = [{
+        "label": "Extract blendshapes", "table_name": "frames",
+        "start_monotonic": 1000.0, "mode_name": "COLUMNS",
+        "message": "row 7",
+    }]
+    text = format_run_indicator_text(live_runs, 50, 1010.0)
+    assert " -- " not in text
+    assert ";" in text
+
+
+def test_indicator_table_run_shows_elapsed_but_never_an_estimate():
+    # A TABLE run's finished_row_count never advances (nothing sets it),
+    # so even given a huge rows_requested and a "finished_first_time" the
+    # estimate must not appear -- TABLE/DISPLAY get elapsed time only.
+    live_runs = [{
+        "label": "Aggregate", "table_name": "frames",
+        "start_monotonic": 0.0, "mode_name": "TABLE",
+        "finished_row_count": 0, "rows_requested": 100_000,
+        "finished_first_time": None,
+    }]
+    text = format_run_indicator_text(live_runs, None, 65.0)
+    assert "0d:0h:01m:05s" in text
+    assert "about" not in text
+    assert "left" not in text
+
+
+def test_indicator_columns_run_shows_no_estimate_before_enough_rows():
+    from run_timing import ESTIMATE_MIN_ROWS
+    live_runs = [{
+        "label": "Extract blendshapes", "table_name": "frames",
+        "start_monotonic": 0.0, "mode_name": "COLUMNS",
+        # One short of the threshold's own row count.
+        "finished_row_count": ESTIMATE_MIN_ROWS,
+        "rows_requested": 10_000,
+        "finished_first_time": 0.0,
+        "finished_count_at_first": 1,
+    }]
+    text = format_run_indicator_text(live_runs, None, 100.0)
+    assert "about" not in text
+    assert "left" not in text
+
+
+def test_indicator_columns_run_shows_an_estimate_once_available():
+    live_runs = [{
+        "label": "Extract blendshapes", "table_name": "frames",
+        "start_monotonic": 0.0, "mode_name": "COLUMNS",
+        "finished_row_count": 31,
+        "rows_requested": 130,
+        "finished_first_time": 0.0,
+        "finished_count_at_first": 1,
+    }]
+    # 30 rows since the anchor in 30s -> rate 1/s -> 99 rows left -> 99s.
+    text = format_run_indicator_text(live_runs, None, 30.0)
+    assert "about" in text
+    assert "left" in text
+    assert "0d:0h:01m:39s" in text  # 99 seconds
+
+
+def test_indicator_several_runs_each_show_their_own_elapsed_time():
+    live_runs = [
+        {"label": "A", "table_name": "frames",
+         "start_monotonic": 900.0, "mode_name": "COLUMNS"},
+        {"label": "B", "table_name": "frames",
+         "start_monotonic": 988.0, "mode_name": "COLUMNS"},
+    ]
+    text = format_run_indicator_text(live_runs, None, 1000.0)
+    assert "0d:0h:01m:40s" in text   # A: 100s elapsed
+    assert "0d:0h:00m:12s" in text  # B: 12s elapsed
 
 
 # ---------------------------------------------------------------------------
@@ -1152,33 +1242,48 @@ def test_get_live_runs_empty_initially(tmp_path):
     assert controller.get_live_runs() == []
 
 
-def test_get_live_runs_returns_only_the_four_public_fields(tmp_path):
-    # NOTE: this test's name and asserted shape changed for run-indicator-2.
-    # It previously pinned exactly three keys; get_live_runs() now also
-    # carries "message" (the run's newest run.log() text, None until one
-    # arrives) per that item's explicit design decision -- see
-    # controller.py's get_live_runs() docstring and operators/CLAUDE.md's
-    # "Progress messages -- run.log". The property this test guards is
-    # unchanged: only the fields a caller may rely on, never "token",
-    # "column_tags" or the rest of the internal bookkeeping.
+def test_get_live_runs_returns_only_the_documented_public_fields(tmp_path):
+    # NOTE: this test's name and asserted shape changed again for the
+    # run-time-estimate item, and again for its anchor-fix follow-up. It
+    # previously pinned exactly four keys; get_live_runs() now also
+    # carries "mode_name", "start_monotonic", "finished_row_count",
+    # "rows_requested", "finished_first_time" and
+    # "finished_count_at_first" -- what controller.format_run_indicator_
+    # text() (via _run_duration_clause()) needs to show elapsed time and
+    # a run-time estimate. See controller.py's get_live_runs() docstring.
+    # The property this test guards is unchanged: only the fields a
+    # caller may rely on, never "token", "column_tags" or the rest of the
+    # internal bookkeeping.
     controller, _dataset, _op_registry = _make_controller(tmp_path)
+    before = time.monotonic()
     controller._register_run("op-1", "Probe", "frames")
+    after = time.monotonic()
 
     # Would still pass if violated? No. A version that returned the raw
     # _live_runs dict would also carry "token", "column_tags" and the
     # rest of the internal bookkeeping -- this pins the public read down
-    # to exactly the four fields a caller may rely on: the run's opaque
-    # identity (run-indicator-1-fix), its label and table, and its
-    # newest log message (run-indicator-2, None before one arrives).
+    # to exactly the fields a caller may rely on.
     live_runs = controller.get_live_runs()
-    assert live_runs == [
-        {
-            "operation_id": "op-1",
-            "label": "Probe",
-            "table_name": "frames",
-            "message": None,
-        }
-    ]
+    assert len(live_runs) == 1
+    run = live_runs[0]
+    assert set(run.keys()) == {
+        "operation_id", "label", "table_name", "message", "mode_name",
+        "start_monotonic", "finished_row_count", "rows_requested",
+        "finished_first_time", "finished_count_at_first",
+    }
+    assert run["operation_id"] == "op-1"
+    assert run["label"] == "Probe"
+    assert run["table_name"] == "frames"
+    assert run["message"] is None
+    assert run["mode_name"] == ""  # not yet attached -- _register_run alone
+    assert run["finished_row_count"] == 0
+    assert run["rows_requested"] == 0
+    assert run["finished_first_time"] is None
+    assert run["finished_count_at_first"] is None
+    # start_monotonic is a real time.monotonic() reading taken inside
+    # _register_run -- not asserting an exact value, only that it was
+    # taken when it should have been.
+    assert before <= run["start_monotonic"] <= after
 
 
 def test_get_live_runs_identity_matches_what_the_run_was_registered_under(
@@ -1282,9 +1387,226 @@ def test_two_concurrent_runs_produce_a_sentence_with_no_percentage():
         {"label": "Run one", "table_name": "frames"},
         {"label": "Run two", "table_name": "frames"},
     ]
-    text = format_run_indicator_text(live_runs, 10)
+    text = format_run_indicator_text(live_runs, 10, 500.0)
     assert "%" not in text
     assert "10" not in text
+
+
+# ---------------------------------------------------------------------------
+# 12d. AppController: the exact per-run finished-row count (run-time-
+# estimate item) -- _on_row_finished / _apply_finished_row_counts.
+# ---------------------------------------------------------------------------
+
+def test_finished_row_count_increments_via_on_row_finished(tmp_path):
+    controller, _dataset, _op_registry = _make_controller(tmp_path)
+    controller._register_run("op-1", "Probe", "frames")
+    controller._attach_run_provenance(
+        "op-1", operator_name="probe", mode_name="COLUMNS",
+        target_table="", parameters={}, rows_requested=100, inputs={},
+    )
+
+    for _ in range(5):
+        controller._on_row_finished("op-1")
+    controller._apply_finished_row_counts()
+
+    assert controller._live_runs["op-1"]["finished_row_count"] == 5
+
+
+def test_finished_first_time_is_recorded_once_and_not_moved_again(tmp_path):
+    controller, _dataset, _op_registry = _make_controller(tmp_path)
+    controller._register_run("op-1", "Probe", "frames")
+    controller._attach_run_provenance(
+        "op-1", operator_name="probe", mode_name="COLUMNS",
+        target_table="", parameters={}, rows_requested=100, inputs={},
+    )
+
+    controller._on_row_finished("op-1")
+    controller._apply_finished_row_counts()
+    first_seen = controller._live_runs["op-1"]["finished_first_time"]
+    assert first_seen is not None
+
+    controller._on_row_finished("op-1")
+    controller._apply_finished_row_counts()
+
+    # Would still pass if violated? No -- if every tick reset this to
+    # "now", the estimate's rate (measured FROM the first finished row)
+    # would keep resetting to zero elapsed time and never converge.
+    assert controller._live_runs["op-1"]["finished_first_time"] == first_seen
+
+
+def test_two_concurrent_runs_keep_separate_finished_counts(tmp_path):
+    controller, _dataset, _op_registry = _make_controller(tmp_path)
+    controller._register_run("op-1", "A", "frames")
+    controller._register_run("op-2", "B", "frames")
+    controller._attach_run_provenance(
+        "op-1", operator_name="a", mode_name="COLUMNS",
+        target_table="", parameters={}, rows_requested=100, inputs={},
+    )
+    controller._attach_run_provenance(
+        "op-2", operator_name="b", mode_name="COLUMNS",
+        target_table="", parameters={}, rows_requested=100, inputs={},
+    )
+
+    for _ in range(3):
+        controller._on_row_finished("op-1")
+    for _ in range(7):
+        controller._on_row_finished("op-2")
+    controller._apply_finished_row_counts()
+
+    assert controller._live_runs["op-1"]["finished_row_count"] == 3
+    assert controller._live_runs["op-2"]["finished_row_count"] == 7
+
+
+def test_finished_count_at_first_captures_the_real_anchor_count_not_one(
+    tmp_path,
+):
+    # Anchor-fix reversal target: if _apply_finished_row_counts assumed
+    # the anchor count was always 1 (the bug this item fixes), a burst of
+    # rows finishing before the drain's first tick ever runs -- the
+    # parallel path's ordinary case, several consumer threads finishing
+    # rows concurrently between two ticks -- would be silently treated as
+    # if they all finished AFTER the anchor, overstating the rate.
+    controller, _dataset, _op_registry = _make_controller(tmp_path)
+    controller._register_run("op-1", "Probe", "frames")
+    controller._attach_run_provenance(
+        "op-1", operator_name="probe", mode_name="COLUMNS",
+        target_table="", parameters={}, rows_requested=100, inputs={},
+    )
+
+    for _ in range(10):
+        controller._on_row_finished("op-1")
+    controller._apply_finished_row_counts()
+
+    run = controller._live_runs["op-1"]
+    assert run["finished_row_count"] == 10
+    assert run["finished_count_at_first"] == 10
+
+
+def test_a_finished_count_for_a_dead_run_is_dropped_silently(tmp_path):
+    # Would still pass if violated? No -- a stray count for an
+    # operation_id no longer in _live_runs (a reload landed while a
+    # worker's last on_row_finished call was still in flight) must not
+    # raise or resurrect an entry.
+    controller, _dataset, _op_registry = _make_controller(tmp_path)
+    with controller._finished_rows_lock:
+        controller._latest_finished_counts["ghost-op"] = 5
+
+    controller._apply_finished_row_counts()
+
+    assert controller.get_live_runs() == []
+
+
+# ---------------------------------------------------------------------------
+# 12e. AppController: the one-time long-run warning
+# (_maybe_warn_long_run / long_run_estimated).
+# ---------------------------------------------------------------------------
+
+class _FakeLongRunGateway:
+    """The one method _maybe_warn_long_run reads."""
+    def __init__(self, threshold_minutes: int):
+        self._threshold = threshold_minutes
+
+    def get_long_run_warning_minutes(self) -> int:
+        return self._threshold
+
+
+def _prime_columns_run(controller, operation_id, *, rows_requested):
+    controller._register_run(operation_id, "Probe", "frames")
+    controller._attach_run_provenance(
+        operation_id, operator_name="probe", mode_name="COLUMNS",
+        target_table="", parameters={}, rows_requested=rows_requested,
+        inputs={},
+    )
+    run = controller._live_runs[operation_id]
+    run["start_monotonic"] = 0.0
+    run["finished_row_count"] = 31
+    run["finished_first_time"] = 0.0
+    run["finished_count_at_first"] = 1
+    return run
+
+
+def test_long_run_estimated_fires_when_first_estimate_exceeds_threshold(tmp_path):
+    controller, _dataset, _op_registry = _make_controller(tmp_path)
+    controller._settings_gateway = _FakeLongRunGateway(threshold_minutes=1)
+    # 30 rows finished in 30s after the first -> rate 1 row/s.
+    # rows_requested huge enough that the remaining-time estimate is
+    # comfortably over the 1-minute threshold.
+    run = _prime_columns_run(controller, "op-1", rows_requested=100_000)
+
+    events = []
+    controller.long_run_estimated.connect(
+        lambda op_id, secs: events.append((op_id, secs))
+    )
+    controller._maybe_warn_long_run("op-1", run, now=30.0)
+
+    assert len(events) == 1
+    assert events[0][0] == "op-1"
+    assert events[0][1] > 60.0
+
+
+def test_long_run_estimated_never_fires_when_under_threshold(tmp_path):
+    controller, _dataset, _op_registry = _make_controller(tmp_path)
+    controller._settings_gateway = _FakeLongRunGateway(threshold_minutes=1_000_000)
+    run = _prime_columns_run(controller, "op-1", rows_requested=100)
+
+    events = []
+    controller.long_run_estimated.connect(lambda *a: events.append(a))
+    controller._maybe_warn_long_run("op-1", run, now=30.0)
+
+    assert events == []
+
+
+def test_long_run_estimated_never_fires_for_a_table_run(tmp_path):
+    # Would still pass if violated? No -- a TABLE run's runner cannot
+    # report progress mid-computation (CLAUDE.md's "Long-running work"),
+    # so it must never be judged against the threshold even if its
+    # bookkeeping happened to look estimate-ready.
+    controller, _dataset, _op_registry = _make_controller(tmp_path)
+    controller._settings_gateway = _FakeLongRunGateway(threshold_minutes=1)
+    controller._register_run("op-1", "Aggregate", "frames")
+    controller._attach_run_provenance(
+        "op-1", operator_name="agg", mode_name="TABLE",
+        target_table="result", parameters={}, rows_requested=0, inputs={},
+    )
+    run = controller._live_runs["op-1"]
+    run["start_monotonic"] = 0.0
+    run["finished_row_count"] = 31
+    run["finished_first_time"] = 0.0
+
+    events = []
+    controller.long_run_estimated.connect(lambda *a: events.append(a))
+    controller._maybe_warn_long_run("op-1", run, now=30.0)
+
+    assert events == []
+
+
+def test_long_run_estimated_never_fires_with_no_settings_gateway(tmp_path):
+    controller, _dataset, _op_registry = _make_controller(tmp_path)
+    assert controller._settings_gateway is None
+    run = _prime_columns_run(controller, "op-1", rows_requested=100_000)
+
+    events = []
+    controller.long_run_estimated.connect(lambda *a: events.append(a))
+    controller._maybe_warn_long_run("op-1", run, now=30.0)
+
+    assert events == []
+
+
+def test_long_run_estimated_fires_at_most_once_per_run(tmp_path):
+    # Reversal check 1: remove the once-only guard ("long_run_checked")
+    # and this must fail -- calling _maybe_warn_long_run again with the
+    # SAME still-exceeding estimate must not emit a second time.
+    controller, _dataset, _op_registry = _make_controller(tmp_path)
+    controller._settings_gateway = _FakeLongRunGateway(threshold_minutes=1)
+    run = _prime_columns_run(controller, "op-1", rows_requested=100_000)
+
+    events = []
+    controller.long_run_estimated.connect(lambda *a: events.append(a))
+    controller._maybe_warn_long_run("op-1", run, now=30.0)
+    controller._maybe_warn_long_run("op-1", run, now=60.0)
+    controller._maybe_warn_long_run("op-1", run, now=90.0)
+
+    assert len(events) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1299,7 +1621,7 @@ def test_indicator_text_includes_a_message_for_one_run():
         {"label": "Extract frames", "table_name": "videos",
          "message": "video 3 of 40: clip.mp4"},
     ]
-    text = format_run_indicator_text(live_runs, None)
+    text = format_run_indicator_text(live_runs, None, 500.0)
     assert "Extract frames" in text
     assert "video 3 of 40: clip.mp4" in text
 
@@ -1308,13 +1630,17 @@ def test_indicator_text_omits_the_message_when_none_has_arrived_yet():
     # A run may carry "message": None (never logged) or omit the key
     # entirely (an older caller's plain dict, e.g. this file's own
     # pre-existing live_runs literals) -- both must render identically.
+    # Neither dict carries "start_monotonic" either, so elapsed time
+    # defaults to zero (see _run_duration_clause's own docstring).
     text_none = format_run_indicator_text(
-        [{"label": "Op", "table_name": "frames", "message": None}], None
+        [{"label": "Op", "table_name": "frames", "message": None}],
+        None, 500.0,
     )
     text_missing = format_run_indicator_text(
-        [{"label": "Op", "table_name": "frames"}], None
+        [{"label": "Op", "table_name": "frames"}], None, 500.0,
     )
-    assert text_none == text_missing == 'Running "Op" on "frames"'
+    expected = 'Running "Op" on "frames"; 0d:0h:00m:00s'
+    assert text_none == text_missing == expected
 
 
 def test_indicator_text_truncates_an_absurdly_long_message():
@@ -1323,7 +1649,7 @@ def test_indicator_text_truncates_an_absurdly_long_message():
     # ceiling well under that catches a missing truncation.
     huge = "x" * 500
     live_runs = [{"label": "Op", "table_name": "frames", "message": huge}]
-    text = format_run_indicator_text(live_runs, None)
+    text = format_run_indicator_text(live_runs, None, 500.0)
     assert len(text) < 200
     assert "..." in text
     assert huge not in text
@@ -1340,7 +1666,7 @@ def test_indicator_text_shows_each_runs_own_message_with_two_live_runs():
         {"label": "Summary statistics", "table_name": "frames",
          "message": None},
     ]
-    text = format_run_indicator_text(live_runs, 77)
+    text = format_run_indicator_text(live_runs, 77, 500.0)
     assert "%" not in text
     assert "Extract blendshapes" in text
     assert "no face detected in row r7" in text

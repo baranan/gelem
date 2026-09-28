@@ -13,6 +13,8 @@ Student A is responsible for implementing this class.
 """
 
 from __future__ import annotations
+import time
+
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QSplitter, QLabel, QComboBox, QToolBar,
@@ -20,11 +22,12 @@ from PySide6.QtWidgets import (
     QStackedWidget, QScrollArea, QFrame,
     QPushButton, QInputDialog,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction
 
 from controller import (
     format_cancel_message,
+    format_long_run_warning_message,
     format_output_copy_conflict_message,
     format_run_indicator_text,
     format_save_blocked_message,
@@ -402,6 +405,12 @@ class MainWindow(QMainWindow):
         sits beside the indicator and shares its visibility: shown
         exactly when something is running, hidden otherwise. Clicking it
         goes through _on_cancel_run_clicked().
+
+        A 1s QTimer ticks _refresh_run_indicator so the elapsed
+        time in the sentence keeps counting up even while nothing else
+        about the run changes -- it runs only while at least one run is
+        live (started/stopped by _on_live_runs_changed), so it costs
+        nothing when idle.
         """
         self._selection_label = QLabel()
         self._selection_label.setStyleSheet("padding: 0 8px;")
@@ -426,6 +435,14 @@ class MainWindow(QMainWindow):
         # whatever starts next.
         self._latest_run_percent: int | None = None
 
+        # Ticks _refresh_run_indicator once a second so the elapsed
+        # time keeps counting up. Runs only while at least one run is
+        # live -- started/stopped by _on_live_runs_changed -- so an idle
+        # window has no timer running at all.
+        self._run_elapsed_timer = QTimer(self)
+        self._run_elapsed_timer.setInterval(1000)
+        self._run_elapsed_timer.timeout.connect(self._refresh_run_indicator)
+
         self._refresh_status_bar()
         self._refresh_run_indicator()
 
@@ -440,9 +457,18 @@ class MainWindow(QMainWindow):
 
         The Cancel button (run-indicator-3) shares this same visibility:
         there is nothing to cancel exactly when there is nothing to show.
+
+        Passes a fresh time.monotonic() reading as `now` on every
+        call -- format_run_indicator_text never reads the clock itself,
+        so the elapsed time and the run-time estimate are only ever as
+        fresh as this call, which the 1s timer and every other trigger
+        (a live run starting or finishing, a new progress tick, a new
+        run.log() message) all funnel through.
         """
         text = format_run_indicator_text(
-            self._controller.get_live_runs(), self._latest_run_percent
+            self._controller.get_live_runs(),
+            self._latest_run_percent,
+            time.monotonic(),
         )
         self._run_indicator_label.setText(text)
         self._run_indicator_label.setVisible(bool(text))
@@ -505,13 +531,67 @@ class MainWindow(QMainWindow):
     def _on_live_runs_changed(self) -> None:
         """A run started or finished. The previous percentage no longer
         describes anything live, so it is dropped here rather than
-        carried into whatever the new live-run set shows."""
+        carried into whatever the new live-run set shows.
+
+        Also starts or stops the 1s elapsed-time timer -- running
+        exactly while at least one run is live, matching the run
+        indicator's own visibility."""
         self._latest_run_percent = None
+        if self._controller.get_live_runs():
+            if not self._run_elapsed_timer.isActive():
+                self._run_elapsed_timer.start()
+        else:
+            self._run_elapsed_timer.stop()
         self._refresh_run_indicator()
 
     def _on_operator_progress(self, percent: int) -> None:
         self._latest_run_percent = percent
         self._refresh_run_indicator()
+
+    def _on_long_run_estimated(
+        self, operation_id: str, estimated_total_seconds: float
+    ) -> None:
+        """Shows the one-time long-run warning dialog for a
+        COLUMNS run whose first estimate exceeded long_run_warning_minutes
+        (AppController._maybe_warn_long_run fires this at most once per
+        run). The run itself keeps going while this dialog is open --
+        this is a notice, not a pause. "Cancel run" goes through the same
+        cancel_run() the status-bar Cancel button uses (run-indicator-3);
+        "Keep running" does nothing further.
+
+        A run that finished (or was already cancelled) between the
+        signal being emitted and this handler running is simply not
+        found in get_live_runs() any more -- the label falls back to a
+        generic phrase rather than failing, and clicking "Cancel run"
+        against a dead operation_id is a documented no-op
+        (AppController.cancel_run()).
+        """
+        label = next(
+            (
+                run["label"]
+                for run in self._controller.get_live_runs()
+                if run["operation_id"] == operation_id
+            ),
+            "This run",
+        )
+        box = QMessageBox(self)
+        box.setWindowTitle("This run may take a while")
+        box.setText(
+            format_long_run_warning_message(label, estimated_total_seconds)
+        )
+        keep_button = box.addButton(
+            "Keep running", QMessageBox.ButtonRole.AcceptRole
+        )
+        cancel_button = box.addButton(
+            "Cancel run", QMessageBox.ButtonRole.RejectRole
+        )
+        box.setDefaultButton(keep_button)
+        box.exec()
+        if box.clickedButton() is cancel_button:
+            self._controller.cancel_run(operation_id)
+            QMessageBox.information(
+                self, "Cancelling run", format_cancel_message(label)
+            )
 
     def _refresh_status_bar(self) -> None:
         """
@@ -910,6 +990,7 @@ class MainWindow(QMainWindow):
         ctrl.operator_progress.connect(self._on_operator_progress)
         ctrl.operator_log_changed.connect(self._refresh_run_indicator)
         ctrl.operator_complete.connect(self._on_operator_complete)
+        ctrl.long_run_estimated.connect(self._on_long_run_estimated)
         ctrl.table_created.connect(self._on_table_created)
 
         # FilterPanel -> Controller

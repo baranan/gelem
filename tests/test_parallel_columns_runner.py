@@ -402,7 +402,7 @@ def test_ineligible_combinations_never_reach_the_parallel_method(monkeypatch):
     def _spy(self, operator, snapshot, row_ids, table_name, run,
              operation_id, on_item_complete, on_progress, on_complete,
              on_setup_error, on_row_errors, media_column, needs_frame,
-             label, worker_count, start_time):
+             label, worker_count, start_time, on_row_finished=None):
         parallel_calls.append(True)
         # Fall through to a harmless no-op completion so the run still
         # ends cleanly and the test can inspect `started`.

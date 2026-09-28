@@ -194,6 +194,7 @@ _WORKER_CALLBACKS = {
     "_on_item_complete",
     "_on_progress",
     "_on_run_log",
+    "_on_row_finished",
     "_on_create_columns_complete",
     "_on_operator_setup_error",
     "_on_operator_row_errors",

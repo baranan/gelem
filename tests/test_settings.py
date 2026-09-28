@@ -32,6 +32,7 @@ from settings.settings import (
     DEFAULT_MAX_OPEN_DECODERS,
     DEFAULT_FRAME_STEPPER_MAX_SECONDS,
     DEFAULT_OPERATOR_WORKER_COUNT,
+    DEFAULT_LONG_RUN_WARNING_MINUTES,
     PICTURE_MEMORY_MAX_BYTES_RANGE,
     WORKER_COUNT_RANGE,
     THUMBNAIL_MAX_SIDE_RANGE,
@@ -92,6 +93,7 @@ def test_empty_mapping_gives_documented_defaults_and_no_problems():
     assert settings.thumbnail_max_side == DEFAULT_THUMBNAIL_MAX_SIDE
     assert settings.preview_max_side == DEFAULT_PREVIEW_MAX_SIDE
     assert settings.max_open_decoders == DEFAULT_MAX_OPEN_DECODERS
+    assert settings.long_run_warning_minutes == DEFAULT_LONG_RUN_WARNING_MINUTES
 
 
 def test_default_construction_matches_from_values_defaults():
@@ -329,6 +331,9 @@ def test_settings_store_round_trip_through_dict_backend():
             DEFAULT_FRAME_STEPPER_MAX_SECONDS
         ),
         "operators/operator_worker_count": str(DEFAULT_OPERATOR_WORKER_COUNT),
+        "operators/long_run_warning_minutes": str(
+            DEFAULT_LONG_RUN_WARNING_MINUTES
+        ),
     }
     assert backend.data == expected_persisted
 

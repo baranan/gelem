@@ -96,6 +96,16 @@ FRAME_STEPPER_MAX_SECONDS_RANGE = (1, 120)
 DEFAULT_OPERATOR_WORKER_COUNT = 2
 OPERATOR_WORKER_COUNT_RANGE = (1, os.cpu_count() or 8)
 
+# Above this many minutes, a COLUMNS run's first run-time estimate
+# triggers a one-time warning dialog (AppController._maybe_warn_long_run)
+# rather than running silently for however long it takes. 30 minutes
+# default; 1 minute (warn on almost anything) to 10080 (one week) -- not a
+# machine-dependent number in the same sense as worker_count above, but
+# still a settings-editable threshold per CLAUDE.md's generality rule,
+# same reasoning as frame_stepper_max_seconds.
+DEFAULT_LONG_RUN_WARNING_MINUTES = 30
+LONG_RUN_WARNING_MINUTES_RANGE = (1, 10080)
+
 
 # ---------------------------------------------------------------------------
 # Tolerant parsing helpers. Each appends at most one problem message and
@@ -168,6 +178,7 @@ class GelemSettings:
     max_open_decoders: int = DEFAULT_MAX_OPEN_DECODERS
     frame_stepper_max_seconds: int = DEFAULT_FRAME_STEPPER_MAX_SECONDS
     operator_worker_count: int = DEFAULT_OPERATOR_WORKER_COUNT
+    long_run_warning_minutes: int = DEFAULT_LONG_RUN_WARNING_MINUTES
 
     @classmethod
     def from_values(
@@ -250,6 +261,13 @@ class GelemSettings:
             "operator worker count",
             problems,
         )
+        long_run_warning_minutes = _parse_int_field(
+            mapping.get("long_run_warning_minutes"),
+            DEFAULT_LONG_RUN_WARNING_MINUTES,
+            LONG_RUN_WARNING_MINUTES_RANGE,
+            "long run warning threshold",
+            problems,
+        )
 
         # Cross-field rule: a preview must not be smaller than a thumbnail.
         # Both are now the largest side directly, so this is a plain compare.
@@ -274,6 +292,7 @@ class GelemSettings:
                 max_open_decoders=max_open_decoders,
                 frame_stepper_max_seconds=frame_stepper_max_seconds,
                 operator_worker_count=operator_worker_count,
+                long_run_warning_minutes=long_run_warning_minutes,
             ),
             problems,
         )
