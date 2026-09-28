@@ -911,10 +911,47 @@ class MainWindow(QMainWindow):
         )
         return reply == QMessageBox.StandardButton.Yes
 
+    def _ask_rerun_choice(self, info) -> str:
+        """Shows the P2.2a re-run choice dialog for one ExistingOutputsInfo
+        and returns "overwrite", "fill_only_empty" or "cancel".
+
+        The default button and the Escape key both mean cancel, so
+        dismissing the dialog -- however the researcher does it -- never
+        starts a run they have not actively chosen.
+        """
+        box = QMessageBox(self)
+        box.setWindowTitle("Some columns already have values")
+        box.setText(info.message)
+        overwrite_button = box.addButton(
+            "Overwrite all", QMessageBox.ButtonRole.DestructiveRole
+        )
+        fill_button = box.addButton(
+            "Fill only empty rows", QMessageBox.ButtonRole.AcceptRole
+        )
+        cancel_button = box.addButton(
+            "Cancel", QMessageBox.ButtonRole.RejectRole
+        )
+        box.setDefaultButton(cancel_button)
+        box.setEscapeButton(cancel_button)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is overwrite_button:
+            return "overwrite"
+        if clicked is fill_button:
+            return "fill_only_empty"
+        return "cancel"
+
     def _on_run_create_columns(self, operator_name: str) -> None:
         """
         Shows the scope and parameter dialogs, then runs
         create_columns() on the chosen rows.
+
+        P2.2a: if any column this run would write to already exists on
+        the active table, asks the researcher first whether to overwrite
+        every chosen row, fill in only the ones still empty, or cancel --
+        before the write/read conflict confirm, so a researcher who
+        cancels here never sees that second dialog for a run that is not
+        going to start anyway.
         """
         result = self._show_scope_and_params_dialog(
             operator_name, ExecutionMode.COLUMNS
@@ -922,11 +959,38 @@ class MainWindow(QMainWindow):
         if result is None:
             return
         row_ids, parameters = result
+
+        fill_only_empty = False
+        clear_existing_outputs = False
+        info = self._controller.describe_existing_outputs(
+            operator_name, ExecutionMode.COLUMNS.name, row_ids, parameters
+        )
+        if info is not None:
+            choice = self._ask_rerun_choice(info)
+            if choice == "cancel":
+                return
+            if choice == "fill_only_empty":
+                if info.empty_row_count == 0:
+                    QMessageBox.information(
+                        self,
+                        "Nothing to run",
+                        "None of the selected rows are empty for these "
+                        "columns, so there is nothing to fill in.",
+                    )
+                    return
+                fill_only_empty = True
+            else:
+                clear_existing_outputs = True
+
         if not self._confirm_start_despite_conflicts(
             operator_name, ExecutionMode.COLUMNS
         ):
             return
-        self._controller.run_create_columns(operator_name, row_ids, parameters)
+        self._controller.run_create_columns(
+            operator_name, row_ids, parameters,
+            fill_only_empty=fill_only_empty,
+            clear_existing_outputs=clear_existing_outputs,
+        )
 
     def _on_run_create_table(self, operator_name: str) -> None:
         """

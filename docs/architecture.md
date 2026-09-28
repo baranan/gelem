@@ -518,8 +518,15 @@ retroactively make a finished result incomplete. See `docs/known_defects.md`
 for the open question of whether an UNcancelled run that silently produced
 less than it was asked for should be held to the same "partial" standard.
 
-Not yet in the entry, and still open: operator and model **version**, and a
-cache identity for the run -- both wait on `P2.2`'s caching design (§8).
+The operator's own **version** is in the entry as of P2.2a
+(`operator_version`, COLUMNS runs only -- `Dataset.record_operator_run()`'s
+own docstring is the authority for what a missing value means). It backs
+the re-run choice: a COLUMNS run whose declared output columns already
+exist on the target table asks the researcher to overwrite every chosen
+row, fill in only the rows still empty, or cancel, before it starts
+(`CLAUDE.md`'s "Long-running work" is the authority for that choice, not
+restated here). Still open: **model** version, and a cache identity for
+the run -- both wait on `P2.2`'s caching design (§8).
 
 **Supersession needs two checks, not one.** A run's input tables can move
 under it while it is still running, and each check catches a different moment

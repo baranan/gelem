@@ -427,6 +427,17 @@ to P1.8d, and the two OS-native / non-parsing media-cell entries to P1.8e.
   overwrites the other's entry with an equivalent one -- wasted work, not a
   correctness bug, since the index is a pure function of the file. No item
   assigned.
+- **`AppController.run_create_columns`'s "Overwrite all" clearing runs before
+  the run is built, so a build failure loses the cleared values for
+  nothing.** `clear_existing_outputs=True` calls `Dataset.clear_output_columns()`
+  before `_build_operator_run` -- deliberately, so the run's own recorded
+  input-table version already reflects the clearing rather than seeing a
+  foreign write land under it. If `_build_operator_run` then raises
+  (`OperatorRunError` from a bad parameter set, or `RuntimeError` from a
+  missing descriptor), the chosen rows' output columns are already empty and
+  no run starts to refill them. Not observed: the parameter set is already
+  validated by the parameter dialog before this point, so a build failure
+  here has no known trigger in the current UI flow. No item assigned.
 
 ## Open -- test-suite instability and process leaks
 

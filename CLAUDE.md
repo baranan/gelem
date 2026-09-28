@@ -577,6 +577,28 @@ state. This rule carries no violation list of its own -- it points at the three
 - **`[TARGET -> P2.2]`** Resumability is narrower than cancellability and must be
   stated per mode; see `operators/CLAUDE.md`. A generator gives progressive output
   and a cancellation point. It does not by itself give resumability.
+- **`[NOW]`** A COLUMNS run whose declared output columns already exist on the
+  target table asks the researcher before it starts: overwrite every chosen
+  row, fill in only the rows still empty, or cancel (default and Escape).
+  "Empty" means every one of those columns that already exists on the table
+  is empty (missing/None/NaN) for that row -- `Dataset.empty_rows_for_columns()`.
+  Choosing "Overwrite all" first empties the chosen rows' existing declared
+  output columns through `Dataset.clear_output_columns()`, before the run's
+  own row snapshot is taken, so a row whose media this run cannot resolve --
+  which the per-row runner never delivers a result for at all -- ends the run
+  empty rather than silently keeping a value an earlier run under different
+  settings left there. **Gelem keeps no per-row "done" record of its own**;
+  this choice is how the researcher decides each time, every time. As a
+  hint only, the dialog also says how the given parameters and operator
+  version differ from the most recent recorded COLUMNS run of this operator
+  on a table with this name (`Dataset.most_recent_operator_run()`,
+  `Dataset.record_operator_run(operator_version=...)`) -- silent when nothing
+  is recorded, and silent about version specifically when the recorded entry
+  predates version tracking. `AppController.describe_existing_outputs()` and
+  `AppController.run_create_columns(fill_only_empty=..., clear_existing_outputs=...)`
+  are the seams; `ui/main_window.py` shows the three-button dialog and reads
+  its choice, never composing the wording itself. Tests:
+  `tests/test_rerun_choice.py`.
 - **`[NOW]`** A FRAME-mode COLUMNS run's rows whose media is a `#f=` address on a
   video decode each source ONCE, IN ORDER, through
   `MediaResolver.decode_frames_in_order()` -- never one seek per row. Made true by

@@ -2147,9 +2147,11 @@ class Dataset:
         outcome: str,
         superseded_tables: list,
         cancellation_requested: bool = False,
+        operator_version: str | None = None,
     ) -> None:
         """Records one operator run in the provenance log (P1.12f-1;
-        cancellation_requested added by run-indicator-3-fix).
+        cancellation_requested added by run-indicator-3-fix;
+        operator_version added by P2.2a).
 
         Dataset is the only component that writes self.provenance
         (CLAUDE.md, "Data ownership"); AppController calls this rather
@@ -2203,6 +2205,17 @@ class Dataset:
                                   that was never cancelled (every caller
                                   before run-indicator-3-fix) need not
                                   mention it.
+            operator_version:     The operator descriptor's `version` at
+                                  the moment this run started, or None
+                                  when the caller does not track it (every
+                                  caller before P2.2a, and TABLE/DISPLAY
+                                  runs today). Read back by
+                                  most_recent_operator_run() so a later
+                                  re-run of the same operator, mode and
+                                  table can tell the researcher its
+                                  version changed since last time --
+                                  never treated as missing-means-unversioned
+                                  by anything else.
 
         Every value stored here must be JSON-serialisable: save() writes
         the whole provenance log with json.dumps.
@@ -2223,7 +2236,129 @@ class Dataset:
             "outcome":                outcome,
             "superseded_tables":      list(superseded_tables),
             "cancellation_requested": cancellation_requested,
+            "operator_version":       operator_version,
         })
+
+    def most_recent_operator_run(
+        self, operator_name: str, mode: str, target_table: str
+    ) -> dict | None:
+        """The params dict of the most recent "operator_run" provenance
+        entry for this exact (operator_name, mode, target_table), or None
+        if none is recorded (P2.2a).
+
+        Read-only -- used by AppController to describe how a re-run's
+        parameters and operator version differ from the last recorded run
+        of this operator, in this mode, against this table. Scans the log
+        from the end, so the LAST matching entry wins when it ran more
+        than once.
+        """
+        for entry in reversed(self.provenance.to_list()):
+            if entry["action"] != "operator_run":
+                continue
+            params = entry["params"]
+            if (
+                params["operator"] == operator_name
+                and params["mode"] == mode
+                and params["target_table"] == target_table
+            ):
+                return params
+        return None
+
+    def empty_rows_for_columns(
+        self, table_name: str, columns: list[str], row_ids: list[str]
+    ) -> list[str]:
+        """Which of row_ids (in the given order) are "empty" for columns:
+        every one of columns that already exists on table_name holds
+        None/NaN in that row (P2.2a). A column columns names that the
+        table does not have yet is simply not checked -- it disqualifies
+        no row, so a first-ever run (nothing exists yet) treats every
+        chosen row as empty.
+
+        Read-only -- used by AppController to narrow a COLUMNS re-run to
+        "fill only empty rows". A row_id not in the table is skipped
+        rather than raising: the caller's row_ids already come from a
+        scope chosen against this table, so this is defensive, not a path
+        any real caller exercises.
+
+        Vectorised: the chosen rows' positions are gathered once, then one
+        whole-block `isna().all(axis=1)` over exactly that sub-frame
+        decides every row at once, instead of a Python loop calling
+        `pd.isna(df.iat[pos, loc])` once per (row, column) pair. Measured
+        at a 1,000,000-row, 52-column table (half the rows empty): under
+        a second here, versus tens of seconds for 1/20th that many rows
+        on the per-cell loop -- describe_existing_outputs runs this on
+        the main thread every time the re-run dialog is about to open, so
+        it must stay well under a UI-blocking threshold even at Gelem's
+        target scale (~5M rows).
+        """
+        df = self._get_stored_table(table_name)
+        existing = [c for c in columns if c in df.columns]
+        index = self._row_index_for(table_name)
+
+        kept: list[str] = []
+        positions: list[int] = []
+        for row_id in row_ids:
+            pos = index.get(row_id)
+            if pos is not None:
+                kept.append(row_id)
+                positions.append(pos)
+
+        if not existing or not positions:
+            # No declared column exists yet: nothing disqualifies a
+            # chosen row, so every row_id found in the table is empty.
+            return kept
+
+        empty_mask = df[existing].iloc[positions].isna().all(axis=1).to_numpy()
+        return [row_id for row_id, empty in zip(kept, empty_mask) if empty]
+
+    def clear_output_columns(
+        self, table_name: str, columns: list[str], row_ids: list[str]
+    ) -> None:
+        """Sets every one of columns that already exists on table_name to
+        None, for exactly row_ids -- every other row and every other
+        column on the table is untouched (P2.2a).
+
+        Used by AppController before an "Overwrite all" COLUMNS re-run: a
+        row whose media cannot be resolved this run is never delivered
+        through apply_row_updates at all (see
+        operators/operator_registry.py's _record_row_error), so without
+        this it would silently keep last run's value under this run's
+        different settings.
+
+        Vectorised: one block assignment over the chosen rows' positions
+        and the existing columns' locations, instead of building an
+        apply_row_updates() update dict and writing one cell at a time
+        through it. Measured at a 1,000,000-row, 52-column table: under
+        two seconds here, versus over seven minutes for 1/20th that many
+        rows on the per-cell path -- clearly disqualifying at Gelem's
+        target scale (~5M rows). Still goes through _accept_table
+        directly -- the same schema-validating, version-bumping commit
+        apply_row_updates itself ends on -- so this write is schema-
+        validated and bumps the table's write-ticket version exactly as
+        any other write does. On a rejection, the touched columns are
+        rolled back to their pre-clear values, the same recovery
+        apply_row_updates makes for its own per-cell writes.
+        """
+        df = self._get_stored_table(table_name)
+        existing = [c for c in columns if c in df.columns]
+        if not existing or not row_ids:
+            return
+        index = self._row_index_for(table_name)
+        positions = [index[rid] for rid in row_ids if rid in index]
+        if not positions:
+            return
+
+        col_locs = [df.columns.get_loc(c) for c in existing]
+        column_snapshot = {col: df[col].copy() for col in existing}
+        df.iloc[positions, col_locs] = None
+        try:
+            self._accept_table(table_name, df, source="clear_output_columns")
+        except (SchemaRejection, TypeError, ValueError) as exc:
+            for col, original in column_snapshot.items():
+                df[col] = original
+            if self.strict_schema:
+                raise
+            self._schema_messages.append(str(exc))
 
     def take_schema_messages(self) -> list[str]:
         """Returns the accumulated plain-English schema-adjustment notes and

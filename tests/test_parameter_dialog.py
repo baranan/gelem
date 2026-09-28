@@ -358,7 +358,14 @@ class _FakeController:
     def get_write_read_conflict_warnings(self, operator_name, mode_name):
         return list(self._conflict_warnings)
 
-    def run_create_columns(self, operator_name, row_ids, parameters):
+    def describe_existing_outputs(self, operator_name, mode_name, row_ids, parameters):
+        # P2.2a: none of this file's operators collide with an existing
+        # column, so the real re-run choice dialog never needs to appear
+        # for these tests -- stubbed to say so.
+        return None
+
+    def run_create_columns(self, operator_name, row_ids, parameters,
+                           *, fill_only_empty=False, clear_existing_outputs=False):
         self.run_create_columns_calls.append((operator_name, row_ids, parameters))
 
     def run_create_table(self, operator_name, row_ids, parameters):

@@ -22,6 +22,7 @@ This file is written centrally (not by a student).
 """
 
 from __future__ import annotations
+from dataclasses import dataclass
 from dataclasses import replace as _dataclasses_replace
 from pathlib import Path
 import queue
@@ -470,6 +471,77 @@ def format_table_name_changed_message(shown_name: str, stored_name: str) -> str:
         f'"{shown_name}": another table named "{shown_name}" was created '
         f"in the meantime."
     )
+
+
+# ---------------------------------------------------------------------------
+# P2.2a: the re-run choice. When a COLUMNS run's declared output columns
+# already exist on the active table, the researcher is asked before it
+# starts -- overwrite everything, fill only the rows still empty, or
+# cancel. Pure, Qt-free data and wording -- the same two-layer pattern as
+# format_cancel_message above -- so ui/main_window.py only reads this and
+# shows it, never composes the text itself.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ExistingOutputsInfo:
+    """What AppController.describe_existing_outputs found: which of the
+    mode's declared output columns already exist on the active table, how
+    many of the chosen rows those columns cover, how many of those are
+    still empty, and the message text to show the researcher."""
+
+    existing_columns: tuple[str, ...]
+    chosen_row_count: int
+    empty_row_count: int
+    message: str
+
+
+def format_existing_outputs_message(
+    *,
+    label: str,
+    table_name: str,
+    existing_columns: tuple[str, ...],
+    chosen_row_count: int,
+    empty_row_count: int,
+    parameter_changes: list[tuple[str, object, object]],
+    version_change: tuple[str, str] | None,
+) -> str:
+    """The plain-English body of the re-run choice dialog.
+
+    parameter_changes is every parameter present in both the current
+    values and the most recent matching provenance entry whose value
+    differs -- an unchanged parameter, or one recorded run does not
+    mention at all, is left out. version_change is (old, new) only when
+    the most recent entry recorded a version, the current operator has
+    one, and the two differ -- an older entry with no recorded version
+    says nothing about version at all, per the caller's own lookup.
+    Neither line is shown when nothing was recorded for this operator,
+    mode and table before.
+    """
+    columns_str = ", ".join(f'"{c}"' for c in existing_columns)
+    lines = [
+        f'"{label}" writes to the column(s) {columns_str}, which already '
+        f'exist on "{table_name}".',
+        "",
+        f"{chosen_row_count} row(s) are selected; {empty_row_count} of "
+        f"them have no value yet in those columns.",
+    ]
+    if parameter_changes or version_change is not None:
+        lines.append("")
+        lines.append("Since the last run of this operator on this table:")
+        for name, old_value, new_value in parameter_changes:
+            lines.append(f"  {name}: was {old_value}, now {new_value}")
+        if version_change is not None:
+            old_version, new_version = version_change
+            lines.append(f"  version: was {old_version}, now {new_version}")
+    lines.append("")
+    lines.append(
+        "Overwrite all recomputes every selected row. Fill only empty "
+        "rows recomputes only the rows with no value yet, and leaves "
+        "every other selected row exactly as it is. Gelem keeps no "
+        "record of which rows were already done, so this choice "
+        "decides that each time."
+    )
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -1180,6 +1252,7 @@ class AppController(QObject):
         parameters: dict,
         rows_requested: int,
         inputs: dict[str, dict],
+        operator_version: str | None = None,
     ) -> None:
         """Fills in the provenance fields _register_run defaults to empty
         (P1.12f-1), as a step separate from _register_run itself.
@@ -1192,16 +1265,24 @@ class AppController(QObject):
         item's permitted files. Called immediately after _register_run,
         before the worker starts, so there is no window where a live run
         carries the empty defaults while it could actually complete.
+
+        operator_version (P2.2a) defaults to None: only run_create_columns
+        passes the descriptor's actual version, since only a COLUMNS run's
+        re-run choice needs it recorded for a later run to compare
+        against (Dataset.most_recent_operator_run). A TABLE or DISPLAY
+        run's entry simply carries no version, same as before this
+        parameter existed.
         """
         run = self._live_runs.get(operation_id)
         if run is None:
             return
-        run["operator_name"]  = operator_name
-        run["mode_name"]      = mode_name
-        run["target_table"]   = target_table
-        run["parameters"]     = dict(parameters)
-        run["rows_requested"] = rows_requested
-        run["inputs"]         = dict(inputs)
+        run["operator_name"]   = operator_name
+        run["mode_name"]       = mode_name
+        run["target_table"]    = target_table
+        run["parameters"]      = dict(parameters)
+        run["rows_requested"]  = rows_requested
+        run["inputs"]          = dict(inputs)
+        run["operator_version"] = operator_version
 
     def _attach_table_name_resolution(
         self,
@@ -1550,6 +1631,7 @@ class AppController(QObject):
             outcome=outcome,
             superseded_tables=superseded,
             cancellation_requested=self._run_was_cancelled(run),
+            operator_version=run.get("operator_version"),
         )
         run["_provenance_recorded"] = True
         if superseded:
@@ -3021,11 +3103,101 @@ class AppController(QObject):
         )
         return run, token
 
+    def describe_existing_outputs(
+        self,
+        operator_name: str,
+        mode_name: str,
+        row_ids: list[str],
+        parameters: dict,
+    ) -> ExistingOutputsInfo | None:
+        """Whether starting operator_name's mode_name run right now would
+        write into a column that already exists on the active table, and
+        if so, everything ui/main_window.py needs to ask the researcher
+        about it (P2.2a).
+
+        Returns None when the mode declares no output column the active
+        table already has -- the ordinary case, meaning the run needs no
+        extra confirmation and starts exactly as it always has. Read-only:
+        looks at the operator's descriptor, the active table's columns and
+        rows, and past provenance, but writes nothing.
+
+        The settings-changed and version-changed hints come from
+        Dataset.most_recent_operator_run() for this exact (operator_name,
+        mode_name, target_table) -- only a parameter present in both the
+        current values and that entry, with a different value, is
+        reported; an entry with no recorded version says nothing about
+        version. Nothing recorded at all means no hint at all, not an
+        empty one.
+        """
+        operator = self._op_registry.get(operator_name)
+        if operator is None or operator.descriptor is None:
+            return None
+        try:
+            mode = ExecutionMode[mode_name]
+        except KeyError:
+            return None
+        mode_descriptor = operator.descriptor.mode_for(mode)
+        if mode_descriptor is None:
+            return None
+        table_name = self._active_table
+        table_columns = set(self.get_column_names(table_name))
+        existing_columns = tuple(
+            column.name for column in mode_descriptor.output.columns
+            if column.name in table_columns
+        )
+        if not existing_columns:
+            return None
+
+        empty_row_ids = self._dataset.empty_rows_for_columns(
+            table_name, list(existing_columns), row_ids
+        )
+
+        parameter_changes: list[tuple[str, object, object]] = []
+        version_change: tuple[str, str] | None = None
+        previous = self._dataset.most_recent_operator_run(
+            operator_name, mode_name, table_name
+        )
+        if previous is not None:
+            old_parameters = previous.get("parameters", {})
+            for name, new_value in parameters.items():
+                if name not in old_parameters:
+                    continue
+                old_value = old_parameters[name]
+                if old_value != new_value:
+                    parameter_changes.append((name, old_value, new_value))
+            old_version = previous.get("operator_version")
+            new_version = operator.descriptor.version
+            if (
+                old_version is not None
+                and new_version is not None
+                and old_version != new_version
+            ):
+                version_change = (old_version, new_version)
+
+        message = format_existing_outputs_message(
+            label=mode_descriptor.label,
+            table_name=table_name,
+            existing_columns=existing_columns,
+            chosen_row_count=len(row_ids),
+            empty_row_count=len(empty_row_ids),
+            parameter_changes=parameter_changes,
+            version_change=version_change,
+        )
+        return ExistingOutputsInfo(
+            existing_columns=existing_columns,
+            chosen_row_count=len(row_ids),
+            empty_row_count=len(empty_row_ids),
+            message=message,
+        )
+
     def run_create_columns(
         self,
         operator_name: str,
         row_ids: list[str],
         parameters: dict | None = None,
+        *,
+        fill_only_empty: bool = False,
+        clear_existing_outputs: bool = False,
     ) -> None:
         """
         Runs create_columns() on a list of rows in a background thread.
@@ -3037,7 +3209,39 @@ class AppController(QObject):
                            operator's declared descriptor parameter names
                            (from the parameter dialog's parameter_values(),
                            via MainWindow). None means "no parameters".
+            fill_only_empty: Narrow row_ids, before anything else, to the
+                           rows Dataset.empty_rows_for_columns() reports
+                           empty for this mode's declared output columns
+                           (P2.2a's "Fill only empty rows" choice). A row
+                           outside that narrowed set is left untouched. If
+                           narrowing leaves no rows, no run is started and
+                           nothing is registered.
+            clear_existing_outputs: Before anything else, set this mode's
+                           declared output columns that already exist to
+                           None for exactly row_ids, through
+                           Dataset.clear_output_columns() (P2.2a's
+                           "Overwrite all" choice). This runs BEFORE the
+                           row snapshot and before the run is built, so a
+                           row whose media cannot be resolved this run --
+                           which the per-row runner never delivers a
+                           result for at all -- ends this run empty rather
+                           than keeping a value an earlier run under
+                           different settings left there; and so the run's
+                           own recorded input-table version already
+                           reflects the clearing, not a foreign write that
+                           happened under it.
+
+        Raises:
+            ValueError: fill_only_empty and clear_existing_outputs are
+                        both True -- narrowing to already-empty rows and
+                        emptying the chosen rows first contradict each
+                        other, so this is refused before anything runs.
         """
+        if fill_only_empty and clear_existing_outputs:
+            raise ValueError(
+                "run_create_columns cannot both fill only empty rows and "
+                "clear existing outputs in the same run."
+            )
         parameters = dict(parameters or {})
         try:
             operator = self._op_registry.get(operator_name)
@@ -3048,10 +3252,43 @@ class AppController(QObject):
                 return
             operation_id = str(uuid.uuid4())
             table_name   = self._active_table
+
+            # The declared output columns this mode would write, read off
+            # the descriptor directly -- not through _build_operator_run,
+            # which is not called until after the clearing/narrowing below
+            # needs them. An operator with no descriptor, or none for
+            # COLUMNS, declares none here; _build_operator_run still
+            # raises its own RuntimeError for that a few lines down, this
+            # just means clearing/narrowing has nothing to act on yet.
+            declared_output_columns: list[str] = []
+            if operator.descriptor is not None:
+                columns_mode_descriptor = operator.descriptor.mode_for(
+                    ExecutionMode.COLUMNS
+                )
+                if columns_mode_descriptor is not None:
+                    declared_output_columns = [
+                        column.name
+                        for column in columns_mode_descriptor.output.columns
+                    ]
+
+            if clear_existing_outputs:
+                self._dataset.clear_output_columns(
+                    table_name, declared_output_columns, row_ids
+                )
+
+            if fill_only_empty:
+                row_ids = self._dataset.empty_rows_for_columns(
+                    table_name, declared_output_columns, row_ids
+                )
+                if not row_ids:
+                    return
+
             # One snapshot of exactly the selected rows, taken once here
             # on the main thread -- not one Dataset.get_row() call (and
             # one full-table copy) per row. The RunData snapshot below
-            # wraps this SAME frame; it is not copied again.
+            # wraps this SAME frame; it is not copied again. Taken AFTER
+            # the clearing above, so a cleared cell reaches the worker as
+            # empty rather than as this run's stale input.
             snapshot = self._dataset.snapshot_rows(table_name, row_ids)
 
             # Build (and validate) the run before registering it, so a
@@ -3202,6 +3439,7 @@ class AppController(QObject):
                 parameters=dict(run.spec.parameters),
                 rows_requested=len(row_ids),
                 inputs=self._run_inputs_snapshot(run),
+                operator_version=operator.descriptor.version,
             )
             # How many threads may split this run's rows in
             # parallel -- read here, once, at run start, and passed in as

@@ -1478,6 +1478,16 @@ documents implied it did.
   suppress outputs already stored. This costs recomputation but is reproducible,
   which is the property that matters here.
 
+**P2.2a as built.** Gelem keeps no automatic record of which rows a previous
+run finished, so resuming after a cancel or a failure is the researcher's own
+choice, made explicitly each time: starting a COLUMNS run whose declared
+output columns already exist on the target table offers "Fill only empty
+rows", which narrows the run to exactly the chosen rows still empty for
+those columns (`Dataset.empty_rows_for_columns()`) and leaves every other
+row untouched. This is the independent-frame case's cheap, exact skip
+described above, driven by the researcher rather than by a stored resume
+point. A crash-log-driven resume is P2.2b's, not this one's.
+
 *Consequence for P1.6:* the segment operator's boundaries are the natural reset
 boundaries, which is a further reason segments are a first-class row type rather
 than a display convenience.
