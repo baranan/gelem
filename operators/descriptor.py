@@ -50,7 +50,7 @@ from __future__ import annotations
 import keyword
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
+from typing import Mapping, Optional
 
 
 class OperatorDescriptorError(Exception):
@@ -560,6 +560,39 @@ class OutputSpec:
 
 
 # ---------------------------------------------------------------------------
+# SequenceOption -- lets a COLUMNS mode's rows run as ordered sequences,
+# each with its own fresh model, at the researcher's option (P2.4a).
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True, kw_only=True)
+class SequenceOption:
+    """Names the BooleanParameter that turns this COLUMNS mode's rows into
+    ordered per-sequence runs -- one isolated model per sequence, rows
+    reaching the operator in ascending order within a sequence -- and,
+    optionally, the ColumnParameter that splits a single source into more
+    than one sequence.
+
+    ``enabled_by`` must name a ``BooleanParameter`` declared by the SAME
+    mode; ``group_by``, if given, must name a ``ColumnParameter`` declared
+    by the SAME mode. ``ModeDescriptor`` is the object that can see both
+    this option and the mode's own parameters, so that cross-check is
+    enforced there, not here.
+
+    See ``runs_as_sequences`` / ``sequence_group_column`` below -- the ONE
+    place this decision is made -- and ``operators/CLAUDE.md``'s "the
+    sequence runner" section.
+    """
+
+    enabled_by: str
+    group_by: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        _require_identifier(self.enabled_by, "SequenceOption.enabled_by")
+        if self.group_by is not None:
+            _require_identifier(self.group_by, "SequenceOption.group_by")
+
+
+# ---------------------------------------------------------------------------
 # ModeDescriptor -- one execution mode of one operator.
 # ---------------------------------------------------------------------------
 
@@ -584,6 +617,12 @@ class ModeDescriptor:
     parameters: tuple[ParameterSpec, ...] = ()
     output: OutputSpec
     model_lifecycle: ModelLifecycle = ModelLifecycle.NONE
+    # P2.4a: lets a COLUMNS mode's rows run as ordered per-sequence runs
+    # at the researcher's option, rather than only when model_lifecycle
+    # itself is PER_SEQUENCE. See SequenceOption above and
+    # runs_as_sequences() / sequence_group_column() below. None (the
+    # default) means this mode offers no such option.
+    sequence_option: Optional[SequenceOption] = None
     # Whether the same inputs and parameters always give the same output.
     deterministic: bool = True
     # Whether the runner may serve a cached result instead of re-running.
@@ -627,6 +666,38 @@ class ModeDescriptor:
             raise OperatorDescriptorError(
                 "A DISPLAY mode must declare output.is_display_only = True."
             )
+
+        # sequence_option (P2.4a): only meaningful for COLUMNS, and only
+        # meaningful naming parameters this SAME mode actually declares --
+        # a dangling name could never be populated at run time.
+        if self.sequence_option is not None:
+            if self.mode is not ExecutionMode.COLUMNS:
+                raise OperatorDescriptorError(
+                    "ModeDescriptor.sequence_option is only allowed on a "
+                    f"COLUMNS mode; this mode is {self.mode.name}."
+                )
+            if self.model_lifecycle is ModelLifecycle.SHARED:
+                raise OperatorDescriptorError(
+                    "ModeDescriptor.sequence_option cannot be combined with "
+                    "model_lifecycle SHARED -- a sequence's model is never "
+                    "shared with another sequence."
+                )
+            parameters_by_name = {spec.name: spec for spec in self.parameters}
+            enabled_spec = parameters_by_name.get(self.sequence_option.enabled_by)
+            if not isinstance(enabled_spec, BooleanParameter):
+                raise OperatorDescriptorError(
+                    "SequenceOption.enabled_by "
+                    f"{self.sequence_option.enabled_by!r} must name a "
+                    "BooleanParameter declared by this same mode."
+                )
+            if self.sequence_option.group_by is not None:
+                group_spec = parameters_by_name.get(self.sequence_option.group_by)
+                if not isinstance(group_spec, ColumnParameter):
+                    raise OperatorDescriptorError(
+                        "SequenceOption.group_by "
+                        f"{self.sequence_option.group_by!r} must name a "
+                        "ColumnParameter declared by this same mode."
+                    )
 
 
 # ---------------------------------------------------------------------------
@@ -680,3 +751,48 @@ class OperatorDescriptor:
             if mode_descriptor.mode is mode:
                 return mode_descriptor
         return None
+
+
+# ---------------------------------------------------------------------------
+# P2.4a -- the ONE place "does this run go through the sequence runner?"
+# and "which column, if any, splits it into more than one sequence?" are
+# decided. Every caller (the runner, the controller, a test) goes through
+# these two pure functions rather than re-deriving the answer from
+# model_lifecycle / sequence_option / parameters itself.
+# ---------------------------------------------------------------------------
+
+def runs_as_sequences(
+    mode_descriptor: ModeDescriptor, parameters: Mapping[str, object],
+) -> bool:
+    """True if this run's rows should be processed as ordered sequences,
+    each with its own fresh model (operators/base.py's
+    ``build_sequence_model`` / ``create_columns_in_sequence``), rather
+    than through the ordinary per-row path.
+
+    True when the mode declares ``model_lifecycle`` ``PER_SEQUENCE``
+    outright, or when it declares a ``sequence_option`` and this run's
+    parameters turn it on (``parameters[sequence_option.enabled_by]`` is
+    true).
+    """
+    if mode_descriptor.model_lifecycle is ModelLifecycle.PER_SEQUENCE:
+        return True
+    option = mode_descriptor.sequence_option
+    if option is None:
+        return False
+    return bool(parameters.get(option.enabled_by, False))
+
+
+def sequence_group_column(
+    mode_descriptor: ModeDescriptor, parameters: Mapping[str, object],
+) -> Optional[str]:
+    """The column name this run's rows are grouped by within one source,
+    or ``None`` for no grouping (every #f= row of one source is a single
+    sequence). Reads ``parameters[sequence_option.group_by]`` -- the
+    column name the researcher picked in the generated dialog -- or
+    ``None`` if this mode declares no ``group_by`` parameter at all.
+    """
+    option = mode_descriptor.sequence_option
+    if option is None or option.group_by is None:
+        return None
+    value = parameters.get(option.group_by)
+    return value if isinstance(value, str) else None

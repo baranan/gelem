@@ -49,7 +49,6 @@ from operators.descriptor import (
     ExecutionMode,
     InputKind,
     MediaRequirement,
-    ModelLifecycle,
     NewTableNameParameter,
 )
 from operators.run_context import (
@@ -3393,7 +3392,7 @@ class AppController(QObject):
             # A table with no visual column to show has no column to
             # read a FRAME/ADDRESS run's media from either, so the run
             # is refused before it starts, the same place VIDEO_SPAN /
-            # AUDIO_SPAN and PER_SEQUENCE are refused below.
+            # AUDIO_SPAN is refused below.
             media_column: str | None = None
             if media_requirement in (
                 MediaRequirement.FRAME, MediaRequirement.ADDRESS,
@@ -3408,24 +3407,14 @@ class AppController(QObject):
                     return
                 self._absolutise_media_columns(table_name, snapshot)
 
-            # The runner builds this operator's model once per worker
-            # (PER_WORKER) or once per application (SHARED), but the
-            # per-row runner has no concept of a sequence, so it cannot
-            # honour PER_SEQUENCE -- one isolated model instance per
-            # clip-run, reset at the sequence boundary. A COLUMNS mode
-            # that declares it is refused here, before any worker starts
-            # and before the run is registered -- the same place a bad
-            # parameter set and a VIDEO_SPAN / AUDIO_SPAN requirement are
-            # refused. The worker keeps a defensive guard in case one
-            # slips through.
-            model_lifecycle = run.spec.mode_descriptor.model_lifecycle
-            if model_lifecycle is ModelLifecycle.PER_SEQUENCE:
-                self.error_occurred.emit(
-                    f'Cannot start "{mode_label}": it declares '
-                    f'model_lifecycle {model_lifecycle.name}, which the '
-                    f'per-row runner cannot honour.'
-                )
-                return
+            # P2.4a: a mode that declares model_lifecycle PER_SEQUENCE,
+            # or whose sequence_option this run's parameters turn on, is
+            # routed by OperatorRegistry to its sequence runner -- see
+            # operators.descriptor.runs_as_sequences() and
+            # operators/operator_registry.py's
+            # _run_create_columns_sequenced. Nothing needs deciding here:
+            # the run's parameters already reach the registry through
+            # run.spec.parameters.
 
             self._register_run(
                 operation_id, mode_label, table_name,

@@ -302,10 +302,18 @@ def test_shared_builds_once_across_two_runs_and_both_see_the_same_object(
 
 
 # ---------------------------------------------------------------------------
-# PER_SEQUENCE -- refused before the run starts
+# PER_SEQUENCE -- P2.4a: routed to the sequence runner, not refused
 # ---------------------------------------------------------------------------
+#
+# Superseded by P2.4a: this mode used to be refused before the run
+# started (there was no sequence runner to honour it). It is now routed
+# to OperatorRegistry._run_create_columns_sequenced -- see
+# operators.descriptor.runs_as_sequences() and
+# tests/test_sequence_runner.py, which owns the sequence runner's own
+# behaviour in depth. This test only re-asserts, at the AppController
+# seam, that the refusal is gone.
 
-def test_per_sequence_run_does_not_start_and_message_names_operator_and_lifecycle(
+def test_per_sequence_run_starts_and_gives_each_row_its_own_model(
     tmp_path, monkeypatch
 ):
     controller, _dataset, op_registry = _make_controller(tmp_path)
@@ -316,33 +324,27 @@ def test_per_sequence_run_does_not_start_and_message_names_operator_and_lifecycl
     errors: list[str] = []
     controller.error_occurred.connect(errors.append)
 
-    # If the registry is reached at all, record it -- it must not be.
-    started: list = []
-    monkeypatch.setattr(
-        op_registry, "run_create_columns",
-        lambda *a, **k: (started.append(True), True)[1],
+    _run_columns_and_wait(controller, op.name, row_ids, monkeypatch)
+
+    assert not errors, f"a PER_SEQUENCE run is no longer refused: {errors}"
+    # _ModelOperator's media_requirement is METADATA and this mode
+    # declares no sequence_group_column, so every row is its own
+    # one-row sequence: build_sequence_model() (build_model()'s default)
+    # is called once PER ROW, and no two rows share a model instance --
+    # the opposite of PER_WORKER's "one instance for every row"
+    # (test_per_worker_builds_once_before_the_first_row_and_every_row_sees_it
+    # above).
+    assert op.events.count("build") == len(row_ids), (
+        "expected one build_sequence_model() call per row"
+    )
+    assert len(op.models_seen) == len(row_ids)
+    assert len({id(model) for model in op.models_seen}) == len(row_ids), (
+        "two rows saw the same model instance -- PER_SEQUENCE must give "
+        "every sequence its own"
     )
 
-    controller.run_create_columns(op.name, row_ids)
-
-    assert started == [], (
-        "a PER_SEQUENCE run reached the registry; it must be refused before "
-        "it starts"
-    )
-    assert op.events == [], "build_model() or create_columns() ran for a refused run"
-    assert errors, "no error surfaced for the PER_SEQUENCE run"
-    message = errors[-1]
-    # The message names the run by its COLUMNS mode descriptor label
-    # (P1.12d-3 removed BaseOperator.display_label).
-    columns_label = op.descriptor.mode_for(ExecutionMode.COLUMNS).label
-    assert columns_label in message, message
-    assert ModelLifecycle.PER_SEQUENCE.name in message, message
-    # The run left no live-run entry behind.
-    assert controller._live_runs == {}
-
-    # Would still pass if AppController silently handed the operator a
-    # PER_WORKER-built model instead? No -- the run would start, `started`
-    # would be non-empty and there would be no error naming the lifecycle.
+    # Would still pass if the run were still refused before it started?
+    # No -- events and models_seen would both be empty.
 
 
 # ---------------------------------------------------------------------------

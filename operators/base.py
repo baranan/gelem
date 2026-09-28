@@ -378,6 +378,69 @@ class BaseOperator:
         """
         return None
 
+    def build_sequence_model(self, run):
+        """
+        FACTORY for one sequence's model (P2.4a's sequence runner). The
+        runner calls this ONCE PER SEQUENCE -- never once per worker or
+        once per application -- whenever
+        ``operators.descriptor.runs_as_sequences()`` is true for this
+        run's mode and parameters: at the start of every sequence, and
+        again, mid-sequence, after a row this sequence's own
+        ``create_columns_in_sequence()`` raised (a reset -- the sequence
+        continues with its next row under a fresh model, never the one a
+        failure may have left in an unreliable state).
+
+        The default returns ``self.build_model()``, so an operator that
+        has not opted into sequence-aware modelling keeps behaving
+        exactly as it does today even if its mode later gains a
+        ``sequence_option``. Override this instead of ``build_model()``
+        only if the sequence case needs something different (e.g. a
+        model that is cheaper to build than the PER_WORKER one, since a
+        sequence-runner sequence is usually much shorter-lived than a
+        whole run).
+
+        Raise ``OperatorSetupError`` if a one-time prerequisite is
+        missing -- the runner aborts the WHOLE run through
+        ``on_setup_error``, exactly as a ``build_model()`` failure does.
+        """
+        return self.build_model()
+
+    def create_columns_in_sequence(
+        self,
+        row_id: str,
+        media: np.ndarray | None,
+        metadata: dict,
+        run,
+        media_time_us: int | None,
+    ) -> dict:
+        """
+        ONE ROW of a sequence, called by the runner when
+        ``operators.descriptor.runs_as_sequences()`` is true for this
+        run's mode and parameters -- the sequence-runner counterpart of
+        ``create_columns()``. Rows of one sequence reach this in
+        ascending order; ``run.model`` is the instance
+        ``build_sequence_model()`` built for THIS sequence and no other.
+
+        The default calls ``self.create_columns(row_id, media, metadata,
+        run)`` unchanged -- an operator that has not opted into
+        sequence-aware processing behaves exactly as it does today even
+        under the sequence runner. Override this instead of
+        ``create_columns()`` only if the operator needs
+        ``media_time_us``, or needs to read cross-row state its own
+        ``build_sequence_model()`` put on the model.
+
+        Args:
+            row_id, media, metadata, run: same as ``create_columns()``.
+            media_time_us: this row's presentation time in the source,
+                in integer microseconds (``FramePayload.
+                presentation_time_us``), or ``None`` when the row's
+                media has no timeline (a still image, or METADATA /
+                ADDRESS media_requirement).
+
+        Returns / Raises: same contract as ``create_columns()``.
+        """
+        return self.create_columns(row_id, media, metadata, run)
+
     # ── Form guidance ─────────────────────────────────────────────────
 
     def refine_form(self, values) -> FormAdvice:

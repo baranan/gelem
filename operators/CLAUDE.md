@@ -285,7 +285,7 @@ loading one on `self`.
 | `NONE` | the mode uses no model | nobody; `run.model` is `None` |
 | `SHARED` | immutable, *demonstrated* thread-safe -- lookup tables, config, pure functions | the COLUMNS runner, once per application, cached on `OperatorRegistry` under a `threading.Lock`; reused across every run (the cache is not cleared on a project switch -- fine only while SHARED stays project-independent) |
 | `PER_WORKER` | stateless-per-call inference that is expensive to load | the COLUMNS runner, once per worker, inside the worker before the row loop; the same instance serves every row of that run |
-| `PER_SEQUENCE` | anything that tracks state across frames | nobody yet -- declared but refused, see below |
+| `PER_SEQUENCE` | anything that tracks state across frames | the sequence runner, once per sequence, reset after a row error -- see below |
 
 `SHARED` requires evidence, not assumption. If you do not know, choose
 `PER_WORKER`; if the model tracks across frames, `PER_SEQUENCE` is the only correct
@@ -325,15 +325,69 @@ def build_model(self):
     return load_landmarker()
 ```
 
-`[TARGET -> P2.4]` **`PER_SEQUENCE` is declared but refused today.** The per-row
-COLUMNS runner sees one row at a time and has no sequence boundary to reset a
-tracking model at, so `AppController.run_create_columns` refuses a run whose mode
-declares it -- before any worker starts, in a message naming the operator and the
-lifecycle -- and the worker keeps a defensive guard for one that slips through.
-`iter_column_updates` exists and is used (P2.1), but only as the SERIAL REFERENCE
-over an already-decoded, already-ordered group of frames -- it does not yet give a
-model a per-sequence reset point. An operator that needs tracking state waits on
-P2.4.
+`[NOW]` **P2.4a: `PER_SEQUENCE` is honoured by the sequence runner --
+`OperatorRegistry._run_create_columns_sequenced`.** A COLUMNS mode reaches it
+either by declaring `model_lifecycle` `PER_SEQUENCE` outright, or by declaring
+a `SequenceOption` and having the researcher turn it on at run time
+(`operators/descriptor.py`'s `SequenceOption`, `runs_as_sequences()` and
+`sequence_group_column()` -- the ONE place this decision is made, consulted by
+the controller and the runner alike, never re-derived from `model_lifecycle` /
+`sequence_option` / parameters anywhere else):
+
+```python
+sequence_option = SequenceOption(
+    enabled_by="track_across_rows",   # names a BooleanParameter of this mode
+    group_by="participant_id",        # optional: names a ColumnParameter
+)
+```
+
+**How sequences are formed.** Every row whose media is a `#f=` address on a
+video is grouped by `(source path, stream)`, further split by
+`sequence_group_column()`'s chosen column when the mode declares one -- a row
+whose group value is missing (`NaN`/`None`) forms ONE sequence together with
+every other row of that same source whose value is also missing, in
+ascending frame order, exactly like any other group value -- never split
+into one-row sequences, which would give each a cold model and defeat
+grouping in the first place. A still-image row, a `#t=`
+time-point row, and every row under `METADATA`/`ADDRESS` `media_requirement`
+is its own one-row sequence. A row the runner refuses today
+(missing/unparseable media, a whole-video row) is an immediate row error and
+never becomes a sequence, exactly as it always has been.
+
+**Every sequence gets its own fresh model**, from `build_sequence_model(run)`
+-- override this instead of `build_model()` only if the sequence case needs
+something different; the default just calls `build_model()`. Rows of one
+sequence reach `create_columns_in_sequence(row_id, media, metadata, run,
+media_time_us)` in ascending presentation order; the default calls
+`create_columns(row_id, media, metadata, run)` unchanged, so an operator that
+has not opted into sequence-aware processing behaves exactly as it always has,
+even once its mode gains a `SequenceOption`. `media_time_us` is the row's
+presentation time in microseconds (`FramePayload.presentation_time_us`), or
+`None` when its media has no timeline (a still image, or a `METADATA` /
+`ADDRESS` row).
+
+**A row the operator raises on is a row error, and RESETS the sequence's
+model** -- a fresh `build_sequence_model()` -- before the sequence continues
+with its next row: the failure may have left the discarded model's cross-row
+state unreliable. `build_sequence_model()` itself raising -- the initial
+build, or a reset -- aborts the WHOLE run through `on_setup_error`, exactly
+like a `PER_WORKER` / `SHARED` build failure does.
+
+**Threads own whole sequences, not rows.** `min(worker_count, number of
+sequences)` worker threads each take one whole sequence at a time from a work
+queue, decode it themselves (`MediaResolver.decode_frames_in_order()` for a
+grouped video sequence, `MediaResolver.resolve_frame()` for a single row --
+the decoder pool is safe for several threads decoding the same or different
+source files at once, unlike the P2.3 parallel path where one producer thread
+does every decode). Only the coordinator thread ever records
+(`on_item_complete` / `on_setup_error` / `on_row_errors` / progress --
+CLAUDE.md's threading rule); a worker thread that dies from something other
+than a per-row exception loses only its own current sequence's undelivered
+rows, as row errors, and the run continues with the next sequence.
+
+`iter_column_updates` (P2.1's serial reference over an already-decoded,
+already-ordered group) is unrelated to this path -- the sequence runner never
+calls it. Tests: `tests/test_sequence_runner.py`.
 
 Building the model before the row loop also means a missing prerequisite is
 reported before any work starts. The old lazy load inside `create_columns` only

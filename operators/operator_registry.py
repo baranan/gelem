@@ -41,6 +41,7 @@ This file is written centrally (not by a student).
 from __future__ import annotations
 from pathlib import Path
 import dataclasses
+import functools
 import queue
 import threading
 import time
@@ -52,12 +53,22 @@ from operators.descriptor import (
     MediaRequirement,
     ModelLifecycle,
     OperatorDescriptorError,
+    runs_as_sequences,
+    sequence_group_column,
 )
 from operators.run_context import OperatorRunError
 from media.extensions import IMAGE_EXTENSIONS, is_image_path
 from media.media_address import MediaAddressError, parse as parse_address
 from media.resolver import MediaResolverError
 from models.table_schema import ColumnHint, ColumnRole
+
+
+# P2.4a: the sentinel for "this row's sequence_group_column value is
+# missing (None/NaN)" in _run_create_columns_sequenced's group key. A
+# dedicated object, not a string -- a real group value that happens to
+# equal a string like "_missing_" must never collide with this and be
+# folded into the missing-value group by mistake.
+_MISSING_GROUP_VALUE = object()
 
 
 def _is_bare_video_address(addr) -> bool:
@@ -115,11 +126,14 @@ def _iter_group_rows(run, addresses, media_by_address_id):
         yield row_id, payload.pixels, metadata
 
 
-def _classify_row_result(operator, row_id: str, media, metadata: dict, run):
-    """Call operator.create_columns() for one row and classify what
-    happened -- the exception mapping the serial `_deliver` closure and
-    the parallel runner's consumer threads both need, factored out so
-    there is exactly ONE place that decides what each exception means.
+def _classify_row_result(
+    operator, row_id: str, media, metadata: dict, run, call=None,
+):
+    """Call ``call`` (default ``operator.create_columns``) for one row and
+    classify what happened -- the exception mapping the serial `_deliver`
+    closure, the parallel runner's consumer threads, and the sequence
+    runner's worker threads (P2.4a) all need, factored out so there is
+    exactly ONE place that decides what each exception means.
     Pure: no side effect on any shared state, so it is safe to
     call from any thread. Returns one of:
 
@@ -128,15 +142,25 @@ def _classify_row_result(operator, row_id: str, media, metadata: dict, run):
         ("abort_silent", message)        -- NotImplementedError
         ("abort_setup_error", message)   -- OperatorSetupError
 
+    ``call`` is invoked as ``call(row_id, media, metadata, run)`` -- the
+    sequence runner passes a callable already bound to that row's
+    ``media_time_us`` (``operators.base.BaseOperator.
+    create_columns_in_sequence`` takes one more argument than
+    ``create_columns``), so this function itself never needs to know
+    which method it is calling.
+
     RECORDING what a tag means (appending to row_errors, calling
     on_item_complete, incrementing emitted, reporting progress) is a
     separate concern and must happen only on the run's coordinator
-    thread -- see _run_create_columns_worker's `_deliver` and
-    `_run_create_columns_parallel`'s `_record`, the two callers of this
+    thread -- see _run_create_columns_worker's `_deliver`,
+    `_run_create_columns_parallel`'s `_record`, and
+    `_run_create_columns_sequenced`'s own `_record`, the callers of this
     function.
     """
+    if call is None:
+        call = operator.create_columns
     try:
-        result = operator.create_columns(row_id, media, metadata, run)
+        result = call(row_id, media, metadata, run)
     except NotImplementedError:
         return (
             "abort_silent",
@@ -789,6 +813,25 @@ class OperatorRegistry:
         # FRAME is the only requirement that makes the runner decode.
         needs_frame = media_requirement is MediaRequirement.FRAME
 
+        # P2.4a: a run whose mode declares model_lifecycle PER_SEQUENCE
+        # outright, or whose sequence_option this run's parameters turn
+        # on, is routed to the sequence runner -- ordered per-source
+        # groups (further split by sequence_group_column, if the mode
+        # declares one), each with its OWN fresh model from
+        # build_sequence_model(), on possibly-different threads. This is
+        # decided before the classic parallel-path eligibility check
+        # below: the two are different execution shapes for the same
+        # COLUMNS mode, and a mode running as sequences never takes the
+        # per-worker-shared-model parallel path.
+        if runs_as_sequences(run.spec.mode_descriptor, run.spec.parameters):
+            self._run_create_columns_sequenced(
+                operator, snapshot, row_ids, table_name, run, operation_id,
+                on_item_complete, on_progress, on_complete, on_setup_error,
+                on_row_errors, media_column, needs_frame, label,
+                worker_count, start_time, on_row_finished,
+            )
+            return
+
         # Whether this run is eligible for the parallel path,
         # decided BEFORE any model is built -- model_lifecycle PER_WORKER,
         # the operator does not override iter_column_updates() (an
@@ -830,14 +873,11 @@ class OperatorRegistry:
         #   SHARED       -- one instance for the whole application, built
         #                   and cached on the registry under a lock so two
         #                   runs starting at once cannot both build.
-        #   PER_SEQUENCE -- one isolated instance per clip-run, reset at
-        #                   the sequence boundary. This per-row runner has
-        #                   no sequence concept and cannot honour it;
-        #                   AppController.run_create_columns refuses such a
-        #                   run before it starts. The check below is a
-        #                   defensive guard for a run that somehow reaches
-        #                   here anyway -- same shape as the VIDEO_SPAN /
-        #                   AUDIO_SPAN guard above.
+        #   PER_SEQUENCE -- handled entirely by the sequence runner
+        #                   (_run_create_columns_sequenced, P2.4a), which
+        #                   runs_as_sequences() has already routed this
+        #                   run to above -- model_lifecycle can never be
+        #                   PER_SEQUENCE here.
         #
         # If build_model() raises OperatorSetupError -- e.g. a model file
         # was never downloaded -- the run aborts through on_setup_error
@@ -846,25 +886,6 @@ class OperatorRegistry:
         # whose media happened to decode: a run where every row failed to
         # decode used to report success having processed zero rows and
         # never mention the missing model.
-        if model_lifecycle is ModelLifecycle.PER_SEQUENCE:
-            if on_setup_error is not None:
-                on_setup_error(
-                    operation_id,
-                    label,
-                    f"declares model_lifecycle {model_lifecycle.name}, which "
-                    f"the per-row runner cannot honour -- it has no sequence "
-                    f"boundary to reset at. AppController should have refused "
-                    f"this run before it started.",
-                )
-            if on_complete is not None:
-                elapsed_seconds = time.perf_counter() - start_time
-                _log_run_cost(operator.name, emitted, elapsed_seconds, 1)
-                on_complete(
-                    operation_id, operator.name, emitted,
-                    elapsed_seconds=elapsed_seconds, worker_count=1,
-                )
-            return
-
         try:
             if model_lifecycle is ModelLifecycle.PER_WORKER:
                 run = dataclasses.replace(run, model=operator.build_model())
@@ -1638,6 +1659,495 @@ class OperatorRegistry:
             on_complete(
                 operation_id, operator.name, emitted,
                 elapsed_seconds=elapsed_seconds, worker_count=worker_count,
+            )
+
+    # ── _run_create_columns_sequenced ────────────────────────────────────
+
+    def _run_create_columns_sequenced(
+        self,
+        operator: BaseOperator,
+        snapshot: pd.DataFrame,
+        row_ids: list[str],
+        table_name: str,
+        run,
+        operation_id: str,
+        on_item_complete,
+        on_progress,
+        on_complete,
+        on_setup_error,
+        on_row_errors,
+        media_column: str | None,
+        needs_frame: bool,
+        label: str,
+        worker_count: int,
+        start_time: float,
+        on_row_finished=None,
+    ) -> None:
+        """
+        P2.4a: the ordered-sequence COLUMNS path. Reached only when
+        operators.descriptor.runs_as_sequences() is true for this run's
+        mode and parameters -- every other run takes the serial or
+        classic-parallel path above, unchanged.
+
+        Every row this run covers is classified into a SEQUENCE, here on
+        the coordinator thread, before any worker starts:
+
+          * every #f= row of one video is grouped by (source path,
+            stream[, the sequence_group_column value, if the mode
+            declares one]) -- every row of one source whose group value
+            is missing (None/NaN) forms ONE sequence together, in
+            ascending frame order, exactly like any other group value
+            (never split into one-row sequences: that would give each a
+            cold model and defeat grouping in the first place);
+          * a still-image row (#f=0) or a #t= time-point row is its own
+            one-row sequence;
+          * METADATA / ADDRESS media_requirement: every row is its own
+            one-row sequence, media=None;
+          * a row this runner refuses today (missing/unparseable media,
+            a whole-video row) is an immediate row error, exactly as the
+            serial path's own per-row checks -- it never becomes a
+            sequence.
+
+        min(worker_count, number of sequences) worker threads then each
+        take ONE WHOLE SEQUENCE at a time from a work queue: build that
+        sequence's own model (operator.build_sequence_model(run)), decode
+        it themselves (run.resolver.decode_frames_in_order() for a
+        grouped video sequence, run.resolver.resolve_frame() for a
+        single #t=/still row -- MediaResolver's decoder pool is safe for
+        several threads decoding the same or different source files at
+        once, verified before this item was built), and call
+        operator.create_columns_in_sequence() per row IN ORDER, through
+        the shared _classify_row_result mapping (never a second one). A
+        row the operator raises on is a row error and RESETS that
+        sequence's model (a fresh build_sequence_model()) before the
+        sequence continues with its next row -- the failure may have
+        left the discarded model's cross-row state unreliable.
+
+        Only THIS thread -- the coordinator, same as
+        _run_create_columns_parallel -- ever appends to row_errors, calls
+        on_item_complete / on_setup_error, or reports progress
+        (CLAUDE.md's threading rule). Worker threads only decode and
+        compute; every outcome reaches the coordinator through a results
+        queue. Neither queue used here ever blocks without bound: every
+        sequence is formed up front (there is no live producer streaming
+        more work in), so work_queue.get_nowait() and results_queue.put()
+        never wait; the coordinator's one blocking results_queue.get() is
+        bounded because every worker's _worker_loop sends exactly one
+        "worker_finished" message from a `finally` block on every exit
+        path, cancelled/aborted/crashed/normal alike.
+
+        Failure shapes:
+          * a decode failure partway through a GROUPED sequence: every
+            not-yet-delivered row of THAT sequence becomes a row error
+            with the shared reason; other sequences continue.
+          * build_sequence_model() raising (the initial build, or a
+            reset after a row error) aborts the WHOLE run through
+            on_setup_error, like a PER_WORKER/SHARED build failure does
+            today -- results already recorded for other sequences are
+            kept.
+          * NotImplementedError / OperatorSetupError raised by the
+            operator's own create_columns_in_sequence() aborts the whole
+            run the same way.
+          * cancel: no new row is started after cancel; results already
+            recorded are kept.
+          * a worker thread crashing from something other than the
+            above (a bug in this method itself, not a per-row exception
+            -- those are already mapped by _classify_row_result): that
+            sequence's undelivered rows become row errors and the
+            worker moves on; if every worker crashes this way, the
+            coordinator processes whatever sequences are still queued
+            itself, on its own thread, by calling the very same
+            sequence-processing code the workers used.
+        """
+        total = len(row_ids)
+        row_errors: list[tuple[str, str, str]] = []
+        emitted = 0
+        progress_count = 0
+        aborted = False
+        setup_error_reported = False
+
+        def _report_progress() -> None:
+            nonlocal progress_count
+            progress_count += 1
+            if on_progress is not None:
+                on_progress(int(progress_count / total * 100))
+
+        def _record(row_id: str, outcome: tuple) -> bool:
+            """Coordinator-only recording -- the same shape as
+            _run_create_columns_parallel's own _record, for an outcome a
+            worker thread (or, in the all-crashed fallback, this very
+            thread) computed. Returns False to abort the run."""
+            nonlocal emitted
+            kind = outcome[0]
+            if kind == "abort_silent":
+                print(
+                    f"[OperatorRegistry] Operator '{operator.name}' "
+                    f"does not implement create_columns()."
+                )
+                return False
+            if kind == "abort_setup_error":
+                message = outcome[1]
+                print(
+                    f"[OperatorRegistry] Setup error in '{operator.name}': "
+                    f"{message}"
+                )
+                if on_setup_error is not None:
+                    on_setup_error(operation_id, label, message)
+                return False
+            if kind == "row_error":
+                _, exc_kind, message, all_none = outcome
+                print(
+                    f"[OperatorRegistry] Unexpected error in '{operator.name}' "
+                    f"on {row_id}: {exc_kind}: {message}"
+                )
+                row_errors.append((row_id, exc_kind, message))
+                if on_item_complete is not None:
+                    on_item_complete(operation_id, table_name, row_id, all_none)
+                    emitted += 1
+                if on_row_finished is not None:
+                    on_row_finished(operation_id)
+                _report_progress()
+                return True
+            # "ok"
+            _, result = outcome
+            if on_item_complete is not None:
+                on_item_complete(operation_id, table_name, row_id, result)
+                emitted += 1
+            if on_row_finished is not None:
+                on_row_finished(operation_id)
+            _report_progress()
+            return True
+
+        def _record_row_error(row_id: str, kind: str, message: str) -> None:
+            row_errors.append((row_id, kind, message))
+            if on_row_finished is not None:
+                on_row_finished(operation_id)
+
+        def _describe_build_failure(e: Exception) -> str:
+            if isinstance(e, OperatorSetupError):
+                return str(e)
+            return f"could not build its model: {type(e).__name__}: {e}"
+
+        # ── Step 1: classify every row into an immediate row error or a
+        # sequence entry, here on the coordinator, before any worker
+        # starts. Each value is (kind, entries): kind is "grouped_video"
+        # (decoded through decode_frames_in_order, possibly many rows)
+        # or "single_row" (exactly one row, decoded -- if at all --
+        # through resolve_frame). A plain dict preserves first-insertion
+        # key order in Python, though nothing downstream relies on it.
+        group_column = sequence_group_column(
+            run.spec.mode_descriptor, run.spec.parameters
+        )
+        sequences: "dict[object, tuple[str, list[tuple[str, object, dict]]]]" = {}
+        for i, row_id in enumerate(row_ids):
+            metadata = snapshot.iloc[i].to_dict()
+            if not needs_frame:
+                sequences[("_row_", row_id)] = ("single_row", [(row_id, None, metadata)])
+                continue
+
+            full_path = metadata.get(media_column, "")
+            if not full_path or pd.isna(full_path):
+                _record_row_error(
+                    row_id, "MissingMedia",
+                    "this row has no media value to read",
+                )
+                continue
+            try:
+                addr = parse_address(full_path)
+            except MediaAddressError as e:
+                _record_row_error(
+                    row_id, "UnparseableMedia",
+                    f"could not parse the media value {full_path!r}: {e}",
+                )
+                continue
+            if _is_bare_video_address(addr):
+                _record_row_error(
+                    row_id, "WholeVideoRow",
+                    "this operator reads single frames; this row is a "
+                    "whole video",
+                )
+                continue
+
+            if addr.frame is not None and not is_image_path(addr.path):
+                group_value = (
+                    metadata.get(group_column) if group_column is not None else None
+                )
+                if group_column is not None and (
+                    group_value is None or pd.isna(group_value)
+                ):
+                    # Every row of this source whose group value is
+                    # missing forms ONE sequence together, in ascending
+                    # frame order -- exactly like any other group value.
+                    # A one-row-per-missing-row split would give each a
+                    # cold model and no tracking, which defeats the
+                    # point of grouping. _MISSING_GROUP_VALUE is a
+                    # dedicated sentinel object, not a string, so a real
+                    # group value that happens to equal a string like
+                    # "_missing_" is never folded into this group.
+                    group_key = (addr.path, addr.stream, _MISSING_GROUP_VALUE)
+                else:
+                    group_key = (addr.path, addr.stream, group_value)
+                _kind, entries = sequences.setdefault(
+                    group_key, ("grouped_video", [])
+                )
+                entries.append((row_id, addr, metadata))
+                continue
+
+            # A still image (#f=0) or a #t= time point: its own one-row
+            # sequence, decoded per-row on its worker thread below.
+            sequences[("_row_", row_id)] = ("single_row", [(row_id, addr, metadata)])
+
+        if not sequences:
+            row_errors = row_errors + run.collected_row_errors()
+            if row_errors and on_row_errors is not None:
+                on_row_errors(operation_id, label, row_errors)
+            if on_complete is not None:
+                elapsed_seconds = time.perf_counter() - start_time
+                _log_run_cost(operator.name, emitted, elapsed_seconds, 1)
+                on_complete(
+                    operation_id, operator.name, emitted,
+                    elapsed_seconds=elapsed_seconds, worker_count=1,
+                )
+            return
+
+        # ── Step 2: min(worker_count, number of sequences) worker threads
+        # each take one whole sequence from work_queue at a time.
+        num_workers = max(1, min(worker_count, len(sequences)))
+        work_queue: "queue.Queue" = queue.Queue()
+        for entry in sequences.values():
+            work_queue.put(entry)
+        results_queue: "queue.Queue" = queue.Queue()
+        abort_event = threading.Event()
+        _JOIN_TIMEOUT_SECONDS = 5.0
+
+        def _deliver_sequence_row(
+            row_id, media, metadata, media_time_us, sequence_model, sequence_run,
+        ):
+            """Classify one row through the shared _classify_row_result
+            mapping, hand its outcome to the coordinator, and -- on a
+            row_error -- reset this sequence's model before its next
+            row. Returns (model, run, should_stop); should_stop is True
+            once this sequence must not process another row (an
+            operator abort, or a reset build failure, both of which
+            abort the WHOLE run -- see this method's own docstring)."""
+            call = functools.partial(
+                operator.create_columns_in_sequence, media_time_us=media_time_us,
+            )
+            outcome = _classify_row_result(
+                operator, row_id, media, metadata, sequence_run, call=call,
+            )
+            results_queue.put(("row_outcome", row_id, outcome))
+            kind = outcome[0]
+            if kind in ("abort_silent", "abort_setup_error"):
+                return sequence_model, sequence_run, True
+            if kind == "row_error":
+                try:
+                    sequence_model = operator.build_sequence_model(run)
+                except Exception as e:
+                    results_queue.put(("setup_error", _describe_build_failure(e)))
+                    return sequence_model, sequence_run, True
+                sequence_run = dataclasses.replace(run, model=sequence_model)
+            return sequence_model, sequence_run, False
+
+        def _process_sequence(kind: str, entries: list) -> None:
+            """Runs a whole sequence to completion (or to its first
+            abort / stall). Never lets an exception escape -- a bug here
+            is reported as this sequence's undelivered rows becoming row
+            errors, not as a crash that could leave work_queue's
+            remaining sequences unprocessed. Callable from any thread,
+            including the coordinator's own (the all-crashed fallback
+            below calls it directly)."""
+            pending_row_ids = {row_id for (row_id, _a, _m) in entries}
+            try:
+                try:
+                    sequence_model = operator.build_sequence_model(run)
+                except Exception as e:
+                    results_queue.put(("setup_error", _describe_build_failure(e)))
+                    return
+                sequence_run = dataclasses.replace(run, model=sequence_model)
+
+                if kind == "grouped_video":
+                    addresses = [addr for (_rid, addr, _md) in entries]
+                    media_by_address_id = {
+                        id(addr): (row_id, metadata)
+                        for (row_id, addr, metadata) in entries
+                    }
+                    try:
+                        for addr, payload in run.resolver.decode_frames_in_order(
+                            addresses, "analysis"
+                        ):
+                            if run.cancelled() or abort_event.is_set():
+                                return
+                            row_id, metadata = media_by_address_id[id(addr)]
+                            pending_row_ids.discard(row_id)
+                            sequence_model, sequence_run, should_stop = (
+                                _deliver_sequence_row(
+                                    row_id, payload.pixels, metadata,
+                                    payload.presentation_time_us,
+                                    sequence_model, sequence_run,
+                                )
+                            )
+                            if should_stop:
+                                return
+                    except Exception as e:
+                        for row_id in pending_row_ids:
+                            results_queue.put((
+                                "producer_row_error", row_id,
+                                type(e).__name__, str(e),
+                            ))
+                        return
+                else:  # "single_row"
+                    (row_id, addr, metadata), = entries
+                    if run.cancelled() or abort_event.is_set():
+                        return
+                    if addr is None:
+                        media, media_time_us = None, None
+                    else:
+                        try:
+                            payload = run.resolver.resolve_frame(addr, "analysis")
+                        except (MediaResolverError, MediaAddressError, OSError) as e:
+                            full_path = metadata.get(media_column, "")
+                            results_queue.put((
+                                "producer_row_error",
+                                *_unreadable_media_row_error(row_id, full_path, e),
+                            ))
+                            pending_row_ids.discard(row_id)
+                            return
+                        media, media_time_us = payload.pixels, payload.presentation_time_us
+                    pending_row_ids.discard(row_id)
+                    _deliver_sequence_row(
+                        row_id, media, metadata, media_time_us,
+                        sequence_model, sequence_run,
+                    )
+            except BaseException as e:
+                print(
+                    f"[OperatorRegistry] A sequence worker for "
+                    f"'{operator.name}' crashed: {type(e).__name__}: {e}; "
+                    f"the rows still pending in this sequence become row "
+                    f"errors."
+                )
+                results_queue.put(("worker_crashed",))
+                for row_id in pending_row_ids:
+                    results_queue.put((
+                        "producer_row_error", row_id, type(e).__name__,
+                        f"a worker thread failed: {e}",
+                    ))
+
+        def _worker_loop() -> None:
+            try:
+                while True:
+                    if run.cancelled() or abort_event.is_set():
+                        return
+                    try:
+                        kind, entries = work_queue.get_nowait()
+                    except queue.Empty:
+                        return
+                    _process_sequence(kind, entries)
+            finally:
+                results_queue.put(("worker_finished",))
+
+        worker_threads = [
+            threading.Thread(target=_worker_loop, daemon=True)
+            for _ in range(num_workers)
+        ]
+        for t in worker_threads:
+            t.start()
+
+        live_workers = num_workers
+        died_count = 0
+        while live_workers > 0:
+            item = results_queue.get()
+            tag = item[0]
+            if tag == "worker_finished":
+                live_workers -= 1
+            elif tag == "worker_crashed":
+                died_count += 1
+            elif tag == "setup_error":
+                message = item[1]
+                if not setup_error_reported:
+                    setup_error_reported = True
+                    print(
+                        f"[OperatorRegistry] Setup error in "
+                        f"'{operator.name}': {message}"
+                    )
+                    if on_setup_error is not None:
+                        on_setup_error(operation_id, label, message)
+                aborted = True
+                abort_event.set()
+            elif tag == "producer_row_error":
+                _, row_id, error_kind, message = item
+                row_errors.append((row_id, error_kind, message))
+                if on_row_finished is not None:
+                    on_row_finished(operation_id)
+            else:  # "row_outcome"
+                _, row_id, outcome = item
+                if not _record(row_id, outcome):
+                    aborted = True
+                    abort_event.set()
+
+        for t in worker_threads:
+            t.join(timeout=_JOIN_TIMEOUT_SECONDS)
+            if t.is_alive():
+                print(
+                    f"[OperatorRegistry] A sequence worker for "
+                    f"'{operator.name}' did not stop within "
+                    f"{_JOIN_TIMEOUT_SECONDS}s of being told to; "
+                    f"continuing without it (it is a daemon thread and "
+                    f"will not block process exit)."
+                )
+
+        # Every worker died without anything else aborting the run: the
+        # sequences still in work_queue have not been touched. Process
+        # them here, on the coordinator, by calling the SAME sequence-
+        # processing function a worker thread would have -- it only ever
+        # talks to results_queue, so draining that queue right after each
+        # call is exactly what the loop above already knows how to do.
+        if died_count == num_workers and num_workers > 0 and not aborted:
+            while not (run.cancelled() or aborted):
+                try:
+                    kind, entries = work_queue.get_nowait()
+                except queue.Empty:
+                    break
+                _process_sequence(kind, entries)
+                while True:
+                    try:
+                        item = results_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    tag = item[0]
+                    if tag in ("worker_finished", "worker_crashed"):
+                        continue
+                    elif tag == "setup_error":
+                        message = item[1]
+                        if not setup_error_reported:
+                            setup_error_reported = True
+                            print(
+                                f"[OperatorRegistry] Setup error in "
+                                f"'{operator.name}': {message}"
+                            )
+                            if on_setup_error is not None:
+                                on_setup_error(operation_id, label, message)
+                        aborted = True
+                    elif tag == "producer_row_error":
+                        _, row_id, error_kind, message = item
+                        row_errors.append((row_id, error_kind, message))
+                        if on_row_finished is not None:
+                            on_row_finished(operation_id)
+                    else:  # "row_outcome"
+                        _, row_id, outcome = item
+                        if not _record(row_id, outcome):
+                            aborted = True
+
+        row_errors = row_errors + run.collected_row_errors()
+        if row_errors and on_row_errors is not None:
+            on_row_errors(operation_id, label, row_errors)
+
+        if on_complete is not None:
+            elapsed_seconds = time.perf_counter() - start_time
+            _log_run_cost(operator.name, emitted, elapsed_seconds, num_workers)
+            on_complete(
+                operation_id, operator.name, emitted,
+                elapsed_seconds=elapsed_seconds, worker_count=num_workers,
             )
 
     # ── run_create_table ──────────────────────────────────────────────

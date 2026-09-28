@@ -616,6 +616,10 @@ state. This rule carries no violation list of its own -- it points at the three
   paths. No estimate until `run_timing.ESTIMATE_MIN_ROWS` rows have finished
   after the anchor. TABLE and DISPLAY runs show elapsed time only. Tests:
   `tests/test_run_timing.py`, `tests/test_row_finished_counting.py`.
+- **`[NOW]`** A COLUMNS run for which `runs_as_sequences()` is true gives
+  every sequence its own model from `build_sequence_model()`; rows reach the
+  operator in ascending order within a sequence; only the coordinator
+  records. Guarded by `tests/test_sequence_runner.py`.
 
 ---
 
