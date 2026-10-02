@@ -120,3 +120,112 @@ def test_second_players_own_button_mutes_that_player_not_the_first():
 
     third = _make_adapter()
     assert third._audio.isMuted() is True
+
+
+# ---------------------------------------------------------------------------
+# One Play/Pause toggle button. Its label is derived from the player's
+# playbackState. Driving a real QMediaPlayer into PlayingState needs real
+# media, so the tests emit playbackStateChanged on the real player and, for
+# click routing, swap in a stub player that reports a chosen state.
+# ---------------------------------------------------------------------------
+
+from PySide6.QtMultimedia import QMediaPlayer
+from PySide6.QtWidgets import QPushButton
+
+
+def _buttons_with(widget, fragment):
+    return [
+        b for b in widget.findChildren(QPushButton) if fragment in b.text()
+    ]
+
+
+class _StubPlayer:
+    def __init__(self, state):
+        self._state = state
+        self.calls = []
+
+    def playbackState(self):
+        return self._state
+
+    def pause(self):
+        self.calls.append("pause")
+
+    def play(self):
+        self.calls.append("play")
+
+    def position(self):
+        return 0
+
+    def mediaStatus(self):
+        return QMediaPlayer.MediaStatus.NoMedia
+
+    def setPosition(self, ms):
+        self.calls.append(("setPosition", ms))
+
+
+def test_exactly_one_play_pause_button_and_no_separate_pause_button():
+    widget = _make_adapter()
+    # Not playing at construction, so the one button reads Play.
+    assert len(_buttons_with(widget, "Play")) == 1
+    assert len(_buttons_with(widget, "Pause")) == 0
+    assert widget._play_pause_btn.text() == "▶ Play"
+
+
+def test_label_follows_playback_state_signal():
+    widget = _make_adapter()
+    player = widget._player
+    player.playbackStateChanged.emit(QMediaPlayer.PlaybackState.PlayingState)
+    assert "Pause" in widget._play_pause_btn.text()
+    player.playbackStateChanged.emit(QMediaPlayer.PlaybackState.PausedState)
+    assert "Play" in widget._play_pause_btn.text()
+    player.playbackStateChanged.emit(QMediaPlayer.PlaybackState.PlayingState)
+    player.playbackStateChanged.emit(QMediaPlayer.PlaybackState.StoppedState)
+    assert "Play" in widget._play_pause_btn.text()
+
+
+def test_state_slot_maps_each_state_to_a_label():
+    widget = _make_adapter()
+    states = QMediaPlayer.PlaybackState
+    widget._on_playback_state_changed(states.PlayingState)
+    assert "Pause" in widget._play_pause_btn.text()
+    widget._on_playback_state_changed(states.PausedState)
+    assert "Play" in widget._play_pause_btn.text()
+    widget._on_playback_state_changed(states.StoppedState)
+    assert "Play" in widget._play_pause_btn.text()
+
+
+def test_button_width_is_stable_across_labels():
+    widget = _make_adapter()
+    wider = max(
+        QPushButton("▶ Play").sizeHint().width(),
+        QPushButton("⏸ Pause").sizeHint().width(),
+    )
+    assert widget._play_pause_btn.minimumWidth() >= wider
+
+
+def test_click_while_playing_pauses():
+    widget = _make_adapter()
+    stub = _StubPlayer(QMediaPlayer.PlaybackState.PlayingState)
+    widget._player = stub
+    widget._play_pause_btn.click()
+    assert stub.calls == ["pause"]
+
+
+def test_click_while_paused_goes_through_the_play_path():
+    widget = _make_adapter()
+    stub = _StubPlayer(QMediaPlayer.PlaybackState.PausedState)
+    widget._player = stub
+    called = []
+    widget._on_play_clicked = lambda: called.append(True)
+    widget._play_pause_btn.click()
+    assert called == [True]
+    assert "pause" not in stub.calls
+
+
+def test_click_while_paused_plays():
+    widget = _make_adapter()
+    stub = _StubPlayer(QMediaPlayer.PlaybackState.StoppedState)
+    widget._player = stub
+    widget._play_pause_btn.click()
+    assert stub.calls[-1] == "play"
+    assert "pause" not in stub.calls

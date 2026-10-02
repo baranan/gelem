@@ -48,6 +48,11 @@ class PlaybackAdapter(QWidget):
     # app closes. Not persisted to Settings.
     _muted = False
 
+    # The play/pause button names the action a click would perform: Pause
+    # while playing, Play otherwise.
+    _PLAY_LABEL = "▶ Play"
+    _PAUSE_LABEL = "⏸ Pause"
+
     def __init__(self, span: PlaybackSpan, parent=None):
         super().__init__(parent)
         self._span = span
@@ -78,15 +83,22 @@ class PlaybackAdapter(QWidget):
         layout.addWidget(self._elapsed_label)
 
         controls = QHBoxLayout()
-        play_btn = QPushButton("▶ Play")
-        pause_btn = QPushButton("⏸ Pause")
+        play_pause_btn = QPushButton(self._PLAY_LABEL)
         mute_btn = QPushButton()
-        controls.addWidget(play_btn)
-        controls.addWidget(pause_btn)
+        # One button for both actions. Keep its width fixed at the wider
+        # of the two labels so the row does not jump when the text changes.
+        play_pause_btn.setMinimumWidth(
+            max(
+                QPushButton(self._PLAY_LABEL).sizeHint().width(),
+                QPushButton(self._PAUSE_LABEL).sizeHint().width(),
+            )
+        )
+        controls.addWidget(play_pause_btn)
         controls.addWidget(mute_btn)
         controls.addStretch()
         layout.addLayout(controls)
         self._mute_btn = mute_btn
+        self._play_pause_btn = play_pause_btn
 
         # QAudioOutput is required in Qt6 to route audio.
         self._player = QMediaPlayer(self)
@@ -123,11 +135,13 @@ class PlaybackAdapter(QWidget):
         # to where it already told the slider it was.
         self._slider.valueChanged.connect(self._on_slider_value_changed)
 
-        # Play re-derives where to seek from (span start, if Play is
-        # pressed at or after the span's end) before resuming.
-        play_btn.clicked.connect(self._on_play_clicked)
-        # Pause needs no span logic at all -- it always just pauses.
-        pause_btn.clicked.connect(self._player.pause)
+        # The button's label is derived from the player's own state, never
+        # from a flag flipped on click. Every way playback can stop or start
+        # (this button, the span pausing itself at its end, the frame
+        # stepper's pause(), end of media) emits this one signal.
+        self._player.playbackStateChanged.connect(self._on_playback_state_changed)
+        self._on_playback_state_changed(self._player.playbackState())
+        play_pause_btn.clicked.connect(self._on_play_pause_clicked)
 
         self._player.setSource(QUrl.fromLocalFile(span.source_path))
 
@@ -205,6 +219,20 @@ class PlaybackAdapter(QWidget):
         self._player.setPosition(
             position_for_slider_value(value, self._span, self._duration_ms)
         )
+
+    def _on_playback_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
+        """Sets the play/pause button's label from the player's state."""
+        if state == QMediaPlayer.PlaybackState.PlayingState:
+            self._play_pause_btn.setText(self._PAUSE_LABEL)
+        else:
+            self._play_pause_btn.setText(self._PLAY_LABEL)
+
+    def _on_play_pause_clicked(self) -> None:
+        """Pauses while playing; otherwise plays (see _on_play_clicked)."""
+        if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self._player.pause()
+        else:
+            self._on_play_clicked()
 
     def _on_play_clicked(self) -> None:
         at_end = self._player.mediaStatus() == QMediaPlayer.MediaStatus.EndOfMedia
