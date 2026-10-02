@@ -106,6 +106,7 @@ WIDGET_MODULES: tuple[str, ...] = (
     "test_results_panel.py",
     "test_settings.py",
     "test_settings_dialog.py",
+    "test_table_view_widget.py",
     "test_visible_row_order.py",
 )
 

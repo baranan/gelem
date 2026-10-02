@@ -387,6 +387,8 @@ state. This rule carries no violation list of its own -- it points at the three
   (an AST walk over every file under `ui/` for a string literal passed as
   `render_column_value()`'s first argument).
 
+- **`[NOW]`** The table view reads cells only through `AppController.get_cell_texts(table_name, result_id, start, stop, columns)`; a stale result id returns None. Guarded by `tests/test_cell_texts.py`.
+
 ### Media
 
 - **`[NOW]`** **Only the media resolver decodes *source* media.** No

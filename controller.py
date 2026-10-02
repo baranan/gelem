@@ -41,6 +41,7 @@ from models.project_paths import ProjectPaths, build_project_paths
 from models.output_copy import OutputCopyPlan
 from models.output_copy import execute_output_copy as _execute_output_copy
 from models.output_copy import plan_output_copy as _plan_output_copy
+from column_types.text_format import format_cell_text
 from media.media_address import from_path as _media_address_from_path
 from media.media_address import resolve_source, MediaAddressError
 from media.media_address import parse as _parse_media_address
@@ -645,6 +646,22 @@ def format_output_copy_conflict_message(
         f"({shown}). Choose a different folder, or remove the conflicting "
         f"files there, then save again."
     )
+
+
+@dataclass(frozen=True)
+class CellTexts:
+    """
+    A page of display text for the table view.
+
+    Attributes:
+        row_ids: The row ids at the requested flat-order positions, in
+                 order.
+        texts:   One list of strings per row, one string per requested
+                 column, in the order the columns were asked for.
+    """
+
+    row_ids: list[str]
+    texts: list[list[str]]
 
 
 class _ResolvedTableNameOperatorView:
@@ -2641,6 +2658,51 @@ class AppController(QObject):
         lo = max(0, min(start, n))
         hi = max(lo, min(stop, n))
         return list(self._result.row_ids[lo:hi])
+
+    def get_cell_texts(
+        self,
+        table_name: str,
+        result_id: str,
+        start: int,
+        stop: int,
+        columns: list[str],
+    ) -> CellTexts | None:
+        """
+        Returns the row ids and display text of the cells at flat-order
+        positions [start, stop) for the given columns, or None when the
+        caller's view of the world is stale.
+
+        None means: table_name is not the active table, result_id is not
+        the current result's id, or a requested column is not in the
+        table any more. The caller holds an order that no longer exists
+        and must wait for the next result_changed / columns_updated.
+
+        [start, stop) is clamped to the result exactly as
+        get_row_ids_in_range() clamps it. The controller only delegates:
+        Dataset reads the raw values, column_types.text_format makes the
+        text, using each column's schema type tag.
+        """
+        result = self._result
+        if (
+            result is None
+            or table_name != self._active_table
+            or result.table_name != table_name
+            or result_id != result.result_id
+        ):
+            return None
+
+        known = set(self.get_column_names(table_name))
+        if any(column not in known for column in columns):
+            return None
+
+        row_ids = self.get_row_ids_in_range(start, stop)
+        raw_rows = self._dataset.get_cell_values(table_name, row_ids, columns)
+        tags = [self._schema_tag_for(column, table_name) for column in columns]
+        texts = [
+            [format_cell_text(value, tag) for value, tag in zip(raw_row, tags)]
+            for raw_row in raw_rows
+        ]
+        return CellTexts(row_ids=row_ids, texts=texts)
 
     def get_result_index(self, row_id: str) -> int | None:
         """Returns row_id's position in the flat order, or None."""

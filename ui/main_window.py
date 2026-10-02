@@ -39,6 +39,7 @@ from ui.gallery_widget import GalleryWidget
 from ui.filter_panel import FilterPanel
 from ui.detail_widget import DetailWidget
 from ui.results_panel import ResultsPanel
+from ui.result_table_view import ResultTableView
 from ui.run_operator_dialog import RunOperatorDialog
 from ui.save_table_dialog import SaveTableDialog
 from ui.csv_image_column_dialog import CsvImageColumnDialog
@@ -365,7 +366,35 @@ class MainWindow(QMainWindow):
         self._grouped_scroll.setWidget(self._grouped_container)
         self._gallery_stack.addWidget(self._grouped_scroll)
 
-        splitter.addWidget(self._gallery_stack)
+        # The table view: a read-only grid of the same result.
+        self._table_view = ResultTableView(self._controller)
+
+        # One level above the gallery stack: the "Gallery | Table" switch
+        # and a stack holding the whole gallery area (page 0) or the
+        # table (page 1). Selection belongs to whichever is showing.
+        centre = QWidget()
+        centre_layout = QVBoxLayout(centre)
+        centre_layout.setContentsMargins(0, 0, 0, 0)
+        centre_layout.setSpacing(4)
+
+        switch_row = QHBoxLayout()
+        switch_row.setContentsMargins(0, 0, 0, 0)
+        self._gallery_button = QPushButton("Gallery")
+        self._table_button = QPushButton("Table")
+        for button in (self._gallery_button, self._table_button):
+            button.setCheckable(True)
+            button.setAutoExclusive(True)
+            switch_row.addWidget(button)
+        self._gallery_button.setChecked(True)
+        switch_row.addStretch(1)
+        centre_layout.addLayout(switch_row)
+
+        self._view_stack = QStackedWidget()
+        self._view_stack.addWidget(self._gallery_stack)
+        self._view_stack.addWidget(self._table_view)
+        centre_layout.addWidget(self._view_stack)
+
+        splitter.addWidget(centre)
 
         # Right: tabbed panels — Detail and Results only.
         # Kept as an instance attribute so handlers can switch focus
@@ -600,7 +629,12 @@ class MainWindow(QMainWindow):
         the main gallery; in grouped mode the counts are aggregated
         across every group gallery.
         """
-        selected = len(self._collect_selected_row_ids())
+        if self._table_showing():
+            # The table counts its selection from the selection model's
+            # ranges, without fetching a single row id.
+            selected = self._table_view.selected_count()
+        else:
+            selected = len(self._collect_selected_row_ids())
         # O(1): the controller already knows the flat-order length. The
         # old code copied every row id just to count them, on every
         # selection change (P0.4 follow-up 2).
@@ -1125,9 +1159,88 @@ class MainWindow(QMainWindow):
         # galleries get their own keys in _build_group_section.
         self._main_gallery.displayed_range_changed.connect(
             lambda start, stop, result_id:
-            self._controller.report_displayed_range(
-                "flat", start, stop, result_id
-            )
+            self._report_gallery_range("flat", start, stop, result_id)
+        )
+
+        # View switch and table view. The table reads the controller
+        # itself; MainWindow only tells it when to start over (result,
+        # columns, active table or project changed) and which rows were
+        # updated in place.
+        self._gallery_button.clicked.connect(
+            lambda: self._show_view(table=False)
+        )
+        self._table_button.clicked.connect(
+            lambda: self._show_view(table=True)
+        )
+        ctrl.columns_updated.connect(lambda _names: self._table_view.refresh())
+        ctrl.active_table_changed.connect(lambda _name: self._table_view.refresh())
+        ctrl.project_loaded.connect(self._table_view.refresh)
+        self._table_view.selection_changed.connect(self._refresh_status_bar)
+        self._table_view.row_double_clicked.connect(
+            self._on_table_row_double_clicked
+        )
+
+    # ── Gallery / Table switch ─────────────────────────────────────────
+
+    def _table_showing(self) -> bool:
+        """True while the table, not the gallery area, is on screen."""
+        return self._view_stack.currentWidget() is self._table_view
+
+    def _report_gallery_range(
+        self, key: str, start: int, stop: int, result_id: str
+    ) -> None:
+        """Forwards a gallery's displayed-range report to the controller,
+        unless the table is showing: a hidden gallery shows nothing, so
+        it must not ask for thumbnails. Every gallery reports through
+        here so that rule is written once."""
+        if self._table_showing():
+            return
+        self._controller.report_displayed_range(key, start, stop, result_id)
+
+    def _clear_all_gallery_ranges(self) -> None:
+        """Tells the controller no gallery is displaying anything."""
+        self._controller.clear_displayed_range("flat")
+        for key in self._grouped_viewport_keys:
+            self._controller.clear_displayed_range(key)
+
+    def _reset_galleries_to_layout(self) -> None:
+        """Re-points every gallery at its slice of the current result.
+        set_range() clears a gallery's selection and its remembered last
+        report, so this both empties the selection and makes each gallery
+        report its range afresh the next time reports are allowed."""
+        layout = self._controller.get_result_layout()
+        if layout.groups is None:
+            self._main_gallery.set_range(0, layout.total, layout.result_id)
+            return
+        for gallery, section in zip(self._galleries, layout.groups):
+            gallery.set_range(section.start, section.stop, layout.result_id)
+
+    def _show_view(self, table: bool) -> None:
+        """Switches the centre area between the galleries and the table.
+        The selection is cleared in both views on every switch, and the
+        galleries report no displayed range while the table is showing."""
+        if table == self._table_showing():
+            return
+        self._table_view.clear_selection()
+        if table:
+            self._view_stack.setCurrentWidget(self._table_view)
+            self._clear_all_gallery_ranges()
+            self._table_view.refresh()
+        else:
+            self._view_stack.setCurrentWidget(self._gallery_stack)
+        # Clears every gallery's selection; with the table gone these
+        # reports now reach the controller, restoring thumbnail demand.
+        self._reset_galleries_to_layout()
+        self._gallery_button.setChecked(not table)
+        self._table_button.setChecked(table)
+        self._refresh_status_bar()
+
+    def _on_table_row_double_clicked(self, row_id: str) -> None:
+        """A table row was double-clicked: same outcome as double-clicking
+        a tile -- the whole selection side by side if the row is part of a
+        multi-row selection, otherwise Detail opens on that row."""
+        self._open_in_detail(
+            [row_id], self._table_view.get_selected_row_ids()
         )
 
     def _on_tile_double_clicked(
@@ -1145,11 +1258,23 @@ class MainWindow(QMainWindow):
                          the flat main gallery; per-group galleries pass
                          themselves so selection is read from the right one.
         """
+        gallery  = gallery or self._main_gallery
+        self._open_in_detail(clicked_ids, gallery.get_selected_row_ids())
+
+    def _open_in_detail(
+        self, clicked_ids: list[str], selected: list[str]
+    ) -> None:
+        """Shared by tile and table-row double-clicks: opens the clicked
+        row in Detail, or the whole selection if the clicked row is one of
+        several selected.
+
+        Args:
+            clicked_ids: row_ids of the double-clicked item.
+            selected:    the showing view's current selection.
+        """
         if not clicked_ids:
             return
 
-        gallery  = gallery or self._main_gallery
-        selected = gallery.get_selected_row_ids()
         if len(selected) > 1 and clicked_ids[0] in selected:
             # Preserve flat-order sequence so panels read left-to-right
             # the same way the tiles do. The controller owns that order.
@@ -1196,7 +1321,13 @@ class MainWindow(QMainWindow):
                                        its group's absolute range. An
                                        empty tuple is a valid grouped
                                        result with zero groups.
+
+        The table view starts over on every new result too. While it is
+        showing, the galleries below are still given their ranges (so
+        they are right when switched back to) but their displayed-range
+        reports are dropped by _report_gallery_range().
         """
+        self._table_view.refresh()
         if layout.groups is None:
             self._clear_grouped_galleries()
             self._galleries = [self._main_gallery]
@@ -1308,9 +1439,7 @@ class MainWindow(QMainWindow):
         # learns keys exist.
         gallery.displayed_range_changed.connect(
             lambda start, stop, result_id, k=viewport_key:
-            self._controller.report_displayed_range(
-                k, start, stop, result_id
-            )
+            self._report_gallery_range(k, start, stop, result_id)
         )
         layout.addWidget(gallery)
 
@@ -1332,8 +1461,11 @@ class MainWindow(QMainWindow):
         """
         Returns the selected row_ids across every live gallery, in
         order and de-duplicated. In flat mode this is just the main
-        gallery; in grouped mode it spans all group galleries.
+        gallery; in grouped mode it spans all group galleries. While the
+        table is showing, the selection is the table's, in flat order.
         """
+        if self._table_showing():
+            return self._table_view.get_selected_row_ids()
         return self._collect_row_ids(
             lambda g: g.get_selected_row_ids()
         )
@@ -1345,7 +1477,8 @@ class MainWindow(QMainWindow):
         order now -- one flat sequence that covers both the flat and the
         grouped view -- so there is no per-gallery flattening to do. The
         old version de-duplicated across galleries, but groups never
-        overlap, so that was a no-op.
+        overlap, so that was a no-op. The same order feeds the gallery and
+        the table, so this does not depend on which view is showing.
         """
         return self._controller.get_visible_row_ids()
 
@@ -1419,10 +1552,12 @@ class MainWindow(QMainWindow):
         """
         A batch of rows in payload.table_name changed. Repaint those
         tiles only if that table is on screen. See _on_thumbnails_ready
-        for why the check is here.
+        for why the check is here. The table view drops its cached pages
+        holding those rows and repaints them, with no reset.
         """
         if payload.table_name != self._controller.get_active_table():
             return
+        self._table_view.on_rows_updated(payload.row_ids)
         for gallery in self._galleries:
             gallery.on_rows_updated(payload.row_ids)
 

@@ -2494,6 +2494,62 @@ class Dataset:
             return {}
         return df.iloc[pos].to_dict()
 
+    def get_cell_values(
+        self,
+        table_name: str,
+        row_ids: list[str],
+        columns: list[str],
+    ) -> list[list]:
+        """
+        Returns the raw stored values for the given rows and columns of
+        one table: one inner list per requested row id, in the order the
+        ids were given, with one value per requested column, in the order
+        the columns were given.
+
+        Reads by position through the row-id index (_row_index_for), one
+        column at a time, so the cost is proportional to the number of
+        cells asked for. It never copies the table and never scans it.
+        Only the requested columns are touched.
+
+        A row id the table does not hold yields a row of None in its
+        place, so the result is always exactly as long as row_ids and a
+        caller pairing the two by position never sees rows shift.
+
+        Raises:
+            KeyError: the table does not exist, or a requested column is
+                      not in it.
+        """
+        df = self._get_stored_table(table_name)
+        missing = [c for c in columns if c not in df.columns]
+        if missing:
+            raise KeyError(
+                f"get_cell_values: column(s) {missing} are not in table "
+                f"'{table_name}'."
+            )
+
+        index = self._row_index_for(table_name)
+
+        # Positions of the ids that exist, remembering where each one goes
+        # in the output so an unknown id leaves its None row untouched.
+        out_rows = [[None] * len(columns) for _ in row_ids]
+        slots: list[int] = []
+        positions: list[int] = []
+        for slot, row_id in enumerate(row_ids):
+            pos = index.get(row_id)
+            if pos is not None:
+                slots.append(slot)
+                positions.append(pos)
+
+        if positions:
+            for col_number, column in enumerate(columns):
+                # One positional take per column; .tolist() yields plain
+                # Python values (ints stay exact, NaN stays NaN, NaT and
+                # pd.NA come through as themselves).
+                values = df[column].iloc[positions].tolist()
+                for slot, value in zip(slots, values):
+                    out_rows[slot][col_number] = value
+        return out_rows
+
     # ------------------------------------------------------------------
     # Save and load
     # ------------------------------------------------------------------
