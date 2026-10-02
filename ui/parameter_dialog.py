@@ -38,7 +38,7 @@ standard-library only and pulls in no data library.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from html import escape as _html_escape
 from typing import Optional
 
@@ -120,6 +120,13 @@ class FieldSpec:
                          already filtered to the right input and tags.
       * ``allow_multiple`` -- whether a "column" lets the researcher pick
                          more than one.
+
+    Dependency on another field (any kind):
+      * ``enabled_by``     -- the name of a boolean field that must be on
+                         for this field to be editable, or ``None`` for a
+                         field that is always editable. Set by
+                         ``build_field_specs`` from the mode's
+                         ``sequence_option``; ``resolve_form`` reads it.
     """
 
     name: str
@@ -140,6 +147,9 @@ class FieldSpec:
     # column
     column_names: tuple[str, ...] = ()
     allow_multiple: bool = False
+
+    # the boolean field that switches this field on, if any
+    enabled_by: Optional[str] = None
 
 
 def build_field_specs(mode_descriptor, columns_by_input) -> tuple[FieldSpec, ...]:
@@ -279,6 +289,20 @@ def build_field_specs(mode_descriptor, columns_by_input) -> tuple[FieldSpec, ...
             f"{type(parameter).__name__} cannot be rendered by the "
             f"generated parameter form."
         )
+
+    # A mode's sequence_option names a boolean that turns sequence handling
+    # on, and optionally a column that only has meaning while it is on.
+    # Record that dependency on the column's spec, so resolve_form can keep
+    # the column disabled while the boolean is off. Generic: it reads the
+    # descriptor and knows no operator by name.
+    option = getattr(mode_descriptor, "sequence_option", None)
+    if option is not None and option.group_by is not None:
+        specs = [
+            replace(spec, enabled_by=option.enabled_by)
+            if spec.name == option.group_by
+            else spec
+            for spec in specs
+        ]
 
     return tuple(specs)
 
@@ -542,7 +566,13 @@ def resolve_form(field_specs, advice, raw_values) -> ResolvedForm:
                 f"inapplicable instead."
             )
 
+    # A field tied to a boolean (FieldSpec.enabled_by) is inapplicable
+    # while that boolean is off, exactly as if the operator had listed it.
+    # A missing raw value counts as off.
     inapplicable = set(advice.inapplicable)
+    for spec in field_specs:
+        if spec.enabled_by is not None and not raw_values.get(spec.enabled_by):
+            inapplicable.add(spec.name)
 
     # Disabled fields, in form order.
     disabled_fields = tuple(

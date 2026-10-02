@@ -364,6 +364,11 @@ class _FakeController:
         # for these tests -- stubbed to say so.
         return None
 
+    def count_one_row_sequence_rows(self, operator_name, mode_name, table_name,
+                                    row_ids, parameters):
+        # No photo-tracking warning for these tests.
+        return 0
+
     def run_create_columns(self, operator_name, row_ids, parameters,
                            *, fill_only_empty=False, clear_existing_outputs=False):
         self.run_create_columns_calls.append((operator_name, row_ids, parameters))

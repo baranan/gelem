@@ -51,7 +51,9 @@ from operators.descriptor import (
     InputKind,
     MediaRequirement,
     NewTableNameParameter,
+    runs_as_sequences,
 )
+from operators.operator_registry import address_forms_one_row_sequence
 from operators.run_context import (
     CancellationToken,
     OperatorRun,
@@ -3287,6 +3289,63 @@ class AppController(QObject):
             empty_row_count=len(empty_row_ids),
             message=message,
         )
+
+    def count_one_row_sequence_rows(
+        self,
+        operator_name: str,
+        mode_name: str,
+        table_name: str,
+        row_ids: list[str],
+        parameters: dict,
+    ) -> int:
+        """How many of the chosen rows would be one-row sequences if this
+        run started now -- the number the pre-run "tracking has no effect
+        on photos" warning reports (ui/main_window.py).
+
+        Zero when the operator or mode is unknown, when the mode reads no
+        frames, or when ``runs_as_sequences`` is false for these
+        parameters (tracking off): nothing is warned about in those cases.
+        Otherwise it counts the rows whose media address
+        ``operators.operator_registry.address_forms_one_row_sequence``
+        says is a still image or a time point. A row with missing or
+        unparseable media is not counted. Read-only.
+
+        The media column is the active table's detail media column, the
+        same one ``run_create_columns`` reads, so ``table_name`` is
+        expected to be the active table.
+        """
+        operator = self._op_registry.get(operator_name)
+        if operator is None or operator.descriptor is None:
+            return 0
+        try:
+            mode = ExecutionMode[mode_name]
+        except KeyError:
+            return 0
+        mode_descriptor = operator.descriptor.mode_for(mode)
+        if mode_descriptor is None:
+            return 0
+        if mode_descriptor.media_requirement is not MediaRequirement.FRAME:
+            return 0
+        if not runs_as_sequences(mode_descriptor, parameters):
+            return 0
+        media_column = self.get_detail_media_column()
+        if media_column is None:
+            return 0
+
+        snapshot = self._dataset.snapshot_rows(
+            table_name, row_ids, [media_column]
+        )
+        count = 0
+        for value in snapshot[media_column]:
+            if not value or pd.isna(value):
+                continue
+            try:
+                address = _parse_media_address(value)
+            except MediaAddressError:
+                continue
+            if address_forms_one_row_sequence(address):
+                count += 1
+        return count
 
     def run_create_columns(
         self,

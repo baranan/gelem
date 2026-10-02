@@ -225,14 +225,14 @@ class BlendshapeOperator(BaseOperator):
                     ColumnParameter(
                         name="sequence_column",
                         label=(
-                            "Treat rows with the same value in this column "
-                            "as one sequence"
+                            "Split each video into separate sequences by "
+                            "this column"
                         ),
                         from_input="active_table",
                         required=False,
                         help_text=(
-                            "Optional; when empty, each source video is "
-                            "one sequence."
+                            "Optional. When empty, each video file is one "
+                            "sequence."
                         ),
                     ),
                 ),

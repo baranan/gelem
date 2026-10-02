@@ -495,11 +495,6 @@ to P1.8d, and the two OS-native / non-parsing media-cell entries to P1.8e.
   stops the pools it starts, so roughly 30 daemon threads survive to the end of
   a full test run and are only cleaned up by process exit.
 
-- **`operators/blendshapes.py` never closes its `FaceLandmarker`.**
-  *Consequence unverified.* The MediaPipe `FaceLandmarker` it creates is never
-  `.close()`d. This was proven **not** to be the native crash above, but it is
-  still a resource leak.
-
 - **Two files under `tests/` are named `test_*.py` but are standalone
   manual-check scripts, not pytest modules.** *Consequence unverified.*
   `tests/test_renderer.py` and `tests/test_results_panel.py` do their work at
@@ -527,6 +522,12 @@ to P1.8d, and the two OS-native / non-parsing media-cell entries to P1.8e.
 ---
 
 ## Fixed
+
+- **`operators/blendshapes.py` never closed its `FaceLandmarker`.** The
+  MediaPipe `FaceLandmarker` it creates was never `.close()`d. It was proven
+  **not** to be the native crash above, but it was still a resource leak.
+  *(Fixed by P2.4b, 0246d79: the runner closes every model it builds through
+  `operator.close_model()`.)*
 
 - **A FRAME-requirement COLUMNS run read only the `full_path` metadata key**
   (`operators/operator_registry.py`'s `_run_create_columns_worker`), never a

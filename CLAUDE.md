@@ -593,6 +593,18 @@ state. This rule carries no violation list of its own -- it points at the three
 - **`[TARGET -> P2.2]`** Resumability is narrower than cancellability and must be
   stated per mode; see `operators/CLAUDE.md`. A generator gives progressive output
   and a cancellation point. It does not by itself give resumability.
+- **`[NOW]`** A `sequence_option`'s `group_by` field is disabled in the
+  parameter dialog while its `enabled_by` boolean is off, and enabled while it
+  is on, live as the checkbox toggles: `build_field_specs` records the
+  boolean on the field's `FieldSpec.enabled_by` and `resolve_form` disables it,
+  generically, with no operator named. A field disabled this way keeps its
+  value and never blocks OK. Which rows are one-row sequences (a still image
+  or a `#t=` time point) is decided by one function,
+  `address_forms_one_row_sequence` in `operators/operator_registry.py`, used
+  by the sequence runner and by `AppController.count_one_row_sequence_rows`,
+  which feeds the "Tracking has no effect on photos" confirm in
+  `ui/main_window.py`. Tests: `tests/test_sequence_option_form.py`,
+  `tests/test_one_row_sequences.py` (the latter has the call-site AST guard).
 - **`[NOW]`** A COLUMNS run whose declared output columns already exist on the
   target table asks the researcher before it starts: overwrite every chosen
   row, fill in only the rows still empty, or cancel (default and Escape).

@@ -941,6 +941,29 @@ class MainWindow(QMainWindow):
             return "fill_only_empty"
         return "cancel"
 
+    def _confirm_tracking_on_photos(self, photo_count: int, chosen_count: int) -> bool:
+        """Tells the researcher that tracking has no effect on the photos
+        and single time points among the chosen rows, and returns whether
+        to run anyway. The default button and Escape both mean Cancel.
+        """
+        box = QMessageBox(self)
+        box.setWindowTitle("Tracking has no effect on photos")
+        box.setText(
+            f"{photo_count} of the {chosen_count} chosen rows are photos "
+            f"or single time points. Tracking has no effect on them; each "
+            f"is analysed on its own."
+        )
+        run_button = box.addButton(
+            "Run anyway", QMessageBox.ButtonRole.AcceptRole
+        )
+        cancel_button = box.addButton(
+            "Cancel", QMessageBox.ButtonRole.RejectRole
+        )
+        box.setDefaultButton(cancel_button)
+        box.setEscapeButton(cancel_button)
+        box.exec()
+        return box.clickedButton() is run_button
+
     def _on_run_create_columns(self, operator_name: str) -> None:
         """
         Shows the scope and parameter dialogs, then runs
@@ -981,6 +1004,18 @@ class MainWindow(QMainWindow):
                 fill_only_empty = True
             else:
                 clear_existing_outputs = True
+
+        # Tracking follows a face from one frame to the next, so it means
+        # nothing for a photo or a single time point. Say so before the
+        # run starts, not after.
+        photo_count = self._controller.count_one_row_sequence_rows(
+            operator_name, ExecutionMode.COLUMNS.name,
+            self._controller.get_active_table(), row_ids, parameters,
+        )
+        if photo_count > 0 and not self._confirm_tracking_on_photos(
+            photo_count, len(row_ids)
+        ):
+            return
 
         if not self._confirm_start_despite_conflicts(
             operator_name, ExecutionMode.COLUMNS

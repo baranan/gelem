@@ -90,6 +90,27 @@ def _is_bare_video_address(addr) -> bool:
     return Path(addr.path).suffix.lower() not in IMAGE_EXTENSIONS
 
 
+def address_forms_one_row_sequence(addr) -> bool:
+    """True when a row with this media address is a sequence of its own
+    in a sequence run: a still image, or a ``#t=`` time point. Such a row
+    has no ordered stream to walk, so each one gets its own model and
+    nothing is tracked from one row to the next. A ``#f=`` frame of a
+    video is NOT one -- those rows are grouped, in frame order, into a
+    sequence per source (and per group value).
+
+    A bare whole-video address is not a photo and is not counted: the
+    runner refuses that row before it ever reaches a sequence.
+
+    This is the ONE place that decides it. The sequence runner groups with
+    it, and the controller's pre-run warning counts with it
+    (``AppController.count_one_row_sequence_rows``); neither repeats the
+    test.
+    """
+    if _is_bare_video_address(addr):
+        return False
+    return not (addr.frame is not None and not is_image_path(addr.path))
+
+
 def _unreadable_media_row_error(row_id: str, full_path, exc: Exception) -> tuple:
     """The row_errors tuple for a still-image or #t= row whose
     resolve_frame() call raised. Shared by the serial per-row loop and
@@ -1034,7 +1055,7 @@ class OperatorRegistry:
                 # ORIGINAL per-row resolve_frame() path immediately
                 # below -- a still has no sequential stream to walk, and
                 # a lone time point gains nothing from grouping.
-                if addr.frame is not None and not is_image_path(addr.path):
+                if not address_forms_one_row_sequence(addr):
                     group_key = (addr.path, addr.stream)
                     frame_groups.setdefault(group_key, []).append(
                         (row_id, addr, metadata)
@@ -1457,7 +1478,7 @@ class OperatorRegistry:
                             "is a whole video",
                         ))
                         continue
-                    if addr.frame is not None and not is_image_path(addr.path):
+                    if not address_forms_one_row_sequence(addr):
                         group_key = (addr.path, addr.stream)
                         frame_groups.setdefault(group_key, []).append(
                             (row_id, addr, metadata)
@@ -1916,7 +1937,7 @@ class OperatorRegistry:
                 )
                 continue
 
-            if addr.frame is not None and not is_image_path(addr.path):
+            if not address_forms_one_row_sequence(addr):
                 group_value = (
                     metadata.get(group_column) if group_column is not None else None
                 )
