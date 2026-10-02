@@ -728,6 +728,16 @@ class AppController(QObject):
                                  long_run_warning_minutes setting.
                                  MainWindow shows the warning dialog; the
                                  run itself keeps going regardless.
+        project_loaded:          The open project was replaced -- by
+                                 load_folder(), load_csv_as_primary() or
+                                 load_project(). Carries no payload. A
+                                 widget holding state tied to the PREVIOUS
+                                 project (e.g. DetailWidget's shown row)
+                                 connects to this to reset itself, rather
+                                 than inferring a project change from
+                                 active_table_changed, which does not fire
+                                 when the active table keeps the same name
+                                 across the switch.
     """
 
     result_changed           = Signal(object)
@@ -747,6 +757,7 @@ class AppController(QObject):
     display_result_ready     = Signal(dict)
     table_created            = Signal(str)
     long_run_estimated       = Signal(str, float)
+    project_loaded           = Signal()
 
     def __init__(
         self,
@@ -2759,6 +2770,76 @@ class AppController(QObject):
 
     # ── Public API ────────────────────────────────────────────────────
 
+    def _reset_project_state(self) -> None:
+        """
+        The single place every per-project piece of controller state is
+        reset, called by load_folder(), load_csv_as_primary() and
+        load_project() once the dataset itself already holds the new
+        project (so the active-table healing below can read its real
+        table list). Replaces three separately maintained copies of this
+        block, which had drifted: load_folder() and load_csv_as_primary()
+        never healed a stale active table the way load_project() already
+        did.
+
+        Deliberately does NOT touch self._project_root, self._project_paths
+        or the artifact store's directory binding (set_artifacts_dir /
+        load_index / reconcile_and_evict) -- those differ by load path
+        (load_project re-roots them to the saved project's own folder;
+        load_folder / load_csv_as_primary leave the current workspace in
+        place) and stay each caller's own job, called around this method.
+        self._store.reset() is likewise the caller's job, for the same
+        reason load_project() must call it before load_index() reseeds
+        the artifact index (see that method's own note) -- folding it in
+        here would fix its position for two callers and break it for the
+        third.
+
+        Also deliberately does NOT touch self._unsaved_baseline.
+        has_unsaved_changes() (tests/test_unsaved_changes.py) is a
+        dirty flag re-baselined only after a successful save_project() or
+        load_project() -- a fresh load_folder() or load_csv_as_primary()
+        is specified to read as unsaved, since neither names a project
+        folder the researcher has saved to yet. load_project() still
+        re-baselines it, as its own step, same as before this method
+        existed.
+
+        A run still live when the project is replaced is cancelled
+        through cancel_run() -- the same mechanism the Cancel button
+        uses -- not merely dropped from the registry, so its worker
+        thread is told to stop rather than left running against a
+        project nothing refers to any more. For a COLUMNS run this stops
+        the loop between rows, same as an ordinary cancellation; its
+        results, if any still arrive after this method returns, are
+        dropped by the item drain exactly as any dead run's are.
+        """
+        for operation_id in list(self._live_runs):
+            self.cancel_run(operation_id)
+        if self._live_runs:
+            self._live_runs.clear()
+            self.live_runs_changed.emit()
+
+        self._display_state.forget_all()
+        self._query_state.forget_all()
+        self._shown_table_name_suggestions.clear()
+
+        # Heal a table name only the PREVIOUS project had -- the same
+        # rule load_project() already applied on its own: keep the
+        # current active table if this project also has one by that
+        # name, otherwise fall back to its first table, or "" if it has
+        # none.
+        loaded_tables = self._dataset.list_tables()
+        if self._active_table not in loaded_tables:
+            self._active_table = loaded_tables[0] if loaded_tables else ""
+
+        # Fires before columns_updated / tables_updated: a widget holding
+        # a stimulus from the replaced project (DetailWidget) clears
+        # itself first, rather than briefly rendering against a table
+        # list that no longer matches what it is showing.
+        self.project_loaded.emit()
+
+        self.columns_updated.emit(self.get_column_names())
+        self.tables_updated.emit(loaded_tables)
+        self._refresh_result()
+
     def load_folder(self, folder_path: Path) -> None:
         """
         Loads a folder of media files into the dataset.
@@ -2770,23 +2851,10 @@ class AppController(QObject):
             folder_path: Path to the folder containing media files.
         """
         try:
-            self._store.reset()
-            # The dataset is being replaced: every in-flight operator run
-            # now targets rows that will not exist. Drop them so a late
-            # result cannot write onto the new folder's rows. Guarded so
-            # live_runs_changed fires only on an actual change.
-            if self._live_runs:
-                self._live_runs.clear()
-                self.live_runs_changed.emit()
-            self._query_state.forget_all()
-            self._display_state.forget_all()
-            self._project_root   = Path(folder_path)
-
             self._dataset.load_folder(folder_path)
-
-            self.columns_updated.emit(self.get_column_names())
-            self.tables_updated.emit(self._dataset.list_tables())
-            self._refresh_result()
+            self._project_root = Path(folder_path)
+            self._store.reset()
+            self._reset_project_state()
 
         except Exception as e:
             self.error_occurred.emit(f"Failed to load folder: {e}")
@@ -2804,26 +2872,12 @@ class AppController(QObject):
             image_column: Optional column containing media file paths.
         """
         try:
-            self._store.reset()
-            # See load_folder(): the dataset is being replaced, so no
-            # in-flight run's results are valid any more. Guarded so
-            # live_runs_changed fires only on an actual change.
-            if self._live_runs:
-                self._live_runs.clear()
-                self.live_runs_changed.emit()
-            self._query_state.forget_all()
-            self._display_state.forget_all()
+            self._dataset.load_csv_as_primary(csv_path, image_column)
             # Relative image paths in the CSV are relative to the CSV's
             # own folder, not the process working directory.
-            self._project_root   = Path(csv_path).parent
-
-            self._dataset.load_csv_as_primary(csv_path, image_column)
-            # Thumbnails are generated on demand as tiles paint
-            # (P0.5b-3i), not in an eager whole-table pass here.
-
-            self.columns_updated.emit(self.get_column_names())
-            self.tables_updated.emit(self._dataset.list_tables())
-            self._refresh_result()
+            self._project_root = Path(csv_path).parent
+            self._store.reset()
+            self._reset_project_state()
 
         except Exception as e:
             self.error_occurred.emit(f"Failed to load CSV: {e}")
@@ -4070,23 +4124,6 @@ class AppController(QObject):
             # Dataset.load() takes project_path as an argument and reads no
             # controller state.
             self._dataset.load(project_path)
-            # The dataset is now the new project: drop every in-flight run so
-            # a late result cannot land in it, and re-root media resolution.
-            # Guarded so live_runs_changed fires only on an actual change.
-            if self._live_runs:
-                self._live_runs.clear()
-                self.live_runs_changed.emit()
-            # The dataset is a different project's now: a remembered
-            # visible-columns choice keyed by table name (e.g. "frames",
-            # which every load_folder() and every project alike can name)
-            # must not leak into it -- see load_folder() and
-            # load_csv_as_primary() for the same call, and
-            # table_display.py's own module docstring for why (CC-27).
-            # A remembered filter is the same risk -- without
-            # this, a filter set in one project could survive into an
-            # unrelated one and silently show zero rows.
-            self._display_state.forget_all()
-            self._query_state.forget_all()
             self._project_root = Path(project_path)
             # reset() BEFORE load_index(): otherwise the new project's
             # index lands on top of the previous project's live image
@@ -4134,31 +4171,15 @@ class AppController(QObject):
             # JPEG as an orphan over a recoverable error.
             if index_is_authoritative:
                 self._store.reconcile_and_evict()
-            # The active table may be a name only the PREVIOUS project
-            # had (e.g. an operator-created "frame_rows"). Nothing about
-            # which table a project considers "active" is persisted by
-            # save()/load() (CC-28) -- neither Dataset nor schemas.json
-            # carries such a field -- so the rule is: keep the current
-            # active table when this project also has a table by that
-            # name, otherwise fall back to the project's first table
-            # (list_tables() always puts "frames" first when it is
-            # present). A project with zero tables would leave no active
-            # table at all, but Dataset.load() itself refuses to load
-            # one (its own FileNotFoundError for "no .parquet files"),
-            # so that branch cannot be reached through this method today
-            # -- handled defensively rather than left to raise if that
-            # guarantee ever changes.
-            loaded_tables = self._dataset.list_tables()
-            if self._active_table not in loaded_tables:
-                self._active_table = loaded_tables[0] if loaded_tables else ""
-            self.tables_updated.emit(loaded_tables)
-            self.columns_updated.emit(self.get_column_names())
-            self._refresh_result()
+            self._reset_project_state()
             # Re-baseline the dirty flag against what was just loaded --
             # see has_unsaved_changes(). Dataset.load() mints fresh
             # table_versions() numbers for every table, so this must be
             # read back AFTER load() returns, never computed once at
             # startup (docs/review/unsaved-work-survey.md section 3).
+            # load_project() alone does this -- load_folder() and
+            # load_csv_as_primary() deliberately do not (see
+            # _reset_project_state()'s own docstring).
             self._unsaved_baseline = self._dataset.table_versions()
         except Exception as e:
             self.error_occurred.emit(f"Failed to load project: {e}")

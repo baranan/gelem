@@ -514,9 +514,10 @@ def test_rows_updated_is_a_batched_payload_with_table_name(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 9. Only the three dataset-replacing paths clear the run registry;
-#    set_active_table() does not. Source check -- directly answers review
-#    check #1.
+# 9. The whole run registry is only ever cleared/cancelled inside
+#    _reset_project_state(), and that method is only ever called by the
+#    three dataset-replacing load paths. set_active_table() does neither.
+#    Source check -- directly answers review check #1.
 # ---------------------------------------------------------------------------
 
 def test_only_dataset_replacing_paths_clear_the_run_registry():
@@ -528,27 +529,42 @@ def test_only_dataset_replacing_paths_clear_the_run_registry():
         if isinstance(n, ast.FunctionDef)
     }
 
-    clears = "_live_runs.clear()"
-    for name in ("load_folder", "load_csv_as_primary", "load_project"):
-        assert name in methods, f"{name} not found in controller.py"
-        assert clears in methods[name], (
-            f"{name} must clear the run registry -- it replaces the dataset"
-        )
-
-    assert clears not in methods["set_active_table"], (
-        "set_active_table() must NOT clear the run registry: a live run's "
-        "result belongs in its own table whatever is on screen"
+    assert "_reset_project_state" in methods, (
+        "_reset_project_state not found in controller.py"
     )
 
-    # And nothing else clears it (keeps 'only those three paths' honest).
-    other_clearers = [
-        name for name, src in methods.items()
-        if clears in src and name not in (
-            "load_folder", "load_csv_as_primary", "load_project", "__init__",
-        )
+    # (a) Clearing or cancelling the WHOLE registry happens only inside
+    # _reset_project_state() -- nowhere else, including set_active_table()
+    # (a live run's result belongs in its own table whatever is on screen)
+    # and cancel_run() itself (which only ever touches the one run named
+    # by its operation_id argument, never the registry as a whole).
+    whole_registry_markers = ("_live_runs.clear()", "self.cancel_run(")
+    offenders = [
+        (name, marker)
+        for name, src in methods.items()
+        if name != "_reset_project_state"
+        for marker in whole_registry_markers
+        if marker in src
     ]
-    assert not other_clearers, (
-        f"unexpected methods clear the run registry: {other_clearers}"
+    assert not offenders, (
+        f"only _reset_project_state() may clear or cancel the whole run "
+        f"registry; found elsewhere: {offenders}"
+    )
+    for marker in whole_registry_markers:
+        assert marker in methods["_reset_project_state"], (
+            f"_reset_project_state() must itself contain {marker!r}"
+        )
+
+    # (b) _reset_project_state() is called only by the three
+    # dataset-replacing load paths -- not by set_active_table() or
+    # anything else.
+    callers = [
+        name for name, src in methods.items()
+        if name != "_reset_project_state" and "_reset_project_state()" in src
+    ]
+    assert set(callers) == {"load_folder", "load_csv_as_primary", "load_project"}, (
+        f"_reset_project_state() must be called by exactly load_folder, "
+        f"load_csv_as_primary and load_project; found: {sorted(callers)}"
     )
 
 

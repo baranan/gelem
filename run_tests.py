@@ -99,6 +99,7 @@ WIDGET_MODULES: tuple[str, ...] = (
     "test_operator_tag_hints.py",
     "test_parameter_dialog.py",
     "test_playback_mute.py",
+    "test_project_load_reset.py",
     "test_renderer.py",
     "test_result_delivery.py",
     "test_results_panel.py",

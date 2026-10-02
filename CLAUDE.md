@@ -113,6 +113,22 @@ state. This rule carries no violation list of its own -- it points at the three
   `AppController.load_project()` calls `Dataset.load()` before it mutates any
   controller field, so a failed load never moves `_project_root` or drops live
   runs. Tests: `tests/test_project_load.py`.
+- **`[NOW]`** `AppController._reset_project_state()` is the single place every
+  per-project piece of controller state is reset, called by `load_folder()`,
+  `load_csv_as_primary()` and `load_project()` once the dataset already holds
+  the new project. A run still live when the project is replaced is cancelled
+  through `cancel_run()` -- the same mechanism the Cancel button uses -- not
+  merely dropped from the live-run registry. A stale active table (one only
+  the previous project had) is healed before `_refresh_result()` runs, the
+  same rule `load_project()` already applied on its own before this method
+  existed, now shared by all three paths. `project_loaded` (no payload) fires
+  on every call, which is what a widget holding state tied to the previous
+  project -- `DetailWidget` -- connects to, rather than inferring a project
+  change from `active_table_changed`, which does not fire when the healed
+  active table keeps the same name across the switch. Does not touch
+  `_project_root`, `_project_paths`, the artifact store's directory binding,
+  or `_unsaved_baseline` -- those differ by load path and stay each caller's
+  own step around this method. Tests: `tests/test_project_load_reset.py`.
 - **`[NOW]`** `get_table()` returns a copy. Modifying it does not modify the stored
   table.
 - **`[NOW]`** Reading one row must not copy the whole table. `get_row()` reads

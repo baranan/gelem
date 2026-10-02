@@ -1044,6 +1044,7 @@ class MainWindow(QMainWindow):
         ctrl.columns_updated.connect(self._on_columns_updated)
         ctrl.tables_updated.connect(self._on_tables_updated)
         ctrl.active_table_changed.connect(self._on_active_table_changed)
+        ctrl.project_loaded.connect(self._detail_widget.clear)
         ctrl.thumbnails_ready.connect(self._on_thumbnails_ready)
         ctrl.rows_updated.connect(self._on_rows_updated)
         ctrl.row_selected.connect(self._on_row_selected)
