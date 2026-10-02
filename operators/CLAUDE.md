@@ -272,7 +272,11 @@ Declare the lifecycle in the mode descriptor's `model_lifecycle`
 `build_model(self)`. The runner -- `OperatorRegistry`, the one component that
 builds models -- calls the factory and hands the result back as **`run.model`**.
 That is the one channel, for every lifecycle; an operator never builds or caches
-a model itself.
+a model itself. The runner is equally the one component that discards a model,
+calling `close_model(self, model)` on the thread that used it last (`[NOW]`,
+root `CLAUDE.md`'s "Long-running work"); an operator whose model holds a native
+resource -- a handle, a background dispatcher thread, an open file -- overrides
+it to release that resource, rather than leaving it to `__del__`.
 
 **Today only the per-row COLUMNS runner honours this** (`_run_create_columns_worker`).
 `run_create_table` and `run_create_display` build no model and leave `run.model`

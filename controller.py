@@ -46,6 +46,7 @@ from media.media_address import resolve_source, MediaAddressError
 from media.media_address import parse as _parse_media_address
 from media.resolver import MediaResolverError
 from operators.descriptor import (
+    BooleanParameter,
     ExecutionMode,
     InputKind,
     MediaRequirement,
@@ -494,6 +495,17 @@ class ExistingOutputsInfo:
     message: str
 
 
+def _plain_value(name: str, value: object, boolean_names: frozenset[str]) -> str:
+    """One parameter value, worded for an undergraduate reader: a
+    boolean as "on"/"off", an empty optional value (never set, or set
+    then cleared) as "none", anything else exactly as it is."""
+    if name in boolean_names:
+        return "on" if value else "off"
+    if value is None or value == "" or value == ():
+        return "none"
+    return str(value)
+
+
 def format_existing_outputs_message(
     *,
     label: str,
@@ -503,8 +515,11 @@ def format_existing_outputs_message(
     empty_row_count: int,
     parameter_changes: list[tuple[str, object, object]],
     version_change: tuple[str, str] | None,
+    parameter_specs: tuple = (),
 ) -> str:
-    """The plain-English body of the re-run choice dialog.
+    """The plain-English body of the re-run choice dialog, written for a
+    researcher with no programming background -- short sentences, named
+    counts, no jargon ("column(s)", "row(s)").
 
     parameter_changes is every parameter present in both the current
     values and the most recent matching provenance entry whose value
@@ -515,31 +530,60 @@ def format_existing_outputs_message(
     says nothing about version at all, per the caller's own lookup.
     Neither line is shown when nothing was recorded for this operator,
     mode and table before.
+
+    parameter_specs is the mode's declared ParameterSpec tuple -- used
+    only to look up each changed parameter's researcher-facing LABEL (not
+    its internal name) and to tell a boolean parameter apart from any
+    other kind, so its value reads "on"/"off" rather than True/False. A
+    changed name absent from parameter_specs (should not happen for a
+    real run, but not assumed) falls back to showing the name itself.
     """
-    columns_str = ", ".join(f'"{c}"' for c in existing_columns)
+    column_count = len(existing_columns)
+    shown_columns = ", ".join(existing_columns[:3])
+    if column_count > 3:
+        shown_columns += f", and {column_count - 3} more"
+    column_word = "column" if column_count == 1 else "columns"
+
+    row_word = "row" if chosen_row_count == 1 else "rows"
+    row_verb = "is" if chosen_row_count == 1 else "are"
+    empty_row_word = "row" if empty_row_count == 1 else "rows"
+
     lines = [
-        f'"{label}" writes to the column(s) {columns_str}, which already '
-        f'exist on "{table_name}".',
+        f'"{label}" has already filled its {column_count} {column_word} '
+        f"({shown_columns}) on the table \"{table_name}\".",
         "",
-        f"{chosen_row_count} row(s) are selected; {empty_row_count} of "
-        f"them have no value yet in those columns.",
+        f"{chosen_row_count} {row_word} {row_verb} selected. "
+        f"{empty_row_count} of them have no values yet.",
     ]
+
     if parameter_changes or version_change is not None:
+        labels_by_name = {spec.name: spec.label for spec in parameter_specs}
+        boolean_names = frozenset(
+            spec.name for spec in parameter_specs
+            if isinstance(spec, BooleanParameter)
+        )
         lines.append("")
-        lines.append("Since the last run of this operator on this table:")
+        lines.append("Your settings are different from the last run on this table:")
         for name, old_value, new_value in parameter_changes:
-            lines.append(f"  {name}: was {old_value}, now {new_value}")
+            param_label = labels_by_name.get(name, name)
+            old_text = _plain_value(name, old_value, boolean_names)
+            new_text = _plain_value(name, new_value, boolean_names)
+            lines.append(f"  • {param_label}: was {old_text}, now {new_text}")
         if version_change is not None:
             old_version, new_version = version_change
-            lines.append(f"  version: was {old_version}, now {new_version}")
+            lines.append(f"  • version: was {old_version}, now {new_version}")
+
     lines.append("")
     lines.append(
-        "Overwrite all recomputes every selected row. Fill only empty "
-        "rows recomputes only the rows with no value yet, and leaves "
-        "every other selected row exactly as it is. Gelem keeps no "
-        "record of which rows were already done, so this choice "
-        "decides that each time."
+        f"• Overwrite all – compute all {chosen_row_count} "
+        f"selected {row_word} again."
     )
+    lines.append(
+        f"• Fill only empty rows – compute only the "
+        f"{empty_row_count} {empty_row_word} with no values; the other "
+        f"rows stay as they are."
+    )
+    lines.append("• Cancel – do nothing.")
     return "\n".join(lines)
 
 
@@ -3181,6 +3225,7 @@ class AppController(QObject):
             empty_row_count=len(empty_row_ids),
             parameter_changes=parameter_changes,
             version_change=version_change,
+            parameter_specs=mode_descriptor.parameters,
         )
         return ExistingOutputsInfo(
             existing_columns=existing_columns,

@@ -31,6 +31,8 @@ import mediapipe as mp
 
 from operators.base import BaseOperator, OperatorSetupError
 from operators.descriptor import (
+    BooleanParameter,
+    ColumnParameter,
     ExecutionMode,
     InputKind,
     InputSpec,
@@ -40,6 +42,7 @@ from operators.descriptor import (
     OperatorDescriptor,
     OutputColumn,
     OutputSpec,
+    SequenceOption,
 )
 
 # Where the model file lives, and where to download it from. Kept in one
@@ -87,6 +90,58 @@ BLENDSHAPE_NAMES = [
 ]
 
 
+def _landmarker_options(running_mode=None):
+    """
+    The FaceLandmarkerOptions shared by build_model() (IMAGE, the default
+    running mode MediaPipe uses when none is given) and
+    BlendshapeOperator.build_sequence_model() (VIDEO, P2.4b) -- ONE place
+    for the missing-model check and every option that must stay identical
+    between the two, so they cannot drift apart.
+
+    Raises OperatorSetupError if the model file has not been downloaded
+    yet.
+    """
+    if not _MODEL_PATH.exists():
+        raise OperatorSetupError(
+            f"The MediaPipe face-landmarker model file is missing.\n"
+            f"Download it once with this command:\n"
+            f'  curl -L -o {_MODEL_RELATIVE} "{_MODEL_URL}"'
+        )
+    kwargs = dict(
+        base_options=mp.tasks.BaseOptions(model_asset_path=str(_MODEL_PATH)),
+        output_face_blendshapes=True,
+        num_faces=1,
+    )
+    if running_mode is not None:
+        kwargs["running_mode"] = running_mode
+    return mp.tasks.vision.FaceLandmarkerOptions(**kwargs)
+
+
+def _scores_from_detection_result(detection_result, row_id, run):
+    """
+    Turns one MediaPipe FaceLandmarkerResult into the blendshape score
+    dict create_columns() and create_columns_in_sequence() both return --
+    ONE place for the no-face handling, the run.log line, and the
+    category-name -> column-name mapping, so the two call sites cannot
+    drift apart.
+    """
+    if not detection_result.face_blendshapes:
+        # run-indicator-2: worth more than a percentage on a run where
+        # many rows come back empty. LATEST WINS, PER RUN, so this
+        # costs one dict write per row, same as any other row.
+        run.log(f"no face detected in row {row_id}")
+        return {name: None for name in BLENDSHAPE_NAMES}
+
+    detected_scores = detection_result.face_blendshapes[0]
+    # The order is NOT the same as BLENDSHAPE_NAMES — its first entry is "_neutral".
+    # tongueOut is currently absent from MediaPipe output, so it will be None.
+    score_by_name = {bs.category_name: bs.score for bs in detected_scores}
+    return {
+        bs_name: score_by_name.get(bs_name.removeprefix("bs_"))
+        for bs_name in BLENDSHAPE_NAMES
+    }
+
+
 class BlendshapeOperator(BaseOperator):
     """
     Extracts blendshape values from face images using mediapipe.
@@ -103,30 +158,41 @@ class BlendshapeOperator(BaseOperator):
     # ------------------------------------------------------------------
     # Descriptor (P1.12d-1). Describes what create_columns() does:
     #  - one COLUMNS mode, over the active table;
-    #  - no parameters (get_parameters_dialog is not overridden);
+    #  - two parameters (P2.4b): track_face (opt into MediaPipe's VIDEO
+    #    running mode, tracked across frames) and sequence_column (an
+    #    optional column that splits one source into more than one
+    #    sequence). Both are read by the runner alone, through
+    #    operators.descriptor's SequenceOption / runs_as_sequences() /
+    #    sequence_group_column() -- this operator itself never reads
+    #    run.parameters["track_face"] or ["sequence_column"];
     #  - media_requirement FRAME: mediapipe needs the face image, so the
     #    runner decodes one frame and hands it in as `media`;
     #  - model_lifecycle PER_WORKER (honoured by the runner as of
-    #    P1.12d-2b-2). The FaceLandmarker is created in IMAGE running mode
-    #    (no running_mode is passed to FaceLandmarkerOptions, and
-    #    create_columns() calls run.model.detect()), so it carries no
-    #    cross-frame tracking state and PER_SEQUENCE is not required; but
-    #    MediaPipe landmarkers are not documented as thread-safe, so
-    #    SHARED cannot be claimed either -- PER_WORKER is the fallback
-    #    operators/CLAUDE.md's "Where a model lives" section prescribes
-    #    when thread-safety is unknown. The runner calls build_model()
-    #    once per worker and hands the landmarker in as run.model; this
-    #    class stores nothing on self.
-    #  - deterministic: the same image and model give the same scores.
+    #    P1.12d-2b-2) for the default, tracking-off path: the FaceLandmarker
+    #    is created in IMAGE running mode (build_model(), create_columns())
+    #    and carries no cross-frame tracking state, so PER_SEQUENCE is not
+    #    required there; but MediaPipe landmarkers are not documented as
+    #    thread-safe, so SHARED cannot be claimed either -- PER_WORKER is
+    #    the fallback operators/CLAUDE.md's "Where a model lives" section
+    #    prescribes when thread-safety is unknown. With track_face on, the
+    #    sequence_option below routes the run to the P2.4a sequence runner
+    #    instead: build_sequence_model() builds one VIDEO-mode landmarker
+    #    per sequence, and create_columns_in_sequence() calls
+    #    detect_for_video() in ascending presentation order. Either way the
+    #    runner builds the model and hands it in as run.model; this class
+    #    stores nothing on self.
+    #  - deterministic: the same image (or the same sequence, in order) and
+    #    model give the same scores.
     # ------------------------------------------------------------------
     descriptor = OperatorDescriptor(
         name="blendshapes",
-        version="1.0",
+        version="1.1",
         description=(
             "Runs MediaPipe's FaceLandmarker on each row's face image and "
             "writes the 52 ARKit blendshape activation scores (0.0-1.0) as "
             "numeric columns. Rows with no detected face get None for every "
-            "blendshape column."
+            "blendshape column. Optionally tracks the face across frames "
+            "instead of treating each frame independently."
         ),
         modes=(
             ModeDescriptor(
@@ -140,7 +206,36 @@ class BlendshapeOperator(BaseOperator):
                     ),
                 ),
                 media_requirement=MediaRequirement.FRAME,
-                parameters=(),
+                parameters=(
+                    BooleanParameter(
+                        name="track_face",
+                        label="Track the face across frames",
+                        required=False,
+                        default=False,
+                        help_text=(
+                            "Tracking follows the face from one frame to "
+                            "the next, which smooths the results and gives "
+                            "different numbers from per-image mode – use "
+                            "one mode for a whole study. With tracking on, "
+                            "each still image (and each time-range row) "
+                            "builds its own model, which is slow on large "
+                            "tables of still images."
+                        ),
+                    ),
+                    ColumnParameter(
+                        name="sequence_column",
+                        label=(
+                            "Treat rows with the same value in this column "
+                            "as one sequence"
+                        ),
+                        from_input="active_table",
+                        required=False,
+                        help_text=(
+                            "Optional; when empty, each source video is "
+                            "one sequence."
+                        ),
+                    ),
+                ),
                 output=OutputSpec(
                     columns=tuple(
                         OutputColumn(name=bs_name, type_tag="numeric")
@@ -148,6 +243,10 @@ class BlendshapeOperator(BaseOperator):
                     ),
                 ),
                 model_lifecycle=ModelLifecycle.PER_WORKER,
+                sequence_option=SequenceOption(
+                    enabled_by="track_face",
+                    group_by="sequence_column",
+                ),
                 deterministic=True,
                 cacheable=True,
             ),
@@ -156,8 +255,10 @@ class BlendshapeOperator(BaseOperator):
 
     def build_model(self):
         """
-        FACTORY for the MediaPipe FaceLandmarker (see operators/base.py ->
-        build_model and operators/CLAUDE.md -> "Where a model lives").
+        FACTORY for the MediaPipe FaceLandmarker in IMAGE running mode --
+        the tracking-off, per-frame-independent default (see
+        operators/base.py -> build_model and operators/CLAUDE.md -> "Where
+        a model lives").
 
         The runner calls this once per worker -- the descriptor declares
         model_lifecycle PER_WORKER -- and hands the result to
@@ -169,16 +270,45 @@ class BlendshapeOperator(BaseOperator):
         downloaded yet. The runner aborts the run before any row is
         processed and surfaces this message to the researcher.
         """
-        if not _MODEL_PATH.exists():
-            raise OperatorSetupError(
-                f"The MediaPipe face-landmarker model file is missing.\n"
-                f"Download it once with this command:\n"
-                f'  curl -L -o {_MODEL_RELATIVE} "{_MODEL_URL}"'
-            )
-        landmarker_config = mp.tasks.vision.FaceLandmarkerOptions(
-            base_options=mp.tasks.BaseOptions(model_asset_path=str(_MODEL_PATH)),
-            output_face_blendshapes=True,
-            num_faces=1,
+        landmarker_config = _landmarker_options()
+        return mp.tasks.vision.FaceLandmarker.create_from_options(
+            landmarker_config
+        )
+
+    def close_model(self, model) -> None:
+        """
+        Releases the FaceLandmarker's native resources. The runner calls
+        this on the thread that used `model` last, right after its last
+        use (operators/base.py's own docstring lists every call site) --
+        never relying on garbage collection, which can call `close()`
+        from an unrelated thread at an unpredictable moment and hang.
+        """
+        model.close()
+
+    def build_sequence_model(self, run):
+        """
+        FACTORY for one sequence's MediaPipe FaceLandmarker, in VIDEO
+        running mode (P2.4b). Reached only when the researcher turns on
+        the "Track the face across frames" parameter -- the descriptor's
+        sequence_option routes that run through the P2.4a sequence
+        runner, which calls this once per sequence rather than
+        build_model() once per worker.
+
+        VIDEO mode carries tracking state forward from one
+        detect_for_video() call to the next on the SAME landmarker
+        instance, which is exactly why the sequence runner gives every
+        sequence its own fresh one: two sequences (two sources, or two
+        groups of one source) must never share a landmarker's tracking
+        state.
+
+        Raises OperatorSetupError if the model file has not been
+        downloaded yet -- the same check build_model() makes, through the
+        same _landmarker_options() helper, so the message cannot drift
+        between the two paths. The runner aborts the whole run through
+        on_setup_error, exactly like a build_model() failure does.
+        """
+        landmarker_config = _landmarker_options(
+            running_mode=mp.tasks.vision.RunningMode.VIDEO
         )
         return mp.tasks.vision.FaceLandmarker.create_from_options(
             landmarker_config
@@ -201,12 +331,14 @@ class BlendshapeOperator(BaseOperator):
                       and ADDRESS). This operator declares FRAME, so it is
                       the face frame as a numpy array (height, width, 3), RGB.
             metadata: Existing column values for this row (not used here).
-            run:      The OperatorRun for this run. This operator declares
-                      no parameters, so run.parameters is empty. The
-                      landmarker the runner built once for this run (the
-                      descriptor declares model_lifecycle PER_WORKER) is
-                      run.model; this operator never builds or caches one
-                      itself.
+            run:      The OperatorRun for this run. Read per-run values from
+                      run.parameters if needed; this method itself does
+                      not -- the runner decides whether tracking is on and
+                      routes to create_columns_in_sequence() instead when
+                      it is. The landmarker the runner built once for this
+                      run (the descriptor declares model_lifecycle
+                      PER_WORKER) is run.model; this operator never builds
+                      or caches one itself.
 
         Returns:
             Dict mapping each blendshape name to its score (0.0–1.0).
@@ -221,21 +353,44 @@ class BlendshapeOperator(BaseOperator):
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=media)
         detection_result = landmarker.detect(mp_image)
 
-        if not detection_result.face_blendshapes:
-            # run-indicator-2: worth more than a percentage on a run where
-            # many rows come back empty. LATEST WINS, PER RUN, so this
-            # costs one dict write per row, same as any other row.
-            run.log(f"no face detected in row {row_id}")
-            return {name: None for name in BLENDSHAPE_NAMES}
+        return _scores_from_detection_result(detection_result, row_id, run)
 
-        detected_scores = detection_result.face_blendshapes[0]
-        # The order is NOT the same as BLENDSHAPE_NAMES — its first entry is "_neutral".
-        # tongueOut is currently absent from MediaPipe output, so it will be None.
-        score_by_name = {bs.category_name: bs.score for bs in detected_scores}
-        return {
-            bs_name: score_by_name.get(bs_name.removeprefix("bs_"))
-            for bs_name in BLENDSHAPE_NAMES
-        }
+    def create_columns_in_sequence(
+        self,
+        row_id: str,
+        media: np.ndarray,
+        metadata: dict,
+        run,
+        media_time_us: int | None,
+    ) -> dict:
+        """
+        Runs mediapipe face detection, WITH TRACKING, on one row of a
+        sequence (P2.4b). Reached only when "Track the face across
+        frames" is on; run.model is the VIDEO-mode landmarker
+        build_sequence_model() built for THIS sequence.
+
+        media_time_us is this row's presentation time in microseconds, or
+        None when its media has no timeline (a still image is its own
+        one-row sequence -- see operators/CLAUDE.md's "the sequence
+        runner"). MediaPipe's detect_for_video() takes a millisecond
+        timestamp and requires it to strictly increase within one
+        landmarker's lifetime; a one-row sequence has no earlier
+        timestamp to increase from, so None becomes 0.
+
+        Returns / raises: same contract as create_columns(). A row whose
+        timestamp does not strictly increase (two rows naming the same
+        instant, or a grouping column mixing two sources) is exactly the
+        kind of failure the sequence runner's own row-error handling
+        covers: whatever MediaPipe raises becomes a row error and resets
+        this sequence's model before its next row.
+        """
+        landmarker = run.model
+        timestamp_ms = 0 if media_time_us is None else media_time_us // 1000
+
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=media)
+        detection_result = landmarker.detect_for_video(mp_image, timestamp_ms)
+
+        return _scores_from_detection_result(detection_result, row_id, run)
 
 # TODO: for a one-off terminal check, build a landmarker with build_model()
 # and call landmarker.detect() on a loaded image directly. create_columns()

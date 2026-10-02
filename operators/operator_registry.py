@@ -178,6 +178,22 @@ def _classify_row_result(
     return ("ok", result)
 
 
+def _safe_close_model(operator, model) -> None:
+    """Calls operator.close_model(model), swallowing and logging any
+    exception it raises -- operators/base.py's close_model contract: a
+    discarded model's cleanup must never fail a row or a run. The ONE
+    place every path (serial, parallel, sequenced) that discards a model
+    calls through, so a close failure is reported identically everywhere.
+    Call this on the thread that used `model` last."""
+    try:
+        operator.close_model(model)
+    except Exception as e:
+        print(
+            f"[OperatorRegistry] close_model() raised for "
+            f"'{operator.name}': {type(e).__name__}: {e} -- ignored."
+        )
+
+
 def _log_run_cost(
     operator_name: str, rows: int, elapsed_seconds: float, worker_count: int
 ) -> None:
@@ -1195,6 +1211,16 @@ class OperatorRegistry:
         if row_errors and on_row_errors is not None:
             on_row_errors(operation_id, label, row_errors)
 
+        # This run's own model (PER_WORKER only -- a SHARED model is
+        # cached on the registry and reused by every future run, so it is
+        # never closed here; NONE never built one). Every exit path above
+        # (normal completion, cancellation, an aborted row) converges
+        # here before on_complete, so this is model's one and only "last
+        # use has ended" point on this (the only) thread this path runs
+        # on. See operators/base.py's close_model docstring.
+        if model_lifecycle is ModelLifecycle.PER_WORKER:
+            _safe_close_model(operator, run.model)
+
         if on_complete is not None:
             elapsed_seconds = time.perf_counter() - start_time
             _log_run_cost(operator.name, emitted, elapsed_seconds, 1)
@@ -1357,6 +1383,11 @@ class OperatorRegistry:
                     f"[OperatorRegistry] Model build failed for "
                     f"'{operator.name}': {type(e).__name__}: {e}"
                 )
+                # Every model built so far was never handed to a consumer
+                # thread and never will be -- close each on this
+                # (coordinator) thread, the only one that ever touched it.
+                for built_model in models:
+                    _safe_close_model(operator, built_model)
                 if on_setup_error is not None:
                     on_setup_error(operation_id, label, message)
                 if on_complete is not None:
@@ -1494,31 +1525,41 @@ class OperatorRegistry:
                         break
 
         def _consumer(consumer_run) -> None:
-            while True:
-                try:
-                    item = work_queue.get(timeout=0.5)
-                except queue.Empty:
+            # consumer_run.model is this consumer's own PER_WORKER
+            # instance, built once before any thread started and never
+            # reassigned -- this thread is the only one that ever uses
+            # it, and every exit path below (normal completion,
+            # cancellation, a crash) is this model's "last use has
+            # ended" point, so one `finally` covers all of them. See
+            # operators/base.py's close_model docstring.
+            try:
+                while True:
+                    try:
+                        item = work_queue.get(timeout=0.5)
+                    except queue.Empty:
+                        if run.cancelled() or abort_event.is_set():
+                            results_queue.put(("consumer_finished",))
+                            return
+                        continue
+                    if item is _SENTINEL:
+                        results_queue.put(("consumer_finished",))
+                        return
                     if run.cancelled() or abort_event.is_set():
                         results_queue.put(("consumer_finished",))
                         return
-                    continue
-                if item is _SENTINEL:
-                    results_queue.put(("consumer_finished",))
-                    return
-                if run.cancelled() or abort_event.is_set():
-                    results_queue.put(("consumer_finished",))
-                    return
-                row_id, media, metadata = item
-                try:
-                    outcome = _classify_row_result(
-                        operator, row_id, media, metadata, consumer_run
-                    )
-                except BaseException as e:
-                    results_queue.put(
-                        ("consumer_died", row_id, media, metadata, e)
-                    )
-                    return
-                results_queue.put(("row_outcome", row_id, outcome))
+                    row_id, media, metadata = item
+                    try:
+                        outcome = _classify_row_result(
+                            operator, row_id, media, metadata, consumer_run
+                        )
+                    except BaseException as e:
+                        results_queue.put(
+                            ("consumer_died", row_id, media, metadata, e)
+                        )
+                        return
+                    results_queue.put(("row_outcome", row_id, outcome))
+            finally:
+                _safe_close_model(operator, consumer_run.model)
 
         producer_thread = threading.Thread(target=_producer, daemon=True)
         consumer_threads = [
@@ -1652,6 +1693,13 @@ class OperatorRegistry:
         row_errors = row_errors + run.collected_row_errors()
         if row_errors and on_row_errors is not None:
             on_row_errors(operation_id, label, row_errors)
+
+        # The lazily-built fallback model (_get_fallback_run()), if this
+        # run ever needed one: used only by this (coordinator) thread,
+        # across however many rows it fell back to, so its one "last use
+        # has ended" point is here, now that every row is accounted for.
+        if fallback_run_holder:
+            _safe_close_model(operator, fallback_run_holder[0].model)
 
         if on_complete is not None:
             elapsed_seconds = time.perf_counter() - start_time
@@ -1929,7 +1977,16 @@ class OperatorRegistry:
             row. Returns (model, run, should_stop); should_stop is True
             once this sequence must not process another row (an
             operator abort, or a reset build failure, both of which
-            abort the WHOLE run -- see this method's own docstring)."""
+            abort the WHOLE run -- see this method's own docstring).
+
+            CLOSE INVARIANT (close_model, operators/base.py): a model
+            this function discards -- the one an abort outcome just used,
+            or the one a row_error just used, whether or not its
+            replacement build succeeds -- is closed right here, on this
+            thread, before this function returns. should_stop == True
+            therefore always means the returned `sequence_model` is
+            ALREADY CLOSED; should_stop == False always means it is
+            still live and the caller remains responsible for it."""
             call = functools.partial(
                 operator.create_columns_in_sequence, media_time_us=media_time_us,
             )
@@ -1939,8 +1996,10 @@ class OperatorRegistry:
             results_queue.put(("row_outcome", row_id, outcome))
             kind = outcome[0]
             if kind in ("abort_silent", "abort_setup_error"):
+                _safe_close_model(operator, sequence_model)
                 return sequence_model, sequence_run, True
             if kind == "row_error":
+                _safe_close_model(operator, sequence_model)
                 try:
                     sequence_model = operator.build_sequence_model(run)
                 except Exception as e:
@@ -1956,8 +2015,19 @@ class OperatorRegistry:
             errors, not as a crash that could leave work_queue's
             remaining sequences unprocessed. Callable from any thread,
             including the coordinator's own (the all-crashed fallback
-            below calls it directly)."""
+            below calls it directly).
+
+            CLOSE INVARIANT: this function builds exactly one sequence
+            model and is responsible for making sure it (or whatever it
+            was reset to, per _deliver_sequence_row's own invariant) is
+            closed exactly once before this function returns, on
+            whichever thread is running it -- the thread that used it
+            last. `sequence_model_closed` tracks whether that has already
+            happened via _deliver_sequence_row (should_stop == True), so
+            the paths below and the crash handler never double-close."""
             pending_row_ids = {row_id for (row_id, _a, _m) in entries}
+            sequence_model = None
+            sequence_model_closed = False
             try:
                 try:
                     sequence_model = operator.build_sequence_model(run)
@@ -1977,6 +2047,8 @@ class OperatorRegistry:
                             addresses, "analysis"
                         ):
                             if run.cancelled() or abort_event.is_set():
+                                _safe_close_model(operator, sequence_model)
+                                sequence_model_closed = True
                                 return
                             row_id, metadata = media_by_address_id[id(addr)]
                             pending_row_ids.discard(row_id)
@@ -1988,8 +2060,16 @@ class OperatorRegistry:
                                 )
                             )
                             if should_stop:
+                                sequence_model_closed = True
                                 return
+                        # The loop ran out of frames without aborting --
+                        # this sequence is done; sequence_model is the
+                        # live model that processed its last row.
+                        _safe_close_model(operator, sequence_model)
+                        sequence_model_closed = True
                     except Exception as e:
+                        _safe_close_model(operator, sequence_model)
+                        sequence_model_closed = True
                         for row_id in pending_row_ids:
                             results_queue.put((
                                 "producer_row_error", row_id,
@@ -1999,6 +2079,8 @@ class OperatorRegistry:
                 else:  # "single_row"
                     (row_id, addr, metadata), = entries
                     if run.cancelled() or abort_event.is_set():
+                        _safe_close_model(operator, sequence_model)
+                        sequence_model_closed = True
                         return
                     if addr is None:
                         media, media_time_us = None, None
@@ -2012,13 +2094,21 @@ class OperatorRegistry:
                                 *_unreadable_media_row_error(row_id, full_path, e),
                             ))
                             pending_row_ids.discard(row_id)
+                            _safe_close_model(operator, sequence_model)
+                            sequence_model_closed = True
                             return
                         media, media_time_us = payload.pixels, payload.presentation_time_us
                     pending_row_ids.discard(row_id)
-                    _deliver_sequence_row(
+                    sequence_model, sequence_run, should_stop = _deliver_sequence_row(
                         row_id, media, metadata, media_time_us,
                         sequence_model, sequence_run,
                     )
+                    # Exactly one row in this sequence -- it is over
+                    # either way. should_stop == True means
+                    # _deliver_sequence_row already closed it.
+                    if not should_stop:
+                        _safe_close_model(operator, sequence_model)
+                    sequence_model_closed = True
             except BaseException as e:
                 print(
                     f"[OperatorRegistry] A sequence worker for "
@@ -2026,6 +2116,8 @@ class OperatorRegistry:
                     f"the rows still pending in this sequence become row "
                     f"errors."
                 )
+                if sequence_model is not None and not sequence_model_closed:
+                    _safe_close_model(operator, sequence_model)
                 results_queue.put(("worker_crashed",))
                 for row_id in pending_row_ids:
                     results_queue.put((

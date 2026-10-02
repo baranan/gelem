@@ -620,6 +620,19 @@ state. This rule carries no violation list of its own -- it points at the three
   every sequence its own model from `build_sequence_model()`; rows reach the
   operator in ascending order within a sequence; only the coordinator
   records. Guarded by `tests/test_sequence_runner.py`.
+- **`[NOW]`** The runner closes every model it builds, via
+  `operator.close_model()`, on the thread that used it last: a sequence
+  reset after a row error, the end of a sequence, the end of each worker or
+  consumer thread in the parallel COLUMNS path, the end of the serial path,
+  the coordinator's fallback model, and a run that aborts or is cancelled.
+  A `SHARED` model is never closed this way -- it is cached and reused by
+  every run. `close_model()` does nothing by default; an operator whose
+  model holds a native resource overrides it. A close failure is logged
+  and swallowed -- it never fails a row or a run. Built to stop exactly
+  the failure mode P2.4b found: a model left for Python's garbage
+  collector to close can hang `close()` indefinitely once it finally
+  runs, if that happens on a different thread or well after the model was
+  discarded. Guarded by `tests/test_close_model.py`.
 
 ---
 

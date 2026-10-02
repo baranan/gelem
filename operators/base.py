@@ -378,6 +378,38 @@ class BaseOperator:
         """
         return None
 
+    def close_model(self, model) -> None:
+        """
+        Releases a model the runner built (``build_model()`` or
+        ``build_sequence_model()``) and is about to discard, called on
+        the thread that used ``model`` last, right after its last use:
+        a sequence reset after a row error, the end of a sequence, the
+        end of a worker or consumer thread in the parallel COLUMNS path,
+        the end of the serial path, the coordinator's fallback model, and
+        a run that aborts or is cancelled (operators/CLAUDE.md -> "Where
+        a model lives"). NEVER called for a ``SHARED`` model -- that
+        lifecycle means "reused by every run", so the runner never
+        discards one; ``_shared_models`` lives for the process.
+
+        Does nothing by default, which is correct for a model that holds
+        no resource needing release (a plain Python object, a dict). An
+        operator whose model owns something that must be released
+        explicitly -- a native handle, a background dispatcher thread, an
+        open file -- overrides this to release it. ``model`` is always
+        the real object a factory returned, never ``None``.
+
+        Discovered necessary (not theoretical) by P2.4b: a MediaPipe
+        ``FaceLandmarker`` left for Python's garbage collector to close,
+        rather than closed explicitly right after use, can hang `close()`
+        indefinitely once it finally runs, if that happens on a different
+        thread or well after the model was discarded (the GC can run on
+        any thread, including the main one, at an unpredictable moment).
+
+        Any exception this raises is logged and swallowed by the runner;
+        it must never fail a row or a run.
+        """
+        pass
+
     def build_sequence_model(self, run):
         """
         FACTORY for one sequence's model (P2.4a's sequence runner). The

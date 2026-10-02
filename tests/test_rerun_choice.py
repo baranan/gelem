@@ -49,6 +49,8 @@ from column_types.registry import ColumnTypeRegistry
 from operators.operator_registry import OperatorRegistry
 from operators.base import BaseOperator
 from operators.descriptor import (
+    BooleanParameter,
+    ColumnParameter,
     ExecutionMode,
     InputKind,
     InputSpec,
@@ -58,7 +60,7 @@ from operators.descriptor import (
     OutputColumn,
     OutputSpec,
 )
-from controller import AppController
+from controller import AppController, format_existing_outputs_message
 
 TEST_IMAGES = project_root / "test_images"
 
@@ -420,7 +422,7 @@ def test_describe_existing_outputs_no_settings_line_when_nothing_is_recorded(tmp
     )
 
     assert info is not None
-    assert "Since the last run" not in info.message
+    assert "Your settings are different" not in info.message
 
 
 def test_describe_existing_outputs_no_version_line_when_the_old_entry_lacks_a_version(tmp_path):
@@ -578,3 +580,146 @@ def test_overwrite_all_clears_a_row_with_missing_media_instead_of_keeping_its_ol
     for rid in row_ids[1:]:
         assert rid in op.rows_seen
         assert _out_value(dataset, "frames", rid) == 42.0
+
+
+# ---------------------------------------------------------------------------
+# format_existing_outputs_message's plain-language wording.
+# Calls the function directly -- it is Qt-free and takes plain data, so
+# these do not need a controller, a dataset, or an operator at all.
+# ---------------------------------------------------------------------------
+
+def _message(
+    *,
+    existing_columns=("out",),
+    chosen_row_count=10,
+    empty_row_count=3,
+    parameter_changes=(),
+    version_change=None,
+    parameter_specs=(),
+    label="Run",
+    table_name="frame_rows",
+):
+    return format_existing_outputs_message(
+        label=label,
+        table_name=table_name,
+        existing_columns=existing_columns,
+        chosen_row_count=chosen_row_count,
+        empty_row_count=empty_row_count,
+        parameter_changes=list(parameter_changes),
+        version_change=version_change,
+        parameter_specs=parameter_specs,
+    )
+
+
+def test_message_uses_the_parameter_label_not_its_internal_name():
+    # Would still pass if the message showed the internal parameter name
+    # instead of its researcher-facing label? No -- "track_face" would
+    # appear in the message and the label would not.
+    specs = (
+        BooleanParameter(
+            name="track_face", label="Track the face across frames",
+            required=False, default=False,
+        ),
+    )
+    message = _message(
+        parameter_changes=[("track_face", False, True)],
+        parameter_specs=specs,
+    )
+
+    assert "Track the face across frames" in message
+    assert "track_face" not in message
+
+
+def test_message_formats_a_boolean_as_on_off_not_true_false():
+    # Would still pass if a boolean's Python value leaked through as
+    # "True"/"False"? No -- those words would appear instead of "on"/"off".
+    specs = (
+        BooleanParameter(
+            name="track_face", label="Track the face across frames",
+            required=False, default=False,
+        ),
+    )
+    message = _message(
+        parameter_changes=[("track_face", False, True)],
+        parameter_specs=specs,
+    )
+
+    assert "was off, now on" in message
+    assert "True" not in message
+    assert "False" not in message
+
+
+def test_message_formats_an_empty_optional_value_as_none():
+    # Would still pass if an unset optional value were shown as the
+    # literal Python None, or as a blank? No -- the word "None", or an
+    # empty gap where a value belongs, would appear instead of "none".
+    specs = (
+        ColumnParameter(
+            name="sequence_column",
+            label="Treat rows with the same value in this column as one sequence",
+            from_input="active_table", required=False,
+        ),
+    )
+    message = _message(
+        parameter_changes=[("sequence_column", None, "trial_id")],
+        parameter_specs=specs,
+    )
+
+    assert "was none, now trial_id" in message
+    assert "None" not in message
+
+    cleared_message = _message(
+        parameter_changes=[("sequence_column", "trial_id", "")],
+        parameter_specs=specs,
+    )
+    assert "was trial_id, now none" in cleared_message
+
+
+def test_message_lists_at_most_three_columns_and_says_how_many_more():
+    # Would still pass if every column name were listed regardless of
+    # count? No -- the 4th and 5th names would both appear in the
+    # message instead of being folded into "and 2 more".
+    columns = ("bs_browDownLeft", "bs_browDownRight", "bs_browInnerUp",
+               "bs_browOuterUpLeft", "bs_browOuterUpRight")
+    message = _message(existing_columns=columns)
+
+    assert "bs_browDownLeft" in message
+    assert "bs_browDownRight" in message
+    assert "bs_browInnerUp" in message
+    assert "bs_browOuterUpLeft" not in message
+    assert "bs_browOuterUpRight" not in message
+    assert "and 2 more" in message
+
+
+def test_message_lists_every_column_when_three_or_fewer():
+    # Would still pass if the "and N more" wording appeared even when
+    # nothing was actually left out? No -- "more" would appear in the
+    # message even though all 2 columns are already named.
+    message = _message(existing_columns=("bs_jawOpen", "bs_mouthClose"))
+
+    assert "bs_jawOpen" in message
+    assert "bs_mouthClose" in message
+    assert "more" not in message
+
+
+def test_message_never_contains_a_double_dash():
+    # Exercises every optional section at once (columns, counts, a
+    # boolean setting change, a version change, the three choice lines)
+    # so a regression in any one of them would be caught here.
+    specs = (
+        BooleanParameter(
+            name="track_face", label="Track the face across frames",
+            required=False, default=False,
+        ),
+    )
+    message = _message(
+        existing_columns=tuple(f"bs_col_{i}" for i in range(6)),
+        chosen_row_count=499,
+        empty_row_count=33,
+        parameter_changes=[("track_face", False, True)],
+        version_change=("1.0", "1.1"),
+        parameter_specs=specs,
+    )
+
+    assert "--" not in message
+    assert "–" in message, "expected an en dash in the choice lines"

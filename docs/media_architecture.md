@@ -1486,7 +1486,8 @@ rows", which narrows the run to exactly the chosen rows still empty for
 those columns (`Dataset.empty_rows_for_columns()`) and leaves every other
 row untouched. This is the independent-frame case's cheap, exact skip
 described above, driven by the researcher rather than by a stored resume
-point. A crash-log-driven resume is P2.2b's, not this one's.
+point. A crash-log-driven resume is P2.2b's, not this one's -- **postponed
+to the wishlist** (§9's "Deferred, with known cost").
 
 *Consequence for P1.6:* the segment operator's boundaries are the natural reset
 boundaries, which is a further reason segments are a first-class row type rather
@@ -1510,8 +1511,18 @@ student's 8 GB laptop costs roughly 200 MB for models, not a device-defining
 number, though CPU contention (not memory) is still the reason the default stays
 low rather than defaulting to the machine's full core count.
 
-**P2.4 Tracking mode as a flag**, defaulting to per-image, with a test of how far
-the two diverge on real data.
+**P2.4 Tracking mode as a flag -- built (P2.4a/P2.4b).** The general-purpose
+mechanism (P2.4a) lives in `operators/descriptor.py` (`SequenceOption`,
+`runs_as_sequences()`, `sequence_group_column()`), `operators/base.py`
+(`build_sequence_model()`, `create_columns_in_sequence()`) and
+`operators/operator_registry.py`'s `_run_create_columns_sequenced`. P2.4b
+wired the first real operator to it: "Extract blendshapes" gained a
+`track_face` `BooleanParameter`, **defaulting to off** (per-image, exactly
+today's behaviour, unrouted through any sequence machinery), and an
+optional `sequence_column` `ColumnParameter` that splits one source into
+more than one sequence. With tracking on, MediaPipe's `FaceLandmarker`
+runs in VIDEO mode and follows the face frame to frame; the divergence
+from per-image mode was measured across three recordings (§11).
 
 ---
 
@@ -1666,6 +1677,12 @@ not volunteer it.
 - **`row_id` is a string.** At 500k rows this costs ~50 MB, which is tolerable. At
   tens of millions it is fatal. Changing it is a wide refactor. Revisit only if the
   row-count trigger fires.
+- **P2.2b's crash-log-driven resume.** §6.3's P2.2a section describes what
+  is built: the researcher's own explicit "Fill only empty rows" choice,
+  no automatic record of a previous run's progress. A crash-log-driven
+  resume -- reading back which rows a killed run had already finished,
+  without the researcher having to say so -- is postponed indefinitely,
+  not scheduled against any work item.
 
 ---
 
@@ -1848,7 +1865,7 @@ causes were checked, per the method rules, before accepting this:
 | Does PyAV release the GIL during decode? | **Yes, confirmed.** W > 1 at every worker count tested (never ≈1.0, which would mean no parallelism). Sub-linear: same-file W = 1.60 (2 workers) / 2.06 (4 workers, of ideal 4.0); different-files W = 1.36 / 1.72 (5-repeat median, tight range -- see `RUNLOG.md`). | Whether the C library releases the GIL during its C-level decode call is a fact about the binding, true on any machine. That scaling is sub-linear, and further reduced when threads decode different files/codecs simultaneously rather than one shared file, is a real, reproduced effect -- but the exact multipliers are this CPU's core count and scheduler, and will not generalise numerically. |
 | Sorted vs scattered batching benefit | **0.5-2.9% faster sorted**, one file (h265 1 s-GOP) measured 7.4% *slower* sorted -- within noise. No meaningful benefit observed. | **Does not generalise, and cannot be read as "batching doesn't help."** The method's mandatory warm-cache protocol (discard first pass, report second) removes exactly the disk-I/O locality effect that sequential access is supposed to exploit. This result says the batching benefit is not visible *once the OS page cache is already warm* -- it is silent on the cold-cache / Google-Drive-Streaming case §4.3 is actually written for. A cold-cache variant would be needed to test the claim as stated. |
 | MediaPipe parallelises across threads? | **Yes, confirmed, measured 27 Sep 2026.** Thread speedup at N=4 = 3.25x, process speedup at N=4 (inference only) = 3.26x -- threads reach 99.9% of the process speedup. Bit-identical output between N=1 and N=4 threads on 20 sampled frames (max abs diff 0.0). MediaPipe's own internal CPU usage at N=1 sampled ~100% of one core (mean), 155% max. | Whether the library releases the GIL during inference is a fact about the binding, true on any machine, and decides threads over processes independent of core count. The specific speedup multipliers (3.25x / 3.26x at N=4) are this CPU's core count and scheduler, and will not generalise numerically -- see the process-startup-cost row below for the machine-specific numbers this measurement also produced. |
-| Tracking vs per-image output divergence | unknown -- not yet measured | A property of the model; still gates Phase 2 (§6.0) |
+| Tracking vs per-image output divergence | measured 28 Sep, median r across blendshapes 0.31-0.86 over three recordings, brows differ most | A property of the model; still gates Phase 2 (§6.0) |
 
 ### Machine and file specific, must not become a constant
 
